@@ -166,6 +166,24 @@ impl World {
         g
     }
 
+    /// A copy of this world (tests).
+    #[cfg(test)]
+    pub fn clone_world(&self) -> World {
+        World { blocks: self.blocks.clone(), spawn_points: self.spawn_points.clone(), half: self.half, deco: self.deco.clone(), braziers: self.braziers.clone(), banners: self.banners.clone() }
+    }
+
+    /// What's under someone's feet: the material of the highest surface just below `p`.
+    pub fn ground_mat(&self, p: V3) -> Mat {
+        let mut best = (-1.0f32, Mat::Floor);
+        for bl in &self.blocks {
+            let b = &bl.b;
+            if p.x >= b.min.x && p.x <= b.max.x && p.z >= b.min.z && p.z <= b.max.z && b.max.y <= p.y + 0.05 && b.max.y > best.0 {
+                best = (b.max.y, bl.mat);
+            }
+        }
+        best.1
+    }
+
     pub fn line_clear(&self, a: V3, b: V3) -> bool {
         let d = b - a;
         let l = d.len();

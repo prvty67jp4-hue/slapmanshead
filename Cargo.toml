@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "duel_arena"
 version = "0.1.0"
 edition = "2024"
@@ -7,7 +7,10 @@ edition = "2024"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 cpal = "0.18.2"
 eframe = "0.37.0"
+glam = "0.34.3"
+gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+symphonia = { version = "0.5", default-features = false, features = ["ogg", "vorbis", "mp3", "wav", "pcm"] }
 
 [profile.dev]
 opt-level = 1

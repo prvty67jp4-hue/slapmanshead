@@ -1,4 +1,4 @@
-use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
+﻿use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct V3 {
@@ -120,6 +120,62 @@ impl M3 {
 }
 
 /// Axis aligned box.
+/// Where a ray (unit direction `d`) first meets a capsule (the segment `a`-`b` grown by `r`),
+/// within `max_t`. A ray starting inside counts as a hit at 0.
+pub fn ray_capsule(o: V3, d: V3, max_t: f32, a: V3, b: V3, r: f32) -> Option<f32> {
+    if seg_dist(o, a, b) <= r {
+        return Some(0.0);
+    }
+    let mut best: Option<f32> = None;
+    let mut take = |t: f32| {
+        if t >= 0.0 && t <= max_t && best.map_or(true, |x| t < x) {
+            best = Some(t);
+        }
+    };
+    // the round side
+    let ba = b - a;
+    let baba = ba.dot(ba);
+    if baba > 1e-10 {
+        let oa = o - a;
+        let bard = ba.dot(d);
+        let baoa = ba.dot(oa);
+        let rdoa = d.dot(oa);
+        let oaoa = oa.dot(oa);
+        let qa = baba - bard * bard;
+        let qb = baba * rdoa - baoa * bard;
+        let qc = baba * oaoa - baoa * baoa - r * r * baba;
+        if qa.abs() > 1e-10 {
+            let h = qb * qb - qa * qc;
+            if h >= 0.0 {
+                let t = (-qb - h.sqrt()) / qa;
+                let y = baoa + t * bard;
+                if y > 0.0 && y < baba {
+                    take(t);
+                }
+            }
+        }
+    }
+    // the two round ends
+    for c in [a, b] {
+        let oc = o - c;
+        let pb = d.dot(oc);
+        let pc = oc.dot(oc) - r * r;
+        let h = pb * pb - pc;
+        if h >= 0.0 {
+            take(-pb - h.sqrt());
+        }
+    }
+    best
+}
+
+/// Distance from a point to the segment `a`-`b`.
+pub fn seg_dist(p: V3, a: V3, b: V3) -> f32 {
+    let ab = b - a;
+    let l2 = ab.dot(ab);
+    let t = if l2 > 1e-12 { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    (p - (a + ab * t)).len()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Aabb {
     pub min: V3,

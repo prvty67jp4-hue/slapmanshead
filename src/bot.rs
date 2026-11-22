@@ -20,6 +20,7 @@ pub struct Bot {
     style: f32,
     target: Option<usize>,
     retarget: f32,
+    slide_hold: f32,
 }
 
 impl Bot {
@@ -44,6 +45,7 @@ impl Bot {
             style,
             target: None,
             retarget: 0.0,
+            slide_hold: 0.0,
         }
     }
 
@@ -118,7 +120,7 @@ impl Bot {
                     }
                 }
             };
-            self.want = if dist < sword_range {
+            self.want = if g.mt.mode.melee_only() || dist < sword_range {
                 0
             } else {
                 let (a, b) = (me.slot_weapon(1), me.slot_weapon(2));
@@ -158,6 +160,19 @@ impl Bot {
             inp.right = self.strafe * 0.3;
         }
 
+        // objective modes: go for the flag, bring it home, or return ours
+        if let Some(goal) = g.objective(i) {
+            let carrying = g.mt.flags.iter().any(|fl| fl.state == 1 && fl.carrier as usize == i);
+            if carrying || !visible || dist > 11.0 {
+                let to = goal - me.pos;
+                if to.flat().len() > 0.5 {
+                    inp.yaw = to.x.atan2(to.z);
+                    inp.pitch = 0.0;
+                    inp.fwd = 1.0;
+                    inp.right = self.strafe * 0.15;
+                }
+            }
+        }
         // unstick: jump and wall-run over things
         let moved = (me.pos - self.last_pos).flat().len();
         self.last_pos = me.pos;
@@ -186,6 +201,19 @@ impl Bot {
             if melee && dist > 3.0 {
                 inp.fwd = 1.0;
                 inp.right = 0.0;
+            }
+        }
+
+        // slide in at speed now and then (closing in with a blade, or dodging around)
+        self.slide_hold -= dt;
+        if self.slide_hold <= 0.0 && me.on_ground && me.vel.flat().len() > 8.0 && visible && dist > 5.0 && self.rng.chance(dt * (0.4 + s)) {
+            self.slide_hold = 0.35 + self.rng.f() * 0.3;
+        }
+        if self.slide_hold > 0.0 {
+            inp.crouch = true;
+            inp.fwd = 1.0;
+            if self.slide_hold < 0.08 && melee {
+                inp.jump = true; // and jump out of it
             }
         }
 

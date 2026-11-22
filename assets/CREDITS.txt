@@ -1,0 +1,32 @@
+Third-party assets (all public domain, CC0 1.0 - https://creativecommons.org/publicdomain/zero/1.0/)
+No attribution is required for any of these; it's listed here anyway, with thanks.
+
+assets/UAL1_Standard.glb
+  "Universal Animation Library [Standard]" by Quaternius (quaternius.com)
+  Source: https://quaternius.itch.io/universal-animation-library
+
+assets/sfx/shotgun_*.wav, revolver_*.wav, smg_*.wav, rifle_*.wav
+  "Gunshots" by kurt (OpenGameArt), CC0 - cut to single shots, resampled to 44.1 kHz mono
+  Source: https://opengameart.org/content/gunshots
+
+assets/sfx/swing_*.wav, dash_*.wav, throw.wav
+  "Swishes Sound Pack" by artisticdude (OpenGameArt), CC0 - resampled to 44.1 kHz mono
+  Source: https://opengameart.org/content/swishes-sound-pack
+
+assets/sfx/*.ogg (impacts, clangs, footsteps on stone and wood, explosions, rocket, reload,
+  cloth, UI clicks, jingles)
+  "Impact Sounds", "Interface Sounds", "RPG Audio", "Sci-Fi Sounds", "Music Jingles"
+  by Kenney (kenney.nl), CC0
+  Source: https://kenney.nl/assets
+
+assets/music/fight.ogg
+  "Fast fight / battle music" by bonsaiheldin (OpenGameArt), CC0
+  Source: https://opengameart.org/content/fast-fight-battle-music
+
+assets/music/battle.mp3
+  "Battle Theme A" by cynicmusic (OpenGameArt), CC0
+  Source: https://opengameart.org/content/battle-theme-a
+
+assets/music/menu.ogg
+  "Tragic ambient main menu" by haeldb (OpenGameArt), used under its CC0 option
+  Source: https://opengameart.org/content/tragic-ambient-main-menu

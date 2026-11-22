@@ -3,6 +3,8 @@
 
 use crate::game::*;
 use crate::math::*;
+use crate::anim::{Rig, SkinVtx};
+use crate::character::{self, CharState};
 use crate::render::{Cam, sword_arm};
 use crate::world::{Mat, World};
 use bytemuck::{Pod, Zeroable};
@@ -17,6 +19,10 @@ const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const TEX: u32 = 256;
 const LAYERS: u32 = 8;
 const SUN: V3 = v3(0.5, 0.62, 0.6);
+const MAX_JOINTS: usize = 72;
+const MAX_INST: usize = 16;
+/// Per character: two tints, the hit flash (three words of joint bits + strength), the joints.
+const INST_FLOATS: usize = 12 + MAX_JOINTS * 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -89,6 +95,33 @@ fn fogit(c: vec3<f32>, wpos: vec3<f32>) -> vec3<f32> {
     c = base.rgb * (hemi + sunc * ndl * sunvis) + sunc * spec;
   }
   return vec4<f32>(fogit(c, i.wpos), base.a);
+}
+
+struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, joints: array<mat4x4<f32>, 72> };
+@group(0) @binding(3) var<storage, read> insts: array<Inst>;
+struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32 };
+@vertex fn vs_skin(v: SIn, @builtin(instance_index) ii: u32) -> VOut {
+  let m = insts[ii].joints[v.j.x] * v.w.x + insts[ii].joints[v.j.y] * v.w.y + insts[ii].joints[v.j.z] * v.w.z + insts[ii].joints[v.j.w] * v.w.w;
+  let wp = m * vec4<f32>(v.pos, 1.0);
+  var o: VOut;
+  o.clip = u.vp * vec4<f32>(wp.xyz, 1.0);
+  o.wpos = wp.xyz;
+  o.nrm = normalize((m * vec4<f32>(v.nrm, 0.0)).xyz);
+  o.uv = vec2<f32>(0.0, 0.0);
+  o.col = select(insts[ii].tint1, insts[ii].tint0, v.mat == 0u);
+  // the body part just hit flashes white: test the joint that moves this vertex most
+  var jd = v.j.x; var wd = v.w.x;
+  if (v.w.y > wd) { jd = v.j.y; wd = v.w.y; }
+  if (v.w.z > wd) { jd = v.j.z; wd = v.w.z; }
+  if (v.w.w > wd) { jd = v.j.w; wd = v.w.w; }
+  let fl = insts[ii].flash;
+  var word = bitcast<u32>(fl.x);
+  if (jd >= 64u) { word = bitcast<u32>(fl.z); } else if (jd >= 32u) { word = bitcast<u32>(fl.y); }
+  if (fl.w > 0.0 && ((word >> (jd & 31u)) & 1u) == 1u) {
+    o.col = vec4<f32>(mix(o.col.rgb, vec3<f32>(2.2, 2.2, 2.2), fl.w), o.col.a);
+  }
+  o.ex = vec4<f32>(-1.0, 0.0, 1.0, 0.35);
+  return o;
 }
 
 struct SkyOut { @builtin(position) clip: vec4<f32>, @location(0) ndc: vec2<f32> };
@@ -829,6 +862,113 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
         _ => {}
     }
 }
+/// Things attached to an animated character's bones: the weapon in the right hand, the sword's
+/// swing trail, hair, and the long coat.
+#[allow(clippy::too_many_arguments)]
+fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, flash: f32) {
+    let tint = |c: [u8; 3]| -> [f32; 4] {
+        let l = lin(c);
+        [l[0] + (1.0 - l[0]) * flash, l[1] + (0.3 - l[1]).max(0.0) * flash, l[2] + (0.3 - l[2]).max(0.0) * flash, 1.0]
+    };
+    // hair cap
+    let hf = &p.head_frame;
+    mb.ellipsoid(p.head + hf.y * 0.1 - hf.z * 0.015, hf, v3(0.105, 0.07, 0.115), tint(lk.hair), -1.0, 0.4, 0.0);
+    mb.ellipsoid(p.head + hf.y * 0.05 - hf.z * 0.06, hf, v3(0.1, 0.085, 0.07), tint(lk.hair), -1.0, 0.4, 0.0);
+    // long coat from the waist, trailing behind with speed
+    if f.alive {
+        let speed = f.vel.flat().len();
+        let air = !f.on_ground && f.wall.is_none();
+        let flap = 0.15 + (speed / 12.0).min(1.0) * 0.8 + (time * 9.0).sin() * 0.05 * (speed / RUN_SPEED).min(1.0) + if air { 0.3 } else { 0.0 };
+        let fwd = f.fwd();
+        let side = v3(fwd.z, 0.0, -fwd.x);
+        let waist = p.waist - v3(0.0, 0.05, 0.0);
+        let hem = waist + v3(0.0, -0.58 + flap * 0.15, 0.0) - fwd * (0.06 + flap * 0.3);
+        mb.tube(waist, hem, 0.2, 0.31, side, 0.78, tint(lk.coat_dark), 7.0, 0.05);
+    }
+    // weapon
+    weapon_mesh(mb, add_mb, cam, f, p.hand, &p.weapon, time);
+    // swing trail from recent blade positions
+    let w = f.weapon;
+    if w.is_melee() && f.slashing() && f.alive {
+        let len = match w {
+            Weapon::Dagger => 0.2,
+            Weapon::Greatsword => 0.78,
+            _ => 0.56,
+        };
+        let tip = 0.16 + len * 2.0 + 0.05;
+        st.trail.push_back((p.hand + p.weapon.z * (tip * 0.3), p.hand + p.weapon.z * tip, time));
+    }
+    // the trail lingers a moment after the swing, then fades
+    while st.trail.front().map_or(false, |e| time - e.2 > 0.2 || time < e.2) {
+        st.trail.pop_front();
+    }
+    let n = st.trail.len();
+    let heavy = f.slash_idx >= 2 || w == Weapon::Greatsword;
+    for k in 1..n {
+        let (b0, b1, tb) = st.trail[k - 1];
+        let (a0, a1, ta) = st.trail[k];
+        let age = |t0: f32| (1.0 - (time - t0) / 0.2).clamp(0.0, 1.0);
+        let al = 0.55 * age(ta).min(age(tb)) * (0.3 + 0.7 * k as f32 / n as f32);
+        let c = if heavy { lina([255, 170, 80], al) } else { lina([150, 200, 255], al) };
+        let nrm = (b1 - b0).cross(a0 - b0).norm();
+        add_mb.quad([b0, b1, a1, a0], nrm, [[0.5, 0.5]; 4], c, [-1.0, 2.0, 1.0, 0.0]);
+        // bright core near the blade's edge
+        let m0 = b0.lerp(b1, 0.7);
+        let m1 = a0.lerp(a1, 0.7);
+        add_mb.quad([m0, b1, a1, m1], nrm, [[0.5, 0.5]; 4], lina([255, 255, 255], al * 0.7), [-1.0, 2.0, 1.0, 0.0]);
+    }
+}
+
+/// A weapon held at `hand`, pointing along `wf.z`.
+fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, wf: &M3, time: f32) {
+    let steel = lin([200, 206, 218]);
+    let wood = lin([70, 46, 30]);
+    let gunmetal = lin([60, 62, 70]);
+    match f.weapon {
+        w if w.is_melee() => {
+            let (len, wid, guard) = match w {
+                Weapon::Dagger => (0.2, 0.025, 0.04),
+                Weapon::Greatsword => (0.78, 0.06, 0.12),
+                _ => (0.56, 0.03, 0.06),
+            };
+            mb.obox(hand, wf, v3(0.022, 0.022, 0.13), lin([30, 22, 22]), -1.0, 0.2);
+            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.14)), wf, v3(guard, 0.02, 0.02), lin([210, 170, 70]), -1.0, 1.0);
+            let blade = if w == Weapon::Greatsword { lin([170, 176, 190]) } else { steel };
+            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.16 + len)), wf, v3(if w == Weapon::Greatsword { 0.015 } else { 0.008 }, wid, len), blade, -1.0, 2.5);
+            if f.guard {
+                let c = hand + wf.apply(v3(0.0, 0.0, 0.2 + len));
+                add_mb.billboard(cam, c, 0.5 + (time * 20.0).sin().abs() * 0.08, lina([90, 150, 255], 0.5));
+            }
+        }
+        Weapon::Shotgun => {
+            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.05)), wf, v3(0.04, 0.06, 0.25), wood, 4.0, 0.3);
+            mb.tube(hand + wf.apply(v3(0.0, 0.05, 0.0)), hand + wf.apply(v3(0.0, 0.05, 0.7)), 0.03, 0.03, wf.x, 1.0, gunmetal, -1.0, 1.5);
+            mb.tube(hand + wf.apply(v3(0.0, 0.0, 0.25)), hand + wf.apply(v3(0.0, 0.0, 0.55)), 0.035, 0.035, wf.x, 1.0, lin([80, 56, 36]), 4.0, 0.3);
+        }
+        Weapon::Revolver => {
+            mb.obox(hand + wf.apply(v3(0.0, -0.04, 0.0)), wf, v3(0.022, 0.06, 0.04), lin([60, 40, 28]), 4.0, 0.3);
+            mb.ellipsoid(hand + wf.apply(v3(0.0, 0.02, 0.07)), wf, v3(0.035, 0.035, 0.05), lin([90, 92, 100]), -1.0, 1.5, 0.0);
+            mb.tube(hand + wf.apply(v3(0.0, 0.03, 0.07)), hand + wf.apply(v3(0.0, 0.03, 0.3)), 0.018, 0.018, wf.x, 1.0, lin([120, 122, 132]), -1.0, 1.8);
+        }
+        Weapon::Smg => {
+            mb.obox(hand + wf.apply(v3(0.0, 0.04, 0.1)), wf, v3(0.035, 0.05, 0.18), lin([40, 42, 48]), -1.0, 1.0);
+            mb.obox(hand + wf.apply(v3(0.0, -0.06, 0.12)), wf, v3(0.02, 0.09, 0.025), lin([30, 30, 34]), -1.0, 0.5);
+            mb.tube(hand + wf.apply(v3(0.0, 0.05, 0.26)), hand + wf.apply(v3(0.0, 0.05, 0.4)), 0.015, 0.015, wf.x, 1.0, gunmetal, -1.0, 1.5);
+        }
+        Weapon::Rifle => {
+            mb.obox(hand + wf.apply(v3(0.0, 0.0, -0.05)), wf, v3(0.035, 0.06, 0.3), wood, 4.0, 0.3);
+            mb.tube(hand + wf.apply(v3(0.0, 0.04, 0.15)), hand + wf.apply(v3(0.0, 0.04, 0.95)), 0.018, 0.016, wf.x, 1.0, gunmetal, -1.0, 1.6);
+            mb.tube(hand + wf.apply(v3(0.0, 0.11, 0.0)), hand + wf.apply(v3(0.0, 0.11, 0.25)), 0.025, 0.025, wf.x, 1.0, lin([25, 25, 28]), -1.0, 2.0);
+        }
+        Weapon::Rocket => {
+            mb.tube(hand + wf.apply(v3(0.0, 0.1, -0.45)), hand + wf.apply(v3(0.0, 0.1, 0.5)), 0.075, 0.075, wf.x, 1.0, lin([62, 74, 58]), -1.0, 0.6);
+            mb.tube(hand + wf.apply(v3(0.0, 0.1, 0.5)), hand + wf.apply(v3(0.0, 0.1, 0.57)), 0.09, 0.09, wf.x, 1.0, lin([40, 40, 44]), -1.0, 1.0);
+            mb.obox(hand, wf, v3(0.02, 0.06, 0.03), lin([30, 30, 34]), -1.0, 0.5);
+        }
+        _ => {}
+    }
+}
+
 fn shadow_disc(mb: &mut MB, world: &World, pos: V3) {
     let gy = world.ground_below(pos + v3(0.0, 0.1, 0.0));
     let hgt = (pos.y - gy).max(0.0);
@@ -852,6 +992,7 @@ fn shadow_disc(mb: &mut MB, world: &World, pos: V3) {
 
 struct Target {
     size: [u32; 2],
+    multisampled: bool,
     msaa_view: wgpu::TextureView,
     resolve_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
@@ -870,9 +1011,123 @@ pub struct Gpu {
     dyn_cap: u64,
     target: Option<Target>,
     pub tex_id: Option<egui::TextureId>,
+    pipe_skin: wgpu::RenderPipeline,
+    inst_buf: wgpu::Buffer,
+    skin: Option<Skin>,
+    chars: Vec<CharState>,
+    /// For each body part, which skin joints belong to it (bits, three words).
+    part_masks: [[u32; 3]; 7],
+    layout: wgpu::PipelineLayout,
+    module: wgpu::ShaderModule,
+    samples: u32,
+    pub quality: Quality,
 }
 
-fn make_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, blend: Option<wgpu::BlendState>, depth_write: bool, sky: bool) -> wgpu::RenderPipeline {
+struct Skin {
+    rig: Rig,
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    icount: u32,
+}
+
+/// Which skin joints make up each body part (head, chest, hips, left/right arm, left/right leg).
+fn part_masks(rig: &Rig) -> [[u32; 3]; 7] {
+    let mut out = [[0u32; 3]; 7];
+    let n = |name: &str| rig.node(name);
+    let (Some(neck), Some(sp2), Some(pelvis), Some(sp1), Some(ua_l), Some(ua_r), Some(th_l), Some(th_r)) =
+        (n("neck_01"), n("spine_02"), n("pelvis"), n("spine_01"), n("upperarm_l"), n("upperarm_r"), n("thigh_l"), n("thigh_r"))
+    else {
+        return out;
+    };
+    for (ji, &node) in rig.joints.iter().enumerate().take(96) {
+        let part = if rig.is_under(node, neck) {
+            0
+        } else if rig.is_under(node, ua_l) {
+            3
+        } else if rig.is_under(node, ua_r) {
+            4
+        } else if rig.is_under(node, th_l) {
+            5
+        } else if rig.is_under(node, th_r) {
+            6
+        } else if rig.is_under(node, sp2) {
+            1
+        } else if node == pelvis || node == sp1 {
+            2
+        } else {
+            continue;
+        };
+        out[part][ji / 32] |= 1 << (ji % 32);
+    }
+    out
+}
+
+fn make_skin_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, samples: u32) -> wgpu::RenderPipeline {
+    let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 4 => Uint32];
+    let vbl = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SkinVtx>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("duel skinned"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState { module, entry_point: Some("vs_skin"), compilation_options: Default::default(), buffers: &[Some(vbl)] },
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FMT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: samples, mask: !0, alpha_to_coverage_enabled: false },
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState { format: COLOR_FMT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// How much the renderer does each frame (from the graphics preset).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Quality {
+    /// Edge smoothing samples: 1 (off) or 4.
+    pub msaa: u32,
+    /// Render size compared with the window (below 1 is blurrier but faster).
+    pub scale: f32,
+    /// Share of particles drawn (0..1).
+    pub fx: f32,
+    /// Shell casings and other small extras.
+    pub extras: bool,
+}
+
+impl Quality {
+    pub const PRESETS: [(&'static str, Quality); 4] = [
+        ("Low", Quality { msaa: 1, scale: 0.6, fx: 0.35, extras: false }),
+        ("Medium", Quality { msaa: 1, scale: 0.85, fx: 0.7, extras: true }),
+        ("High", Quality { msaa: 4, scale: 1.0, fx: 1.0, extras: true }),
+        ("Ultra", Quality { msaa: 4, scale: 1.4, fx: 1.0, extras: true }),
+    ];
+}
+
+/// Every pipeline for one sample count: opaque, alpha, additive, sky, skinned.
+fn make_pipelines(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, samples: u32) -> [wgpu::RenderPipeline; 5] {
+    let alpha = wgpu::BlendState::ALPHA_BLENDING;
+    let add = wgpu::BlendState {
+        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+    };
+    [
+        make_pipeline(device, layout, module, None, true, false, samples),
+        make_pipeline(device, layout, module, Some(alpha), false, false, samples),
+        make_pipeline(device, layout, module, Some(add), false, false, samples),
+        make_pipeline(device, layout, module, None, false, true, samples),
+        make_skin_pipeline(device, layout, module, samples),
+    ]
+}
+
+fn make_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, blend: Option<wgpu::BlendState>, depth_write: bool, sky: bool, samples: u32) -> wgpu::RenderPipeline {
     let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x4];
     let vbl = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vtx>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs };
     let buffers: Vec<Option<wgpu::VertexBufferLayout>> = if sky { vec![] } else { vec![Some(vbl)] };
@@ -893,7 +1148,7 @@ fn make_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &
             stencil: Default::default(),
             bias: Default::default(),
         }),
-        multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
+        multisample: wgpu::MultisampleState { count: samples, mask: !0, alpha_to_coverage_enabled: false },
         fragment: Some(wgpu::FragmentState {
             module,
             entry_point: Some(if sky { "fs_sky" } else { "fs" }),
@@ -974,7 +1229,19 @@ impl Gpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
+        });
+        let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("duel characters"),
+            size: (MAX_INST * INST_FLOATS * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("duel bind"),
@@ -983,6 +1250,7 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() },
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("duel layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
@@ -991,11 +1259,23 @@ impl Gpu {
             color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
             alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
         };
-        let pipe_opaque = make_pipeline(device, &layout, &module, None, true, false);
-        let pipe_alpha = make_pipeline(device, &layout, &module, Some(alpha), false, false);
-        let pipe_add = make_pipeline(device, &layout, &module, Some(add), false, false);
-        let pipe_sky = make_pipeline(device, &layout, &module, None, false, true);
-
+        let _ = (alpha, add);
+        let [pipe_opaque, pipe_alpha, pipe_add, pipe_sky, pipe_skin] = make_pipelines(device, &layout, &module, MSAA);
+        // the animated character (CC0 Quaternius mannequin)
+        let skin = match Rig::load() {
+            Ok(rig) => {
+                use wgpu::util::DeviceExt;
+                let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("character verts"), contents: bytemuck::cast_slice(&rig.verts), usage: wgpu::BufferUsages::VERTEX });
+                let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("character indices"), contents: bytemuck::cast_slice(&rig.indices), usage: wgpu::BufferUsages::INDEX });
+                let icount = rig.indices.len() as u32;
+                Some(Skin { rig, vbuf, ibuf, icount })
+            }
+            Err(e) => {
+                eprintln!("character model not loaded: {e}");
+                None
+            }
+        };
+        let part_masks = skin.as_ref().map_or([[0u32; 3]; 7], |s| part_masks(&s.rig));
         let verts = build_world(world);
         let static_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("duel world"),
@@ -1019,6 +1299,31 @@ impl Gpu {
             dyn_cap,
             target: None,
             tex_id: None,
+            pipe_skin,
+            inst_buf,
+            skin,
+            chars: (0..MAX_INST).map(|_| CharState::new()).collect(),
+            part_masks,
+            layout,
+            module,
+            samples: MSAA,
+            quality: Quality::PRESETS[2].1,
+        }
+    }
+
+    /// Switch the graphics preset; edge smoothing changes rebuild the pipelines.
+    pub fn set_quality(&mut self, rs: &RenderState, q: Quality) {
+        self.quality = q;
+        let samples = if q.msaa > 1 { MSAA } else { 1 };
+        if samples != self.samples {
+            let [a, b, c, d, e] = make_pipelines(&rs.device, &self.layout, &self.module, samples);
+            self.pipe_opaque = a;
+            self.pipe_alpha = b;
+            self.pipe_add = c;
+            self.pipe_sky = d;
+            self.pipe_skin = e;
+            self.samples = samples;
+            self.target = None; // remade with the new sample count
         }
     }
 
@@ -1026,6 +1331,7 @@ impl Gpu {
         if self.target.as_ref().map_or(false, |t| t.size == size) {
             return;
         }
+        let samples = self.samples;
         let device = &rs.device;
         let mk = |samples: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -1039,11 +1345,13 @@ impl Gpu {
                 view_formats: &[],
             })
         };
-        let msaa = mk(MSAA, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let resolve = mk(1, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
-        let depth = mk(MSAA, DEPTH_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        // without edge smoothing the scene is drawn straight into the texture that is shown
+        let msaa = if samples > 1 { mk(samples, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT) } else { resolve.clone() };
+        let depth = mk(samples, DEPTH_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let t = Target {
             size,
+            multisampled: samples > 1,
             msaa_view: msaa.create_view(&Default::default()),
             resolve_view: resolve.create_view(&Default::default()),
             depth_view: depth.create_view(&Default::default()),
@@ -1058,8 +1366,9 @@ impl Gpu {
 
     /// Render the scene and return the texture to show.
     pub fn render(&mut self, rs: &RenderState, g: &Game, cam: &Cam, rect: egui::Rect, ppp: f32, alpha: f32, local_override: Option<(usize, V3)>) -> Option<egui::TextureId> {
-        let w = ((rect.width() * ppp).round() as u32).clamp(16, 8192);
-        let h = ((rect.height() * ppp).round() as u32).clamp(16, 8192);
+        let sc = self.quality.scale.clamp(0.3, 2.0);
+        let w = ((rect.width() * ppp * sc).round() as u32).clamp(16, 8192);
+        let h = ((rect.height() * ppp * sc).round() as u32).clamp(16, 8192);
         self.ensure_target(rs, [w, h]);
 
         // ---- uniforms
@@ -1099,8 +1408,9 @@ impl Gpu {
         let mut op = MB::default();
         let mut al = MB::default();
         let mut ad = MB::default();
+        let mut insts: Vec<Vec<f32>> = Vec::new();
         for (i, f) in g.f.iter().enumerate() {
-            if !f.present {
+            if !f.present || f.spectate {
                 continue;
             }
             let mut pos = f.prev_pos.lerp(f.pos, alpha.clamp(0.0, 1.0));
@@ -1112,7 +1422,33 @@ impl Gpu {
             if i == g.local && (cam.pos - (pos + v3(0.0, 1.1, 0.0))).len() < 0.8 {
                 continue;
             }
-            fighter_mesh(&mut op, &mut ad, cam, f, pos, g.time);
+            let posed = match (&self.skin, insts.len() < MAX_INST) {
+                (Some(sk), true) => character::animate(&sk.rig, &mut self.chars[i], f, pos, g.time),
+                _ => None,
+            };
+            match posed {
+                Some(p) => {
+                    let lk = look(f.color_idx);
+                    let flash = if f.hurt_t > 0.0 { (f.hurt_t * 1.4).min(0.35) } else { 0.0 };
+                    let tint = |c: [u8; 3]| -> [f32; 4] {
+                        let l = lin(c);
+                        [l[0] + (1.0 - l[0]) * flash, l[1] + (0.3 - l[1]).max(0.0) * flash, l[2] + (0.3 - l[2]).max(0.0) * flash, 1.0]
+                    };
+                    let mut data = Vec::with_capacity(INST_FLOATS);
+                    data.extend_from_slice(&tint(lk.coat));
+                    data.extend_from_slice(&tint(lk.pants));
+                    let m = self.part_masks[(f.hit_part as usize).min(6)];
+                    let strength = (f.flash_t / 0.12).clamp(0.0, 1.0) * 0.85;
+                    data.extend_from_slice(&[f32::from_bits(m[0]), f32::from_bits(m[1]), f32::from_bits(m[2]), strength]);
+                    for j in 0..MAX_JOINTS {
+                        let m = p.palette.get(j).copied().unwrap_or(glam::Mat4::IDENTITY);
+                        data.extend_from_slice(&m.to_cols_array());
+                    }
+                    insts.push(data);
+                    character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash);
+                }
+                None => fighter_mesh(&mut op, &mut ad, cam, f, pos, g.time),
+            }
             if f.spawn_prot > 0.0 && f.alive {
                 // spawn protection shimmer
                 let a = 0.18 + 0.08 * (g.time * 12.0).sin();
@@ -1120,8 +1456,38 @@ impl Gpu {
             }
             shadow_disc(&mut al, &g.world, pos);
         }
-        for gr in &g.grenades {
-            if gr.kind == 1 {
+        // Capture the Flag: base rings and the flags
+        if g.mt.mode == Mode::Ctf {
+            for t in 0..2usize {
+                let col = if t == 0 { [220, 50, 50] } else { [60, 110, 230] };
+                let base = flag_base(t);
+                let seg = 24;
+                for k in 0..seg {
+                    let a0 = k as f32 / seg as f32 * 2.0 * PI;
+                    let a1 = (k + 1) as f32 / seg as f32 * 2.0 * PI;
+                    let (r0, r1) = (1.35, 1.7);
+                    let pt = |a: f32, r: f32| base + v3(a.cos() * r, 0.03, a.sin() * r);
+                    al.quad([pt(a0, r0), pt(a1, r0), pt(a1, r1), pt(a0, r1)], V3::UP, [[0.5, 0.5]; 4], lina(col, 0.55), [-1.0, 2.0, 1.0, 0.0]);
+                }
+                let fl = g.mt.flags[t];
+                let (foot, h) = match fl.state {
+                    1 if (fl.carrier as usize) < g.f.len() => {
+                        let c = &g.f[fl.carrier as usize];
+                        (c.prev_pos.lerp(c.pos, alpha) + v3(0.0, 1.1, 0.0) - c.fwd() * 0.3, 1.3)
+                    }
+                    _ => (fl.pos, 2.3),
+                };
+                let top = foot + v3(0.0, h, 0.0);
+                op.tube(foot, top, 0.025, 0.025, v3(1.0, 0.0, 0.0), 1.0, lin([200, 200, 205]), -1.0, 1.5);
+                let wave = (g.time * 6.0 + t as f32).sin() * 0.12;
+                let side = v3(0.8, 0.0, wave).norm() * 0.75;
+                let c = lin([col[0], col[1], col[2]]);
+                let q = [top, top + side, top + side - v3(0.0, 0.5, 0.0) + v3(0.0, wave * 0.5, 0.0), top - v3(0.0, 0.5, 0.0)];
+                op.quad(q, side.cross(V3::UP).norm(), [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], c, [6.0, 0.0, 1.0, 0.1]);
+                ad.billboard(cam, top - v3(0.0, 0.25, 0.0), 0.7, lina(col, 0.25));
+            }
+        }
+        for gr in &g.grenades {            if gr.kind == 1 {
                 let d = gr.vel.norm();
                 op.tube(gr.pos - d * 0.35, gr.pos + d * 0.2, 0.06, 0.04, V3::UP.cross(d), 1.0, lin([70, 80, 64]), -1.0, 0.8);
                 ad.billboard(cam, gr.pos - d * 0.45, 0.35, lina([255, 180, 80], 0.9));
@@ -1133,15 +1499,32 @@ impl Gpu {
                 ad.billboard(cam, gr.pos + v3(0.0, 0.13, 0.0), 0.15, lina([255, 40, 30], 1.0));
             }
         }
-        for p in &g.particles {
+        let fx_every = (1.0 / self.quality.fx.clamp(0.1, 1.0)).round().max(1.0) as usize;
+        for (pi, p) in g.particles.iter().enumerate() {
+            if pi % fx_every != 0 {
+                continue;
+            }
             let t = (p.life / p.max_life).clamp(0.0, 1.0);
             let size = if p.size > 0.5 { p.size * (1.3 - t) * 2.0 } else { p.size * 2.2 };
             let glow = p.color[0] > 240 && p.color[1] > 150;
-            if glow {
+            if glow && p.size < 0.13 && p.vel.len() > 2.0 {
+                // fast sparks read as streaks
+                ad.beam(cam, p.pos - p.vel * 0.035, p.pos, p.size * 0.35, lina(p.color, t));
+            } else if glow {
                 ad.billboard(cam, p.pos, size, lina(p.color, t));
             } else {
                 al.billboard(cam, p.pos, size, lina(p.color, t * 0.9));
             }
+        }
+        for fl in &g.flashes {
+            let k = (fl.life / 0.06).clamp(0.0, 1.0);
+            ad.billboard(cam, fl.pos, fl.size * (0.6 + 0.4 * k), lina([255, 205, 120], k));
+            ad.billboard(cam, fl.pos, fl.size * 0.35, lina([255, 255, 230], k));
+            ad.beam(cam, fl.pos, fl.pos + fl.dir * fl.size * 1.8, fl.size * 0.3, lina([255, 185, 90], k * 0.9));
+        }
+        for c in g.casings.iter().filter(|_| self.quality.extras) {
+            let r = M3::rot_y(c.spin).mul(&M3::rot_x(c.spin * 1.3));
+            op.obox(c.pos, &r, v3(0.012, 0.012, 0.03), lin(c.color), -1.0, 1.8);
         }
         for tr in &g.tracers {
             let t = (tr.life / 0.09).clamp(0.0, 1.0);
@@ -1175,6 +1558,11 @@ impl Gpu {
         if !all.is_empty() {
             rs.queue.write_buffer(&self.dyn_buf, 0, bytemuck::cast_slice(&all));
         }
+        let n_inst = insts.len() as u32;
+        if n_inst > 0 {
+            let flat: Vec<f32> = insts.concat();
+            rs.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&flat));
+        }
 
         // ---- draw
         let t = self.target.as_ref()?;
@@ -1185,8 +1573,8 @@ impl Gpu {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &t.msaa_view,
                     depth_slice: None,
-                    resolve_target: Some(&t.resolve_view),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
+                    resolve_target: if t.multisampled { Some(&t.resolve_view) } else { None },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: if t.multisampled { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_view,
@@ -1211,6 +1599,20 @@ impl Gpu {
                 if a0 > 0 {
                     pass.draw(0..a0, 0..1);
                 }
+            }
+            if let (Some(sk), true) = (&self.skin, n_inst > 0) {
+                pass.set_pipeline(&self.pipe_skin);
+                pass.set_vertex_buffer(0, sk.vbuf.slice(..));
+                pass.set_index_buffer(sk.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                for k in 0..n_inst {
+                    pass.draw_indexed(0..sk.icount, 0, k..k + 1);
+                }
+            }
+            if !all.is_empty() {
+                pass.set_vertex_buffer(0, self.dyn_buf.slice(..));
+                let a0 = n_op as u32;
+                let a1 = (n_op + n_al) as u32;
+                let a2 = (n_op + n_al + n_ad) as u32;
                 if a1 > a0 {
                     pass.set_pipeline(&self.pipe_alpha);
                     pass.draw(a0..a1, 0..1);

@@ -1,7 +1,10 @@
 ﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim;
 mod audio;
 mod bot;
+mod firewall;
+mod character;
 mod game;
 mod gpu;
 mod math;
@@ -32,15 +35,213 @@ struct Settings {
     port: String,
     join_addr: String,
     volume: f32,
+    music_volume: f32,
     loadout: Loadout,
+    binds: [Bind; N_ACTIONS],
+    /// Graphics preset (index into gpu::Quality::PRESETS).
+    quality: usize,
+    fullscreen: bool,
+    /// Frames per second limit (0 = no limit).
+    fps_cap: u32,
+    vsync: bool,
+    /// 0 = changes with the weapon, then cross, dot, circle, cross + dot, T.
+    cross_style: u8,
+    cross_color: [u8; 3],
+    cross_size: f32,
+    /// The crosshair's dot turns red over an enemy.
+    cross_red: bool,
+    /// Servers joined before, newest first.
+    recent: Vec<RecentServer>,
+    /// Network test: pretend the connection has extra lag and loses packets.
+    net_test: bool,
+    net_lag: f32,
+    net_loss: f32,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+struct RecentServer {
+    addr: String,
+    host: String,
+    mode: String,
+    /// When it was last joined (seconds since 1970).
+    when: u64,
+}
+
+const MAX_RECENT: usize = 6;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn ago(when: u64) -> String {
+    let d = now_secs().saturating_sub(when);
+    match d {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86_399 => format!("{} h ago", d / 3600),
+        _ => format!("{} days ago", d / 86_400),
+    }
+}
+
+// ---------------------------------------------------------------------- controls
+
+/// A key, mouse button or modifier an action is bound to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Bind {
+    Key(Key),
+    Mouse(u8),
+    Shift,
+    Ctrl,
+    Alt,
+    Unbound,
+}
+
+const N_ACTIONS: usize = 17;
+const A_FWD: usize = 0;
+const A_BACK: usize = 1;
+const A_LEFT: usize = 2;
+const A_RIGHT: usize = 3;
+const A_JUMP: usize = 4;
+const A_DASH: usize = 5;
+const A_DASH2: usize = 6;
+const A_FIRE: usize = 7;
+const A_GUARD: usize = 8;
+const A_RELOAD: usize = 9;
+const A_ITEM: usize = 10;
+const A_MELEE: usize = 11;
+const A_GUN1: usize = 12;
+const A_GUN2: usize = 13;
+const A_SCORES: usize = 14;
+const A_CHAT: usize = 15;
+const A_SLIDE: usize = 16;
+
+/// (saved id, what it does)
+const ACTIONS: [(&str, &str); N_ACTIONS] = [
+    ("fwd", "Move forward"),
+    ("back", "Move back"),
+    ("left", "Move left"),
+    ("right", "Move right"),
+    ("jump", "Jump / wall-run / wall-jump"),
+    ("dash", "Dash"),
+    ("dash2", "Dash (second key)"),
+    ("fire", "Shoot / slash"),
+    ("guard", "Guard (sword)"),
+    ("reload", "Reload"),
+    ("item", "Use item"),
+    ("melee", "Melee weapon"),
+    ("gun1", "Gun 1"),
+    ("gun2", "Gun 2"),
+    ("scores", "Player list (hold)"),
+    ("chat", "Chat"),
+    ("slide", "Slide (while running)"),
+];
+
+fn default_binds() -> [Bind; N_ACTIONS] {
+    use Bind::*;
+    [
+        Key(egui::Key::W),
+        Key(egui::Key::S),
+        Key(egui::Key::A),
+        Key(egui::Key::D),
+        Key(egui::Key::Space),
+        Shift,
+        Key(egui::Key::Q),
+        Mouse(0),
+        Mouse(1),
+        Key(egui::Key::R),
+        Key(egui::Key::G),
+        Key(egui::Key::Num1),
+        Key(egui::Key::Num2),
+        Key(egui::Key::Num3),
+        Key(egui::Key::Tab),
+        Key(egui::Key::T),
+        Key(egui::Key::C),
+    ]
+}
+
+fn mouse_button(n: u8) -> egui::PointerButton {
+    match n {
+        0 => egui::PointerButton::Primary,
+        1 => egui::PointerButton::Secondary,
+        2 => egui::PointerButton::Middle,
+        3 => egui::PointerButton::Extra1,
+        _ => egui::PointerButton::Extra2,
+    }
+}
+
+impl Bind {
+    fn name(self) -> String {
+        match self {
+            Bind::Key(k) => k.name().to_string(),
+            Bind::Mouse(0) => "Left click".into(),
+            Bind::Mouse(1) => "Right click".into(),
+            Bind::Mouse(2) => "Middle click".into(),
+            Bind::Mouse(n) => format!("Mouse {}", n + 1),
+            Bind::Shift => "Shift".into(),
+            Bind::Ctrl => "Ctrl".into(),
+            Bind::Alt => "Alt".into(),
+            Bind::Unbound => "-".into(),
+        }
+    }
+    /// The saved form.
+    fn id(self) -> String {
+        match self {
+            Bind::Key(k) => format!("key:{}", k.name()),
+            Bind::Mouse(n) => format!("mouse:{n}"),
+            Bind::Shift => "shift".into(),
+            Bind::Ctrl => "ctrl".into(),
+            Bind::Alt => "alt".into(),
+            Bind::Unbound => "none".into(),
+        }
+    }
+    fn parse(s: &str) -> Option<Bind> {
+        let s = s.trim();
+        if let Some(k) = s.strip_prefix("key:") {
+            return Key::from_name(k).map(Bind::Key);
+        }
+        if let Some(n) = s.strip_prefix("mouse:") {
+            return n.parse::<u8>().ok().filter(|n| *n < 5).map(Bind::Mouse);
+        }
+        match s {
+            "shift" => Some(Bind::Shift),
+            "ctrl" => Some(Bind::Ctrl),
+            "alt" => Some(Bind::Alt),
+            "none" => Some(Bind::Unbound),
+            _ => None,
+        }
+    }
+    fn down(self, i: &egui::InputState) -> bool {
+        match self {
+            Bind::Key(k) => i.key_down(k),
+            Bind::Mouse(n) => i.pointer.button_down(mouse_button(n)),
+            Bind::Shift => i.modifiers.shift,
+            Bind::Ctrl => i.modifiers.ctrl,
+            Bind::Alt => i.modifiers.alt,
+            Bind::Unbound => false,
+        }
+    }
+    /// Pressed this frame (`prev` = the modifiers held last frame).
+    fn tapped(self, i: &egui::InputState, prev: egui::Modifiers) -> bool {
+        match self {
+            Bind::Key(k) => i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat: false, .. } if *key == k)),
+            Bind::Mouse(n) => i.pointer.button_pressed(mouse_button(n)),
+            Bind::Shift => i.modifiers.shift && !prev.shift,
+            Bind::Ctrl => i.modifiers.ctrl && !prev.ctrl,
+            Bind::Alt => i.modifiers.alt && !prev.alt,
+            Bind::Unbound => false,
+        }
+    }
+}
+
+const CROSS_STYLES: [&str; 6] = ["Auto (real spread)", "Cross", "Dot", "Circle", "Cross + dot", "T-shape"];
+const FPS_CAPS: [u32; 7] = [0, 30, 60, 120, 144, 165, 240];
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             name: "Player".into(),
             sens: 1.0,
-            fov: 80.0,
+            fov: 74.0,
             bot_level: 1,
             rounds: 15,
             mode: 0,
@@ -48,7 +249,21 @@ impl Default for Settings {
             port: net::DEFAULT_PORT.to_string(),
             join_addr: String::new(),
             volume: 0.7,
+            music_volume: 0.5,
             loadout: Loadout::default(),
+            binds: default_binds(),
+            quality: 2,
+            fullscreen: false,
+            fps_cap: 0,
+            vsync: true,
+            cross_style: 0,
+            cross_color: [255, 255, 255],
+            cross_size: 0.8,
+            cross_red: true,
+            recent: Vec::new(),
+            net_test: false,
+            net_lag: 100.0,
+            net_loss: 5.0,
         }
     }
 }
@@ -61,8 +276,11 @@ fn settings_path() -> Option<PathBuf> {
 impl Settings {
     fn load() -> Settings {
         let mut s = Settings::default();
+        let mut aim_v = 0u32;
+        let mut saved = false;
         if let Some(p) = settings_path() {
             if let Ok(text) = std::fs::read_to_string(p) {
+                saved = true;
                 for line in text.lines() {
                     if let Some((k, v)) = line.split_once('=') {
                         let v = v.trim();
@@ -72,21 +290,60 @@ impl Settings {
                             "fov" => s.fov = v.parse().unwrap_or(s.fov),
                             "bot" => s.bot_level = v.parse().unwrap_or(s.bot_level).min(3),
                             "rounds" => s.rounds = v.parse().unwrap_or(s.rounds).clamp(1, 50),
-                            "mode" => s.mode = v.parse().unwrap_or(0u8).min(1),
+                            "mode" => s.mode = v.parse().unwrap_or(0u8).min(5),
                             "bots" => s.bots = v.parse().unwrap_or(3usize).clamp(1, 7),
                             "port" => s.port = v.to_string(),
                             "join" => s.join_addr = v.to_string(),
                             "volume" => s.volume = v.parse().unwrap_or(s.volume),
+                            "music_volume" => s.music_volume = v.parse().unwrap_or(0.5f32).clamp(0.0, 1.0),
                             "loadout" => {
                                 let b: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                                 if b.len() == 4 {
                                     s.loadout = Loadout::from_bytes([b[0], b[1], b[2], b[3]]);
                                 }
                             }
+                            "quality" => s.quality = v.parse().unwrap_or(2usize).min(gpu::Quality::PRESETS.len() - 1),
+                            "fullscreen" => s.fullscreen = v == "1",
+                            "fps_cap" => s.fps_cap = v.parse().unwrap_or(0u32).min(1000),
+                            "vsync" => s.vsync = v != "0",
+                            "cross_style" => s.cross_style = v.parse().unwrap_or(0u8).min(CROSS_STYLES.len() as u8 - 1),
+                            "net_test" => s.net_test = v == "1",
+                            "net_lag" => s.net_lag = v.parse().unwrap_or(100.0f32).clamp(0.0, 500.0),
+                            "net_loss" => s.net_loss = v.parse().unwrap_or(5.0f32).clamp(0.0, 30.0),
+                            "cross_size" => s.cross_size = v.parse().unwrap_or(0.8f32).clamp(0.5, 2.0),
+                            "cross_red" => s.cross_red = v != "0",
+                            "aim_v" => aim_v = v.parse().unwrap_or(0),
+                            "cross_color" => {
+                                let b: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                                if b.len() == 3 {
+                                    s.cross_color = [b[0], b[1], b[2]];
+                                }
+                            }
+                            "recent" => {
+                                let parts: Vec<&str> = v.split('|').collect();
+                                if parts.len() == 4 && !parts[0].is_empty() && s.recent.len() < MAX_RECENT {
+                                    s.recent.push(RecentServer { addr: parts[0].into(), host: parts[1].into(), mode: parts[2].into(), when: parts[3].parse().unwrap_or(0) });
+                                }
+                            }
+                            k if k.starts_with("bind.") => {
+                                let id = &k[5..];
+                                if let (Some(a), Some(b)) = (ACTIONS.iter().position(|(n, _)| *n == id), Bind::parse(v)) {
+                                    s.binds[a] = b;
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
+            }
+        }
+        // settings saved before the aiming update: closer default view, smaller crosshair
+        if saved && aim_v < 2 {
+            if (s.fov - 80.0).abs() < 0.01 {
+                s.fov = 74.0;
+            }
+            if (s.cross_size - 1.0).abs() < 0.01 {
+                s.cross_size = 0.8;
             }
         }
         s
@@ -96,11 +353,23 @@ impl Settings {
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let text = format!(
+            let mut text = format!(
                 "name={}\nsens={}\nfov={}\nbot={}\nrounds={}\nmode={}\nbots={}\nport={}\njoin={}\nvolume={}\nloadout={},{},{},{}\n",
                 self.name, self.sens, self.fov, self.bot_level, self.rounds, self.mode, self.bots, self.port, self.join_addr, self.volume,
                 self.loadout.melee as u8, self.loadout.gun1 as u8, self.loadout.gun2 as u8, self.loadout.item
             );
+            let [r, g, b] = self.cross_color;
+            text += &format!(
+                "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\naim_v=2\n",
+                self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8
+            );
+            for (k, (id, _)) in ACTIONS.iter().enumerate() {
+                text += &format!("bind.{id}={}\n", self.binds[k].id());
+            }
+            let clean = |s: &str| s.replace(['|', '\n', '\r'], " ");
+            for r in &self.recent {
+                text += &format!("recent={}|{}|{}|{}\n", clean(&r.addr), clean(&r.host), clean(&r.mode), r.when);
+            }
             let _ = std::fs::write(p, text);
         }
     }
@@ -160,7 +429,25 @@ struct App {
     test_chat_done: bool,
     paused: bool,
     captured: bool,
-    prev_shift: bool,
+    prev_mods: egui::Modifiers,
+    /// Waiting for a key for this action (and the frame it started).
+    rebinding: Option<(usize, u32)>,
+    settings_tab: u8,
+    pause_settings: bool,
+    icon_tex: Option<egui::TextureHandle>,
+    frame_start: Option<std::time::Instant>,
+    shown_fullscreen: Option<bool>,
+    fps: f32,
+    applied_vsync: Option<bool>,
+    show_debug: bool,
+    /// This computer's internet address, looked up once (None while asking).
+    public_ip: Arc<Mutex<Option<Result<String, String>>>>,
+    ip_lookup_started: bool,
+    ip_announced: bool,
+    /// Windows Firewall: what the last check found (None while checking), and the fix's result.
+    fw_status: Arc<Mutex<Option<firewall::FwStatus>>>,
+    fw_started: bool,
+    fw_note: Arc<Mutex<Option<String>>>,
     disconnected: Option<String>,
     demo_t: f32,
     audio: Option<audio::Audio>,
@@ -170,6 +457,13 @@ struct App {
     last_tap: Option<(Key, f64)>,
     cam_dist: std::cell::Cell<f32>,
     frame_dt: f32,
+    fov_kick: std::cell::Cell<f32>,
+    /// The crosshair's drawn spread (pixels), eased toward the real one.
+    cross_gap: std::cell::Cell<f32>,
+    /// Aim-down-sights zoom (1 = none), eased.
+    ads_zoom: std::cell::Cell<f32>,
+    wall_t: f32,
+    train_step: i32,
 }
 
 impl App {
@@ -207,7 +501,22 @@ impl App {
             test_chat_done: false,
             paused: false,
             captured: false,
-            prev_shift: false,
+            prev_mods: egui::Modifiers::NONE,
+            rebinding: None,
+            settings_tab: 0,
+            pause_settings: false,
+            icon_tex: None,
+            frame_start: None,
+            shown_fullscreen: None,
+            fps: 60.0,
+            applied_vsync: None,
+            show_debug: false,
+            public_ip: Arc::new(Mutex::new(None)),
+            ip_lookup_started: false,
+            ip_announced: false,
+            fw_status: Arc::new(Mutex::new(None)),
+            fw_started: false,
+            fw_note: Arc::new(Mutex::new(None)),
             disconnected: None,
             demo_t: 0.0,
             audio,
@@ -217,16 +526,70 @@ impl App {
             last_tap: None,
             cam_dist: std::cell::Cell::new(5.0),
             frame_dt: 0.016,
+            fov_kick: std::cell::Cell::new(0.0),
+            cross_gap: std::cell::Cell::new(0.0),
+            ads_zoom: std::cell::Cell::new(1.0),
+            wall_t: 0.0,
+            train_step: 0,
         };
+        // test switches: DUEL_QUALITY=0..3, DUEL_PAGE=settings:<tab> | join | main, DUEL_RECENT=1 (sample list)
+        if let Some(q) = std::env::var("DUEL_QUALITY").ok().and_then(|v| v.parse::<usize>().ok()) {
+            app.settings.quality = q.min(gpu::Quality::PRESETS.len() - 1);
+        }
+        if let Some(x) = std::env::var("DUEL_CROSS").ok().and_then(|v| v.parse::<u8>().ok()) {
+            app.settings.cross_style = x.min(CROSS_STYLES.len() as u8 - 1);
+            app.settings.cross_color = [80, 255, 120];
+        }
+        // DUEL_NETSIM=100,5 switches the network test on; DUEL_DEBUG shows the F3 overlay
+        if let Ok(v) = std::env::var("DUEL_NETSIM") {
+            let mut it = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok());
+            app.settings.net_test = true;
+            app.settings.net_lag = it.next().unwrap_or(100.0);
+            app.settings.net_loss = it.next().unwrap_or(5.0);
+        }
+        app.show_debug = std::env::var_os("DUEL_DEBUG").is_some();
+        if std::env::var_os("DUEL_RECENT").is_some() {
+            let t = now_secs();
+            app.settings.recent = vec![
+                RecentServer { addr: "192.168.1.20".into(), host: "Mika".into(), mode: "Free-for-All".into(), when: t - 300 },
+                RecentServer { addr: "100.64.3.7:27960".into(), host: "Dario".into(), mode: "Capture the Flag".into(), when: t - 86_400 * 2 },
+            ];
+        }
+        if let Ok(pg) = std::env::var("DUEL_PAGE") {
+            if let Some(tab) = pg.strip_prefix("settings:") {
+                app.settings_tab = tab.parse().unwrap_or(0);
+                app.screen = Screen::Menu(Page::Settings);
+            } else if pg == "join" {
+                app.screen = Screen::Menu(Page::Join);
+            } else if pg == "host" {
+                app.screen = Screen::Menu(Page::Host);
+            }
+        }
         // hidden test mode: a bot plays the local fighter (used to photograph gameplay)
         if std::env::var_os("DUEL_AUTOPLAY").is_some() {
             let nb: usize = std::env::var("DUEL_BOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-            let mode = if std::env::var_os("DUEL_TDM").is_some() { Mode::Tdm } else { Mode::Ffa };
-            let mut g = Game::offline("Tester", nb, 0.6, mode, 15);
+            let mode = match std::env::var("DUEL_MODE").ok().and_then(|v| v.parse::<u8>().ok()) {
+                Some(m) => Mode::from_u8(m),
+                None if std::env::var_os("DUEL_TDM").is_some() => Mode::Tdm,
+                None => Mode::Ffa,
+            };
+            let kills: u16 = std::env::var("DUEL_KILLS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+            let mut g = Game::offline("Tester", nb, 0.6, mode, kills);
             if std::env::var_os("DUEL_HUMAN").is_none() {
                 g.f[0].is_bot = true;
                 g.f[0].ready = true;
                 g.bots[0] = Some(bot::Bot::new(0.8, 5));
+            }
+            app.autoplay = true;
+            app.start_game(g, None);
+        }
+        // hidden test mode: the training room at lesson N (a bot hits the dummies unless DUEL_HUMAN)
+        if let Ok(n) = std::env::var("DUEL_TRAIN") {
+            let mut g = Game::training("Tester");
+            g.train_skip(n.parse().unwrap_or(0));
+            if std::env::var_os("DUEL_HUMAN").is_none() {
+                g.f[0].is_bot = true;
+                g.bots[0] = Some(bot::Bot::new(0.9, 5));
             }
             app.autoplay = true;
             app.start_game(g, None);
@@ -253,8 +616,10 @@ impl App {
 
     fn start_game(&mut self, mut game: Game, net: Option<Net>) {
         let l = game.local;
-        game.my_loadout = self.settings.loadout;
-        if game.f[l].present && !game.f[l].is_bot {
+        if game.train.is_none() {
+            game.my_loadout = self.settings.loadout;
+        }
+        if game.f[l].present && !game.f[l].is_bot && game.train.is_none() {
             game.f[l].loadout = self.settings.loadout;
             game.f[l].equip();
         }
@@ -283,7 +648,10 @@ impl App {
             Some(ip) => format!("{ip}:{port}"),
             None => format!("port {port}"),
         };
-        g.say(format!("Lobby open on {addr} - friends: Join a Friend"));
+        g.say(format!("Lobby open - same Wi-Fi: {addr}"));
+        self.lookup_public_ip();
+        self.check_firewall();
+        self.ip_announced = false;
         self.start_game(g, Some(n));
         Ok(())
     }
@@ -314,6 +682,469 @@ impl App {
     }
 }
 
+impl App {
+    /// While a control is waiting for a key: take the next key, mouse button or modifier.
+    fn capture_rebind(&mut self, ctx: &egui::Context) {
+        let Some((a, started)) = self.rebinding else { return };
+        if self.frames <= started + 1 {
+            return;
+        }
+        let prev = self.prev_mods;
+        let got: Option<Option<Bind>> = ctx.input(|i| {
+            for e in &i.events {
+                if let egui::Event::Key { key, pressed: true, repeat: false, .. } = e {
+                    return Some(if *key == Key::Escape { None } else { Some(Bind::Key(*key)) });
+                }
+            }
+            for n in 0..5u8 {
+                if i.pointer.button_pressed(mouse_button(n)) {
+                    return Some(Some(Bind::Mouse(n)));
+                }
+            }
+            if i.modifiers.shift && !prev.shift {
+                return Some(Some(Bind::Shift));
+            }
+            if i.modifiers.ctrl && !prev.ctrl {
+                return Some(Some(Bind::Ctrl));
+            }
+            if i.modifiers.alt && !prev.alt {
+                return Some(Some(Bind::Alt));
+            }
+            None
+        });
+        if let Some(choice) = got {
+            if let Some(b) = choice {
+                assign_bind(&mut self.settings.binds, a, b);
+                self.settings.save();
+            }
+            self.rebinding = None;
+        }
+    }
+
+    /// The network test settings, when switched on.
+    fn net_sim(&self) -> Option<net::NetSim> {
+        self.settings.net_test.then(|| net::NetSim { lag_ms: self.settings.net_lag, loss: self.settings.net_loss / 100.0 })
+    }
+
+    /// Look up this computer's internet address once, in the background.
+    fn lookup_public_ip(&mut self) {
+        if self.ip_lookup_started {
+            return;
+        }
+        self.ip_lookup_started = true;
+        if let Ok(fake) = std::env::var("DUEL_FAKE_IP") {
+            // test switch: show a made-up address instead of asking the internet
+            if let Ok(mut s) = self.public_ip.lock() {
+                *s = Some(Ok(fake));
+            }
+            return;
+        }
+        if self.autoplay || self.screenshot.is_some() {
+            return; // tests never go online
+        }
+        let slot = self.public_ip.clone();
+        std::thread::spawn(move || {
+            let r = net::fetch_public_ip();
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(r);
+            }
+        });
+    }
+
+    /// Check Windows Firewall once, in the background (reads only).
+    fn check_firewall(&mut self) {
+        if self.fw_started {
+            return;
+        }
+        self.fw_started = true;
+        if (self.autoplay || self.screenshot.is_some()) && std::env::var_os("DUEL_FW_CHECK").is_none() {
+            return; // tests don't poke at the system
+        }
+        let port: u16 = self.settings.port.trim().parse().unwrap_or(net::DEFAULT_PORT);
+        let slot = self.fw_status.clone();
+        std::thread::spawn(move || {
+            let s = firewall::check(port);
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(s);
+            }
+        });
+    }
+
+    /// The firewall line for hosts, with a button to fix it when friends would be blocked.
+    fn firewall_ui(&mut self, ui: &mut egui::Ui) {
+        self.check_firewall();
+        let status = self.fw_status.lock().ok().and_then(|g| *g);
+        let note = self.fw_note.lock().ok().and_then(|g| g.clone());
+        match status {
+            None if self.fw_started && !(self.autoplay || self.screenshot.is_some()) => {
+                ui.label(egui::RichText::new("Checking Windows Firewall…").size(14.0).color(Color32::from_gray(190)));
+            }
+            None => {}
+            Some(s) => {
+                let col = if s.ok() { Color32::from_rgb(140, 225, 140) } else { Color32::from_rgb(255, 170, 110) };
+                ui.label(egui::RichText::new(s.text()).size(14.0).color(col));
+                if matches!(s, firewall::FwStatus::Blocked | firewall::FwStatus::NoRule) {
+                    if ui.button("Allow Duel Rush through Windows Firewall").on_hover_text("Windows will ask for permission. Adds an \"allow\" rule for this game and its UDP port.").clicked() {
+                        let port: u16 = self.settings.port.trim().parse().unwrap_or(net::DEFAULT_PORT);
+                        let (st, nt) = (self.fw_status.clone(), self.fw_note.clone());
+                        if let Ok(mut g) = st.lock() {
+                            *g = None;
+                        }
+                        std::thread::spawn(move || {
+                            let r = firewall::allow(port);
+                            let s = firewall::check(port);
+                            if let Ok(mut g) = nt.lock() {
+                                *g = Some(match r {
+                                    Ok(()) => "Firewall rule added.".to_string(),
+                                    Err(e) => e,
+                                });
+                            }
+                            if let Ok(mut g) = st.lock() {
+                                *g = Some(s);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(n) = note {
+            ui.label(egui::RichText::new(n).size(13.0).color(Color32::from_gray(190)));
+        }
+    }
+
+    /// The internet address line for hosts: the address, still looking, or why it failed.
+    fn public_addr_text(&self) -> (Option<String>, String) {
+        let port = self.settings.port.trim().to_string();
+        match self.public_ip.lock().ok().and_then(|g| g.clone()) {
+            Some(Ok(ip)) => (Some(format!("{ip}:{port}")), format!("{ip}:{port}")),
+            Some(Err(_)) => (None, "couldn't find it (offline?)".into()),
+            None if self.ip_lookup_started => (None, "finding it…".into()),
+            None => (None, "-".into()),
+        }
+    }
+
+    /// Keep a server in the recent list (newest first, no repeats).
+    fn remember_server(&mut self, addr: String, host: String, mode: String) {
+        if addr.is_empty() {
+            return;
+        }
+        self.settings.recent.retain(|r| r.addr != addr);
+        self.settings.recent.insert(0, RecentServer { addr, host, mode, when: now_secs() });
+        self.settings.recent.truncate(MAX_RECENT);
+        if !self.autoplay {
+            self.settings.save();
+        }
+    }
+
+    /// Connect to a server in one click.
+    fn join_server(&mut self, addr: &str) {
+        self.settings.join_addr = addr.to_string();
+        match Net::join(addr) {
+            Ok(n) => {
+                self.settings.save();
+                self.menu_msg = None;
+                self.screen = Screen::Lobby { net: n, waiting_since: 0.0 };
+            }
+            Err(e) => {
+                self.menu_msg = Some(e);
+                self.screen = Screen::Menu(Page::Join);
+            }
+        }
+    }
+
+    /// The list of servers joined before: Join in one click, or forget one.
+    /// Returns the address to join, if one was clicked.
+    fn recent_list_ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        let mut join = None;
+        let mut forget = None;
+        if self.settings.recent.is_empty() {
+            ui.label(egui::RichText::new("Servers you join show up here, so you can hop back in with one click.").color(Color32::from_gray(190)));
+            return None;
+        }
+        for (k, r) in self.settings.recent.iter().enumerate() {
+            egui::Frame::new().fill(Color32::from_rgba_unmultiplied(255, 255, 255, 10)).corner_radius(6.0).inner_margin(8.0).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        let title = if r.host.trim().is_empty() { "Lobby".to_string() } else { format!("{}'s lobby", r.host) };
+                        ui.label(egui::RichText::new(title).strong().color(Color32::from_rgb(245, 235, 225)));
+                        ui.label(egui::RichText::new(&r.addr).size(13.0).color(Color32::from_gray(200)));
+                        ui.label(egui::RichText::new(format!("{}  ·  {}", r.mode, ago(r.when))).size(12.0).color(Color32::from_gray(150)));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").on_hover_text("Forget this server").clicked() {
+                            forget = Some(k);
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("Join").strong()).fill(Color32::from_rgb(170, 90, 40))).clicked() {
+                            join = Some(r.addr.clone());
+                        }
+                    });
+                });
+            });
+        }
+        if let Some(k) = forget {
+            self.settings.recent.remove(k);
+            self.settings.save();
+        }
+        join
+    }
+
+    /// Every setting, in tabs. Used on the main menu and in the pause menu.
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (k, t) in ["Game", "Controls", "Graphics", "Crosshair"].iter().enumerate() {
+                ui.selectable_value(&mut self.settings_tab, k as u8, egui::RichText::new(*t).size(17.0));
+            }
+        });
+        ui.separator();
+        match self.settings_tab {
+            0 => {
+                ui.add(egui::Slider::new(&mut self.settings.sens, 0.2..=3.0).text("mouse sensitivity"));
+                ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("field of view"));
+                ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("effects volume"));
+                ui.add(egui::Slider::new(&mut self.settings.music_volume, 0.0..=1.0).text("music volume"));
+                if self.audio.is_none() && self.screenshot.is_none() {
+                    ui.label("(no sound device found)");
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Network test").size(18.0).color(ACCENT));
+                ui.label(egui::RichText::new("Try online play on one PC: open the game twice, Host in one and Join 127.0.0.1 in the other. This adds fake lag and lost packets to this copy's connection. Press F3 in a match to see ping, packet loss and players.").size(13.0).color(Color32::from_gray(185)));
+                ui.checkbox(&mut self.settings.net_test, "Simulate a bad connection");
+                ui.add_enabled_ui(self.settings.net_test, |ui| {
+                    ui.add(egui::Slider::new(&mut self.settings.net_lag, 0.0..=300.0).step_by(10.0).suffix(" ms").text("extra lag"));
+                    ui.add(egui::Slider::new(&mut self.settings.net_loss, 0.0..=20.0).step_by(1.0).suffix(" %").text("packet loss"));
+                });
+            }
+            1 => {
+                ui.label(egui::RichText::new("Click a control, then press the key or mouse button you want. Esc cancels.").color(Color32::from_gray(200)));
+                // two columns of controls; scrolls if the window is short
+                let room = (ui.ctx().content_rect().height() - 440.0).clamp(110.0, 400.0);
+                egui::ScrollArea::vertical().max_height(room).show(ui, |ui| {
+                    ui.spacing_mut().button_padding = Vec2::new(8.0, 3.0);
+                    egui::Grid::new("binds").num_columns(4).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                        let half = N_ACTIONS.div_ceil(2);
+                        for row in 0..half {
+                            for k in [row, row + half] {
+                                if k >= N_ACTIONS {
+                                    continue;
+                                }
+                                ui.label(egui::RichText::new(ACTIONS[k].1).size(14.5));
+                                let waiting = self.rebinding.map_or(false, |(a, _)| a == k);
+                                let text = if waiting { egui::RichText::new("press a key…").color(ACCENT) } else { egui::RichText::new(self.settings.binds[k].name()).strong() };
+                                if ui.add_sized([112.0, 26.0], egui::Button::new(text)).clicked() && !waiting {
+                                    self.rebinding = Some((k, self.frames));
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+                ui.label(egui::RichText::new("Always on: arrow keys move, Enter opens chat, Esc pauses, F11 fullscreen, mouse wheel swaps weapons.").size(13.0).color(Color32::from_gray(170)));
+                if ui.button("Reset controls to default").clicked() {
+                    self.settings.binds = default_binds();
+                    self.rebinding = None;
+                }
+            }
+            2 => {
+                ui.label("Quality preset");
+                ui.horizontal(|ui| {
+                    for (k, (n, _)) in gpu::Quality::PRESETS.iter().enumerate() {
+                        ui.selectable_value(&mut self.settings.quality, k, *n);
+                    }
+                });
+                let q = gpu::Quality::PRESETS[self.settings.quality.min(3)].1;
+                let what = format!(
+                    "{}% resolution · edge smoothing {} · {} effects",
+                    (q.scale * 100.0).round(),
+                    if q.msaa > 1 { "on" } else { "off" },
+                    if q.fx >= 1.0 { "full" } else if q.fx >= 0.6 { "most" } else { "fewer" }
+                );
+                ui.label(egui::RichText::new(what).size(13.0).color(Color32::from_gray(180)));
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.settings.fullscreen, "Fullscreen (F11)");
+                ui.checkbox(&mut self.settings.vsync, "VSync (no tearing; caps to your screen's refresh rate)");
+                ui.horizontal(|ui| {
+                    ui.label("FPS limit");
+                    egui::ComboBox::from_id_salt("fpscap")
+                        .selected_text(if self.settings.fps_cap == 0 { "Unlimited".to_string() } else { format!("{}", self.settings.fps_cap) })
+                        .show_ui(ui, |ui| {
+                            for c in FPS_CAPS {
+                                ui.selectable_value(&mut self.settings.fps_cap, c, if c == 0 { "Unlimited".to_string() } else { format!("{c}") });
+                            }
+                        });
+                    ui.label(egui::RichText::new(format!("now: {:.0} fps", self.fps)).color(Color32::from_gray(170)));
+                });
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    ui.label("Style");
+                    egui::ComboBox::from_id_salt("xstyle").selected_text(CROSS_STYLES[self.settings.cross_style as usize]).show_ui(ui, |ui| {
+                        for (k, n) in CROSS_STYLES.iter().enumerate() {
+                            ui.selectable_value(&mut self.settings.cross_style, k as u8, *n);
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Colour");
+                    for c in [[255, 255, 255], [80, 255, 120], [0, 230, 255], [255, 230, 0], [255, 80, 200], [255, 70, 60]] {
+                        let col = Color32::from_rgb(c[0], c[1], c[2]);
+                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::click());
+                        ui.painter().rect_filled(r, 4.0, col);
+                        if self.settings.cross_color == c {
+                            ui.painter().rect_stroke(r.expand(2.0), 5.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+                        }
+                        if resp.clicked() {
+                            self.settings.cross_color = c;
+                        }
+                    }
+                    ui.color_edit_button_srgb(&mut self.settings.cross_color);
+                });
+                ui.add(egui::Slider::new(&mut self.settings.cross_size, 0.5..=2.0).text("size"));
+                ui.checkbox(&mut self.settings.cross_red, "Dot turns red when it's over an enemy");
+                // live preview over a bit of arena-ish background
+                let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 110.0), egui::Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(r, 6.0, Color32::from_rgb(70, 60, 58));
+                p.rect_filled(Rect::from_min_max(Pos2::new(r.left(), r.center().y + 10.0), r.max), 6.0, Color32::from_rgb(120, 52, 44));
+                let col = Color32::from_rgb(self.settings.cross_color[0], self.settings.cross_color[1], self.settings.cross_color[2]);
+                // the lines breathe in and out like they do while moving and shooting
+                let gap = 4.0 + 10.0 * (0.5 + 0.5 * (self.wall_t * 2.0).sin());
+                draw_crosshair(p, r.center(), self.settings.cross_style, col, col, self.settings.cross_size, gap, false);
+                ui.label(egui::RichText::new("The lines always show your gun's real spread: every bullet lands inside them. Standing still and waiting a moment makes the next shot dead-on; Auto shows the shotgun's pellet cone as a ring. Right-click with a gun to zoom.").size(13.0).color(Color32::from_gray(170)));
+            }
+        }
+    }
+}
+
+/// Give action `a` the binding `b`; whatever had `b` before takes `a`'s old binding.
+fn assign_bind(binds: &mut [Bind; N_ACTIONS], a: usize, b: Bind) {
+    if let Some(o) = binds.iter().position(|x| *x == b) {
+        if o != a {
+            binds[o] = binds[a];
+        }
+    }
+    binds[a] = b;
+}
+
+/// How many pixels wide a spread is on screen: the camera's focal length (pixels) times the
+/// spread (tangent of the cone's half-angle). Every pellet lands within this radius.
+pub fn spread_px(spread: f32, focal: f32) -> f32 {
+    focal * spread
+}
+
+/// The crosshair. `gap` is the spread's radius in pixels: lines start there (and the circle sits
+/// there), so every shot lands inside. `size` scales the dot and lines (0.8 = 2 px dot, 6 px
+/// lines). `circle` draws the shotgun's cone as a ring instead of lines.
+fn draw_crosshair(p: &egui::Painter, c: Pos2, style: u8, col: Color32, dot_col: Color32, size: f32, gap: f32, circle: bool) {
+    let outline = Color32::from_black_alpha(170);
+    let th = (2.0 * size).max(1.0);
+    let len = 7.5 * size;
+    let gap = gap.max(3.0 * size);
+    let arm = |dx: f32, dy: f32| {
+        let a = c + Vec2::new(dx * gap, dy * gap);
+        let b = c + Vec2::new(dx * (gap + len), dy * (gap + len));
+        let ext = Vec2::new(dx, dy) * 1.0;
+        p.line_segment([a - ext, b + ext], Stroke::new(th + 2.0, outline));
+        p.line_segment([a, b], Stroke::new(th, col));
+    };
+    let dot = || {
+        let r = 1.25 * size;
+        p.circle_filled(c, r + 1.0, outline);
+        p.circle_filled(c, r, dot_col);
+    };
+    let ring = |r: f32| {
+        p.circle_stroke(c, r, Stroke::new(th + 2.0, outline));
+        p.circle_stroke(c, r, Stroke::new(th * 0.8, col));
+    };
+    let four = || {
+        for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            arm(dx, dy);
+        }
+    };
+    match style {
+        2 => dot(),
+        3 => {
+            ring(gap.max(8.0 * size));
+            dot();
+        }
+        1 => four(),
+        5 => {
+            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0)] {
+                arm(dx, dy);
+            }
+            dot();
+        }
+        _ => {
+            if circle && style == 0 {
+                ring(gap);
+            } else {
+                four();
+            }
+            dot();
+        }
+    }
+}
+/// The game's icon, drawn in code: crossed blades over a dark shield with an ember ring.
+fn icon_pixels(n: u32) -> (Vec<u8>, u32) {
+    let mut px = vec![0u8; (n * n * 4) as usize];
+    let h = n as f32 * 0.5;
+    // distance from point p to the segment a-b
+    let seg = |p: (f32, f32), a: (f32, f32), b: (f32, f32)| -> f32 {
+        let (vx, vy) = (b.0 - a.0, b.1 - a.1);
+        let t = (((p.0 - a.0) * vx + (p.1 - a.1) * vy) / (vx * vx + vy * vy)).clamp(0.0, 1.0);
+        let (dx, dy) = (p.0 - a.0 - vx * t, p.1 - a.1 - vy * t);
+        (dx * dx + dy * dy).sqrt()
+    };
+    for y in 0..n {
+        for x in 0..n {
+            // 4x supersampling for smooth edges
+            let mut acc = [0.0f32; 4];
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let u = (x as f32 + 0.25 + sx as f32 * 0.5 - h) / h;
+                    let v = (y as f32 + 0.25 + sy as f32 * 0.5 - h) / h;
+                    let r = (u * u + v * v).sqrt();
+                    let mut c = [0.0f32; 4];
+                    if r < 0.97 {
+                        // dark badge with a warm glow toward the bottom
+                        let glow = ((v + 1.0) * 0.5).powf(2.0);
+                        c = [0.08 + 0.25 * glow, 0.05 + 0.08 * glow, 0.10, 1.0];
+                        if r > 0.84 {
+                            c = [1.0, 0.59, 0.27, 1.0]; // ember ring
+                        }
+                        // two crossed blades, each with a guard and a grip
+                        for s in [1.0f32, -1.0] {
+                            let tip = (0.58 * s, -0.58);
+                            let base = (-0.38 * s, 0.38);
+                            let pommel = (-0.6 * s, 0.6);
+                            let blade = seg((u, v), tip, base);
+                            let w = 0.085 * (0.35 + 0.65 * ((u - tip.0).hypot(v - tip.1) / 1.4).min(1.0));
+                            if blade < w {
+                                let edge = if blade > w * 0.45 { 0.78 } else { 0.97 };
+                                c = [edge, edge, edge + 0.02, 1.0];
+                            }
+                            let guard = seg((u, v), (base.0 - 0.13 * s, base.1 - 0.13), (base.0 + 0.13 * s, base.1 + 0.13));
+                            if guard < 0.05 {
+                                c = [1.0, 0.62, 0.25, 1.0];
+                            }
+                            if seg((u, v), base, pommel) < 0.05 {
+                                c = [0.35, 0.18, 0.12, 1.0];
+                            }
+                        }
+                    }
+                    for k in 0..4 {
+                        acc[k] += c[k] * 0.25;
+                    }
+                }
+            }
+            let i = ((y * n + x) * 4) as usize;
+            for k in 0..4 {
+                px[i + k] = (acc[k].clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        }
+    }
+    (px, n)
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut screenshot = None;
@@ -326,10 +1157,24 @@ fn main() -> eframe::Result<()> {
         i += 1;
     }
 
+    // test switch: DUEL_WINDOW=800x450
+    let size = std::env::var("DUEL_WINDOW")
+        .ok()
+        .and_then(|v| {
+            let (a, b) = v.split_once('x')?;
+            Some([a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?])
+        })
+        .unwrap_or([1280.0, 720.0]);
+    let boot = Settings::load();
+    let (icon, n) = icon_pixels(64);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Duel Rush")
-        .with_inner_size([1280.0, 720.0])
-        .with_min_inner_size([800.0, 450.0]);
+        .with_inner_size(size)
+        .with_min_inner_size([800.0, 450.0])
+        .with_icon(egui::IconData { rgba: icon, width: n, height: n });
+    if screenshot.is_none() && boot.fullscreen {
+        viewport = viewport.with_fullscreen(true);
+    }
     if screenshot.is_some() {
         viewport = viewport.with_active(false);
         #[cfg(windows)]
@@ -339,6 +1184,8 @@ fn main() -> eframe::Result<()> {
     }
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions { viewport, ..Default::default() };
+    // vsync as saved (the settings can switch it while playing)
+    options.wgpu_options.surface.present_mode = if boot.vsync { eframe::wgpu::PresentMode::AutoVsync } else { eframe::wgpu::PresentMode::AutoNoVsync };
     eframe::run_native(
         "Duel Rush",
         options,
@@ -360,10 +1207,54 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.request_repaint();
+        // frame-rate limit: wait out the rest of this frame's time
+        if self.settings.fps_cap > 0 && self.screenshot.is_none() {
+            if let Some(t0) = self.frame_start {
+                let target = std::time::Duration::from_secs_f64(1.0 / self.settings.fps_cap as f64);
+                let spent = t0.elapsed();
+                if spent < target {
+                    let left = target - spent;
+                    if left > std::time::Duration::from_millis(2) {
+                        std::thread::sleep(left - std::time::Duration::from_millis(1));
+                    }
+                    while t0.elapsed() < target {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+        if let Some(t0) = self.frame_start {
+            let dt = t0.elapsed().as_secs_f32().max(1e-4);
+            self.fps += (1.0 / dt - self.fps) * 0.05;
+        }
+        self.frame_start = Some(std::time::Instant::now());
+        // fullscreen (F11 toggles it too)
+        if ctx.input(|i| i.key_pressed(Key::F3)) && self.rebinding.is_none() {
+            self.show_debug = !self.show_debug;
+        }
+        if ctx.input(|i| i.key_pressed(Key::F11)) && self.rebinding.is_none() {
+            self.settings.fullscreen = !self.settings.fullscreen;
+        }
+        if self.screenshot.is_none() && self.shown_fullscreen != Some(self.settings.fullscreen) {
+            if self.shown_fullscreen.is_some() || self.settings.fullscreen {
+                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.settings.fullscreen));
+            }
+            self.shown_fullscreen = Some(self.settings.fullscreen);
+        }
+        self.capture_rebind(&ctx);
+        // vsync on or off, applied right away
+        if self.applied_vsync != Some(self.settings.vsync) {
+            if let Some(mut sc) = frame.wgpu_surface_config() {
+                sc.present_mode = if self.settings.vsync { eframe::wgpu::PresentMode::AutoVsync } else { eframe::wgpu::PresentMode::AutoNoVsync };
+                frame.set_wgpu_surface_config(sc);
+            }
+            self.applied_vsync = Some(self.settings.vsync);
+        }
         self.frames += 1;
         let rect = ui.max_rect();
         let dt = ctx.input(|i| i.unstable_dt).clamp(0.0, 0.1);
         self.frame_dt = dt;
+        self.wall_t += dt;
         self.handle_screenshot(&ctx);
 
         // network + simulation
@@ -387,7 +1278,7 @@ impl eframe::App for App {
             if want_capture && !cfg!(target_os = "macos") {
                 ctx.send_viewport_cmd(ViewportCommand::CursorPosition(rect.center()));
             }
-            sample_keys(&ctx);
+            sample_keys(&ctx, &self.settings.binds);
             self.read_play_input(&ctx);
             self.step_play(dt);
         } else {
@@ -415,17 +1306,28 @@ impl eframe::App for App {
             }
         }
         let mut gpu = self.gpu.take();
+        if let (Some(g3), Some(rs)) = (gpu.as_mut(), frame.wgpu_render_state()) {
+            let q = gpu::Quality::PRESETS[self.settings.quality.min(gpu::Quality::PRESETS.len() - 1)].1;
+            if g3.quality != q {
+                g3.set_quality(rs, q);
+            }
+        }
         let alpha = (self.acc / TICK).clamp(0.0, 1.0);
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        let mut ears = None;
         match &self.screen {
             Screen::Play { game, .. } => {
                 let (cam, lp) = self.play_camera(game, rect);
+                ears = Some((cam.pos, cam.right, cam.fwd));
                 if let (Some(g3), Some(rs)) = (gpu.as_mut(), frame.wgpu_render_state()) {
                     if let Some(id) = g3.render(rs, game, &cam, rect, ppp, alpha, Some((game.local, lp))) {
                         painter.image(id, rect, full_uv, Color32::WHITE);
                     }
                 }
                 self.draw_hud(&painter, rect, &cam, game);
+                if let Screen::Play { net, .. } = &self.screen {
+                    self.draw_net_overlay(&painter, rect, game, net.as_ref());
+                }
             }
             _ => {
                 let cam = self.demo_camera(rect);
@@ -434,8 +1336,33 @@ impl eframe::App for App {
                         painter.image(id, rect, full_uv, Color32::WHITE);
                     }
                 }
-                // darken for readability
-                painter.rect_filled(Rect::from_min_max(rect.min, Pos2::new(rect.left() + 520.0, rect.bottom())), 0.0, Color32::from_rgba_unmultiplied(10, 8, 20, 150));
+                // darken the left side for readability, fading into the arena
+                let mut mesh = egui::epaint::Mesh::default();
+                let fade_w = 640.0f32.min(rect.width() * 0.62);
+                let stops = [(0.0, 190u8), (0.55, 150), (1.0, 0)];
+                for (k, (t, a)) in stops.iter().enumerate() {
+                    let x = rect.left() + fade_w * t;
+                    let col = Color32::from_rgba_unmultiplied(10, 8, 20, *a);
+                    mesh.colored_vertex(Pos2::new(x, rect.top()), col);
+                    mesh.colored_vertex(Pos2::new(x, rect.bottom()), col);
+                    if k > 0 {
+                        let i = (k as u32) * 2;
+                        mesh.add_triangle(i - 2, i - 1, i + 1);
+                        mesh.add_triangle(i - 2, i + 1, i);
+                    }
+                }
+                painter.add(egui::Shape::mesh(mesh));
+                // soft letterbox bars top and bottom
+                for (y0, y1, a0, a1) in [(rect.top(), rect.top() + 90.0, 140u8, 0u8), (rect.bottom() - 90.0, rect.bottom(), 0, 160)] {
+                    let mut m = egui::epaint::Mesh::default();
+                    m.colored_vertex(Pos2::new(rect.left(), y0), Color32::from_rgba_unmultiplied(0, 0, 0, a0));
+                    m.colored_vertex(Pos2::new(rect.right(), y0), Color32::from_rgba_unmultiplied(0, 0, 0, a0));
+                    m.colored_vertex(Pos2::new(rect.left(), y1), Color32::from_rgba_unmultiplied(0, 0, 0, a1));
+                    m.colored_vertex(Pos2::new(rect.right(), y1), Color32::from_rgba_unmultiplied(0, 0, 0, a1));
+                    m.add_triangle(0, 1, 3);
+                    m.add_triangle(0, 3, 2);
+                    painter.add(egui::Shape::mesh(m));
+                }
             }
         }
 
@@ -458,17 +1385,35 @@ impl eframe::App for App {
             self.leave_to_menu();
         }
 
-        // play queued sounds
-        let sounds: Vec<Sfx> = match &mut self.screen {
+        // play queued sounds, in 3D from the camera
+        let mut sounds: Vec<(Sfx, Option<V3>, f32)> = match &mut self.screen {
             Screen::Play { game, .. } => std::mem::take(&mut game.sounds),
             _ => Vec::new(),
         };
+        // menu clicks: big buttons, and a softer click for anything else clicked in a panel
+        let ui_sound = UI_SOUND.with(|u| u.take());
+        if let Some(s) = ui_sound {
+            sounds.push((s, None, 1.0));
+        } else if !self.captured && ctx.input(|i| i.pointer.primary_clicked()) && ctx.is_pointer_over_egui() {
+            sounds.push((Sfx::UiClick, None, 1.0));
+        }
+        let track = match &self.screen {
+            Screen::Play { game, .. } if game.train.is_some() => Some(audio::TRACK_FIGHTS[0]),
+            Screen::Play { game, .. } => Some(audio::TRACK_FIGHTS[(game.mt.number as usize) % audio::TRACK_FIGHTS.len()]),
+            _ => Some(audio::TRACK_MENU),
+        };
         if let Some(a) = &mut self.audio {
-            a.set_volume(if std::env::var_os("DUEL_AUDIO_TEST").is_some() { 0.0 } else { self.settings.volume });
-            for s in sounds {
-                a.play(s);
+            let mute = std::env::var_os("DUEL_AUDIO_TEST").is_some();
+            a.set_volume(if mute { 0.0 } else { self.settings.volume }, if mute { 0.0 } else { self.settings.music_volume });
+            a.set_music(track);
+            if let Some((p, r, f)) = ears {
+                a.set_listener(p, r, f);
+            }
+            for (s, at, pitch) in sounds {
+                a.play(s, at, pitch);
             }
         }
+        self.prev_mods = ctx.input(|i| i.modifiers);
     }
 
     fn on_exit(&mut self) {
@@ -485,7 +1430,9 @@ impl App {
     fn handle_screenshot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.screenshot.clone() else { return };
         let shot_frame: u32 = std::env::var("DUEL_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
-        if self.frames >= shot_frame && !self.shot_requested {
+        let killcam_now = std::env::var_os("DUEL_SHOT_KILLCAM").is_some()
+            && matches!(&self.screen, Screen::Play { game, .. } if game.killcam.as_ref().map_or(false, |k| k.t > 1.3));
+        if (self.frames >= shot_frame || killcam_now) && !self.shot_requested {
             self.shot_requested = true;
             let slot = self.shot_slot.clone();
             ctx.request_screenshot(move |img| {
@@ -529,19 +1476,27 @@ impl App {
         let Screen::Play { .. } = &self.screen else { return };
         let mut toggle_pause = false;
         let captured = self.captured;
-        let sens = self.settings.sens * 0.0024;
+        let sens = self.settings.sens * 0.0024 / self.ads_zoom.get().max(1.0);
+        let b = self.settings.binds;
+        let prev = self.prev_mods;
         ctx.input(|i| {
             if self.chat_open {
                 return; // typing: the chat box has the keyboard
             }
-            if i.key_pressed(Key::Escape) {
+            if i.key_pressed(Key::Escape) && self.rebinding.is_none() {
                 toggle_pause = true;
             }
-            self.show_scores = i.key_down(Key::Tab);
+            self.show_scores = b[A_SCORES].down(i);
             if i.key_pressed(Key::F5) {
                 self.start_request = true;
             }
-            if i.key_pressed(Key::Enter) || i.key_pressed(Key::T) {
+            if i.key_pressed(Key::N) {
+                self.train_step += 1;
+            }
+            if i.key_pressed(Key::P) {
+                self.train_step -= 1;
+            }
+            if i.key_pressed(Key::Enter) || b[A_CHAT].tapped(i, prev) {
                 self.chat_open = true;
                 self.chat_text.clear();
                 return;
@@ -557,47 +1512,39 @@ impl App {
             }
             self.aim_yaw = wrap_angle(self.aim_yaw + d.x * sens);
             self.aim_pitch = (self.aim_pitch - d.y * sens).clamp(-1.4, 1.4);
-            let tap = |k: Key| i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat: false, .. } if *key == k));
-            if tap(Key::Space) {
+            if b[A_JUMP].tapped(i, prev) {
                 self.latch.jump = true;
             }
             // double-tap a direction to dodge
             let now = i.time;
-            for k in [Key::W, Key::A, Key::S, Key::D] {
-                if tap(k) {
-                    if let Some((lk, lt)) = self.last_tap {
-                        if lk == k && now - lt < 0.25 {
-                            self.latch.dash = true;
+            for a in [A_FWD, A_LEFT, A_BACK, A_RIGHT] {
+                if let Bind::Key(k) = b[a] {
+                    if b[a].tapped(i, prev) {
+                        if let Some((lk, lt)) = self.last_tap {
+                            if lk == k && now - lt < 0.25 {
+                                self.latch.dash = true;
+                            }
                         }
+                        self.last_tap = Some((k, now));
                     }
-                    self.last_tap = Some((k, now));
                 }
             }
-            let shift = i.modifiers.shift;
-            if shift && !self.prev_shift {
+            if b[A_DASH].tapped(i, prev) || b[A_DASH2].tapped(i, prev) {
                 self.latch.dash = true;
             }
-            self.prev_shift = shift;
-            if tap(Key::Q) || tap(Key::E) {
-                self.latch.dash = true;
-            }
-            if i.pointer.primary_pressed() {
+            if b[A_FIRE].tapped(i, prev) {
                 self.latch.fire_pressed = true;
             }
-            if tap(Key::R) {
+            if b[A_RELOAD].tapped(i, prev) {
                 self.latch.reload = true;
             }
-            if tap(Key::G) || tap(Key::F) {
+            if b[A_ITEM].tapped(i, prev) {
                 self.latch.item = true;
             }
-            if i.key_pressed(Key::Num1) {
-                self.latch.select = Some(0);
-            }
-            if i.key_pressed(Key::Num2) {
-                self.latch.select = Some(1);
-            }
-            if i.key_pressed(Key::Num3) {
-                self.latch.select = Some(2);
+            for (k, a) in [A_MELEE, A_GUN1, A_GUN2].into_iter().enumerate() {
+                if b[a].tapped(i, prev) {
+                    self.latch.select = Some(k as u8);
+                }
             }
         });
         // scroll wheel cycles weapons
@@ -618,7 +1565,12 @@ impl App {
             }
         }
         if toggle_pause && !self.match_over() && self.disconnected.is_none() {
-            self.paused = !self.paused;
+            if self.paused && self.pause_settings {
+                self.pause_settings = false; // Esc steps back out of the settings first
+                self.settings.save();
+            } else {
+                self.paused = !self.paused;
+            }
         }
     }
 
@@ -631,6 +1583,7 @@ impl App {
         inp.right = (ctx_keys.d as i32 - ctx_keys.a as i32) as f32;
         inp.fire = ctx_keys.fire;
         inp.guard = ctx_keys.guard;
+        inp.crouch = ctx_keys.crouch;
         inp.jump = self.latch.jump;
         inp.dash = self.latch.dash;
         inp.fire_pressed = self.latch.fire_pressed;
@@ -661,7 +1614,15 @@ impl App {
         let ready_req = self.ready_request.take();
         let start_req = std::mem::take(&mut self.start_request);
         let autostart = self.autostart;
+        let train_step = std::mem::take(&mut self.train_step);
+        let sim = self.net_sim();
         let Screen::Play { game, net } = &mut self.screen else { return };
+        if let Some(n) = net.as_mut() {
+            n.sim = sim;
+        }
+        if train_step != 0 {
+            game.train_skip(train_step);
+        }
 
         // network receive
         if let Some(n) = net.as_mut() {
@@ -671,7 +1632,7 @@ impl App {
                         let name = clean_name(&name, slot);
                         let team = game.balance_team();
                         game.add_player(slot, &name, false, None, team);
-                        let t = if game.mt.mode == Mode::Tdm { format!(" ({} team)", TEAM_NAMES[team as usize]) } else { String::new() };
+                        let t = if game.mt.mode.teams() { format!(" ({} team)", TEAM_NAMES[team as usize]) } else { String::new() };
                         game.say(format!("{name} joined{t}"));
                     }
                     Incoming::Leave { slot } => {
@@ -681,9 +1642,12 @@ impl App {
                             game.say(format!("{nm} left"));
                         }
                     }
-                    Incoming::PeerState { slot, st, events } => {
+                    Incoming::PeerState { slot, st, events, sent, stale } => {
                         if game.f[slot].present {
-                            net::apply_remote(&mut game.f[slot], &st, true);
+                            if !stale {
+                                let now = game.time;
+                                net::apply_remote(&mut game.f[slot], &st, true, sent, now);
+                            }
                             for ev in events {
                                 game.handle_remote_event(slot, ev);
                             }
@@ -693,7 +1657,7 @@ impl App {
                     Incoming::HostLeft => {
                         self.disconnected = Some("The host closed the lobby.".into());
                     }
-                    Incoming::Full => {}
+                    Incoming::Full | Incoming::WrongVersion => {}
                 }
             }
             if !n.is_host && n.last_recv.elapsed().as_secs_f32() > 8.0 && self.disconnected.is_none() {
@@ -703,6 +1667,17 @@ impl App {
                 for (s, ping) in n.pings() {
                     if game.f[s].present {
                         game.f[s].ping_ms = ping;
+                    }
+                }
+                for (s, loss) in n.losses() {
+                    if game.f[s].present {
+                        game.f[s].loss_pct = (loss * 100.0).round() as u8;
+                    }
+                }
+                if !self.ip_announced {
+                    if let Some(Ok(ip)) = self.public_ip.lock().ok().and_then(|g| g.clone()) {
+                        self.ip_announced = true;
+                        game.say(format!("Internet address: {ip}:{} (needs the port forwarded)", self.settings.port.trim()));
                     }
                 }
                 let ready = autostart > 0 && game.mt.phase == Phase::Warmup && n.player_count() >= autostart;
@@ -732,7 +1707,42 @@ impl App {
             self.acc = 0.0;
             return;
         }
-        self.acc += dt;
+        if self.autoplay && std::env::var_os("DUEL_HUD_TEST").is_some() && game.time > 3.0 {
+            // test switch: show every HUD effect at once
+            let l = game.local;
+            let me = game.f[l].pos;
+            let right = yaw_right(game.f[l].yaw);
+            game.f[l].cur = 2;
+            game.f[l].loadout.gun2 = Weapon::Revolver;
+            game.f[l].reload_t = 0.7;
+            game.kill_t = 1.2;
+            game.kill_name = "Vex".into();
+            game.streak = 2;
+            game.headshot_t = 0.5;
+            game.hitmarker = 0.3;
+            game.hurt_dirs = vec![(me + right * 6.0, 1.0), (me - yaw_fwd(game.f[l].yaw) * 6.0, 0.6)];
+            if game.dmg_nums.is_empty() {
+                let p = me + yaw_fwd(game.f[l].yaw) * 6.0 + v3(0.0, 1.8, 0.0);
+                game.dmg_nums.push(DmgNum { pos: p, amount: 42, life: 0.8, head: true });
+            }
+            if game.chat.is_empty() {
+                game.add_chat(1, "that was a clean launch, rematch after this?");
+            }
+        }
+        // game feel: a brief freeze when a sword hit lands, slow motion for the final kill
+        if let Some(kc) = game.killcam.as_mut() {
+            kc.t += dt;
+        }
+        let mut scale = 1.0;
+        if game.slowmo > 0.0 {
+            game.slowmo -= dt;
+            scale = 0.25;
+        }
+        if game.hitstop > 0.0 {
+            game.hitstop -= dt;
+        } else {
+            self.acc += dt * scale;
+        }
         let mut steps = 0;
         while self.acc >= TICK && steps < 12 {
             game.tick(&inp);
@@ -749,6 +1759,9 @@ impl App {
         }
         if steps == 12 {
             self.acc = 0.0;
+        }
+        if let Ok(page) = std::env::var("DUEL_GALLERY") {
+            gallery_pose(game, page == "2");
         }
         // after a respawn, look where the new body faces
         let l = game.local;
@@ -774,7 +1787,9 @@ impl App {
     /// Joining: say hello until the host answers, then step into its match.
     fn update_lobby(&mut self, ctx: &egui::Context, dt: f32) {
         let name = clean_name(&self.settings.name, 1);
+        let sim = self.net_sim();
         let Screen::Lobby { net, waiting_since } = &mut self.screen else { return };
+        net.sim = sim;
         *waiting_since += dt;
         net.send_hello(&name, dt);
         let mut first: Option<net::HostMsg> = None;
@@ -789,11 +1804,16 @@ impl App {
                     self.screen = Screen::Menu(Page::Join);
                     return;
                 }
+                Incoming::WrongVersion => {
+                    self.menu_msg = Some("The host has a different version of Duel Rush. You both need the same build: share the newest one and try again.".into());
+                    self.screen = Screen::Menu(Page::Join);
+                    return;
+                }
                 _ => {}
             }
         }
         if first.is_none() && *waiting_since > 15.0 {
-            self.menu_msg = Some("Couldn't reach the host. Check the address, that they pressed Host, and their firewall / port forwarding.".into());
+            self.menu_msg = Some("Couldn't reach the host. Check that: the address is their Internet address from their Host screen; they've opened the lobby; UDP port 27960 is forwarded on their router to their PC; Windows Firewall allows Duel Rush on their PC (the Host screen checks this); and you both have the same version of the game.".into());
             self.screen = Screen::Menu(Page::Join);
             return;
         }
@@ -812,6 +1832,9 @@ impl App {
             }
             let host = g.f[0].name.clone();
             g.say(format!("Joined {host}'s lobby"));
+            let addr = self.settings.join_addr.trim().to_string();
+            let mode = g.mt.mode.name().to_string();
+            self.remember_server(addr, host, mode);
             self.start_game(g, Some(net));
             ctx.request_repaint();
         }
@@ -861,13 +1884,58 @@ impl App {
     }
 
     fn play_camera(&self, game: &Game, rect: Rect) -> (Cam, V3) {
+        if std::env::var_os("DUEL_GALLERY").is_some() {
+            let l = game.local;
+            return (Cam::new(v3(0.0, 2.0, 5.2), 0.0, -0.08, 96.0, rect), game.f[l].pos);
+        }
         let l = game.local;
         let f = &game.f[l];
         let alpha = (self.acc / TICK).clamp(0.0, 1.0);
         let body = f.prev_pos.lerp(f.pos, alpha);
         // the camera follows the mouse right away, not at the next game tick
         let (yaw, pitch) = if f.is_bot { (f.yaw, f.pitch) } else { (self.aim_yaw, self.aim_pitch) };
+        // final kill cam: circle the fallen player in slow motion
+        if let Some(kc) = &game.killcam {
+            if kc.t < KILLCAM_TIME && game.f[kc.victim].present {
+                let v = &game.f[kc.victim];
+                let target = v.prev_pos.lerp(v.pos, alpha) + v3(0.0, 0.9, 0.0);
+                let a = v.yaw + 2.2 + kc.t * 0.55;
+                let mut out = v3(a.sin(), 0.0, a.cos());
+                let mut dist = 4.4 - kc.t * 0.35;
+                if let Some((t, _)) = game.world.raycast(target, (out + v3(0.0, 0.35, 0.0)).norm(), dist + 0.3) {
+                    dist = (t - 0.3).max(1.0);
+                }
+                out = (out + v3(0.0, 0.35, 0.0)).norm();
+                let pos = target + out * dist;
+                let d = (target - pos).norm();
+                return (Cam::new(pos, d.x.atan2(d.z), d.y.asin(), 62.0, rect), body);
+            }
+        }
+        // watching: follow someone still fighting
+        let watching = f.spectate || (!f.alive && game.mt.mode.rounds() && game.mt.phase == Phase::Fight);
+        if watching {
+            let pick = game.mt.duel.iter().map(|&d| d as usize).chain(0..game.f.len()).find(|&i| i < game.f.len() && i != l && game.f[i].present && game.f[i].alive && !game.f[i].spectate);
+            if let Some(t) = pick {
+                let tf = &game.f[t];
+                let tb = tf.prev_pos.lerp(tf.pos, alpha);
+                let (pivot, dir, md) = game.camera_rig(tb, tf.yaw, tf.pitch * 0.5);
+                let pos = pivot - dir * md;
+                return (Cam::new(pos, tf.yaw, tf.pitch * 0.5, self.settings.fov, rect), body);
+            }
+        }
         let (pivot, dir, max_dist) = game.camera_rig(body, yaw, pitch);
+        // right mouse with a gun: aim down sights (zoom in, camera a little closer)
+        let ads = !f.weapon.is_melee() && f.alive && self.keys_snapshot().guard && (self.captured || f.is_bot);
+        let want_zoom = if !ads {
+            1.0
+        } else if matches!(f.weapon, Weapon::Rifle | Weapon::Revolver) {
+            1.5
+        } else {
+            1.2
+        };
+        let zoom = self.ads_zoom.get() + (want_zoom - self.ads_zoom.get()) * (self.frame_dt * 14.0).min(1.0);
+        self.ads_zoom.set(zoom);
+        let max_dist = max_dist * (1.0 - 0.3 * (zoom - 1.0));
         // snap in at once when a wall gets in the way, ease back out smoothly
         let mut d = self.cam_dist.get();
         if max_dist < d {
@@ -877,12 +1945,36 @@ impl App {
         }
         self.cam_dist.set(d);
         let mut pos = pivot - dir * d;
+        let (mut yaw, mut pitch) = (yaw, pitch);
         if game.shake > 0.0 {
-            let s = game.shake * 0.12;
-            let t = game.time * 60.0;
-            pos += v3((t * 1.3).sin() * s, (t * 1.7).cos() * s, (t * 0.9).sin() * s);
+            // trauma-style shake: strong hits shake much more than light ones
+            let tr = game.shake.min(1.2);
+            let k = tr * tr;
+            let t = self.wall_t * 38.0;
+            let n = |a: f32, b: f32| (t * a).sin() * 0.6 + (t * b + 1.7).sin() * 0.4;
+            pos += v3(n(1.3, 2.9), n(1.7, 3.3), n(0.9, 2.3)) * (0.16 * k);
+            yaw += n(1.1, 2.6) * 0.025 * k;
+            pitch += n(1.5, 3.1) * 0.02 * k;
         }
-        (Cam::new(pos, yaw, pitch, self.settings.fov, rect), body)
+        // FOV kick: widens on dashes (and a little at full sprint or on walls)
+        let speed = f.vel.flat().len();
+        let want = if f.dash_t > 0.0 {
+            14.0
+        } else if f.wall.is_some() {
+            7.0
+        } else if speed > RUN_SPEED * 1.1 {
+            4.0
+        } else {
+            0.0
+        };
+        let cur = self.fov_kick.get();
+        let rate = if want > cur { 22.0 } else { 5.0 };
+        let kick = cur + (want - cur) * (self.frame_dt * rate).min(1.0);
+        self.fov_kick.set(kick);
+        // zoom narrows the view: same centre, so the aim point doesn't move
+        let fov = self.settings.fov + kick;
+        let fov = 2.0 * ((fov.to_radians() * 0.5).tan() / zoom).atan().to_degrees();
+        (Cam::new(pos, yaw, pitch, fov, rect), body)
     }
 }
 
@@ -896,22 +1988,127 @@ struct KeysHeld {
     d: bool,
     fire: bool,
     guard: bool,
+    crouch: bool,
 }
 
 thread_local! {
+    /// A menu sound asked for by a button this frame.
+    static UI_SOUND: std::cell::Cell<Option<Sfx>> = const { std::cell::Cell::new(None) };
     static KEYS: std::cell::RefCell<KeysHeld> = std::cell::RefCell::new(KeysHeld::default());
 }
 
-fn sample_keys(ctx: &egui::Context) {
+fn sample_keys(ctx: &egui::Context, b: &[Bind; N_ACTIONS]) {
     let k = ctx.input(|i| KeysHeld {
-        w: i.key_down(Key::W) || i.key_down(Key::ArrowUp),
-        a: i.key_down(Key::A) || i.key_down(Key::ArrowLeft),
-        s: i.key_down(Key::S) || i.key_down(Key::ArrowDown),
-        d: i.key_down(Key::D) || i.key_down(Key::ArrowRight),
-        fire: i.pointer.primary_down(),
-        guard: i.pointer.secondary_down() || i.key_down(Key::C),
+        w: b[A_FWD].down(i) || i.key_down(Key::ArrowUp),
+        a: b[A_LEFT].down(i) || i.key_down(Key::ArrowLeft),
+        s: b[A_BACK].down(i) || i.key_down(Key::ArrowDown),
+        d: b[A_RIGHT].down(i) || i.key_down(Key::ArrowRight),
+        fire: b[A_FIRE].down(i),
+        guard: b[A_GUARD].down(i),
+        crouch: b[A_SLIDE].down(i),
     });
     KEYS.with(|c| *c.borrow_mut() = k);
+}
+
+/// Test switch: line fighters up, each held in one move, to check the animations.
+fn gallery_pose(g: &mut Game, page2: bool) {
+    g.mt.phase = Phase::Fight;
+    g.mt.timer = 500.0;
+    let t = g.time;
+    for i in 0..8usize {
+        if !g.f[i].present {
+            continue;
+        }
+        g.bots[i] = None;
+        let f = &mut g.f[i];
+        let p = v3(-6.65 + i as f32 * 1.9, 0.0, 12.0);
+        f.pos = p;
+        f.prev_pos = p;
+        f.yaw = std::f32::consts::PI;
+        f.pitch = 0.0;
+        f.alive = true;
+        f.hp = 100.0;
+        f.vel = V3::ZERO;
+        f.on_ground = true;
+        f.wall = None;
+        f.dash_t = 0.0;
+        f.slash_t = 0.0;
+        f.guard = false;
+        f.recoil = 0.0;
+        f.hurt_t = 0.0;
+        f.stun_t = 0.0;
+        f.reload_t = 0.0;
+        f.spawn_prot = 0.0;
+        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0 };
+        f.cur = 2;
+        f.weapon = Weapon::Revolver;
+        let fwd = f.fwd();
+        let right = v3(fwd.z, 0.0, -fwd.x);
+        if !page2 {
+            match i {
+                0 => {}
+                1 => {
+                    f.cur = 0;
+                    f.weapon = Weapon::Katana;
+                    f.vel = fwd * 8.0;
+                }
+                2 => {
+                    f.cur = 1;
+                    f.weapon = Weapon::Shotgun;
+                    f.vel = right * 7.0;
+                }
+                3 => {
+                    f.on_ground = false;
+                    f.vel = v3(0.0, 6.0, 0.0);
+                }
+                4 => {
+                    f.on_ground = false;
+                    f.vel = v3(0.0, -6.0, 0.0);
+                }
+                5 => {
+                    f.on_ground = false;
+                    f.wall = Some(WallRun { normal: right, dir: fwd, t: 0.2, vertical: false, speed: 10.0 });
+                    f.vel = fwd * 10.0;
+                }
+                6 => {
+                    f.dash_t = 0.1;
+                    f.vel = fwd * 16.0;
+                }
+                _ => {
+                    f.alive = false;
+                    f.death_t = 2.0;
+                }
+            }
+        } else {
+            f.cur = 0;
+            f.weapon = Weapon::Katana;
+            match i {
+                0..=2 => {
+                    let dur = f.weapon.slash_dur();
+                    f.slash_idx = [0u8, 1, 3][i];
+                    f.slash_t = dur * (1.0 - (t * 1.3 + i as f32 * 0.21).fract()).max(0.05);
+                }
+                3 => f.guard = true,
+                4 => {
+                    f.cur = 1;
+                    f.weapon = Weapon::Shotgun;
+                    f.recoil = (1.0 - (t * 1.5).fract()).max(0.0);
+                }
+                5 => {
+                    f.loadout.gun1 = Weapon::Rifle;
+                    f.cur = 1;
+                    f.weapon = Weapon::Rifle;
+                    f.pitch = 0.3;
+                }
+                6 => {
+                    f.loadout.gun1 = Weapon::Rocket;
+                    f.cur = 1;
+                    f.weapon = Weapon::Rocket;
+                }
+                _ => f.hurt_t = 0.15,
+            }
+        }
+    }
 }
 
 /// A name to show: what they typed, or "Player N".
@@ -922,6 +2119,13 @@ fn clean_name(n: &str, slot: usize) -> String {
 
 /// Follow the host's update: who's here, the match, everyone's fighters and events.
 fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
+    if m.stale {
+        // an older update that came in late: everything in it is out of date except its events
+        for (origin, ev) in m.events {
+            g.handle_remote_event(origin, ev);
+        }
+        return;
+    }
     g.local = m.you;
     for e in &m.roster {
         let s = e.slot;
@@ -939,14 +2143,22 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
         g.f[s].kills = e.kills;
         g.f[s].deaths = e.deaths;
         g.f[s].ping_ms = e.ping;
+        g.f[s].loss_pct = e.loss;
+        g.f[s].wins = e.wins;
+        g.f[s].spectate = e.spectate;
+        if e.spectate && s == g.local {
+            g.f[s].alive = false; // watching this round
+            g.f[s].respawn_t = 1e9;
+        }
         if s != g.local {
             g.f[s].ready = e.ready;
             g.f[s].vote = e.vote;
         }
     }
     let l = g.local;
-    if m.you_alive && g.f[l].alive {
-        // the host keeps the health; ours follows it
+    if m.you_alive && g.f[l].alive && (g.hp_hold <= 0.0 || m.you_hp < g.f[l].hp - 55.0) {
+        // the host keeps the health; ours follows it (except just after we healed: its
+        // figure is from before it heard about that)
         g.f[l].hp = m.you_hp;
         g.f[l].ap = m.you_ap;
     }
@@ -955,10 +2167,11 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
             g.remove_player(s);
         }
     }
-    g.apply_match(m.mode, m.phase, m.timer, m.target, m.team_score, m.number);
+    g.apply_match(m.mode, m.phase, m.timer, m.target, m.team_score, m.number, m.round, m.round_end, m.duel, m.flags);
+    let now = g.time;
     for (s, st) in &m.fighters {
         if *s != g.local && g.f[*s].present {
-            net::apply_remote(&mut g.f[*s], st, false);
+            net::apply_remote(&mut g.f[*s], st, false, m.sent, now);
         }
     }
     for (origin, ev) in m.events {
@@ -972,6 +2185,37 @@ fn text_shadow(p: &egui::Painter, pos: Pos2, align: Align2, s: &str, size: f32, 
     let font = FontId::proportional(size);
     p.text(pos + Vec2::new(2.0, 2.0), align, s, font.clone(), Color32::from_black_alpha(170));
     p.text(pos, align, s, font, color);
+}
+
+/// Draw text from the left, shrinking it (and finally cutting it with "…") so it fits `max_w`.
+fn fit_text(p: &egui::Painter, pos: Pos2, s: &str, size: f32, max_w: f32, color: Color32) {
+    let mut size = size;
+    let mut text = s.to_string();
+    for _ in 0..6 {
+        let w = p.layout_no_wrap(text.clone(), FontId::proportional(size), color).size().x;
+        if w <= max_w || size < 9.0 {
+            break;
+        }
+        size *= 0.9;
+    }
+    while text.chars().count() > 1 && p.layout_no_wrap(text.clone(), FontId::proportional(size), color).size().x > max_w {
+        let n = text.chars().count();
+        text = text.chars().take(n.saturating_sub(2)).collect::<String>() + "…";
+    }
+    text_shadow(p, pos, Align2::LEFT_TOP, &text, size, color);
+}
+
+/// Centred text that shrinks to fit `max_w`.
+fn fit_center(p: &egui::Painter, pos: Pos2, s: &str, size: f32, max_w: f32, color: Color32) {
+    let mut size = size;
+    for _ in 0..10 {
+        let w = p.layout_no_wrap(s.to_string(), FontId::proportional(size), color).size().x;
+        if w <= max_w || size < 9.0 {
+            break;
+        }
+        size *= 0.9;
+    }
+    text_shadow(p, pos, Align2::CENTER_CENTER, s, size, color);
 }
 
 fn bar(p: &egui::Painter, r: Rect, frac: f32, col: Color32) {
@@ -991,24 +2235,28 @@ fn player_color(idx: u8) -> Color32 {
 fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
     let mut rows: Vec<&Fighter> = g.f.iter().filter(|f| f.present).collect();
     rows.sort_by(|a, b| (a.team, -a.kills, a.deaths).cmp(&(b.team, -b.kills, b.deaths)));
-    if g.mt.mode == Mode::Ffa {
-        rows.sort_by(|a, b| (-a.kills, a.deaths).cmp(&(-b.kills, b.deaths)));
+    if !g.mt.mode.teams() {
+        if g.mt.mode.rounds() {
+            rows.sort_by(|a, b| (-a.wins, -a.kills).cmp(&(-b.wins, -b.kills)));
+        } else {
+            rows.sort_by(|a, b| (-a.kills, a.deaths).cmp(&(-b.kills, b.deaths)));
+        }
     }
     let w = 540.0;
-    let h = 70.0 + rows.len() as f32 * 28.0 + if g.mt.mode == Mode::Tdm { 30.0 } else { 0.0 };
+    let h = 70.0 + rows.len() as f32 * 28.0 + if g.mt.mode.teams() { 30.0 } else { 0.0 };
     let r = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 110.0 + h * 0.5), Vec2::new(w, h));
     p.rect_filled(r, 10.0, Color32::from_rgba_unmultiplied(10, 8, 20, 215));
     p.rect_stroke(r, 10.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 150, 70, 110)), egui::StrokeKind::Inside);
     let x0 = r.left() + 20.0;
     let mut y = r.top() + 16.0;
     text_shadow(p, Pos2::new(x0, y), Align2::LEFT_TOP, &format!("PLAYERS  ({}/8)", rows.len()), 16.0, ACCENT);
-    text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, "KILLS", 13.0, Color32::from_gray(200));
+    text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, if g.mt.mode.rounds() { "WINS" } else { "KILLS" }, 13.0, Color32::from_gray(200));
     text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, "DEATHS", 13.0, Color32::from_gray(200));
     text_shadow(p, Pos2::new(r.right() - 45.0, y), Align2::CENTER_TOP, "PING", 13.0, Color32::from_gray(200));
     y += 34.0;
     let mut last_team = 255u8;
     for f in rows {
-        if g.mt.mode == Mode::Tdm && f.team != last_team {
+        if g.mt.mode.teams() && f.team != last_team {
             last_team = f.team;
             let t = (f.team as usize).min(1);
             text_shadow(p, Pos2::new(x0, y), Align2::LEFT_TOP, &format!("{} TEAM  —  {}", TEAM_NAMES[t].to_uppercase(), g.mt.team_score[t]), 14.0, player_color(t as u8));
@@ -1028,12 +2276,22 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
         if g.mt.phase == Phase::Loadout && f.ready {
             name.push_str("  - ready");
         }
+        if g.mt.phase == Phase::Fight && g.mt.mode == Mode::Duel {
+            if g.duel_side(f.slot).is_some() {
+                name.push_str("  - fighting");
+            } else if f.spectate {
+                name.push_str("  - waiting");
+            }
+        } else if g.mt.phase == Phase::Fight && f.spectate {
+            name.push_str("  - next round");
+        }
         if g.mt.phase == Phase::MatchOver && f.vote {
             name.push_str("  - rematch!");
         }
         p.circle_filled(Pos2::new(x0 + 6.0, y + 9.0), 6.0, player_color(f.color_idx));
         text_shadow(p, Pos2::new(x0 + 20.0, y), Align2::LEFT_TOP, &name, 16.0, Color32::WHITE);
-        text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, &format!("{}", f.kills), 16.0, Color32::WHITE);
+        let score = if g.mt.mode.rounds() { f.wins } else { f.kills };
+        text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, &format!("{}", score), 16.0, Color32::WHITE);
         text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, &format!("{}", f.deaths), 16.0, Color32::from_gray(200));
         let ping = if f.is_bot || (f.slot == 0 && g.kind != Kind::Offline) || g.kind == Kind::Offline { "-".to_string() } else { format!("{}", f.ping_ms) };
         let pc = if f.ping_ms > 150 { Color32::from_rgb(255, 140, 120) } else if f.ping_ms > 80 { Color32::from_rgb(255, 220, 140) } else { Color32::from_rgb(160, 230, 160) };
@@ -1043,15 +2301,153 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
 }
 
 impl App {
+    /// F3: frame rate, ping, packet loss, players and traffic. A small tag always shows while
+    /// the network test is on, so nobody forgets it.
+    fn draw_net_overlay(&self, p: &egui::Painter, rect: Rect, g: &Game, n: Option<&Net>) {
+        let s = (rect.width() / 1280.0).min(rect.height() / 720.0).clamp(0.62, 1.5);
+        let x = rect.left() + 14.0 * s;
+        let mut y = rect.top() + 14.0 * s;
+        let warn = Color32::from_rgb(255, 170, 60);
+        if self.settings.net_test && n.is_some() && !self.show_debug {
+            text_shadow(p, Pos2::new(x, y), Align2::LEFT_TOP, &format!("NETWORK TEST  +{:.0} ms  {:.0}% loss  (F3)", self.settings.net_lag, self.settings.net_loss), 13.0 * s, warn);
+        }
+        if !self.show_debug {
+            return;
+        }
+        let mut lines: Vec<(String, Color32)> = Vec::new();
+        let white = Color32::from_rgb(235, 235, 235);
+        let grey = Color32::from_gray(180);
+        let good = |v: f32, ok: f32, bad: f32| if v <= ok { Color32::from_rgb(140, 230, 140) } else if v <= bad { Color32::from_rgb(255, 215, 120) } else { Color32::from_rgb(255, 120, 110) };
+        lines.push((format!("FPS {:.0}  ({:.1} ms)", self.fps, 1000.0 / self.fps.max(1.0)), good(-self.fps, -55.0, -30.0)));
+        let players = g.present().len();
+        match n {
+            None => {
+                lines.push(("Playing offline (no network)".into(), grey));
+                lines.push((format!("Players: {players}"), white));
+            }
+            Some(n) => {
+                let r = n.rates;
+                if n.is_host {
+                    lines.push((format!("Hosting on {}", n.address()), white));
+                    lines.push((format!("Players connected: {} / {}", n.player_count(), MAX_PLAYERS), white));
+                    for f in g.f.iter().filter(|f| f.present && f.slot != g.local) {
+                        let loss = f.loss_pct as f32;
+                        let col = good(f.ping_ms as f32 + loss * 20.0, 120.0, 250.0);
+                        lines.push((format!("  {}  ping {} ms  loss {}%", f.name, f.ping_ms, f.loss_pct), col));
+                    }
+                } else {
+                    let me = &g.f[g.local];
+                    lines.push((format!("Connected to {}", n.address()), white));
+                    lines.push((format!("Players connected: {players}"), white));
+                    lines.push((format!("Ping {} ms", me.ping_ms), good(me.ping_ms as f32, 80.0, 160.0)));
+                    let down = n.down_loss() * 100.0;
+                    let up = me.loss_pct as f32;
+                    lines.push((format!("Packet loss  down {:.1}%  up {:.0}%", down, up), good(down.max(up), 1.0, 5.0)));
+                }
+                lines.push((format!("In {:.0} pkt/s {:.1} KB/s · Out {:.0} pkt/s {:.1} KB/s", r.pkts_in, r.kb_in, r.pkts_out, r.kb_out), grey));
+                let delays: Vec<f32> = g.f.iter().filter(|f| f.present && f.slot != g.local).map(|f| f.interp).collect();
+                let avg = if delays.is_empty() { INTERP_DELAY } else { delays.iter().sum::<f32>() / delays.len() as f32 };
+                lines.push((format!("Others shown {:.0} ms behind for smoothness", avg * 1000.0), grey));
+                if let Some(sim) = n.sim {
+                    lines.push((format!("NETWORK TEST ON: +{:.0} ms lag, {:.0}% loss", sim.lag_ms, sim.loss * 100.0), warn));
+                }
+            }
+        }
+        let fs = 13.5 * s;
+        let galleys: Vec<_> = lines.into_iter().map(|(t, c)| p.layout_no_wrap(t, FontId::monospace(fs), c)).collect();
+        let w = galleys.iter().map(|g| g.size().x).fold(0.0f32, f32::max) + 20.0 * s;
+        let h = galleys.iter().map(|g| g.size().y + 3.0 * s).sum::<f32>() + 14.0 * s;
+        let bg = Rect::from_min_size(Pos2::new(x - 6.0 * s, y - 6.0 * s), Vec2::new(w.min(rect.width() * 0.6), h));
+        p.rect_filled(bg, 6.0 * s, Color32::from_black_alpha(175));
+        y += 1.0 * s;
+        for gal in galleys {
+            let gh = gal.size().y;
+            p.galley(Pos2::new(x + 4.0 * s, y), gal, Color32::WHITE);
+            y += gh + 3.0 * s;
+        }
+    }
+}
+
+/// The training lesson card at the top of the screen. Returns the rectangle it took.
+fn draw_training(p: &egui::Painter, rect: Rect, s: f32, margin: f32, t: &Training) -> Rect {
+    let w = (640.0 * s).min(rect.width() - margin * 2.0);
+    let pad = 14.0 * s;
+    let total = LESSONS.len();
+    let (title, how) = match LESSONS.get(t.lesson) {
+        Some(l) => (format!("Lesson {}/{}: {}", t.lesson + 1, total, l.title), l.how.to_string()),
+        None => ("Training complete!".to_string(), "Every move learned. Keep practising combos on the dummies, or press P to revisit a lesson.".to_string()),
+    };
+    let how_g = p.layout(how, FontId::proportional(15.0 * s), Color32::from_rgb(235, 230, 220), w - pad * 2.0);
+    let h = 36.0 * s + how_g.size().y + 40.0 * s;
+    let r = Rect::from_min_size(Pos2::new(rect.center().x - w * 0.5, rect.top() + margin), Vec2::new(w, h));
+    p.rect_filled(r, 8.0 * s, Color32::from_black_alpha(150));
+    p.rect_stroke(r, 8.0 * s, Stroke::new(1.5 * s, Color32::from_rgba_unmultiplied(255, 150, 70, 120)), egui::StrokeKind::Inside);
+    // title (left) and keys (right)
+    let keys = "N skip · P back";
+    let keys_g = p.layout_no_wrap(keys.to_string(), FontId::proportional(12.0 * s), Color32::from_gray(170));
+    let kw = keys_g.size().x;
+    p.galley(Pos2::new(r.right() - pad - kw, r.top() + 12.0 * s), keys_g, Color32::WHITE);
+    fit_text(p, Pos2::new(r.left() + pad, r.top() + 8.0 * s), &title, 19.0 * s, w - pad * 3.0 - kw, ACCENT);
+    p.galley(Pos2::new(r.left() + pad, r.top() + 36.0 * s), how_g, Color32::WHITE);
+    // progress: one pip per repetition needed, or a big tick when the lesson is done
+    let py = r.bottom() - 18.0 * s;
+    let (have, need) = t.progress();
+    if t.done_t > 0.0 {
+        text_shadow(p, Pos2::new(r.left() + pad, py), Align2::LEFT_CENTER, "✔ NICE! Next lesson...", 17.0 * s, Color32::from_rgb(120, 230, 120));
+    } else if need > 0 {
+        let rad = 7.0 * s;
+        for k in 0..need {
+            let pc = Pos2::new(r.left() + pad + rad + k as f32 * rad * 2.8, py);
+            if k < have {
+                p.circle_filled(pc, rad, Color32::from_rgb(120, 230, 120));
+            } else {
+                p.circle_stroke(pc, rad, Stroke::new(2.0 * s, Color32::from_gray(160)));
+            }
+        }
+        let tx = r.left() + pad + need as f32 * rad * 2.8 + 6.0 * s;
+        text_shadow(p, Pos2::new(tx, py), Align2::LEFT_CENTER, &format!("{have} / {need}"), 14.0 * s, Color32::from_gray(220));
+    }
+    // overall progress along the bottom edge
+    let frac = t.lesson.min(total) as f32 / total as f32;
+    let bar_r = Rect::from_min_size(Pos2::new(r.left() + 8.0 * s, r.bottom() - 5.0 * s), Vec2::new((w - 16.0 * s) * frac, 3.0 * s));
+    p.rect_filled(bar_r, 1.0, ACCENT);
+    r
+}
+
+impl App {
     fn draw_hud(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game) {
         let me = &g.f[g.local];
         let c = rect.center();
+        // everything scales with the window so nothing overlaps at small sizes
+        let s = (rect.width() / 1280.0).min(rect.height() / 720.0).clamp(0.62, 1.5);
+        let margin = 14.0 * s;
+        if let Some(kc) = &g.killcam {
+            if kc.t < KILLCAM_TIME {
+                let bar_h = rect.height() * 0.11;
+                p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
+                p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - bar_h), Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
+                let a = ((kc.t / 0.3).min(1.0) * 255.0) as u8;
+                text_shadow(p, Pos2::new(c.x, rect.top() + bar_h * 0.5), Align2::CENTER_CENTER, "FINAL KILL", 30.0 * s, Color32::from_rgba_unmultiplied(255, 150, 70, a));
+                let victim = &g.f[kc.victim].name;
+                let line = match kc.killer.filter(|&k| k < g.f.len()) {
+                    Some(k) => format!("{}  [{}]  {}", g.f[k].name, kc.tool, victim),
+                    None => format!("{victim} went down"),
+                };
+                fit_center(p, Pos2::new(c.x, rect.bottom() - bar_h * 0.5), &line, 20.0 * s, rect.width() - 40.0, Color32::from_rgba_unmultiplied(240, 230, 220, a));
+                return;
+            }
+        }
 
+        // perfect parry: a white flash
+        if g.parry_flash > 0.0 {
+            let a = ((g.parry_flash / 0.3).clamp(0.0, 1.0) * 110.0) as u8;
+            p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, a));
+        }
         // hurt flash vignette
         if g.hurt_flash > 0.0 {
             let a = (g.hurt_flash * 200.0) as u8;
             let col = Color32::from_rgba_unmultiplied(200, 0, 0, a / 2);
-            let w = 60.0;
+            let w = 60.0 * s;
             p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width(), w)), 0.0, col);
             p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - w), Vec2::new(rect.width(), w)), 0.0, col);
             p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(w, rect.height())), 0.0, col);
@@ -1059,11 +2455,11 @@ impl App {
         }
         if me.hp < 30.0 && me.alive {
             let a = ((g.time * 4.0).sin().abs() * 50.0) as u8;
-            p.rect_stroke(rect.shrink(4.0), 0.0, Stroke::new(8.0, Color32::from_rgba_unmultiplied(220, 0, 0, a)), egui::StrokeKind::Inside);
+            p.rect_stroke(rect.shrink(4.0), 0.0, Stroke::new(8.0 * s, Color32::from_rgba_unmultiplied(220, 0, 0, a)), egui::StrokeKind::Inside);
         }
 
         // name tags over everyone you can see
-        for other in g.f.iter().filter(|o| o.present && o.slot != g.local) {
+        for other in g.f.iter().filter(|o| o.present && !o.spectate && o.slot != g.local) {
             if !(other.alive || other.death_t < 2.0) {
                 continue;
             }
@@ -1075,187 +2471,423 @@ impl App {
             let enemy = g.is_enemy(g.local, other.slot);
             let col = player_color(other.color_idx);
             let label = if enemy { other.name.clone() } else { format!("{} (ally)", other.name) };
-            text_shadow(p, sp + Vec2::new(0.0, -12.0), Align2::CENTER_BOTTOM, &label, 15.0, col);
-            let r = Rect::from_center_size(sp, Vec2::new(70.0, 8.0));
+            text_shadow(p, sp + Vec2::new(0.0, -12.0 * s), Align2::CENTER_BOTTOM, &label, 15.0 * s, col);
+            let r = Rect::from_center_size(sp, Vec2::new(70.0 * s, 8.0 * s));
             bar(p, r, other.hp / MAX_HP, if enemy { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(80, 200, 110) });
-        }        // damage numbers
+        }
+
+        // damage numbers: pop in, drift up, bigger for bigger hits, gold for headshots
         for d in &g.dmg_nums {
             if let Some(sp) = cam.project(d.pos) {
                 let a = (d.life / 0.9 * 255.0).clamp(0.0, 255.0) as u8;
-                let col = if d.head { Color32::from_rgba_unmultiplied(255, 220, 60, a) } else { Color32::from_rgba_unmultiplied(255, 255, 255, a) };
-                text_shadow(p, sp, Align2::CENTER_CENTER, &format!("{}", d.amount), if d.head { 24.0 } else { 18.0 }, col);
+                let pop = 1.0 + 0.7 * ((d.life - 0.72) / 0.18).clamp(0.0, 1.0);
+                let size = (16.0 + (d.amount.min(80) as f32 / 80.0) * 12.0) * pop * s;
+                let col = if d.head { Color32::from_rgba_unmultiplied(255, 215, 50, a) } else if d.amount >= 40 { Color32::from_rgba_unmultiplied(255, 150, 90, a) } else { Color32::from_rgba_unmultiplied(255, 255, 255, a) };
+                text_shadow(p, sp, Align2::CENTER_CENTER, &format!("{}", d.amount), size, col);
+                if d.head {
+                    text_shadow(p, sp + Vec2::new(0.0, size * 0.75), Align2::CENTER_CENTER, "HEADSHOT", 11.0 * s, col);
+                }
             }
         }
 
-        // crosshair
+        // where hits are coming from: red arcs around the crosshair
+        let flat_fwd = v3(cam.fwd.x, 0.0, cam.fwd.z).norm();
+        let flat_right = v3(cam.right.x, 0.0, cam.right.z).norm();
+        for (src, life) in &g.hurt_dirs {
+            let d = (*src - me.pos).flat();
+            if d.len() < 0.3 {
+                continue;
+            }
+            let ang = d.dot(flat_right).atan2(d.dot(flat_fwd));
+            let a = ((life / 1.2).clamp(0.0, 1.0) * 220.0) as u8;
+            let col = Color32::from_rgba_unmultiplied(235, 30, 30, a);
+            let (r0, r1) = (105.0 * s, 128.0 * s);
+            let mut mesh = egui::epaint::Mesh::default();
+            let steps = 10;
+            for k in 0..=steps {
+                let t = ang - 0.32 + 0.64 * k as f32 / steps as f32;
+                let dir = Vec2::new(t.sin(), -t.cos());
+                // thicker in the middle: an arrow-ish wedge
+                let mid = 1.0 - ((k as f32 / steps as f32) - 0.5).abs() * 2.0;
+                mesh.colored_vertex(c + dir * r0, col);
+                mesh.colored_vertex(c + dir * (r0 + (r1 - r0) * (0.35 + 0.65 * mid)), col);
+            }
+            for k in 0..steps as u32 {
+                let i = k * 2;
+                mesh.add_triangle(i, i + 1, i + 3);
+                mesh.add_triangle(i, i + 3, i + 2);
+            }
+            p.add(egui::Shape::mesh(mesh));
+        }
+
+        // crosshair: exactly as wide as the next shot's spread
         if me.alive {
-            let col = Color32::from_rgba_unmultiplied(255, 255, 255, 220);
-            let st = Stroke::new(2.0, col);
-            match me.weapon {
-                w if w.is_melee() => {
-                    p.circle_stroke(c, 10.0, st);
-                    p.circle_filled(c, 2.0, col);
+            let [cr, cg, cb] = self.settings.cross_color;
+            let col = Color32::from_rgba_unmultiplied(cr, cg, cb, 235);
+            let on_enemy = self.settings.cross_red && !me.weapon.is_melee() && {
+                let (yaw, pitch) = if me.is_bot { (me.yaw, me.pitch) } else { (self.aim_yaw, self.aim_pitch) };
+                g.aim_enemy(g.local, yaw, pitch).is_some()
+            };
+            let dot_col = if on_enemy { Color32::from_rgb(255, 45, 45) } else { col };
+            let target = spread_px(me.spread(), cam.focal);
+            // open fast (fully within 50 ms, before any gun can fire again), close smoothly
+            let mut gap = self.cross_gap.get();
+            let dt = self.frame_dt.max(0.0);
+            if target > gap {
+                gap = (gap + ((target - gap) * dt * 30.0).max(dt * 2000.0)).min(target);
+            } else {
+                gap += (target - gap) * (dt * 12.0).min(1.0);
+            }
+            self.cross_gap.set(gap);
+            let size = self.settings.cross_size * s;
+            draw_crosshair(p, c, self.settings.cross_style, col, dot_col, size, gap, me.weapon == Weapon::Shotgun);
+            // the reload ring and labels sit outside the spread
+            let ring_r = (30.0 * s).max(gap + 12.0 * s);
+            // reload: a ring that fills up around the crosshair
+            if !me.weapon.is_melee() && me.reload_t > 0.0 {
+                let total = me.weapon.reload_time().max(0.01);
+                let prog = (1.0 - me.reload_t / total).clamp(0.0, 1.0);
+                let r = ring_r;
+                p.circle_stroke(c, r, Stroke::new(5.0 * s, Color32::from_black_alpha(120)));
+                let n = 48;
+                let pts: Vec<Pos2> = (0..=((n as f32 * prog) as usize))
+                    .map(|k| {
+                        let t = k as f32 / n as f32 * std::f32::consts::TAU;
+                        c + Vec2::new(t.sin(), -t.cos()) * r
+                    })
+                    .collect();
+                if pts.len() >= 2 {
+                    p.add(egui::Shape::line(pts, Stroke::new(4.0 * s, ACCENT)));
                 }
-                Weapon::Shotgun | Weapon::Smg => {
-                    let base = if me.weapon == Weapon::Shotgun { 26.0 } else { 14.0 };
-                    let r = base + me.recoil * 10.0;
-                    p.circle_stroke(c, r, Stroke::new(1.5, col));
-                    p.circle_filled(c, 2.0, col);
+            } else if !me.weapon.is_melee() && me.mag[me.cur] == 0 {
+                text_shadow(p, c + Vec2::new(0.0, ring_r + 4.0 * s), Align2::CENTER_CENTER, "R to reload", 13.0 * s, Color32::from_rgb(255, 200, 120));
+            }
+            // hit confirm: a small X on the crosshair, thicker for headshots, red for a kill
+            if g.hitmarker > 0.0 {
+                let a = ((g.hitmarker / 0.18).min(1.0) * 255.0) as u8;
+                let head = g.hit_head;
+                let kill = g.kill_t > 1.2;
+                let hc = if kill { Color32::from_rgba_unmultiplied(255, 50, 40, a) } else { Color32::from_rgba_unmultiplied(255, 255, 255, a) };
+                let pop = 1.0 + ((g.hitmarker - 0.2) / 0.15).clamp(0.0, 1.0) * 0.25;
+                let r0 = (gap * 0.72 + 4.0 * s).max(5.0 * s) * pop;
+                let r1 = r0 + 6.0 * s * if head || kill { 1.25 } else { 1.0 };
+                let th = if head { 3.2 } else { 1.8 } * s.max(0.8);
+                for (dx, dy) in [(1.0f32, 1.0f32), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+                    let dir = Vec2::new(dx, dy) * std::f32::consts::FRAC_1_SQRT_2;
+                    p.line_segment([c + dir * (r0 - 1.0), c + dir * (r1 + 1.0)], Stroke::new(th + 2.0, Color32::from_black_alpha((a as f32 * 0.6) as u8)));
+                    p.line_segment([c + dir * r0, c + dir * r1], Stroke::new(th, hc));
                 }
-                Weapon::Rocket => {
-                    p.circle_stroke(c, 16.0, Stroke::new(2.5, col));
-                    p.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(6.0, 0.0)], st);
-                    p.line_segment([c + Vec2::new(0.0, -6.0), c + Vec2::new(0.0, 6.0)], st);
+            }
+            if g.headshot_t > 0.0 {
+                let a = (g.headshot_t / 0.7 * 255.0).min(255.0) as u8;
+                text_shadow(p, c - Vec2::new(0.0, (50.0 * s).max(ring_r + 14.0 * s)), Align2::CENTER_CENTER, "HEADSHOT", 16.0 * s, Color32::from_rgba_unmultiplied(255, 215, 50, a));
+            }
+        }
+
+        // ---- movement flow: speed lines at the edges, a chain counter, perfect timing
+        if me.alive {
+            let flat = me.vel.flat().len();
+            let flow_k = me.flow.min(FLOW_MAX) as f32 / FLOW_MAX as f32;
+            let fast = ((flat - RUN_SPEED) / (RUN_SPEED * 0.8)).clamp(0.0, 1.0);
+            let strength = (flow_k * 0.75 + fast * 0.45).min(1.0);
+            if strength > 0.05 {
+                let n = 34;
+                let half = rect.size() * 0.5;
+                let reach = half.length();
+                let frame = (g.time * 24.0) as u32;
+                for k in 0..n {
+                    // a cheap hash so the streaks flicker without any state
+                    let h = |salt: u32| -> f32 {
+                        let mut x = (k as u32).wrapping_mul(2654435761) ^ frame.wrapping_mul(40503) ^ salt.wrapping_mul(97);
+                        x ^= x >> 13;
+                        x = x.wrapping_mul(0x5bd1e995);
+                        x ^= x >> 15;
+                        (x & 0xffff) as f32 / 65535.0
+                    };
+                    if h(1) > strength * 0.9 + 0.1 {
+                        continue;
+                    }
+                    let ang = (k as f32 + h(2) * 0.6) / n as f32 * std::f32::consts::TAU;
+                    let dir = Vec2::new(ang.cos(), ang.sin());
+                    let r1 = reach * 1.02;
+                    let r0 = reach * (0.86 - 0.16 * strength - h(3) * 0.08);
+                    let a = (60.0 + 120.0 * strength * h(4)) as u8;
+                    let col = Color32::from_rgba_unmultiplied(255, 245, 230, a);
+                    p.line_segment([c + dir * r0, c + dir * r1], Stroke::new((1.0 + 1.5 * h(5)) * s, col));
                 }
-                _ => {
-                    let moving = me.vel.flat().len() > 1.0 || !me.on_ground;
-                    let tight = if me.weapon == Weapon::Rifle { 0.5 } else { 1.0 };
-                    let gap = (5.0 + if moving { 7.0 } else { 0.0 } + me.recoil * 8.0) * tight;
-                    for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-                        let a = c + Vec2::new(dx * gap, dy * gap);
-                        let b = c + Vec2::new(dx * (gap + 9.0), dy * (gap + 9.0));
-                        p.line_segment([a + Vec2::new(1.0, 1.0), b + Vec2::new(1.0, 1.0)], Stroke::new(2.0, Color32::from_black_alpha(150)));
-                        p.line_segment([a, b], st);
+            }
+            let base_y = rect.bottom() - margin - 128.0 * s;
+            if me.flow > 0 {
+                let pop = 1.0 + (me.flow_pop / 0.35).clamp(0.0, 1.0) * 0.35;
+                let col = if me.flow >= FLOW_MAX { Color32::from_rgb(255, 190, 80) } else { Color32::from_rgb(170, 230, 255) };
+                let text = format!("FLOW x{}  +{}%", me.flow, (me.flow.min(FLOW_MAX) as f32 * FLOW_STEP * 100.0).round() as i32);
+                text_shadow(p, Pos2::new(c.x, base_y), Align2::CENTER_CENTER, &text, 16.0 * s * pop, col);
+                // little pips
+                for k in 0..FLOW_MAX {
+                    let pc = Pos2::new(c.x + (k as f32 - (FLOW_MAX as f32 - 1.0) * 0.5) * 14.0 * s, base_y + 15.0 * s);
+                    if k < me.flow {
+                        p.circle_filled(pc, 3.5 * s, col);
+                    } else {
+                        p.circle_stroke(pc, 3.5 * s, Stroke::new(1.0, Color32::from_white_alpha(90)));
                     }
                 }
             }
-            if g.hitmarker > 0.0 {
-                let a = (g.hitmarker / 0.35 * 255.0).min(255.0) as u8;
-                let hc = Color32::from_rgba_unmultiplied(255, 80, 60, a);
-                for (dx, dy) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
-                    p.line_segment([c + Vec2::new(dx * 7.0, dy * 7.0), c + Vec2::new(dx * 15.0, dy * 15.0)], Stroke::new(2.5, hc));
-                }
+            if me.perfect_t > 0.0 {
+                let a = ((me.perfect_t / 0.6).min(1.0) * 255.0) as u8;
+                let rise = (0.6 - me.perfect_t) * 30.0 * s;
+                text_shadow(p, Pos2::new(c.x, base_y - 24.0 * s - rise), Align2::CENTER_CENTER, "PERFECT", 15.0 * s, Color32::from_rgba_unmultiplied(255, 225, 120, a));
+            }
+        }
+        // health back after a kill
+        if g.heal_pop > 0.0 {
+            let a = ((g.heal_pop / 0.5).min(1.0) * 255.0) as u8;
+            let rise = (1.6 - g.heal_pop) * 14.0 * s;
+            let at = Pos2::new(rect.left() + margin + 150.0 * s, rect.bottom() - margin - 104.0 * s - rise);
+            text_shadow(p, at, Align2::CENTER_CENTER, &format!("+{} HP", KILL_HEAL as i32), 17.0 * s, Color32::from_rgba_unmultiplied(110, 235, 120, a));
+        }
+
+        // kill confirmation icon
+        if g.kill_t > 0.0 {
+            let a = (g.kill_t.min(0.5) / 0.5 * 255.0) as u8;
+            let pop = 1.0 + 0.5 * ((g.kill_t - 1.4) / 0.2).clamp(0.0, 1.0);
+            let ic = c + Vec2::new(0.0, 150.0 * s);
+            let r = 16.0 * s * pop;
+            let red = Color32::from_rgba_unmultiplied(230, 40, 40, a);
+            p.circle_filled(ic, r, Color32::from_rgba_unmultiplied(20, 10, 10, a / 2));
+            p.circle_stroke(ic, r, Stroke::new(2.5 * s, red));
+            // crossed blades
+            let k = r * 0.6;
+            p.line_segment([ic + Vec2::new(-k, -k), ic + Vec2::new(k, k)], Stroke::new(3.0 * s, Color32::from_rgba_unmultiplied(255, 255, 255, a)));
+            p.line_segment([ic + Vec2::new(k, -k), ic + Vec2::new(-k, k)], Stroke::new(3.0 * s, Color32::from_rgba_unmultiplied(255, 255, 255, a)));
+            text_shadow(p, ic + Vec2::new(0.0, r + 12.0 * s), Align2::CENTER_CENTER, &format!("ELIMINATED {}", g.kill_name.to_uppercase()), 14.0 * s, Color32::from_rgba_unmultiplied(255, 120, 110, a));
+            let streak = match g.streak {
+                2 => Some("DOUBLE KILL"),
+                3 => Some("TRIPLE KILL"),
+                n if n >= 4 => Some("RAMPAGE"),
+                _ => None,
+            };
+            if let Some(t) = streak {
+                text_shadow(p, ic + Vec2::new(0.0, r + 33.0 * s), Align2::CENTER_CENTER, t, 18.0 * s, Color32::from_rgba_unmultiplied(255, 190, 80, a));
             }
         }
 
-        // health / armor
-        let base = Pos2::new(rect.left() + 28.0, rect.bottom() - 30.0);
-        let panel = Rect::from_min_max(Pos2::new(base.x - 14.0, base.y - 78.0), Pos2::new(base.x + 300.0, base.y + 14.0));
-        p.rect_filled(panel, 8.0, Color32::from_black_alpha(110));
-        text_shadow(p, Pos2::new(base.x, base.y - 70.0), Align2::LEFT_TOP, &me.name, 16.0, Color32::from_rgb(240, 230, 220));
-        let hp_r = Rect::from_min_size(Pos2::new(base.x, base.y - 44.0), Vec2::new(230.0, 18.0));
+        // ---- bottom-left: health and armor
+        let pw = 300.0 * s;
+        let ph = 92.0 * s;
+        let left = Rect::from_min_size(Pos2::new(rect.left() + margin, rect.bottom() - margin - ph), Vec2::new(pw, ph));
+        p.rect_filled(left, 8.0 * s, Color32::from_black_alpha(110));
+        let pad = 12.0 * s;
+        text_shadow(p, left.left_top() + Vec2::new(pad, 8.0 * s), Align2::LEFT_TOP, &me.name, 16.0 * s, Color32::from_rgb(240, 230, 220));
+        let num_w = 44.0 * s;
+        let hp_r = Rect::from_min_size(left.left_top() + Vec2::new(pad, 36.0 * s), Vec2::new(pw - pad * 2.0 - num_w, 18.0 * s));
         bar(p, hp_r, me.hp / MAX_HP, Color32::from_rgb(220, 60, 60));
-        text_shadow(p, Pos2::new(hp_r.right() + 10.0, hp_r.center().y), Align2::LEFT_CENTER, &format!("{}", me.hp.max(0.0).ceil() as i32), 18.0, Color32::WHITE);
-        let ap_r = Rect::from_min_size(Pos2::new(base.x, base.y - 20.0), Vec2::new(230.0 * 0.6, 12.0));
+        text_shadow(p, Pos2::new(left.right() - pad, hp_r.center().y), Align2::RIGHT_CENTER, &format!("{}", me.hp.max(0.0).ceil() as i32), 18.0 * s, Color32::WHITE);
+        let ap_r = Rect::from_min_size(left.left_top() + Vec2::new(pad, 64.0 * s), Vec2::new((pw - pad * 2.0 - num_w) * 0.6, 12.0 * s));
         bar(p, ap_r, me.ap / MAX_AP, Color32::from_rgb(80, 150, 240));
-        text_shadow(p, Pos2::new(ap_r.right() + 10.0, ap_r.center().y), Align2::LEFT_CENTER, &format!("AP {}", me.ap.max(0.0).ceil() as i32), 14.0, Color32::from_rgb(170, 200, 255));
+        text_shadow(p, Pos2::new(ap_r.right() + 8.0 * s, ap_r.center().y), Align2::LEFT_CENTER, &format!("AP {}", me.ap.max(0.0).ceil() as i32), 13.0 * s, Color32::from_rgb(170, 200, 255));
 
-        // chat
-        let mut cy = base.y - 92.0;
-        for line in g.chat.iter().rev() {
-            let a = (line.life.min(1.0) * 255.0) as u8;
-            let galley_name = p.layout_no_wrap(format!("{}: ", line.name), FontId::proportional(15.0), Color32::from_rgba_unmultiplied(player_color(line.color).r(), player_color(line.color).g(), player_color(line.color).b(), a));
-            let galley_text = p.layout_no_wrap(line.text.clone(), FontId::proportional(15.0), Color32::from_rgba_unmultiplied(240, 240, 240, a));
-            let w = galley_name.size().x + galley_text.size().x;
-            p.rect_filled(Rect::from_min_size(Pos2::new(base.x - 8.0, cy - 3.0), Vec2::new(w + 16.0, 22.0)), 4.0, Color32::from_black_alpha((a as f32 * 0.5) as u8));
-            let nw = galley_name.size().x;
-            p.galley(Pos2::new(base.x, cy), galley_name, Color32::WHITE);
-            p.galley(Pos2::new(base.x + nw, cy), galley_text, Color32::WHITE);
-            cy -= 24.0;
-        }
-
-        // weapons
-        let wb = Pos2::new(rect.right() - 28.0, rect.bottom() - 30.0);
-        let panel = Rect::from_min_max(Pos2::new(wb.x - 300.0, wb.y - 78.0), Pos2::new(wb.x + 14.0, wb.y + 14.0));
-        p.rect_filled(panel, 8.0, Color32::from_black_alpha(110));
+        // ---- bottom-right: weapons, in three rows that never share space
+        let right = Rect::from_min_size(Pos2::new(rect.right() - margin - pw, rect.bottom() - margin - ph), Vec2::new(pw, ph));
+        p.rect_filled(right, 8.0 * s, Color32::from_black_alpha(110));
+        // row 1: weapon name (left) and ammo (right)
         let ammo = match me.weapon {
             w if w.is_melee() => {
                 if me.guard {
-                    "GUARDING".to_string()
+                    "GUARD".to_string()
                 } else {
                     "∞".to_string()
                 }
             }
-            w => {
-                if me.reload_t > 0.0 {
-                    "RELOADING".to_string()
-                } else {
-                    format!("{} / {}", me.mag[me.cur], w.mag())
-                }
-            }
+            w => format!("{} / {}", me.mag[me.cur], w.mag()),
         };
-        text_shadow(p, Pos2::new(wb.x, wb.y - 70.0), Align2::RIGHT_TOP, me.weapon.name(), 16.0, ACCENT);
-        text_shadow(p, Pos2::new(wb.x, wb.y - 48.0), Align2::RIGHT_TOP, &ammo, 26.0, Color32::WHITE);
+        let ammo_col = if !me.weapon.is_melee() && me.reload_t > 0.0 { Color32::from_gray(140) } else { Color32::WHITE };
+        let ammo_g = p.layout_no_wrap(ammo, FontId::proportional(22.0 * s), ammo_col);
+        let ammo_w = ammo_g.size().x;
+        let row1_y = right.top() + 6.0 * s;
+        p.galley(Pos2::new(right.right() - pad - ammo_w, row1_y), ammo_g, Color32::WHITE);
+        let name_room = pw - pad * 3.0 - ammo_w;
+        fit_text(p, Pos2::new(right.left() + pad, row1_y + 4.0 * s), me.weapon.name(), 16.0 * s, name_room, ACCENT);
+        // row 2: the three slots
+        let slot_gap = 6.0 * s;
+        let slot_w = (pw - pad * 2.0 - slot_gap * 2.0) / 3.0;
+        let slot_h = 32.0 * s;
+        let row2_y = right.top() + 36.0 * s;
         for k in 0..3usize {
-            let r = Rect::from_min_size(Pos2::new(wb.x - 290.0 + k as f32 * 56.0, wb.y - 66.0), Vec2::new(52.0, 40.0));
+            let r = Rect::from_min_size(Pos2::new(right.left() + pad + k as f32 * (slot_w + slot_gap), row2_y), Vec2::new(slot_w, slot_h));
             let sel = me.cur == k;
-            p.rect_filled(r, 5.0, if sel { Color32::from_rgba_unmultiplied(255, 150, 70, 170) } else { Color32::from_black_alpha(120) });
-            text_shadow(p, r.center_top() + Vec2::new(0.0, 4.0), Align2::CENTER_TOP, &format!("{}", k + 1), 13.0, Color32::WHITE);
-            let short: String = me.slot_weapon(k).name().chars().take(7).collect();
-            text_shadow(p, r.center_bottom() - Vec2::new(0.0, 4.0), Align2::CENTER_BOTTOM, &short, 11.0, Color32::from_gray(230));
+            p.rect_filled(r, 5.0 * s, if sel { Color32::from_rgba_unmultiplied(255, 150, 70, 170) } else { Color32::from_black_alpha(120) });
+            text_shadow(p, r.left_center() + Vec2::new(6.0 * s, 0.0), Align2::LEFT_CENTER, &format!("{}", k + 1), 13.0 * s, Color32::from_gray(210));
+            fit_text(p, Pos2::new(r.left() + 18.0 * s, r.center().y - 7.0 * s), me.slot_weapon(k).name(), 12.0 * s, slot_w - 22.0 * s, Color32::WHITE);
         }
-        let gtxt = format!("G: {} x{}", ITEM_NAMES[me.loadout.item.min(2) as usize], me.items);
-        text_shadow(p, Pos2::new(wb.x - 286.0, wb.y - 10.0), Align2::LEFT_CENTER, &gtxt, 14.0, Color32::from_rgb(220, 220, 180));
-        let mut dash = "Dash ready".to_string();
-        if me.dash_cd > 0.0 {
-            dash = "Dash ...".into();
-        }
-        text_shadow(p, Pos2::new(wb.x - 120.0, wb.y - 10.0), Align2::LEFT_CENTER, &dash, 14.0, Color32::from_rgb(180, 220, 200));
+        // row 3: item (left) and dash (right)
+        let row3_y = right.bottom() - 14.0 * s;
+        let dash = if me.dash_cd > 0.0 { "Dash ..." } else { "Dash ready" };
+        let dash_g = p.layout_no_wrap(dash.to_string(), FontId::proportional(13.0 * s), Color32::from_rgb(180, 220, 200));
+        let dash_w = dash_g.size().x;
+        p.galley(Pos2::new(right.right() - pad - dash_w, row3_y - dash_g.size().y * 0.5), dash_g, Color32::WHITE);
+        let item = format!("G  {} x{}", ITEM_NAMES[me.loadout.item.min(2) as usize], me.items);
+        fit_text(p, Pos2::new(right.left() + pad, row3_y - 8.0 * s), &item, 13.0 * s, pw - pad * 3.0 - dash_w, Color32::from_rgb(220, 220, 180));
 
-        // scores + timer
-        let top = Pos2::new(c.x, rect.top() + 18.0);
-        let sb = Rect::from_center_size(top + Vec2::new(0.0, 22.0), Vec2::new(420.0, 52.0));
-        p.rect_filled(sb, 8.0, Color32::from_black_alpha(130));
+        // ---- chat, above the health panel, wrapped to its own column
+        let chat_w = (rect.width() * 0.42).max(pw);
+        let mut cy = left.top() - 8.0 * s;
+        for line in g.chat.iter().rev() {
+            let a = (line.life.min(1.0) * 255.0) as u8;
+            let pc = player_color(line.color);
+            let mut job = egui::text::LayoutJob::default();
+            job.append(&format!("{}: ", line.name), 0.0, egui::TextFormat { font_id: FontId::proportional(15.0 * s), color: Color32::from_rgba_unmultiplied(pc.r(), pc.g(), pc.b(), a), ..Default::default() });
+            job.append(&line.text, 0.0, egui::TextFormat { font_id: FontId::proportional(15.0 * s), color: Color32::from_rgba_unmultiplied(240, 240, 240, a), ..Default::default() });
+            job.wrap.max_width = chat_w - 16.0 * s;
+            let gal = p.layout_job(job);
+            let h = gal.size().y;
+            cy -= h + 6.0 * s;
+            if cy < rect.top() + rect.height() * 0.4 {
+                break;
+            }
+            p.rect_filled(Rect::from_min_size(Pos2::new(left.left(), cy - 3.0 * s), Vec2::new(gal.size().x + 16.0 * s, h + 6.0 * s)), 4.0, Color32::from_black_alpha((a as f32 * 0.5) as u8));
+            p.galley(Pos2::new(left.left() + 8.0 * s, cy), gal, Color32::WHITE);
+        }
+
+        // ---- top: the training lesson, or scores and timer
+        let sb = if let Some(t) = &g.train {
+            draw_training(p, rect, s, margin, t)
+        } else {
+            Rect::from_center_size(Pos2::new(c.x, rect.top() + margin + 26.0 * s), Vec2::new(420.0 * s, 52.0 * s))
+        };
+        if g.train.is_none() {
+        p.rect_filled(sb, 8.0 * s, Color32::from_black_alpha(130));
         let red = player_color(0);
         let blue = player_color(1);
         let tt = match g.mt.phase {
+            Phase::Fight if g.mt.mode.rounds() && g.mt.round_end > 0.0 => "NEXT ROUND".into(),
             Phase::Fight => {
-                let s = g.mt.timer.max(0.0).ceil() as i32;
-                format!("{}:{:02}", s / 60, s % 60)
+                let secs = g.mt.timer.max(0.0).ceil() as i32;
+                if g.mt.mode.rounds() { format!("R{}  {}:{:02}", g.mt.round, secs / 60, secs % 60) } else { format!("{}:{:02}", secs / 60, secs % 60) }
             }
             Phase::Warmup => "WARM-UP".into(),
             Phase::Countdown => "GET READY".into(),
             Phase::Loadout => format!("LOADOUT {:.0}", g.mt.timer.max(0.0)),
             Phase::MatchOver => "OVER".into(),
         };
-        text_shadow(p, sb.center() + Vec2::new(0.0, -6.0), Align2::CENTER_CENTER, &tt, 18.0, Color32::WHITE);
-        text_shadow(p, sb.center() + Vec2::new(0.0, 15.0), Align2::CENTER_CENTER, &format!("{} · first to {}", g.mt.mode.name(), g.mt.target), 11.0, Color32::from_gray(200));
+        text_shadow(p, sb.center() + Vec2::new(0.0, -6.0 * s), Align2::CENTER_CENTER, &tt, 18.0 * s, Color32::WHITE);
+        text_shadow(p, sb.center() + Vec2::new(0.0, 15.0 * s), Align2::CENTER_CENTER, &format!("{} · first to {} {}", g.mt.mode.name(), g.mt.target, g.mt.mode.goal_word()), 11.0 * s, Color32::from_gray(200));
+        let side_w = 120.0 * s;
         match g.mt.mode {
-            Mode::Tdm => {
-                text_shadow(p, sb.left_center() + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, "RED", 17.0, red);
-                text_shadow(p, sb.right_center() - Vec2::new(14.0, 0.0), Align2::RIGHT_CENTER, "BLUE", 17.0, blue);
-                text_shadow(p, sb.center() + Vec2::new(-95.0, 0.0), Align2::CENTER_CENTER, &format!("{}", g.mt.team_score[0]), 30.0, red);
-                text_shadow(p, sb.center() + Vec2::new(95.0, 0.0), Align2::CENTER_CENTER, &format!("{}", g.mt.team_score[1]), 30.0, blue);
+            Mode::Tdm | Mode::Ctf => {
+                text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, 0.0), Align2::LEFT_CENTER, "RED", 17.0 * s, red);
+                text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, 0.0), Align2::RIGHT_CENTER, "BLUE", 17.0 * s, blue);
+                text_shadow(p, sb.center() + Vec2::new(-95.0 * s, 0.0), Align2::CENTER_CENTER, &format!("{}", g.mt.team_score[0]), 30.0 * s, red);
+                text_shadow(p, sb.center() + Vec2::new(95.0 * s, 0.0), Align2::CENTER_CENTER, &format!("{}", g.mt.team_score[1]), 30.0 * s, blue);
             }
-            Mode::Ffa => {
-                let leader = g.f.iter().filter(|f| f.present).max_by_key(|f| f.kills);
-                text_shadow(p, sb.left_center() + Vec2::new(14.0, -8.0), Align2::LEFT_CENTER, "YOU", 12.0, Color32::from_gray(210));
-                text_shadow(p, sb.left_center() + Vec2::new(14.0, 10.0), Align2::LEFT_CENTER, &format!("{} kills", me.kills), 17.0, player_color(me.color_idx));
+            _ => {
+                let rounds = g.mt.mode.rounds();
+                let sc = |f: &Fighter| if rounds { f.wins } else { f.kills };
+                let leader = g.f.iter().filter(|f| f.present).max_by_key(|f| sc(f));
+                text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, -8.0 * s), Align2::LEFT_CENTER, "YOU", 12.0 * s, Color32::from_gray(210));
+                text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, 10.0 * s), Align2::LEFT_CENTER, &format!("{} {}", sc(me), if rounds { "wins" } else { "kills" }), 17.0 * s, player_color(me.color_idx));
                 if let Some(l) = leader {
-                    text_shadow(p, sb.right_center() - Vec2::new(14.0, 8.0), Align2::RIGHT_CENTER, "LEADER", 12.0, Color32::from_gray(210));
-                    text_shadow(p, sb.right_center() - Vec2::new(14.0, -10.0), Align2::RIGHT_CENTER, &format!("{} {}", l.name, l.kills), 17.0, player_color(l.color_idx));
+                    text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, 8.0 * s), Align2::RIGHT_CENTER, "LEADER", 12.0 * s, Color32::from_gray(210));
+                    let lt = format!("{} {}", l.name, sc(l));
+                    let gal = p.layout_no_wrap(lt.clone(), FontId::proportional(17.0 * s), Color32::WHITE);
+                    let lw = gal.size().x.min(side_w);
+                    fit_text(p, Pos2::new(sb.right() - 14.0 * s - lw, sb.center().y + 1.0 * s), &lt, 17.0 * s, side_w, player_color(l.color_idx));
                 }
             }
         }
+        }
 
-        // banner
+        // training combo counter, right of the crosshair
+        if let Some(t) = &g.train {
+            let x = rect.right() - margin - 10.0 * s;
+            let y = c.y - 60.0 * s;
+            if t.combo > 0 {
+                let a = ((t.combo_t / 0.4).min(1.0) * 255.0) as u8;
+                let hot = (t.combo as f32 / 10.0).min(1.0);
+                let col = Color32::from_rgba_unmultiplied(255, (220.0 - 140.0 * hot) as u8, (90.0 - 60.0 * hot) as u8, a);
+                text_shadow(p, Pos2::new(x, y), Align2::RIGHT_CENTER, &format!("{} HIT", t.combo), (30.0 + 10.0 * hot) * s, col);
+                text_shadow(p, Pos2::new(x, y + 30.0 * s), Align2::RIGHT_CENTER, "COMBO", 16.0 * s, Color32::from_rgba_unmultiplied(255, 240, 220, a));
+                text_shadow(p, Pos2::new(x, y + 52.0 * s), Align2::RIGHT_CENTER, &format!("{} damage", t.combo_dmg.round() as i32), 14.0 * s, Color32::from_rgba_unmultiplied(230, 230, 230, a));
+                // time left to keep it going
+                let bw = 110.0 * s;
+                let br = Rect::from_min_size(Pos2::new(x - bw, y + 66.0 * s), Vec2::new(bw, 5.0 * s));
+                p.rect_filled(br, 2.0, Color32::from_black_alpha(140));
+                p.rect_filled(Rect::from_min_size(br.min, Vec2::new(bw * (t.combo_t / 1.5).clamp(0.0, 1.0), br.height())), 2.0, col);
+            }
+            if t.best_combo > 0 {
+                text_shadow(p, Pos2::new(x, y + 86.0 * s), Align2::RIGHT_CENTER, &format!("Best combo: {}", t.best_combo), 13.0 * s, Color32::from_gray(200));
+            }
+        }
+
+        // banner and phase messages
         if let Some((text, _)) = &g.banner {
-            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.3), Align2::CENTER_CENTER, text, 46.0, ACCENT);
+            fit_center(p, Pos2::new(c.x, rect.top() + rect.height() * 0.3), text, 46.0 * s, rect.width() - 40.0, ACCENT);
         }
         if g.mt.phase == Phase::Countdown {
             let n = g.mt.timer.ceil().max(1.0) as i32;
-            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.42), Align2::CENTER_CENTER, &format!("{n}"), 64.0, Color32::WHITE);
+            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.42), Align2::CENTER_CENTER, &format!("{n}"), 64.0 * s, Color32::WHITE);
         }
+        let mut under_sb = sb.bottom() + 8.0 * s;
         if g.mt.phase == Phase::Warmup {
             let players = g.present().len();
             let hint = if g.kind == Kind::Host {
-                format!("Warm-up · {players} in the lobby · press F5 to start the match")
+                let (public, _) = self.public_addr_text();
+                match public {
+                    Some(a) => format!("Warm-up · {players} in the lobby · friends join {a} · F5 starts the match"),
+                    None => format!("Warm-up · {players} in the lobby · press F5 to start the match"),
+                }
             } else {
                 format!("Warm-up · {players} in the lobby · waiting for the host to start")
             };
-            text_shadow(p, Pos2::new(c.x, sb.bottom() + 18.0), Align2::CENTER_TOP, &hint, 16.0, Color32::from_rgb(255, 230, 180));
+            fit_center(p, Pos2::new(c.x, under_sb + 10.0 * s), &hint, 16.0 * s, rect.width() - 40.0, Color32::from_rgb(255, 230, 180));
+            under_sb += 26.0 * s;
+            let fw = self.fw_status.lock().ok().and_then(|g| *g);
+            if g.kind == Kind::Host && fw.is_some_and(|f| matches!(f, firewall::FwStatus::Blocked | firewall::FwStatus::NoRule)) {
+                let warn = "Windows Firewall may block friends - press Esc and choose \"Allow Duel Rush through Windows Firewall\"";
+                fit_center(p, Pos2::new(c.x, under_sb + 10.0 * s), warn, 15.0 * s, rect.width() - 40.0, Color32::from_rgb(255, 150, 100));
+                under_sb += 24.0 * s;
+            }
         }
-        if !me.alive && g.mt.phase != Phase::MatchOver {
-            let s = me.respawn_t.max(0.0).ceil() as i32;
-            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.62), Align2::CENTER_CENTER, &format!("You're down - back in {s}"), 20.0, Color32::from_rgb(255, 200, 200));
+        if g.mt.phase == Phase::Fight && g.mt.mode == Mode::Duel {
+            let name = |d: u8| if (d as usize) < g.f.len() && g.f[d as usize].present { g.f[d as usize].name.clone() } else { "?".into() };
+            let line = format!("{}  vs  {}", name(g.mt.duel[0]), name(g.mt.duel[1]));
+            fit_center(p, Pos2::new(c.x, under_sb + 10.0 * s), &line, 16.0 * s, rect.width() - 40.0, Color32::from_rgb(255, 230, 180));
+            under_sb += 24.0 * s;
+        }
+        if g.mt.mode == Mode::Ctf && matches!(g.mt.phase, Phase::Fight | Phase::Countdown) {
+            let status = |t: usize| -> String {
+                let fl = g.mt.flags[t];
+                match fl.state {
+                    1 if (fl.carrier as usize) < g.f.len() => format!("taken by {}", g.f[fl.carrier as usize].name),
+                    2 => format!("dropped ({:.0}s)", fl.timer.max(0.0)),
+                    _ => "at base".into(),
+                }
+            };
+            let line = format!("Red flag: {}   ·   Blue flag: {}", status(0), status(1));
+            fit_center(p, Pos2::new(c.x, under_sb + 10.0 * s), &line, 15.0 * s, rect.width() - 40.0, Color32::from_rgb(235, 225, 210));
+            under_sb += 24.0 * s;
+        }
+        if me.spectate && g.mt.phase == Phase::Fight {
+            let pos_in_line = g.queue.iter().position(|&q| q == g.local);
+            let msg = match (g.mt.mode, pos_in_line) {
+                (Mode::Duel, Some(0)) => "Watching - you're up next".to_string(),
+                (Mode::Duel, Some(n)) => format!("Watching - {} ahead of you", n),
+                (Mode::Duel, None) => "Watching - waiting for your turn".to_string(),
+                _ => "Watching - you join at the next round".to_string(),
+            };
+            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.62), Align2::CENTER_CENTER, &msg, 20.0 * s, Color32::from_rgb(220, 230, 255));
+        } else if !me.alive && g.mt.phase != Phase::MatchOver && g.mt.mode.rounds() && g.mt.phase == Phase::Fight {
+            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.62), Align2::CENTER_CENTER, "You're out - watching until the round ends", 20.0 * s, Color32::from_rgb(255, 200, 200));
+        } else if !me.alive && g.mt.phase != Phase::MatchOver {
+            let secs = me.respawn_t.max(0.0).ceil() as i32;
+            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.62), Align2::CENTER_CENTER, &format!("You're down - back in {secs}"), 20.0 * s, Color32::from_rgb(255, 200, 200));
         }
 
-        // kill feed
-        let mut y = rect.top() + 18.0;
+        // ---- kill feed (top right; drops below the score bar when the window is narrow)
+        let font = FontId::proportional(15.0 * s);
+        let mut lines = Vec::new();
         for line in &g.feed {
             let a = (line.life.min(1.0) * 255.0) as u8;
             let fade = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
-            let font = FontId::proportional(15.0);
             let mut parts: Vec<(String, Color32)> = Vec::new();
             if let Some(t) = &line.text {
                 parts.push((t.clone(), Color32::from_rgb(255, 240, 220)));
@@ -1269,24 +2901,40 @@ impl App {
                     parts.push(("  went down".into(), Color32::from_gray(220)));
                 }
             }
-            let galleys: Vec<_> = parts.into_iter().map(|(s, col)| p.layout_no_wrap(s, font.clone(), fade(col))).collect();
+            let galleys: Vec<_> = parts.into_iter().map(|(t, col)| p.layout_no_wrap(t, font.clone(), fade(col))).collect();
             let total: f32 = galleys.iter().map(|g| g.size().x).sum();
-            let back = Rect::from_min_size(Pos2::new(rect.right() - 24.0 - total, y - 3.0), Vec2::new(total + 12.0, 22.0));
+            lines.push((galleys, total, a));
+        }
+        let widest = lines.iter().map(|l| l.1).fold(0.0f32, f32::max);
+        let feed_left = rect.right() - margin - widest - 12.0 * s;
+        let mut y = if feed_left < sb.right() + 8.0 * s { under_sb + 4.0 * s } else { rect.top() + margin };
+        let row_h = 24.0 * s;
+        for (galleys, total, a) in lines {
+            let back = Rect::from_min_size(Pos2::new(rect.right() - margin - total - 12.0 * s, y - 3.0 * s), Vec2::new(total + 12.0 * s, row_h - 2.0 * s));
             p.rect_filled(back, 4.0, Color32::from_black_alpha((a as f32 * 0.45) as u8));
-            let mut x = rect.right() - 18.0 - total;
+            let mut x = rect.right() - margin - 6.0 * s - total;
             for gl in galleys {
                 let w = gl.size().x;
                 p.galley(Pos2::new(x, y), gl, Color32::WHITE);
                 x += w;
             }
-            y += 26.0;
+            y += row_h;
         }
 
         // player list: hold Tab (always shown in the warm-up and at the end)
         if self.show_scores || g.mt.phase == Phase::MatchOver || (g.mt.phase == Phase::Warmup && g.time < 6.0) {
             draw_scoreboard(p, rect, g);
-        }        if self.captured && g.time < 12.0 {
-            text_shadow(p, Pos2::new(c.x, rect.bottom() - 18.0), Align2::CENTER_BOTTOM, "Esc: menu   ·   Tab: players   ·   1/2/3 or wheel: weapons   ·   Shift: dash   ·   Space at a wall: wall-run", 14.0, Color32::from_gray(220));
+        }
+        // controls hint, only when it fits between the two bottom panels
+        if self.captured && g.time < 12.0 {
+            let hint = "Esc: menu · Tab: players · 1/2/3: weapons · Shift: dash · Space at a wall: wall-run · Enter: chat";
+            let gal = p.layout_no_wrap(hint.to_string(), FontId::proportional(13.0 * s), Color32::from_gray(220));
+            let room = right.left() - left.right() - 16.0 * s;
+            if gal.size().x <= room {
+                text_shadow(p, Pos2::new(c.x, rect.bottom() - margin - 8.0 * s), Align2::CENTER_BOTTOM, hint, 13.0 * s, Color32::from_gray(220));
+            } else {
+                fit_center(p, Pos2::new(c.x, left.top() - 14.0 * s), hint, 13.0 * s, rect.width() - 40.0, Color32::from_gray(220));
+            }
         }
     }
 
@@ -1345,11 +2993,14 @@ fn loadout_picker(ui: &mut egui::Ui, lo: &mut Loadout) {
 }
 
 fn mode_picker(ui: &mut egui::Ui, mode: &mut u8) {
-    ui.horizontal(|ui| {
-        ui.label("Mode");
-        ui.selectable_value(mode, 0, "Free-for-All");
-        ui.selectable_value(mode, 1, "Team Deathmatch");
+    ui.label("Mode");
+    ui.horizontal_wrapped(|ui| {
+        for m in Mode::ALL {
+            ui.selectable_value(mode, m as u8, m.name()).on_hover_text(m.blurb());
+        }
     });
+    let m = Mode::from_u8(*mode);
+    ui.label(egui::RichText::new(format!("{}: {} (the limit below counts {})", m.name(), m.blurb(), m.goal_word())).size(13.0).color(Color32::from_gray(200)));
 }
 
 fn panel<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -1373,21 +3024,58 @@ fn panel<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, f: impl FnOnce
 
 impl App {
     fn big_button(ui: &mut egui::Ui, text: &str) -> bool {
-        ui.add_sized([ui.available_width(), 44.0], egui::Button::new(egui::RichText::new(text).size(19.0))).clicked()
+        let clicked = ui.add_sized([ui.available_width(), 44.0], egui::Button::new(egui::RichText::new(text).size(19.0))).clicked();
+        if clicked {
+            let back = matches!(text, "Back" | "Cancel" | "Leave match" | "Back to menu" | "Quit");
+            UI_SOUND.with(|u| u.set(Some(if back { Sfx::UiBack } else { Sfx::UiConfirm })));
+        }
+        clicked
     }
 
     fn menu_ui(&mut self, ctx: &egui::Context, rect: Rect, page: Page) -> bool {
         let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("title")));
-        let tpos = Pos2::new(rect.left() + 48.0, rect.top() + 40.0);
+        // game icon beside the title
+        if self.icon_tex.is_none() {
+            let (px, n) = icon_pixels(128);
+            let img = egui::ColorImage::from_rgba_unmultiplied([n as usize, n as usize], &px);
+            self.icon_tex = Some(ctx.load_texture("game-icon", img, egui::TextureOptions::LINEAR));
+        }
+        let ipos = Pos2::new(rect.left() + 44.0, rect.top() + 34.0);
+        let pulse = 0.5 + 0.5 * (self.wall_t * 1.6).sin();
+        p.circle_filled(ipos + Vec2::splat(36.0), 40.0 + 3.0 * pulse, Color32::from_rgba_unmultiplied(255, 140, 60, (30.0 + 30.0 * pulse) as u8));
+        if let Some(t) = &self.icon_tex {
+            p.image(t.id(), Rect::from_min_size(ipos, Vec2::splat(72.0)), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        let tpos = Pos2::new(rect.left() + 128.0, rect.top() + 34.0);
         p.text(tpos + Vec2::new(3.0, 3.0), Align2::LEFT_TOP, TITLE, FontId::proportional(64.0), Color32::from_black_alpha(200));
         p.text(tpos, Align2::LEFT_TOP, TITLE, FontId::proportional(64.0), ACCENT);
-        p.text(tpos + Vec2::new(4.0, 74.0), Align2::LEFT_TOP, "blades · bullets · wall-runs   —   arena duels for up to 8", FontId::proportional(17.0), Color32::from_rgb(235, 220, 210));
+        // a slow shine sweeping under the title
+        let line_y = tpos.y + 72.0;
+        let shine = (self.wall_t * 0.35).fract();
+        p.line_segment([Pos2::new(tpos.x, line_y), Pos2::new(tpos.x + 330.0, line_y)], Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 150, 70, 70)));
+        let sx = tpos.x + 330.0 * shine;
+        p.line_segment([Pos2::new((sx - 40.0).max(tpos.x), line_y), Pos2::new((sx + 40.0).min(tpos.x + 330.0), line_y)], Stroke::new(2.5, Color32::from_rgba_unmultiplied(255, 210, 160, 200)));
+        p.text(Pos2::new(rect.left() + 48.0, rect.top() + 116.0), Align2::LEFT_TOP, "blades · bullets · wall-runs   —   arena duels for up to 8", FontId::proportional(17.0), Color32::from_rgb(235, 220, 210));
+        p.text(Pos2::new(rect.right() - 16.0, rect.bottom() - 12.0), Align2::RIGHT_BOTTOM, "F11 fullscreen  ·  Settings has controls, graphics and crosshair", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(230, 220, 210, 160));
         let mut next: Option<Page> = None;
         let mut action: Option<Box<dyn FnOnce(&mut App)>> = None;
         let pos = Pos2::new(rect.left() + 48.0, rect.top() + 150.0);
         let msg = self.menu_msg.clone();
         let mut quit = false;
-        panel(ctx, "menu", pos, 380.0, |ui| {
+        // recent servers, top right of the main page (when there's room)
+        if page == Page::Main && rect.width() >= 980.0 && !self.settings.recent.is_empty() {
+            let w = 330.0;
+            let mut join = None;
+            panel(ctx, "recent", Pos2::new(rect.right() - w - 88.0, rect.top() + 40.0), w, |ui| {
+                ui.label(egui::RichText::new("Recent servers").size(20.0).color(ACCENT));
+                join = self.recent_list_ui(ui);
+            });
+            if let Some(a) = join {
+                action = Some(Box::new(move |app: &mut App| app.join_server(&a)));
+            }
+        }
+        let width = if page == Page::Settings { 600.0 } else { 380.0 };
+        panel(ctx, "menu", pos, width, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
             if let Some(m) = &msg {
                 ui.colored_label(Color32::from_rgb(255, 180, 120), m);
@@ -1402,6 +3090,12 @@ impl App {
                     ui.add_space(6.0);
                     if Self::big_button(ui, "Practice vs Bots") {
                         next = Some(Page::Practice);
+                    }
+                    if Self::big_button(ui, "Training") {
+                        action = Some(Box::new(|app: &mut App| {
+                            let name = clean_name(&app.settings.name, 0);
+                            app.start_game(Game::training(&name), None);
+                        }));
                     }
                     if Self::big_button(ui, "Host a Lobby") {
                         next = Some(Page::Host);
@@ -1429,7 +3123,7 @@ impl App {
                             ui.selectable_value(&mut self.settings.bot_level, k, *n);
                         }
                     });
-                    ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("kills to win"));
+                    ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
                     if Self::big_button(ui, "Fight!") {
                         action = Some(Box::new(|app: &mut App| {
                             let lvl = BOT_LEVELS[app.settings.bot_level].1;
@@ -1446,9 +3140,32 @@ impl App {
                 }
                 Page::Host => {
                     ui.heading("Host a Lobby");
-                    ui.label("Up to 8 players. You start in a warm-up; friends drop in with Join a Friend, then you press F5 (or Start the match in the Esc menu). On the same Wi-Fi they use your local address; over the internet, forward the UDP port on your router (or use a virtual LAN app like Tailscale, ZeroTier or Radmin VPN).");
+                    self.lookup_public_ip();
+                    let port = self.settings.port.trim().to_string();
+                    let (public, public_text) = self.public_addr_text();
+                    let lan = self.lan_ip.as_ref().map(|ip| format!("{ip}:{port}"));
+                    egui::Grid::new("host-addrs").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                        ui.colored_label(ACCENT, "Internet");
+                        ui.label(egui::RichText::new(&public_text).strong());
+                        if let Some(a) = &public {
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(a.clone());
+                            }
+                        }
+                        ui.end_row();
+                        ui.colored_label(ACCENT, "Same Wi-Fi");
+                        ui.label(egui::RichText::new(lan.clone().unwrap_or_else(|| "-".into())).strong());
+                        if let Some(a) = &lan {
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(a.clone());
+                            }
+                        }
+                        ui.end_row();
+                    });
+                    self.firewall_ui(ui);
+                    ui.label(egui::RichText::new("Friends join your Internet address (UDP port forwarded to this PC). You can't join it yourself from home: test with a friend, or 127.0.0.1 from a second copy.").size(13.5).color(Color32::from_gray(200)));
                     mode_picker(ui, &mut self.settings.mode);
-                    ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("kills to win"));
+                    ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
                     ui.horizontal(|ui| {
                         ui.label("Port (UDP)");
                         ui.add(egui::TextEdit::singleline(&mut self.settings.port).desired_width(90.0));
@@ -1474,29 +3191,28 @@ impl App {
                     ui.label("Type the address your friend sees on their Host screen, for example 192.168.1.20 or 192.168.1.20:27960");
                     ui.add(egui::TextEdit::singleline(&mut self.settings.join_addr).hint_text("address[:port]").desired_width(f32::INFINITY));
                     if Self::big_button(ui, "Connect") {
-                        action = Some(Box::new(|app: &mut App| match Net::join(&app.settings.join_addr) {
-                            Ok(n) => {
-                                app.settings.save();
-                                app.menu_msg = None;
-                                app.screen = Screen::Lobby { net: n, waiting_since: 0.0 };
-                            }
-                            Err(e) => app.menu_msg = Some(e),
+                        action = Some(Box::new(|app: &mut App| {
+                            let a = app.settings.join_addr.trim().to_string();
+                            app.join_server(&a);
                         }));
                     }
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Recent servers").size(18.0).color(ACCENT));
+                    egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
+                        if let Some(a) = self.recent_list_ui(ui) {
+                            action = Some(Box::new(move |app: &mut App| app.join_server(&a)));
+                        }
+                    });
                     if Self::big_button(ui, "Back") {
                         next = Some(Page::Main);
                     }
                 }
                 Page::Settings => {
                     ui.heading("Settings");
-                    ui.add(egui::Slider::new(&mut self.settings.sens, 0.2..=3.0).text("mouse sensitivity"));
-                    ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("field of view"));
-                    ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("volume"));
-                    if self.audio.is_none() && self.screenshot.is_none() {
-                        ui.label("(no sound device found)");
-                    }
+                    self.settings_ui(ui);
                     if Self::big_button(ui, "Back") {
                         self.settings.save();
+                        self.rebinding = None;
                         next = Some(Page::Main);
                     }
                 }
@@ -1507,11 +3223,14 @@ impl App {
                             ("W A S D", "move"),
                             ("Mouse", "aim"),
                             ("Left click", "shoot / slash (click again for a 3-hit combo)"),
-                            ("Right click", "guard with the katana (blocks bullets & slashes)"),
+                            ("Right click", "guard with the katana (raise it just before a slash lands for a perfect parry)"),
                             ("Space", "jump"),
                             ("Space at a wall", "while in the air: run along it, or up it if you face it"),
                             ("Space on a wall", "kick off the wall"),
-                            ("Shift / Q / E", "dash (once more in the air)"),
+                            ("Shift / Q", "dash (once more in the air)"),
+                            ("C while running", "slide, keeping your speed; Space jumps out of it"),
+                            ("Flow", "chain moves without stopping on the ground: each adds +6% speed (up to +30%)"),
+                            ("Perfect timing", "jump or dash the instant you land for an extra boost"),
                             ("Double-tap W A S D", "dodge in that direction"),
                             ("Cancel", "after a slash lands: dash, jump or guard to cut it short"),
                             ("Butterfly", "slash, right-click guard, slash, guard... in rhythm"),
@@ -1519,17 +3238,22 @@ impl App {
                             ("Air combo", "slash in the air to juggle; 3rd air slash smashes down"),
                             ("1  2  3 / wheel", "melee, gun 1, gun 2 (pick them on the loadout screen)"),
                             ("R", "reload"),
-                            ("G / F", "use your item (medkit, armor kit or grenade; 2 per life)"),
+                            ("G", "use your item (medkit, armor kit or grenade; 2 per life)"),
                             ("Enter / T", "chat"),
                             ("Tab", "player list and scores"),
                             ("F5", "(host) start the match from the warm-up"),
                             ("Esc", "pause menu"),
+                            ("Rocket jump", "rocket launcher: look at your feet, jump and fire together"),
+                            ("N / P", "(Training) next / previous lesson"),
+                            ("F11", "fullscreen / windowed"),
                         ] {
                             ui.colored_label(ACCENT, k);
                             ui.label(v);
                             ui.end_row();
                         }
                     });
+                    ui.label("Every key can be changed in Settings > Controls (these are the defaults).");
+                    ui.label("New here? Pick Training on the main menu: a room with dummies that walks you through every move step by step.");
                     ui.label("The third katana hit is heavy: it breaks guards and launches. Headshots with the revolver do extra damage. Free-for-All: everyone for themselves. Team Deathmatch: Red vs Blue. First to the kill limit wins; you respawn after 3 seconds.");
                     if Self::big_button(ui, "Back") {
                         next = Some(Page::Main);
@@ -1643,6 +3367,13 @@ impl App {
             });
             return leave;
         }
+        let killcam_running = match &self.screen {
+            Screen::Play { game, .. } => game.killcam.as_ref().map_or(false, |k| k.t < KILLCAM_TIME),
+            _ => false,
+        };
+        if phase == Phase::MatchOver && killcam_running {
+            return leave;
+        }
         if phase == Phase::MatchOver {
             let mut rematch = false;
             let mut vote = false;
@@ -1675,6 +3406,22 @@ impl App {
             }
             return leave;
         }
+        if self.paused && self.pause_settings {
+            let mut back = false;
+            panel(ctx, "pause-settings", center, 600.0, |ui| {
+                ui.heading("Settings");
+                self.settings_ui(ui);
+                if App::big_button(ui, "Back") {
+                    back = true;
+                }
+            });
+            if back {
+                self.pause_settings = false;
+                self.rebinding = None;
+                self.settings.save();
+            }
+            return leave;
+        }
         if self.paused {
             let mut resume = false;
             panel(ctx, "pause", center, 360.0, |ui| {
@@ -1683,8 +3430,24 @@ impl App {
                     ui.label("The match keeps going while this menu is open!");
                 }
                 if kind == Kind::Host {
+                    let (public, public_text) = self.public_addr_text();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Internet: {public_text}"));
+                        if let Some(a) = public {
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(a);
+                            }
+                        }
+                    });
+                    self.firewall_ui(ui);
                     if let Some(ip) = &self.lan_ip {
-                        ui.label(format!("Friends join with: {ip}:{}", self.settings.port.trim()));
+                        let a = format!("{ip}:{}", self.settings.port.trim());
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Same Wi-Fi: {a}"));
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(a.clone());
+                            }
+                        });
                     }
                     if phase == Phase::Warmup && App::big_button(ui, "Start the match") {
                         self.start_request = true;
@@ -1692,8 +3455,11 @@ impl App {
                     }
                 }
                 ui.add(egui::Slider::new(&mut self.settings.sens, 0.2..=3.0).text("mouse sensitivity"));
-                ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("field of view"));
-                ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("volume"));
+                ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("effects volume"));
+                ui.add(egui::Slider::new(&mut self.settings.music_volume, 0.0..=1.0).text("music volume"));
+                if ui.button("All settings (controls, graphics, crosshair)…").clicked() {
+                    self.pause_settings = true;
+                }
                 ui.collapsing("Loadout", |ui| {
                     loadout_picker(ui, &mut self.settings.loadout);
                     let when = if matches!(phase, Phase::Fight | Phase::MatchOver) { "Use it from my next respawn" } else { "Use this loadout" };
@@ -1725,6 +3491,117 @@ impl App {
         match &self.screen {
             Screen::Play { game, .. } => self.paused && game.kind == Kind::Offline,
             _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn binds_save_and_swap() {
+        for b in default_binds().iter().chain([Bind::Mouse(4), Bind::Alt, Bind::Ctrl, Bind::Unbound, Bind::Key(Key::F)].iter()) {
+            assert_eq!(Bind::parse(&b.id()), Some(*b), "{:?} survives saving", b);
+        }
+        let mut binds = default_binds();
+        // giving Jump the Shift key moves Dash onto Space, so nothing is lost
+        assign_bind(&mut binds, A_JUMP, Bind::Shift);
+        assert_eq!(binds[A_JUMP], Bind::Shift);
+        assert_eq!(binds[A_DASH], Bind::Key(Key::Space));
+    }
+
+    #[test]
+    fn icon_is_drawn() {
+        let (px, n) = icon_pixels(32);
+        assert_eq!(px.len(), (n * n * 4) as usize);
+        let opaque = px.chunks(4).filter(|c| c[3] > 200).count();
+        assert!(opaque > 500, "a round badge fills most of the icon");
+        assert_eq!(px[3], 0, "corners are see-through");
+    }
+}
+
+#[cfg(test)]
+mod aim_tests {
+    use super::*;
+    use crate::world::{Block, Mat, World};
+
+    /// A shooting range: a floor and a big wall 25 m ahead.
+    fn range_world() -> World {
+        let wall = |a: V3, b: V3| Block { b: Aabb::new(a, b), mat: Mat::Wall };
+        World {
+            blocks: vec![wall(v3(-80.0, -1.0, -80.0), v3(80.0, 0.0, 80.0)), wall(v3(-80.0, 0.0, 25.0), v3(80.0, 40.0, 27.0))],
+            spawn_points: vec![(V3::ZERO, 0.0)],
+            half: 80.0,
+            deco: Vec::new(),
+            braziers: Vec::new(),
+            banners: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_shot_lands_inside_the_crosshair() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let mut rng = Rng(99);
+        for fov in (60..=110).step_by(5) {
+            for w in [Weapon::Shotgun, Weapon::Smg, Weapon::Revolver, Weapon::Rifle] {
+                // 0: rested, 1: running right after a shot, 2: standing mid-spray
+                for state in 0..3 {
+                    let mut g = Game::new(Kind::Offline, 0, Mode::Ffa, 5);
+                    g.world = range_world();
+                    g.add_player(0, "T", true, None, 0);
+                    let (pos, yaw, pitch) = (v3(0.0, 0.0, 0.0), 0.12, 0.06);
+                    {
+                        let f = &mut g.f[0];
+                        f.pos = pos;
+                        f.yaw = yaw;
+                        f.pitch = pitch;
+                        f.weapon = w;
+                        let cap = w.gun().move_cap;
+                        (f.since_shot, f.move_spread, f.recoil) = match state {
+                            0 => (5.0, 1.0, 0.0),
+                            1 => (0.05, cap, 0.8),
+                            _ => (0.075, 1.0, 0.4),
+                        };
+                    }
+                    let spread = g.f[0].spread();
+                    if state == 0 && w != Weapon::Shotgun {
+                        assert_eq!(spread, 0.0, "a rested first shot is dead on");
+                    }
+                    let (pivot, dir, dist) = g.camera_rig(pos, yaw, pitch);
+                    let cam = Cam::new(pivot - dir * dist, yaw, pitch, fov as f32, rect);
+                    let radius = spread_px(spread, cam.focal);
+                    let (o, d) = g.shot_ray(0);
+                    let mut widest = 0.0f32;
+                    for _ in 0..400 {
+                        let pd = pellet_dir(d, yaw_right(yaw), spread, &mut rng);
+                        let (t, _) = g.world.raycast(o, pd, 300.0).expect("hits the wall");
+                        let sp = cam.project(o + pd * t).expect("in front of the camera");
+                        let off = (sp - cam.center).length();
+                        widest = widest.max(off);
+                        assert!(off <= radius + 1.0, "{w:?} fov {fov} state {state}: pellet {off:.1}px out, crosshair {radius:.1}px");
+                    }
+                    if spread > 0.0 {
+                        assert!(widest > radius * 0.7, "{w:?} fov {fov}: crosshair ({radius:.1}px) isn't much wider than the shots ({widest:.1}px)");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moving_costs_little_accuracy() {
+        for w in [Weapon::Smg, Weapon::Revolver, Weapon::Rifle, Weapon::Shotgun] {
+            let mut f = Fighter::new("T", 0, true);
+            f.weapon = w;
+            f.since_shot = 0.1;
+            f.recoil = 0.0;
+            f.move_spread = 1.0;
+            let still = f.spread();
+            f.move_spread = w.gun().move_cap;
+            let moving = f.spread();
+            let cap = if w == Weapon::Rifle { 2.0 } else { 1.5 };
+            assert!(moving <= still * cap + 1e-6, "{w:?}: moving {moving} vs still {still}");
         }
     }
 }
