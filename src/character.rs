@@ -2,7 +2,7 @@
 //! then layers aiming, strafing, guard, sword swings and weapon holds on top.
 
 use crate::anim::{Rig, Trs, blend_into, blend_masked};
-use crate::game::{Capsule, Fighter, HitPose, Part, RUN_SPEED, Tuning, Weapon};
+use crate::game::{Capsule, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, Tuning, Weapon};
 use crate::math::{M3, V3, look_dir, v3, wrap_angle};
 use crate::render::sword_arm;
 use glam::{Mat4, Quat, Vec3};
@@ -429,6 +429,18 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
         }
     }
 
+    // ---- kick: the right leg snaps forward and back
+    if f.alive && f.kick_t > 0.0 {
+        let p = 1.0 - (f.kick_t / KICK_TIME).clamp(0.0, 1.0);
+        // fast out (it lands at about a third), slower back
+        let k = if p < 0.3 { (p / 0.3).powf(0.7) } else { (1.0 - (p - 0.3) / 0.7).max(0.0).powi(2) };
+        let g = rig.globals(&pose);
+        rig.rotate_global(&mut pose, &g, b.thigh_r, ours(rig, Vec3::X, -1.45 * k));
+        let g = rig.globals(&pose);
+        rig.rotate_global(&mut pose, &g, b.calf_r, ours(rig, Vec3::X, 0.5 * (1.0 - k) * k * 2.0));
+        let g = rig.globals(&pose);
+        rig.rotate_global(&mut pose, &g, b.spine1, ours(rig, Vec3::X, 0.25 * k));
+    }
     if flinch > 0.0 && matches!(hit_part, Part::ArmL | Part::ArmR) {
         let k = (flinch * std::f32::consts::PI).sin().max(flinch * 0.6);
         let (bone, side) = if hit_part == Part::ArmL { (b.up_l, -1.0) } else { (b.up_r, 1.0) };

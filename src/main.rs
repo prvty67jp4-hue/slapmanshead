@@ -105,7 +105,7 @@ enum Bind {
     Unbound,
 }
 
-const N_ACTIONS: usize = 18;
+const N_ACTIONS: usize = 19;
 const A_FWD: usize = 0;
 const A_BACK: usize = 1;
 const A_LEFT: usize = 2;
@@ -124,6 +124,7 @@ const A_SCORES: usize = 14;
 const A_CHAT: usize = 15;
 const A_SLIDE: usize = 16;
 const A_MUSIC: usize = 17;
+const A_KICK: usize = 18;
 
 /// (saved id, what it does)
 const ACTIONS: [(&str, &str); N_ACTIONS] = [
@@ -145,6 +146,7 @@ const ACTIONS: [(&str, &str); N_ACTIONS] = [
     ("chat", "Chat"),
     ("slide", "Slide (while running)"),
     ("music", "Music on / off"),
+    ("kick", "Kick"),
 ];
 
 fn default_binds() -> [Bind; N_ACTIONS] {
@@ -168,6 +170,7 @@ fn default_binds() -> [Bind; N_ACTIONS] {
         Key(egui::Key::T),
         Key(egui::Key::C),
         Key(egui::Key::M),
+        Key(egui::Key::F),
     ]
 }
 
@@ -468,6 +471,7 @@ struct Latch {
     fire_pressed: bool,
     reload: bool,
     item: bool,
+    kick: bool,
     select: Option<u8>,
 }
 
@@ -2067,6 +2071,9 @@ impl App {
             if b[A_RELOAD].tapped(i, prev) {
                 self.latch.reload = true;
             }
+            if b[A_KICK].tapped(i, prev) {
+                self.latch.kick = true;
+            }
             if b[A_ITEM].tapped(i, prev) {
                 self.latch.item = true;
             }
@@ -2117,6 +2124,7 @@ impl App {
         inp.dash = self.latch.dash;
         inp.fire_pressed = self.latch.fire_pressed;
         inp.reload = self.latch.reload;
+        inp.kick = self.latch.kick;
         inp.item = self.latch.item;
         inp.select = self.latch.select;
         inp
@@ -3312,6 +3320,54 @@ impl App {
             if g.headshot_t > 0.0 {
                 let a = (g.headshot_t / 0.7 * 255.0).min(255.0) as u8;
                 text_shadow(p, c - Vec2::new(0.0, (50.0 * s).max(ring_r + 14.0 * s)), Align2::CENTER_CENTER, "HEADSHOT", 16.0 * s, Color32::from_rgba_unmultiplied(255, 215, 50, a));
+            }
+        }
+
+        // ---- melee: the guard meter under the crosshair, and the heavy's charge ring
+        if me.alive && me.weapon.is_melee() {
+            let show = me.guard || me.guard_hp < GUARD_MAX - 0.5 || me.guard_broke > 0.0;
+            if show {
+                let w = 64.0 * s;
+                let h = 5.0 * s;
+                let top = c.y + 30.0 * s;
+                let bg = Rect::from_min_size(Pos2::new(c.x - w * 0.5, top), Vec2::new(w, h));
+                p.rect_filled(bg.expand(1.5 * s), 2.0 * s, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+                let k = (me.guard_hp / GUARD_MAX).clamp(0.0, 1.0);
+                let col = if me.guard_broke > 0.0 {
+                    // broken: flashing red
+                    if (g.time * 14.0).sin() > 0.0 { Color32::from_rgb(255, 60, 50) } else { Color32::from_rgb(120, 20, 20) }
+                } else if k < 0.3 {
+                    Color32::from_rgb(255, 110, 60)
+                } else if me.guard {
+                    Color32::from_rgb(150, 205, 255)
+                } else {
+                    Color32::from_rgb(110, 160, 210)
+                };
+                p.rect_filled(Rect::from_min_size(bg.min, Vec2::new(w * k, h)), 2.0 * s, col);
+                if me.guard_broke > 0.0 {
+                    text_shadow(p, Pos2::new(c.x, top + h + 10.0 * s), Align2::CENTER_CENTER, "GUARD BROKEN", 13.0 * s, Color32::from_rgb(255, 90, 70));
+                }
+            }
+            if me.charge_t > 0.15 {
+                let k = ((me.charge_t - 0.15) / (CHARGE_TIME - 0.15)).clamp(0.0, 1.0);
+                let r = 22.0 * s;
+                let col = if me.charged {
+                    let pulse = 0.6 + 0.4 * (g.time * 18.0).sin();
+                    Color32::from_rgba_unmultiplied(255, 240, 200, (255.0 * pulse) as u8)
+                } else {
+                    Color32::from_rgba_unmultiplied(255, 190, 90, 200)
+                };
+                let n = 40;
+                let pts: Vec<Pos2> = (0..=((n as f32 * k) as usize)).map(|q| {
+                    let a = -std::f32::consts::FRAC_PI_2 + q as f32 / n as f32 * std::f32::consts::TAU;
+                    c + Vec2::new(a.cos(), a.sin()) * r
+                }).collect();
+                if pts.len() > 1 {
+                    p.add(egui::Shape::line(pts, Stroke::new(if me.charged { 3.5 } else { 2.5 } * s, col)));
+                }
+                if me.charged {
+                    p.circle_stroke(c, r + 5.0 * s + 3.0 * s * (g.time * 18.0).sin().abs(), Stroke::new(1.5 * s, col));
+                }
             }
         }
 

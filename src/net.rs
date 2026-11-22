@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
-const MAGIC: [u8; 4] = *b"DRA7";
+const MAGIC: [u8; 4] = *b"DRA8";
 /// The protocol version as text (Steam lobbies only list games that speak the same one).
 pub const PROTOCOL: &str = "DRA7";
 /// Steam message channels: game packets, and lobby-browser ping probes.
@@ -43,7 +43,7 @@ const K_HOST: u8 = 3;
 const K_BYE: u8 = 4;
 const K_FULL: u8 = 5;
 /// "I'm a different version": the packet is just the 4-byte mark and this kind.
-const K_VERSION: u8 = 6;
+const K_VERSION: u8 = 7;
 pub const DEFAULT_PORT: u16 = 27960;
 const EVENT_WINDOW: f32 = 0.5;
 const MAX_EVENTS: usize = 48;
@@ -137,6 +137,8 @@ pub struct FState {
     pub weapon: u8,
     pub flags: u8,
     pub flags2: u8,
+    /// 1 kicking, 2 heavy charged, 4 charging, 8 dash-through, 16 greatsword plunge.
+    pub flags3: u8,
     pub slash_t: f32,
     pub slash_idx: u8,
     pub hurt_t: f32,
@@ -149,7 +151,7 @@ pub struct FState {
 impl FState {
     /// A living, running fighter at `pos` (for tests).
     pub fn test_state(pos: V3, vel: V3) -> FState {
-        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
+        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
     }
 }
 
@@ -163,6 +165,7 @@ fn write_fstate(w: &mut W, f: &Fighter) {
     w.u8(f.weapon as u8);
     w.u8(f.flags());
     w.u8(if f.spawn_prot > 0.0 { 1 } else { 0 } | if f.stagger_t > 0.0 { 2 } else { 0 } | if f.sliding > 0.0 { 4 } else { 0 } | if f.scope_t > 0.0 { 8 } else { 0 });
+    w.u8(if f.kick_t > 0.0 { 1 } else { 0 } | if f.charged { 2 } else { 0 } | if f.charge_t > 0.2 { 4 } else { 0 } | if f.through_t > 0.0 { 8 } else { 0 } | if f.slam { 16 } else { 0 });
     w.f(f.slash_t);
     w.u8(f.slash_idx);
     w.f(f.hurt_t);
@@ -184,6 +187,7 @@ fn read_fstate(r: &mut R) -> Option<FState> {
         weapon: r.u8()?,
         flags: r.u8()?,
         flags2: r.u8()?,
+        flags3: r.u8()?,
         slash_t: r.f()?,
         slash_idx: r.u8()?,
         hurt_t: r.f()?,
@@ -202,7 +206,7 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.u8(*wp);
             w.u8(*spark);
         }
-        Ev::Hit { victim, dmg, knock, stun, head, w: wp, o, dir } => {
+        Ev::Hit { victim, dmg, knock, stun, head, w: wp, o, dir, guard } => {
             w.u8(2);
             w.u8(*victim);
             w.f(*dmg);
@@ -212,6 +216,12 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.u8(*wp);
             w.v(*o);
             w.v(*dir);
+            w.f(*guard);
+        }
+        Ev::Deflect { by, dmg } => {
+            w.u8(9);
+            w.u8(*by);
+            w.f(*dmg);
         }
         Ev::Grenade { p, v, kind } => {
             w.u8(3);
@@ -245,7 +255,7 @@ fn write_ev(w: &mut W, ev: &Ev) {
 fn read_ev(r: &mut R) -> Option<Ev> {
     Some(match r.u8()? {
         1 => Ev::Shot { o: r.v()?, e: r.v()?, w: r.u8()?, spark: r.u8()? },
-        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, LETHAL), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()? },
+        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, LETHAL), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()?, guard: r.f()?.clamp(0.0, 100.0) },
         3 => Ev::Grenade { p: r.v()?, v: clamp_v(r.v()?, 40.0), kind: r.u8()?.min(1) },
         4 => Ev::Died { victim: r.u8()?, killer: r.u8()?, w: r.u8()?, head: r.u8()? == 1 },
         5 => {
@@ -255,6 +265,7 @@ fn read_ev(r: &mut R) -> Option<Ev> {
         6 => Ev::Item { kind: r.u8()?.min(1) },
         7 => Ev::Ready,
         8 => Ev::Vote,
+        9 => Ev::Deflect { by: r.u8()?, dmg: r.f()?.clamp(0.0, 60.0) },
         _ => return None,
     })
 }
@@ -1090,6 +1101,18 @@ pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool, sent: f32, now
     f.stagger_t = if s.flags2 & 2 != 0 { 0.2 } else { 0.0 };
     f.sliding = if s.flags2 & 4 != 0 { 0.1 } else { 0.0 };
     f.scope_t = if s.flags2 & 8 != 0 { f.scope_t.max(SCOPE_IN) } else { 0.0 };
+    // the kick plays out here from its start; the rest are on/off
+    if s.flags3 & 1 != 0 {
+        if f.kick_t <= 0.0 {
+            f.kick_t = crate::game::KICK_TIME;
+        }
+    } else {
+        f.kick_t = 0.0;
+    }
+    f.charged = s.flags3 & 2 != 0;
+    f.charge_t = if s.flags3 & 4 != 0 { f.charge_t.max(0.25) } else { 0.0 };
+    f.through_t = if s.flags3 & 8 != 0 { 0.1 } else { 0.0 };
+    f.slam = s.flags3 & 16 != 0;
     if f.snaps.len() <= 1 {
         f.slash_t = s.slash_t;
         f.slash_idx = s.slash_idx;
@@ -1205,5 +1228,40 @@ mod steam_addr_tests {
         // real addresses aren't mistaken for Steam players
         assert_eq!(addr_steam(&"192.168.1.20:27960".parse().unwrap()), None);
         assert_eq!(addr_steam(&"[::1]:1".parse().unwrap()), None);
+    }
+}
+
+#[cfg(test)]
+mod melee_net_tests {
+    use super::*;
+
+    fn round_trip(ev: Ev) -> Ev {
+        let mut w = W(Vec::new());
+        write_ev(&mut w, &ev);
+        let mut r = R { b: &w.0, i: 0 };
+        read_ev(&mut r).expect("decodes")
+    }
+
+    #[test]
+    fn guard_drain_and_deflects_cross_the_network() {
+        match round_trip(Ev::Hit { victim: 3, dmg: 0.0, knock: v3(1.0, 0.0, 0.0), stun: 0.5, head: false, w: crate::game::KICK_TOOL, o: V3::ZERO, dir: V3::ZERO, guard: 31.0 }) {
+            Ev::Hit { victim, guard, w, stun, .. } => assert!(victim == 3 && (guard - 31.0).abs() < 1e-3 && w == crate::game::KICK_TOOL && (stun - 0.5).abs() < 1e-3),
+            e => panic!("{e:?}"),
+        }
+        match round_trip(Ev::Deflect { by: 2, dmg: 18.0 }) {
+            Ev::Deflect { by, dmg } => assert!(by == 2 && (dmg - 18.0).abs() < 1e-3),
+            e => panic!("{e:?}"),
+        }
+        // the kick, the charge and the plunge show on other screens
+        let mut f = Fighter::new("x", 1, true);
+        f.alive = true;
+        f.kick_t = 0.2;
+        f.charged = true;
+        f.charge_t = 0.6;
+        f.slam = true;
+        let mut w = W(Vec::new());
+        write_fstate(&mut w, &f);
+        let s = read_fstate(&mut R { b: &w.0, i: 0 }).expect("decodes");
+        assert_eq!(s.flags3 & (1 | 2 | 4 | 16), 1 | 2 | 4 | 16);
     }
 }

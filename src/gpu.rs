@@ -913,8 +913,29 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     }
     // weapon
     weapon_mesh(mb, add_mb, cam, f, p.hand, &p.weapon, time);
-    // swing trail from recent blade positions
     let w = f.weapon;
+    // charging a heavy: the blade glows, then flashes once it's ready
+    if w.is_melee() && f.alive && (f.charged || f.charge_t > 0.2) {
+        let len = match w {
+            Weapon::Dagger => 0.3,
+            Weapon::Greatsword => 1.2,
+            _ => 0.9,
+        } * sc;
+        let (col, size) = if f.charged {
+            let pulse = 0.75 + 0.25 * (time * 18.0).sin();
+            ([255, 236, 190], 0.2 * pulse)
+        } else {
+            ([255, 170, 80], 0.11)
+        };
+        for k in 1..=5 {
+            let at = p.hand + p.weapon.z * (len * k as f32 / 5.0);
+            add_mb.billboard(cam, at, size * sc, lina(col, if f.charged { 0.85 } else { 0.5 }));
+        }
+        if f.charged {
+            add_mb.billboard(cam, p.hand + p.weapon.z * (len * 0.6), 0.55 * sc * (0.8 + 0.2 * (time * 18.0).sin()), lina([255, 220, 150], 0.35));
+        }
+    }
+    // swing trail from recent blade positions
     if w.is_melee() && f.slashing() && f.alive {
         let len = match w {
             Weapon::Dagger => 0.2,

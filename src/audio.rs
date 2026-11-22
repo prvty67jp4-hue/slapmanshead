@@ -86,6 +86,13 @@ fn props(s: Sfx) -> Props {
         Sfx::HandCannon => pp(clips!["revolver_1.wav", "revolver_2.wav"], 1.0, 34.0, 0.8),
         Sfx::Sniper => pp(clips!["rifle_1.wav", "rifle_2.wav", "shotgun_1.wav"], 1.0, 70.0, 0.72),
         Sfx::ScopeIn => pp(clips!["switch_gun.ogg"], 0.4, 0.0, 1.4),
+        // melee depth: a dull boot thump, a huge low clang, a bright ricochet ring, the blade
+        // humming ready, and the ground cracking under a greatsword
+        Sfx::Kick => pp(clips!["land_1.ogg", "land_2.ogg"], 0.85, 10.0, 1.35),
+        Sfx::GuardBreak => pp(clips!["clang_3.ogg", "clang_1.ogg"], 1.0, 26.0, 0.62),
+        Sfx::Deflect => pp(clips!["clang_2.ogg", "clang_1.ogg"], 0.9, 22.0, 1.55),
+        Sfx::ChargeReady => pp(clips!["switch_blade.ogg"], 0.65, 8.0, 1.6),
+        Sfx::Slam => pp(clips!["boom_crunch.ogg", "boom_2.ogg"], 0.95, 28.0, 0.8),
     }
 }
 
@@ -212,7 +219,7 @@ pub struct Audio {
 }
 
 /// Every sound, in the order of `Sfx`.
-pub const ALL: [Sfx; 42] = [
+pub const ALL: [Sfx; 47] = [
     Sfx::Shotgun,
     Sfx::Revolver,
     Sfx::Smg,
@@ -255,6 +262,11 @@ pub const ALL: [Sfx; 42] = [
     Sfx::HandCannon,
     Sfx::Sniper,
     Sfx::ScopeIn,
+    Sfx::Kick,
+    Sfx::GuardBreak,
+    Sfx::Deflect,
+    Sfx::ChargeReady,
+    Sfx::Slam,
 ];
 
 fn mix_into(m: &Arc<Mutex<Mixer>>, frames: usize, channels: usize, rate: f32, mut write: impl FnMut(usize, f32)) {

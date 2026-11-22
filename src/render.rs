@@ -40,7 +40,11 @@ pub fn sword_arm(root: &M3, idx: u8, p: f32) -> M3 {
     match idx {
         0 => root.mul(&M3::rot_y(1.5 - e * 3.0)).mul(&M3::rot_x(-PI * 0.5 + 0.1)),
         1 => root.mul(&M3::rot_y(-1.5 + e * 3.0)).mul(&M3::rot_x(-PI * 0.5 - 0.25)),
-        2 => root.mul(&M3::rot_x(-PI * 1.05 + e * PI * 0.95)),
+        2 | 6 => root.mul(&M3::rot_x(-PI * 1.05 + e * PI * 0.95)),
+        // charged heavy: raised high behind the head, brought all the way down
+        4 => root.mul(&M3::rot_y(0.2)).mul(&M3::rot_x(-PI * 1.25 + e * PI * 1.2)),
+        // dash-through: one long flat cut, held out to the side as you pass
+        5 => root.mul(&M3::rot_y(1.7 - e * 3.6)).mul(&M3::rot_x(-PI * 0.5)),
         // rising launcher: from low behind up over the head
         _ => root.mul(&M3::rot_y(0.25)).mul(&M3::rot_x(0.35 - e * PI * 1.15)),
     }

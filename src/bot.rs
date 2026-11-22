@@ -1,4 +1,4 @@
-﻿use crate::game::{Game, Input, SCOPE_IN, Weapon};
+﻿use crate::game::{CHARGE_TIME, GUARD_MAX, Game, Input, KICK_RANGE, SCOPE_IN, Weapon};
 use crate::math::*;
 
 /// A simple practice opponent.
@@ -21,6 +21,12 @@ pub struct Bot {
     target: Option<usize>,
     retarget: f32,
     slide_hold: f32,
+    /// Holding attack for a charged heavy (time left to hold).
+    charge_hold: f32,
+    /// Slash on the next tick (the katana's dash-through).
+    slash_next: bool,
+    /// Re-raising the guard against gunfire, to catch bullets in the deflect window.
+    guard_tap: f32,
 }
 
 impl Bot {
@@ -46,6 +52,9 @@ impl Bot {
             target: None,
             retarget: 0.0,
             slide_hold: 0.0,
+            charge_hold: 0.0,
+            slash_next: false,
+            guard_tap: 0.0,
         }
     }
 
@@ -209,6 +218,10 @@ impl Bot {
             if melee && dist > 3.0 {
                 inp.fwd = 1.0;
                 inp.right = 0.0;
+                // the katana cuts straight through from a dash
+                if me.weapon == Weapon::Katana && dist < 7.5 && aim_off < 0.5 && self.rng.chance(0.3 + 0.5 * s) {
+                    self.slash_next = true;
+                }
             }
         }
 
@@ -231,16 +244,51 @@ impl Bot {
                 _ if melee => {
                     let facing_me = en.fwd().dot((me.pos - en.pos).flat().norm()) > 0.8;
                     self.guard_t -= dt;
-                    if !en.weapon.is_melee() && facing_me && dist > 3.0 && self.rng.chance(dt * 2.5 * s) {
+                    self.guard_tap -= dt;
+                    let low_guard = me.guard_hp < GUARD_MAX * 0.25;
+                    if !en.weapon.is_melee() && facing_me && dist > 3.0 && !low_guard && self.rng.chance(dt * 2.5 * s) {
                         self.guard_t = 0.4 + self.rng.f() * 0.6;
                     }
-                    if en.slashing() && dist < 3.2 && self.rng.chance(dt * 6.0 * s) {
+                    if en.slashing() && dist < 3.2 && !low_guard && self.rng.chance(dt * 6.0 * s) {
                         self.guard_t = 0.35;
                     }
-                    if self.guard_t > 0.0 {
+                    // against gunfire: drop and re-raise the guard now and then, so a bullet
+                    // sometimes arrives right in the deflect window
+                    let tap_gap = self.guard_t > 0.0 && !en.weapon.is_melee() && self.guard_tap <= 0.0 && self.rng.chance(dt * 3.0 * s);
+                    if tap_gap {
+                        self.guard_tap = 0.45 + self.rng.f() * 0.5;
+                    }
+                    if self.slash_next {
+                        self.slash_next = false;
+                        inp.fire_pressed = true;
+                    } else if self.charge_hold > 0.0 {
+                        // winding up a heavy: hold, then let go once it's ready
+                        self.charge_hold -= dt;
+                        inp.fire = self.charge_hold > 0.0;
+                        if en.slashing() && dist < 2.5 {
+                            self.charge_hold = 0.0; // too slow: let it go
+                        }
+                    } else if en.guard && dist < KICK_RANGE + 0.3 && aim_off < 0.8 && self.rng.chance(dt * (2.0 + 6.0 * s)) {
+                        // a kick beats a guard
+                        inp.kick = true;
+                    } else if en.kick_t > 0.0 && dist < me.weapon.melee_range() && self.rng.chance(dt * 10.0 * s) {
+                        // a slash beats a kick
+                        inp.fire_pressed = true;
+                    } else if me.weapon == Weapon::Greatsword && !me.on_ground && me.pos.y > en.pos.y + 1.4 && dist < 4.0 && !me.slashing() {
+                        // plunge down on them
+                        inp.fire_pressed = true;
+                    } else if self.guard_t > 0.0 && me.guard_hp > 0.0 && !tap_gap {
                         inp.guard = true;
+                    } else if (en.guard || en.stun_t > 0.0) && dist < me.weapon.melee_range() + 1.0 && self.rng.chance(dt * (0.4 + 1.2 * s)) {
+                        // break the guard with a heavy (or punish the stagger)
+                        self.charge_hold = CHARGE_TIME + 0.08;
+                        inp.fire = true;
                     } else if dist < me.weapon.melee_range() && aim_off < 0.6 {
                         inp.fire_pressed = self.rng.chance(dt * (4.0 + 6.0 * s));
+                    }
+                    // low guard: back off a little while it refills
+                    if low_guard && dist < 4.0 && en.weapon.is_melee() {
+                        inp.fwd = -0.6;
                     }
                 }
                 Weapon::Sniper => {
