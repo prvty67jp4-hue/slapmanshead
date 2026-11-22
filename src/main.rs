@@ -6,6 +6,7 @@ mod bot;
 mod career;
 mod character;
 mod chars;
+mod env;
 mod game;
 mod gpu;
 mod math;
@@ -83,6 +84,8 @@ struct Settings {
     ui_scale: usize,
     /// Draw the 3D picture a little smaller when frames run late, to hold the frame rate.
     dyn_res: bool,
+    /// Graphics effects (each preset sets them; each can be switched on its own).
+    post: gpu::Fx,
 }
 
 /// Interface sizes: (name, zoom).
@@ -316,6 +319,7 @@ impl Default for Settings {
             aim_assist: true,
             ui_scale: 0,
             dyn_res: false,
+            post: gpu::Quality::PRESETS[2].1.post,
         }
     }
 }
@@ -369,6 +373,7 @@ impl Settings {
         let mut s = Settings::default();
         let mut aim_v = 0u32;
         let mut saved = false;
+        let mut fx_keys: Vec<(String, bool)> = Vec::new();
         if let Some(p) = settings_path() {
             if let Ok(text) = std::fs::read_to_string(p) {
                 saved = true;
@@ -416,6 +421,7 @@ impl Settings {
                             "aim_assist" => s.aim_assist = v != "0",
                             "ui_scale" => s.ui_scale = v.parse().unwrap_or(0usize).min(UI_SCALES.len() - 1),
                             "dyn_res" => s.dyn_res = v == "1",
+                            k if k.starts_with("fx_") => fx_keys.push((k.to_string(), v != "0")),
                             "aim_v" => aim_v = v.parse().unwrap_or(0),
                             "cross_color" => {
                                 let b: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -450,6 +456,20 @@ impl Settings {
                 s.cross_size = 0.8;
             }
         }
+        // effects: the preset's own, then whatever was switched by hand
+        s.post = gpu::Quality::PRESETS[s.quality.min(gpu::Quality::PRESETS.len() - 1)].1.post;
+        for (k, on) in fx_keys {
+            let f = &mut s.post;
+            match k.as_str() {
+                "fx_soft_shadows" => f.soft_shadows = on,
+                "fx_ssao" => f.ssao = on,
+                "fx_bloom" => f.bloom = on,
+                "fx_rays" => f.rays = on,
+                "fx_grading" => f.grading = on,
+                "fx_vignette" => f.vignette = on,
+                _ => {}
+            }
+        }
         // the first start on a Steam Deck (or another handheld / TV device): big text, full screen,
         // the Deck graphics preset, a steady 60 fps
         if !saved && platform::system().couch() {
@@ -467,6 +487,7 @@ impl Settings {
         self.ui_scale = 1;
         self.fullscreen = true;
         self.quality = gpu::Quality::DECK;
+        self.post = gpu::Quality::PRESETS[gpu::Quality::DECK].1.post;
         self.fps_cap = 60;
         self.vsync = true;
         self.dyn_res = true;
@@ -488,6 +509,11 @@ impl Settings {
                 self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8
             );
             text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8);
+            let f = self.post;
+            text += &format!(
+                "fx_soft_shadows={}\nfx_ssao={}\nfx_bloom={}\nfx_rays={}\nfx_grading={}\nfx_vignette={}\n",
+                f.soft_shadows as u8, f.ssao as u8, f.bloom as u8, f.rays as u8, f.grading as u8, f.vignette as u8
+            );
             for (k, (id, _)) in ACTIONS.iter().enumerate() {
                 text += &format!("bind.{id}={}\n", self.binds[k].id());
             }
@@ -770,6 +796,7 @@ impl App {
         // test switches: DUEL_QUALITY=0..3, DUEL_PAGE=settings:<tab> | join | main, DUEL_RECENT=1 (sample list)
         if let Some(q) = std::env::var("DUEL_QUALITY").ok().and_then(|v| v.parse::<usize>().ok()) {
             app.settings.quality = q.min(gpu::Quality::PRESETS.len() - 1);
+            app.settings.post = gpu::Quality::PRESETS[app.settings.quality].1.post;
         }
         if let Some(x) = std::env::var("DUEL_CROSS").ok().and_then(|v| v.parse::<u8>().ok()) {
             app.settings.cross_style = x.min(CROSS_STYLES.len() as u8 - 1);
@@ -1652,8 +1679,11 @@ impl App {
             2 => {
                 ui.label("Quality preset");
                 ui.horizontal(|ui| {
-                    for (k, (n, _)) in gpu::Quality::PRESETS.iter().enumerate() {
-                        ui.selectable_value(&mut self.settings.quality, k, *n);
+                    for (k, (n, q)) in gpu::Quality::PRESETS.iter().enumerate() {
+                        if ui.selectable_value(&mut self.settings.quality, k, *n).clicked() {
+                            // each preset brings its own set of effects
+                            self.settings.post = q.post;
+                        }
                     }
                 });
                 let q = gpu::Quality::PRESETS[self.settings.quality.min(gpu::Quality::PRESETS.len() - 1)].1;
@@ -1672,6 +1702,19 @@ impl App {
                     }
                 });
                 ui.checkbox(&mut self.settings.dyn_res, "Dynamic resolution (lowers the 3D detail for a moment to hold the frame rate)");
+                ui.label(egui::RichText::new("Effects").size(16.0).color(ACCENT));
+                egui::Grid::new("fx").num_columns(2).spacing([18.0, 2.0]).show(ui, |ui| {
+                    let f = &mut self.settings.post;
+                    ui.checkbox(&mut f.soft_shadows, "Soft shadows");
+                    ui.checkbox(&mut f.ssao, "Ambient occlusion");
+                    ui.end_row();
+                    ui.checkbox(&mut f.bloom, "Bloom (glow)");
+                    ui.checkbox(&mut f.rays, "Light shafts");
+                    ui.end_row();
+                    ui.checkbox(&mut f.grading, "Colour grading (map mood)");
+                    ui.checkbox(&mut f.vignette, "Vignette");
+                    ui.end_row();
+                });
                 if platform::system().couch() && ui.button("Use the recommended Steam Deck settings").clicked() {
                     self.settings.couch_defaults();
                 }
@@ -2104,6 +2147,8 @@ impl eframe::App for App {
             if g3.quality != q {
                 g3.set_quality(rs, q);
             }
+            // the effects as set, with the preset's shadow detail
+            g3.fx = gpu::Fx { shadow_res: q.post.shadow_res, ..self.settings.post };
             // dynamic resolution: hold the frame rate (60, or the chosen limit) during matches
             let target = if self.settings.fps_cap > 0 { self.settings.fps_cap as f32 } else { 60.0 };
             g3.dyn_scale = if self.settings.dyn_res && playing && self.screenshot.is_none() {
@@ -2786,7 +2831,7 @@ impl App {
             self.latch = Latch::default();
         }
         if let Ok(page) = std::env::var("DUEL_GALLERY") {
-            gallery_pose(game, page == "2");
+            gallery_pose(game, &page);
         }
         if self.autoplay && self.show_tuning && std::env::var_os("DUEL_TUNING").is_some() && game.time > 1.0 && !game.f.iter().any(|f| f.present && f.name == "Dummy 15m") {
             let _ = game.spawn_dummy(15.0);
@@ -2933,6 +2978,9 @@ impl App {
 
     fn play_camera(&self, game: &Game, rect: Rect) -> (Cam, V3) {
         self.cam_view_offset.set(V3::ZERO);
+        if let (Some(v), true) = (test_view(), std::env::var_os("DUEL_GALLERY").is_some()) {
+            return (Cam::new(v3(v[0], v[1], v[2]), v[3], v[4], v[5], rect), game.f[game.local].pos);
+        }
         if std::env::var_os("DUEL_GALLERY").is_some() {
             let l = game.local;
             return (Cam::new(v3(0.0, 2.0, 5.2), 0.0, -0.08, 96.0, rect), game.f[l].pos);
@@ -2941,6 +2989,10 @@ impl App {
         let f = &game.f[l];
         let alpha = (self.acc / TICK).clamp(0.0, 1.0);
         let body = f.prev_pos.lerp(f.pos, alpha);
+        // test switch: DUEL_VIEW=x,y,z,yaw,pitch[,fov] puts the camera there (before / after pictures)
+        if let Some(v) = test_view() {
+            return (Cam::new(v3(v[0], v[1], v[2]), v[3], v[4], v[5], rect), body);
+        }
         // the camera follows the mouse right away, not at the next game tick
         let (yaw, pitch) = if f.is_bot { (f.yaw, f.pitch) } else { (self.aim_yaw, self.aim_pitch) };
         // final kill cam: circle the fallen player in slow motion
@@ -3074,6 +3126,17 @@ impl App {
             yaw += n(1.1, 2.6) * 0.025 * k;
             pitch += n(1.5, 3.1) * 0.02 * k;
         }
+        // melee contact: a quick jolt along the blow that snaps back (looks only; shots still go
+        // along the crosshair line set above)
+        if game.jolt_t > 0.0 {
+            let k = (game.jolt_t / JOLT_TIME).clamp(0.0, 1.0);
+            let age = (1.0 - k) * JOLT_TIME;
+            let wobble = (age * 75.0).sin() * k * k;
+            let amp = game.jolt_k * 0.06;
+            pos += game.jolt_dir * (amp * k * k * 0.7 + amp * wobble * 0.35);
+            pitch += wobble * 0.014 * game.jolt_k;
+            yaw += game.jolt_dir.dot(yaw_right(yaw)) * wobble * 0.01 * game.jolt_k;
+        }
         // FOV kick: a snap wider on dashes and wall runs...
         let want = if f.dash_t > 0.0 {
             14.0
@@ -3144,8 +3207,23 @@ fn sample_keys(ctx: &egui::Context, b: &[Bind; N_ACTIONS]) {
     KEYS.with(|c| *c.borrow_mut() = k);
 }
 
+/// Test switch DUEL_VIEW=x,y,z,yaw,pitch[,fov]: a fixed camera (for before / after pictures).
+fn test_view() -> Option<[f32; 6]> {
+    let s = std::env::var("DUEL_VIEW").ok()?;
+    let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    (v.len() >= 5).then(|| [v[0], v[1], v[2], v[3], v[4], v.get(5).copied().unwrap_or(78.0)])
+}
+
 /// Test switch: line fighters up, each held in one move, to check the animations.
-fn gallery_pose(g: &mut Game, page2: bool) {
+fn gallery_pose(g: &mut Game, page: &str) {
+    let page2 = page == "2";
+    // melee pages: 3 = each blow at its contact frame, 4 = mid wind-up, 5 = follow-through
+    let melee_at = match page {
+        "3" => Some(0.0f32),
+        "4" => Some(0.5),
+        "5" => Some(-0.5),
+        _ => None,
+    };
     g.mt.phase = Phase::Fight;
     g.mt.timer = 500.0;
     let t = g.time;
@@ -3178,6 +3256,50 @@ fn gallery_pose(g: &mut Game, page2: bool) {
         f.weapon = Weapon::Revolver;
         let fwd = f.fwd();
         let right = v3(fwd.z, 0.0, -fwd.x);
+        if let Some(phase) = melee_at {
+            // phase: 0 = the blow lands now, + = that share of the wind-up still to go, - = that
+            // share of the follow-through done
+            f.cur = 0;
+            f.weapon = if i == 7 { Weapon::Greatsword } else { Weapon::Katana };
+            f.loadout.melee = f.weapon;
+            f.charge_t = 0.0;
+            f.charged = false;
+            f.kick_t = 0.0;
+            f.fin = 0;
+            let dur = f.weapon.slash_dur();
+            let at = |pre: f32| dur * 0.72 + if phase >= 0.0 { pre * phase } else { dur * 0.72 * phase };
+            match i {
+                0..=2 => {
+                    f.slash_idx = [0u8, 1, 3][i];
+                    f.slash_t = at(dur * 0.28).max(0.01);
+                }
+                3 => {
+                    // charging a heavy (held long enough: it's ready)
+                    f.charge_t = 0.7;
+                    f.charged = true;
+                }
+                4 => {
+                    f.slash_idx = SLASH_HEAVY;
+                    f.slash_t = at(dur * 0.53).max(0.01);
+                }
+                5 => {
+                    f.guard = true;
+                    f.guard_t = 0.5;
+                }
+                6 => {
+                    let hit = KICK_HIT_AT;
+                    f.kick_t = (KICK_TIME - hit - if phase >= 0.0 { -hit * phase } else { (KICK_TIME - hit) * -phase * 0.5 }).clamp(0.01, KICK_TIME);
+                }
+                _ => {
+                    // a finisher (Overhead Crush)
+                    let st = finisher(7);
+                    f.fin = 7;
+                    f.fin_target = 0;
+                    f.fin_t = (st.hit - if phase >= 0.0 { st.hit * phase * 0.5 } else { -(1.0 - st.hit) * phase * 0.5 }) * st.dur;
+                }
+            }
+            continue;
+        }
         if !page2 {
             match i {
                 0 => {}
@@ -3689,6 +3811,9 @@ fn draw_training(p: &egui::Painter, rect: Rect, s: f32, margin: f32, t: &Trainin
 
 impl App {
     fn draw_hud(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game) {
+        if test_view().is_some() {
+            return; // a clean picture of the map
+        }
         let me = &g.f[g.local];
         let c = rect.center();
         // everything scales with the window so nothing overlaps at small sizes (and grows with
@@ -5180,6 +5305,9 @@ mod aim_tests {
             deco: Vec::new(),
             braziers: Vec::new(),
             banners: Vec::new(),
+            props: Vec::new(),
+            vines: Vec::new(),
+            torches: Vec::new(),
             map: crate::world::MapId::Arena,
             flags: [V3::ZERO, V3::ZERO],
         }

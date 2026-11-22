@@ -394,6 +394,8 @@ pub const GUARD_BREAK_TIME: f32 = 0.8;
 pub const DEFLECT_WINDOW: f32 = 0.15;
 /// The kick: quick, short, unblockable; it staggers a guard, loses to a slash.
 pub const KICK_TIME: f32 = 0.34;
+/// How long a melee contact's camera jolt lasts.
+pub const JOLT_TIME: f32 = 0.13;
 pub const KICK_HIT_AT: f32 = 0.1;
 pub const KICK_RANGE: f32 = 1.9;
 pub const KICK_CD: f32 = 0.75;
@@ -1593,6 +1595,11 @@ pub struct Game {
     pub hit_head: bool,
     /// A white flash on screen after a perfect parry.
     pub parry_flash: f32,
+    /// Melee contact: a short sharp jolt of the camera along the blow (direction, strength, time
+    /// left). Looks only: it never moves the aim.
+    pub jolt_dir: V3,
+    pub jolt_k: f32,
+    pub jolt_t: f32,
     /// "+35 HP" shown after a kill.
     pub heal_pop: f32,
     /// Upward aim kick from the last shot, for the screen to apply to the mouse aim.
@@ -1906,6 +1913,9 @@ impl Game {
             hit_chain_t: -10.0,
             hit_head: false,
             parry_flash: 0.0,
+            jolt_dir: V3::ZERO,
+            jolt_k: 0.0,
+            jolt_t: 0.0,
             heal_pop: 0.0,
             aim_kick: 0.0,
             tune: Tuning::default(),
@@ -2618,6 +2628,15 @@ impl Game {
     /// A sound that isn't in the world (hit markers, countdown, jingles).
     fn sfx2d(&mut self, s: Sfx) {
         self.sounds.push((s, None, 1.0));
+    }
+
+    /// A melee blow connected near you (you swung it or took it): jolt the camera along it.
+    pub fn jolt(&mut self, dir: V3, k: f32) {
+        if k >= self.jolt_k * (self.jolt_t / JOLT_TIME) {
+            self.jolt_dir = dir.flat().norm();
+            self.jolt_k = k;
+            self.jolt_t = JOLT_TIME;
+        }
     }
 
     pub fn say(&mut self, s: String) {
@@ -4890,6 +4909,7 @@ impl Game {
                 at.vel = at.vel * 0.2 - d.flat().norm() * 2.5;
                 self.impact_fx(hit_at, 4);
                 if j == self.local || i == self.local {
+                    self.jolt(d, 0.8);
                     self.shake = self.shake.max(0.35);
                     if self.kind == Kind::Offline {
                         self.slowmo = self.slowmo.max(0.35);
@@ -4909,6 +4929,7 @@ impl Game {
                 self.impact_fx(hit_at, 2);
                 if j == self.local || i == self.local {
                     self.shake = self.shake.max(0.2);
+                    self.jolt(d, 0.5);
                 }
                 if self.kind == Kind::Host || self.kind == Kind::Client {
                     self.out_events.push(Ev::Shot { o: hit_at, e: hit_at, w: 0, spark: 2 });
@@ -4984,6 +5005,7 @@ impl Game {
                 let big = heavy || a.slash_idx >= 2;
                 self.hitstop = self.hitstop.max(if big { 0.11 } else { 0.06 });
                 self.shake = self.shake.max(if big { 0.55 } else { 0.22 });
+                self.jolt(d, if big { 1.0 } else { 0.6 });
             }
             if self.kind == Kind::Host || self.kind == Kind::Client {
                 self.out_events.push(Ev::Shot { o: hit_at, e: hit_at, w: 0, spark: 1 });
@@ -5036,6 +5058,7 @@ impl Game {
             if i == self.local || j == self.local {
                 self.hitstop = self.hitstop.max(0.06);
                 self.shake = self.shake.max(0.3);
+                self.jolt(dir, 0.7);
             }
             if self.kind == Kind::Host || self.kind == Kind::Client {
                 self.out_events.push(Ev::Shot { o: at, e: at, w: 0, spark: 9 });
@@ -5090,6 +5113,7 @@ impl Game {
                 self.say("DASH THROUGH!".to_string());
                 self.hitstop = self.hitstop.max(0.05);
                 self.shake = self.shake.max(0.3);
+                self.jolt(dir, 0.7);
             }
             if self.kind == Kind::Host || self.kind == Kind::Client {
                 self.out_events.push(Ev::Shot { o: hit_at, e: hit_at, w: 0, spark: 1 });
@@ -5657,9 +5681,12 @@ impl Game {
             self.hurt_flash = 0.5;
             let heavy = amount >= 30.0 || knock.y.abs() > 6.0;
             self.shake = self.shake.max(if heavy { 0.6 } else { 0.3 });
-            if w < 3 {
-                // a sword hit on you: brief freeze
-                self.hitstop = self.hitstop.max(if heavy { 0.1 } else { 0.05 });
+            if w < 3 || w == KICK_TOOL || w == EXEC_TOOL {
+                // a blade (or a kick) on you: brief freeze, and the camera jolts with the blow
+                if w < 3 {
+                    self.hitstop = self.hitstop.max(if heavy { 0.1 } else { 0.05 });
+                }
+                self.jolt(me - from, if heavy { 0.9 } else { 0.55 });
             }
             let p = self.f[victim].pos;
             self.sfx(Sfx::Hurt, p);
@@ -5750,6 +5777,7 @@ impl Game {
         if i == self.local || t == self.local {
             self.hitstop = self.hitstop.max(0.14);
             self.shake = self.shake.max(0.5);
+            self.jolt(dir, 1.0);
             self.parry_flash = 0.22;
             if self.kind == Kind::Offline {
                 self.slowmo = self.slowmo.max(0.3);
@@ -5989,6 +6017,7 @@ impl Game {
         self.hurt_dirs.retain(|h| h.1 > 0.0);
         self.hurt_flash = (self.hurt_flash - dt).max(0.0);
         self.shake = (self.shake - dt * 2.5).max(0.0);
+        self.jolt_t = (self.jolt_t - dt).max(0.0);
     }
 
     // ------------------------------------------------------------------ network glue
@@ -6205,6 +6234,9 @@ mod lag_comp_tests {
             deco: Vec::new(),
             braziers: Vec::new(),
             banners: Vec::new(),
+            props: Vec::new(),
+            vines: Vec::new(),
+            torches: Vec::new(),
             map: MapId::Arena,
             flags: [v3(0.0, 0.0, -21.5), v3(0.0, 0.0, 21.5)],
         }

@@ -1,8 +1,8 @@
-﻿//! Animation controller: picks and cross-fades clips for each fighter from what it is doing,
+//! Animation controller: picks and cross-fades clips for each fighter from what it is doing,
 //! then layers aiming, strafing, guard, sword swings and weapon holds on top.
 
 use crate::anim::{Rig, Trs, blend_into, blend_masked};
-use crate::game::{Capsule, FAN_THROW_TIME, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, THROW_TIME, Tuning, Weapon, finisher};
+use crate::game::{Capsule, FAN_THROW_TIME, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, SLASH_HEAVY, SLASH_SLAM, SLASH_THROUGH, THROW_TIME, Tuning, Weapon, finisher};
 use crate::math::{M3, V3, look_dir, v3, wrap_angle};
 use crate::render::{finisher_arm, finisher_body, sword_arm};
 use glam::{Mat4, Quat, Vec3};
@@ -22,6 +22,14 @@ struct Play {
     t: f32,
     rate: f32,
     looped: bool,
+    /// Stop the clip here (a reaction only plays its first part).
+    hold: f32,
+}
+
+impl Play {
+    fn new(clip: &'static str, rate: f32, looped: bool) -> Play {
+        Play { clip, t: 0.0, rate, looped, hold: f32::MAX }
+    }
 }
 
 pub struct CharState {
@@ -42,8 +50,10 @@ pub struct CharState {
     land_age: f32,
     stop_k: f32,
     crouch: f32,
-    /// Recent blade positions (base, tip, age) for the swing trail.
-    pub trail: VecDeque<(V3, V3, f32)>,
+    /// Recent blade positions (base, tip, time, brightness) for the swing trail.
+    pub trail: VecDeque<(V3, V3, f32, f32)>,
+    /// A swing that just ended keeps going a moment (its follow-through and recovery).
+    tail: Option<Tail>,
     /// The long coat: cloth points (rows down from the waist), where they were last step, and
     /// when it was last stepped.
     pub cloth: Vec<V3>,
@@ -56,7 +66,7 @@ pub struct CharState {
 impl CharState {
     pub fn new() -> CharState {
         CharState {
-            cur: Play { clip: "Idle_Loop", t: 0.0, rate: 1.0, looped: true },
+            cur: Play::new("Idle_Loop", 1.0, true),
             prev: None,
             fade: 1.0,
             last_time: 0.0,
@@ -73,6 +83,7 @@ impl CharState {
             stop_k: 0.0,
             crouch: 0.0,
             trail: VecDeque::new(),
+            tail: None,
             cloth: Vec::new(),
             cloth_prev: Vec::new(),
             cloth_time: 0.0,
@@ -224,6 +235,18 @@ fn ours(rig: &Rig, axis: Vec3, angle: f32) -> Quat {
 /// `tn` sizes the whole character and sets how much it leans, squashes and plants its feet
 /// (the developer tuning panel changes them).
 pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning) -> Option<Posed> {
+    animate_with(rig, st, f, pos, now, tn, false)
+}
+
+/// The picture: the same, but melee moves, blocks, staggers and knockbacks play real animation
+/// clips (CC0 Quaternius), timed so each blow's contact frame lands exactly when the game's hit
+/// does. The game keeps posing its hit shapes with `animate`, so timing, reach and hitboxes
+/// don't change.
+pub fn animate_show(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning) -> Option<Posed> {
+    animate_with(rig, st, f, pos, now, tn, true)
+}
+
+fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning, show: bool) -> Option<Posed> {
     let b = bones(rig)?;
     let scale = tn.char_scale;
     let dt = (now - st.last_time).clamp(0.0, 0.1);
@@ -239,18 +262,26 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
     let melee = f.weapon.is_melee();
     let mut target_yaw = 0.0;
     let want: Play = if !f.alive {
-        Play { clip: "Death01", t: 0.0, rate: 1.0, looped: false }
+        Play::new("Death01", 1.0, false)
     } else if f.stun_t > 0.0 {
-        Play { clip: "Hit_Head", t: 0.0, rate: 1.4, looped: false }
+        if show && (f.stagger_t > 0.0 || f.guard_broke > 0.0) {
+            // knocked off balance (parried, guard broken, kicked): a real stagger
+            Play::new("Idle_Shield_Break", 1.25, false)
+        } else if show && !f.on_ground {
+            // launched or juggled: thrown back, arms flung out (the fall's first part only)
+            Play { hold: 0.34, ..Play::new("Hit_Knockback", 1.0, false) }
+        } else {
+            Play::new("Hit_Head", 1.4, false)
+        }
     } else if let Some(w) = f.wall {
-        Play { clip: "Sprint_Loop", t: 0.0, rate: if w.vertical { 1.5 } else { 1.3 }, looped: true }
+        Play::new("Sprint_Loop", if w.vertical { 1.5 } else { 1.3 }, true)
     } else if f.sliding > 0.0 && f.on_ground {
         // sliding: low crouch (leaned back below)
-        Play { clip: "Crouch_Idle_Loop", t: 0.0, rate: 1.0, looped: true }
+        Play::new("Crouch_Idle_Loop", 1.0, true)
     } else if dashing && f.on_ground || (dashing && f.vel.y.abs() < 3.0 && !f.air_dash) {
-        Play { clip: "Roll", t: 0.0, rate: 2.0, looped: false }
+        Play::new("Roll", 2.0, false)
     } else if !f.on_ground {
-        if f.vel.y > 1.5 { Play { clip: "Jump_Start", t: 0.0, rate: 1.0, looped: false } } else { Play { clip: "Jump_Loop", t: 0.0, rate: 1.0, looped: true } }
+        if f.vel.y > 1.5 { Play::new("Jump_Start", 1.0, false) } else { Play::new("Jump_Loop", 1.0, true) }
     } else if speed > 0.6 {
         let a = local_v.x.atan2(local_v.z);
         let back = a.abs() > 1.85;
@@ -258,13 +289,13 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
         target_yaw = yaw.clamp(-1.25, 1.25) * 0.85;
         let sprint = speed > RUN_SPEED * 1.15;
         let rate = if sprint { (speed / 8.0).clamp(0.8, 1.6) } else { (speed / 4.6).clamp(0.7, 1.8) };
-        Play { clip: if sprint { "Sprint_Loop" } else { "Jog_Fwd_Loop" }, t: 0.0, rate: if back { -rate } else { rate }, looped: true }
+        Play::new(if sprint { "Sprint_Loop" } else { "Jog_Fwd_Loop" }, if back { -rate } else { rate }, true)
     } else if melee {
-        Play { clip: "Sword_Idle", t: 0.0, rate: 1.0, looped: true }
+        Play::new("Sword_Idle", 1.0, true)
     } else if matches!(f.weapon, Weapon::Revolver | Weapon::HandCannon) {
-        Play { clip: "Pistol_Idle_Loop", t: 0.0, rate: 1.0, looped: true }
+        Play::new("Pistol_Idle_Loop", 1.0, true)
     } else {
-        Play { clip: "Idle_Loop", t: 0.0, rate: 1.0, looped: true }
+        Play::new("Idle_Loop", 1.0, true)
     };
     let restart = (dashing && !st.was_dashing) || (f.alive != st.was_alive);
     st.was_dashing = dashing;
@@ -296,9 +327,9 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
     st.body_yaw += (target_yaw - st.body_yaw) * (dt * 10.0).min(1.0);
 
     let mut pose = Vec::new();
-    rig.sample(st.cur.clip, st.cur.t, st.cur.looped, &mut pose);
+    rig.sample(st.cur.clip, st.cur.t.min(st.cur.hold), st.cur.looped, &mut pose);
     if let Some(p) = &st.prev {
-        rig.sample(p.clip, p.t, p.looped, &mut st.scratch);
+        rig.sample(p.clip, p.t.min(p.hold), p.looped, &mut st.scratch);
         let mut prev_pose = std::mem::take(&mut st.scratch);
         blend_into(&mut prev_pose, &pose, st.fade);
         pose = prev_pose.clone();
@@ -339,10 +370,32 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
     }
     if f.alive && f.hurt_t > 0.0 {
         let k = (f.hurt_t / 0.25).clamp(0.0, 1.0);
-        rig.sample("Hit_Chest", (1.0 - k) * 0.35, false, &mut st.scratch2);
+        // the picture: a head hit snaps the head back, anything else rocks the chest
+        let (clip, len) = if show && Part::from_u8(f.hit_part) == Part::Head { ("Hit_Head", 0.43) } else { ("Hit_Chest", 0.35) };
+        rig.sample(clip, (1.0 - k) * len, false, &mut st.scratch2);
         let tmp = std::mem::take(&mut st.scratch2);
-        blend_masked(rig, &mut pose, &tmp, k * 0.8, b.spine1);
+        blend_masked(rig, &mut pose, &tmp, k * if show { 0.95 } else { 0.8 }, b.spine1);
         st.scratch2 = tmp;
+    }
+    // ---- melee clips (the picture only): swings, finishers, the heavy's wind-up, the block,
+    // and each swing's follow-through and recovery after it
+    let mut clip_arm = false;
+    if show && f.alive && f.stun_t <= 0.0 && melee {
+        if let Some((mp, w, full)) = melee_layer(rig, st, f, dt) {
+            if full && f.on_ground && speed < 2.5 {
+                blend_into(&mut pose, &mp, w);
+            } else {
+                blend_masked(rig, &mut pose, &mp, w, b.spine1);
+            }
+            clip_arm = w > 0.5;
+            // a charged heavy trembles with held power
+            if f.charged && f.slash_t <= 0.0 {
+                let g = rig.globals(&pose);
+                rig.rotate_global(&mut pose, &g, b.spine3, ours(rig, Vec3::Y, (now * 47.0).sin() * 0.025));
+            }
+        }
+    } else if show {
+        st.tail = None;
     }
 
     // ---- strafing: hips turn towards where you run, chest keeps facing the aim
@@ -420,7 +473,17 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
     };
     let chest = (sh_r + sh_l) * 0.5;
     let mut weapon_dir: Option<Vec3> = None;
-    if alive_upper {
+    // a clip holds the sword arm: no hand-built swing on top of it
+    let clip_drives = show && clip_arm;
+    if alive_upper && clip_drives {
+        // the blade leaves the fist on the index-finger side
+        if let (Some(ix), Some(pk)) = (rig.node("index_01_r"), rig.node("pinky_01_r")) {
+            let d = gpos(&pose, ix) - gpos(&pose, pk);
+            if d.length() > 1e-4 {
+                weapon_dir = Some(d.normalize());
+            }
+        }
+    } else if alive_upper {
         let pole_r = sh_r + Vec3::new(0.5, -0.6, -0.3);
         let pole_l = sh_l + Vec3::new(-0.5, -0.6, -0.3);
         if melee && f.fin > 0 {
@@ -497,7 +560,9 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
     }
 
     // ---- kick: the right leg snaps forward and back
-    if f.alive && f.kick_t > 0.0 {
+    if show && f.alive && f.kick_t > 0.0 {
+        show_kick(rig, &b, &mut pose, 1.0 - (f.kick_t / KICK_TIME).clamp(0.0, 1.0));
+    } else if f.alive && f.kick_t > 0.0 {
         let p = 1.0 - (f.kick_t / KICK_TIME).clamp(0.0, 1.0);
         // fast out (it lands at about a third), slower back
         let k = if p < 0.3 { (p / 0.3).powf(0.7) } else { (1.0 - (p - 0.3) / 0.7).max(0.0).powi(2) };
@@ -598,6 +663,322 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
         ],
     };
     Some(Posed { palette, hand, weapon: M3 { x, y, z }, head, head_frame: M3 { x: hx, y: hy, z: hz }, waist: wp(b.spine1), hit })
+}
+// ---------------------------------------------------------------------------------- melee clips
+
+/// The game's swing: the blow lands when this share of the swing time is left.
+const HIT_LEFT: f32 = 0.72;
+/// How long a finished swing's follow-through and recovery keep showing.
+const TAIL: f32 = 0.36;
+
+/// A melee move made from a clip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mv {
+    A,
+    B,
+    C,
+    HeavyFirst,
+    HeavyMid,
+    Slam,
+    Dash,
+    Hook,
+    Combo2,
+    Combo3,
+}
+const MOVES: [Mv; 10] = [Mv::A, Mv::B, Mv::C, Mv::HeavyFirst, Mv::HeavyMid, Mv::Slam, Mv::Dash, Mv::Hook, Mv::Combo2, Mv::Combo3];
+
+struct MoveDef {
+    clip: &'static str,
+    /// Where the wind-up starts, where (around) the blade is fastest, and where it ends.
+    start: f32,
+    window: (f32, f32),
+    end: f32,
+    /// The pack's recovery back to the ready stance, played after.
+    rec: Option<&'static str>,
+}
+
+fn def(m: Mv) -> MoveDef {
+    let d = |clip, start, window, end, rec| MoveDef { clip, start, window, end, rec };
+    match m {
+        Mv::A => d("Sword_Regular_A", 0.0, (0.1, 0.4), 0.43, Some("Sword_Regular_A_Rec")),
+        Mv::B => d("Sword_Regular_B", 0.0, (0.1, 0.5), 0.53, Some("Sword_Regular_B_Rec")),
+        Mv::C => d("Sword_Regular_C", 0.42, (0.45, 0.8), 1.05, None),
+        Mv::HeavyFirst => d("Sword_Heavy_Combo", 0.05, (0.25, 0.6), 0.85, None),
+        Mv::HeavyMid => d("Sword_Heavy_Combo", 1.45, (1.6, 2.0), 2.15, None),
+        Mv::Slam => d("Sword_Heavy_Combo", 2.25, (2.4, 2.8), 3.05, None),
+        Mv::Dash => d("Sword_Dash", 0.1, (0.2, 0.45), 0.75, None),
+        Mv::Hook => d("Melee_Hook", 0.0, (0.15, 0.35), 0.47, Some("Melee_Hook_Rec")),
+        Mv::Combo2 => d("Sword_Regular_Combo", 0.0, (0.6, 0.85), 1.0, None),
+        Mv::Combo3 => d("Sword_Regular_Combo", 0.0, (1.4, 1.7), 1.9, None),
+    }
+}
+
+/// Where in each move's clip the blade is fastest (its contact frame), and where the hand
+/// pauses at the top of the backswing before it (the cocked pose), found once from the clips.
+fn timings(rig: &Rig) -> &'static [(f32, f32); 10] {
+    static T: std::sync::OnceLock<[(f32, f32); 10]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut out = [(0.0, 0.0); 10];
+        let Some(hand) = rig.node("hand_r") else { return out };
+        let mut pose = Vec::new();
+        for (k, m) in MOVES.iter().enumerate() {
+            let d = def(*m);
+            let step = 1.0 / 120.0;
+            let mut prev: Option<Vec3> = None;
+            let mut best = (d.window.0, -1.0f32);
+            let mut speeds = Vec::new();
+            let mut t = d.start;
+            while t <= d.window.1 + 1e-4 {
+                rig.sample(d.clip, t, false, &mut pose);
+                let h = rig.globals(&pose)[hand].w_axis.truncate();
+                if let Some(ph) = prev {
+                    let v = (h - ph).length() / step;
+                    speeds.push((t, v));
+                    if t >= d.window.0 && v > best.1 {
+                        best = (t, v);
+                    }
+                }
+                prev = Some(h);
+                t += step;
+            }
+            let contact = best.0;
+            let cocked = speeds.iter().filter(|(t, _)| *t < contact - 0.05).fold((d.start, f32::MAX), |m, s| if s.1 < m.1 { (s.0, s.1) } else { m }).0;
+            out[k] = (contact, cocked.min(contact));
+        }
+        out
+    })
+}
+
+fn contact_of(rig: &Rig, m: Mv) -> f32 {
+    timings(rig)[MOVES.iter().position(|x| *x == m).unwrap_or(0)].0
+}
+fn cocked_of(rig: &Rig, m: Mv) -> f32 {
+    timings(rig)[MOVES.iter().position(|x| *x == m).unwrap_or(0)].1
+}
+
+/// Which move a swing plays.
+fn slash_move(idx: u8, w: Weapon) -> Mv {
+    match idx {
+        0 if w == Weapon::Dagger => Mv::Hook,
+        0 => Mv::A,
+        1 => Mv::B,
+        2 | SLASH_SLAM => Mv::Slam,
+        3 => Mv::C,
+        SLASH_HEAVY if w == Weapon::Greatsword => Mv::HeavyMid,
+        SLASH_HEAVY => Mv::HeavyFirst,
+        SLASH_THROUGH => Mv::Dash,
+        _ => Mv::A,
+    }
+}
+
+/// Each finisher style's move (and where its wind-up starts).
+fn finisher_move(style: usize) -> (Mv, Option<f32>) {
+    match style {
+        0 => (Mv::Hook, None),         // Throat Cut
+        1 => (Mv::Combo2, None),       // Twin Stab: two stabs, the second kills
+        2 => (Mv::C, Some(0.0)),       // Spinning Edge: the whole spin
+        3 => (Mv::Dash, Some(0.0)),    // Quick Draw
+        4 => (Mv::Combo3, None),       // Cross Cut: three cuts
+        5 => (Mv::A, None),            // Rising Cleave
+        6 => (Mv::Slam, None),         // Overhead Crush
+        7 => (Mv::HeavyFirst, None),   // Impale
+        8 => (Mv::HeavyMid, None),     // Wheel Cleave
+        _ => (Mv::Slam, Some(2.05)),   // Sky Splitter: from high overhead
+    }
+}
+
+/// The clip time for a move, `until` game seconds before its contact (negative after), with
+/// `pre` seconds of wind-up and `post` of follow-through. The wind-up lingers at the start (so it
+/// reads) and accelerates into the blow; the follow-through decelerates.
+fn warp(rig: &Rig, m: Mv, start: Option<f32>, until: f32, pre: f32, post: f32) -> f32 {
+    let d = def(m);
+    let contact = contact_of(rig, m);
+    let start = start.unwrap_or(d.start).min(contact);
+    if until > 0.0 {
+        let u = 1.0 - (until / pre.max(1e-3)).min(1.0);
+        start + (contact - start) * u.powf(1.6)
+    } else {
+        let v = (-until / post.max(1e-3)).min(1.0);
+        contact + (d.end - contact) * (1.0 - (1.0 - v) * (1.0 - v))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Tail {
+    mv: Mv,
+    /// Clip time when the swing ended.
+    t: f32,
+    age: f32,
+}
+
+/// The melee clip pose to lay over the body now, its weight, and whether the legs may follow.
+fn melee_layer(rig: &Rig, st: &mut CharState, f: &Fighter, dt: f32) -> Option<(Vec<Trs>, f32, bool)> {
+    let mut pose = Vec::new();
+    let dur = f.weapon.slash_dur();
+    if f.fin > 0 {
+        let style = finisher(f.fin);
+        let (m, start) = finisher_move(f.fin as usize - 1);
+        let pr = (f.fin_t / style.dur).clamp(0.0, 1.0);
+        let until = (style.hit - pr) * style.dur;
+        let t = warp(rig, m, start, until, style.hit * style.dur, (1.0 - style.hit) * style.dur);
+        rig.sample(def(m).clip, t, false, &mut pose);
+        st.tail = Some(Tail { mv: m, t, age: 0.0 });
+        return Some((pose, 1.0, true));
+    }
+    if f.slash_t > 0.0 {
+        let m = slash_move(f.slash_idx, f.weapon);
+        let until = f.slash_t - dur * HIT_LEFT;
+        let pre = if f.slash_idx == SLASH_HEAVY { dur * (1.25 - HIT_LEFT) } else { dur * (1.0 - HIT_LEFT) };
+        let start = if f.slash_idx == SLASH_HEAVY { Some(cocked_of(rig, m)) } else { None };
+        let t = warp(rig, m, start, until, pre, dur * HIT_LEFT);
+        rig.sample(def(m).clip, t, false, &mut pose);
+        st.tail = Some(Tail { mv: m, t, age: 0.0 });
+        let full = matches!(f.slash_idx, SLASH_HEAVY | SLASH_THROUGH) || (f.slash_idx <= 1 && f.on_ground);
+        return Some((pose, 1.0, full));
+    }
+    // charging a heavy: draw back into the heavy's cocked pose and hold it (easy to read)
+    if f.charge_t > 0.15 {
+        let m = if f.weapon == Weapon::Greatsword { Mv::HeavyMid } else { Mv::HeavyFirst };
+        let w = ((f.charge_t - 0.15) / 0.25).clamp(0.0, 1.0);
+        let w = w * w * (3.0 - 2.0 * w);
+        rig.sample(def(m).clip, cocked_of(rig, m), false, &mut pose);
+        st.tail = None;
+        return Some((pose, w, false));
+    }
+    // the block: the guard snaps up (the raise is the parry's moment), then holds
+    if f.guard {
+        rig.sample("Sword_Block", (f.guard_t * 1.35).min(0.38), false, &mut pose);
+        st.tail = None;
+        return Some((pose, 1.0, false));
+    }
+    // after a swing: carry through, then settle back into the stance
+    if let Some(tl) = st.tail.as_mut() {
+        tl.age += dt;
+        if tl.age >= TAIL {
+            st.tail = None;
+            return None;
+        }
+        let tl = *tl;
+        let d = def(tl.mv);
+        match d.rec {
+            Some(rec) => rig.sample(rec, tl.age * 1.4, false, &mut pose),
+            None => rig.sample(d.clip, (tl.t + tl.age).min(d.end + 0.3), false, &mut pose),
+        }
+        let k = 1.0 - tl.age / TAIL;
+        return Some((pose, k * k * (3.0 - 2.0 * k), false));
+    }
+    None
+}
+
+/// The kick in the picture: the knee chambers up (the tell), the leg snaps out to land exactly
+/// when the game's kick does, holds a beat, then recoils and steps down; the body leans back and
+/// the arms swing to balance.
+fn show_kick(rig: &Rig, b: &Bones, pose: &mut Vec<Trs>, p: f32) {
+    let hit = crate::game::KICK_HIT_AT / KICK_TIME;
+    let smooth = |x: f32| {
+        let x = x.clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    };
+    // chamber (knee up, foot tucked), extend (straight leg), recoil (tucked again), step down
+    let chamber = smooth(p / (hit * 0.55));
+    let extend = smooth((p - hit * 0.55) / (hit * 0.45));
+    let recoil = smooth((p - hit - 0.12) / 0.25);
+    let down = smooth((p - hit - 0.35) / (1.0 - hit - 0.35));
+    let thigh = -1.05 * chamber - 0.65 * extend + 0.3 * recoil;
+    let thigh = thigh * (1.0 - down);
+    let calf = (1.7 * chamber - 1.95 * extend + 1.5 * recoil) * (1.0 - down);
+    let lean = (0.12 * chamber + 0.22 * extend - 0.1 * recoil) * (1.0 - down);
+    let turn = |pose: &mut Vec<Trs>, bone: usize, axis: Vec3, a: f32| {
+        let g = rig.globals(pose);
+        rig.rotate_global(pose, &g, bone, ours(rig, axis, a));
+    };
+    turn(pose, b.thigh_r, Vec3::X, thigh);
+    turn(pose, b.calf_r, Vec3::X, calf.max(-0.3));
+    turn(pose, b.spine1, Vec3::X, lean);
+    // the arms counterbalance: out to the sides and back as the leg goes out
+    let arms = (chamber * 0.6 + extend * 0.4) * (1.0 - down);
+    turn(pose, b.up_l, Vec3::Z, -0.5 * arms);
+    turn(pose, b.up_r, Vec3::Z, 0.35 * arms);
+}
+
+#[cfg(test)]
+mod melee_clip_tests {
+    use super::*;
+
+    #[test]
+    fn every_move_has_its_clip_and_its_blow_lands_on_the_games_hit() {
+        let rig = crate::anim::shared().expect("rig");
+        for m in MOVES {
+            let d = def(m);
+            assert!(rig.clips.contains_key(d.clip), "{m:?}: clip {} is loaded", d.clip);
+            if let Some(r) = d.rec {
+                assert!(rig.clips.contains_key(r), "{m:?}: recovery {r} is loaded");
+            }
+            let c = contact_of(rig, m);
+            assert!(c >= d.window.0 - 1e-3 && c <= d.window.1 + 1e-3, "{m:?}: contact {c} in its window");
+            assert!(cocked_of(rig, m) <= c, "{m:?}: the wind-up comes first");
+            // at the game's hit moment the clip is exactly at its contact frame
+            assert!((warp(rig, m, None, 0.0, 0.1, 0.26) - c).abs() < 1e-4);
+            // before it, the wind-up; after it, the follow-through, both in order
+            assert!(warp(rig, m, None, 0.08, 0.1, 0.26) < warp(rig, m, None, 0.02, 0.1, 0.26));
+            assert!(warp(rig, m, None, -0.05, 0.1, 0.26) < warp(rig, m, None, -0.2, 0.1, 0.26));
+            assert!(warp(rig, m, None, -0.26, 0.1, 0.26) <= d.end + 1e-4);
+        }
+        for k in ["Sword_Block", "Hit_Knockback", "Idle_Shield_Break", "Hit_Chest", "Hit_Head"] {
+            assert!(rig.clips.contains_key(k), "{k} is loaded");
+        }
+    }
+
+    #[test]
+    fn the_picture_never_moves_the_hit_shapes() {
+        // the game poses its hit shapes without the clips: a swing, a block, a charge or a kick
+        // in the picture leaves them exactly as before
+        let rig = crate::anim::shared().expect("rig");
+        let tn = Tuning::default();
+        let mut f = Fighter::new("t", 0, true);
+        f.present = true;
+        f.alive = true;
+        f.on_ground = true;
+        f.weapon = Weapon::Katana;
+        let cases: [(&str, fn(&mut Fighter)); 5] = [
+            ("swing", |f| {
+                f.slash_idx = 1;
+                f.slash_t = 0.2;
+            }),
+            ("heavy", |f| {
+                f.slash_idx = SLASH_HEAVY;
+                f.slash_t = 0.4;
+            }),
+            ("guard", |f| {
+                f.guard = true;
+                f.guard_t = 0.1;
+            }),
+            ("charge", |f| f.charge_t = 0.4),
+            ("kick", |f| f.kick_t = 0.25),
+        ];
+        for (name, set) in cases {
+            let mut g = f.clone();
+            set(&mut g);
+            let (mut a, mut b, mut c) = (CharState::new(), CharState::new(), CharState::new());
+            let mut hits = None;
+            let mut shows = None;
+            let mut again = None;
+            for k in 0..6 {
+                let t = k as f32 / 60.0;
+                hits = animate(rig, &mut a, &g, V3::ZERO, t, &tn).map(|p| p.hit);
+                shows = animate_show(rig, &mut b, &g, V3::ZERO, t, &tn).map(|p| p.hit);
+                again = animate(rig, &mut c, &g, V3::ZERO, t, &tn).map(|p| p.hit);
+            }
+            let (h, a2) = (hits.expect("posed"), again.expect("posed"));
+            for (x, y) in h.caps.iter().zip(a2.caps.iter()) {
+                assert!((x.a - y.a).len() < 1e-5 && (x.b - y.b).len() < 1e-5, "{name}: hit shapes are steady");
+            }
+            // and the picture really does differ (the clips are in use)
+            let s = shows.expect("posed");
+            let moved = h.caps.iter().zip(s.caps.iter()).any(|(x, y)| (x.b - y.b).len() > 0.02);
+            assert!(moved, "{name}: the picture plays the clip");
+        }
+    }
 }
 fn yaw_fwd_of(yaw: f32) -> V3 {
     v3(yaw.sin(), 0.0, yaw.cos())

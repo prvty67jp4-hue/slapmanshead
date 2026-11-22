@@ -1,12 +1,17 @@
-//! Hardware 3D renderer: textured, lit, depth-tested, multisampled. It draws into its own
-//! texture, which the UI then shows (so the HUD and menus stay on top).
+//! Hardware 3D renderer. The scene is drawn lit by its map's sky (CC0 HDRI: ambient light and
+//! reflections) and sun (with a shadow map), with PBR materials (CC0 textures with normal and
+//! roughness maps), flickering brazier and torch lights and height fog, into a high dynamic range
+//! picture. Post-processing (ambient occlusion, bloom, light shafts, colour grading, vignette,
+//! each switchable in Graphics settings) then makes the picture the UI shows (so the
+//! HUD and menus stay on top).
 
 use crate::game::*;
 use crate::math::*;
 use crate::anim::{Rig, SkinVtx};
 use crate::character::{self, CharState};
+use crate::env;
 use crate::render::{Cam, sword_arm};
-use crate::world::{Mat, World};
+use crate::world::{MapId, Mat, Vine, World};
 use bytemuck::{Pod, Zeroable};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
@@ -14,13 +19,18 @@ use eframe::wgpu;
 use std::f32::consts::PI;
 
 const MSAA: u32 = 4;
-const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// The scene is drawn in high dynamic range; post-processing makes the shown picture.
+const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const OUT_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const AO_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// The painted texture layers (banner cloth, fabric) are drawn at this size, then scaled up.
 const TEX: u32 = 256;
-const LAYERS: u32 = 8;
-const SUN: V3 = v3(0.5, 0.62, 0.6);
+const LAYERS: u32 = env::LAYERS;
 const MAX_JOINTS: usize = 72;
 const MAX_INST: usize = 16;
+/// Point lights at once (braziers, torches, muzzle flashes).
+const MAX_LIGHTS: usize = 12;
 /// Per character: two tints, the hit flash (three words of joint bits + strength), the joints.
 // tint0, tint1, flash, rim (4 floats each), then the joints
 const INST_FLOATS: usize = 16 + MAX_JOINTS * 16;
@@ -32,7 +42,8 @@ pub struct Vtx {
     nrm: [f32; 3],
     uv: [f32; 2],
     col: [f32; 4],
-    // layer (-1 none), material (0 lit, 2 unlit, 3 soft particle), sun visibility, shininess
+    // layer (-1 none), material (0 lit, 0.5 fighter texture, 2 unlit, 3 soft particle), ambient
+    // occlusion, shininess
     ex: [f32; 4],
 }
 
@@ -44,19 +55,88 @@ struct Uniforms {
     right: [f32; 4],
     up: [f32; 4],
     fwd: [f32; 4],
+    /// direction to the sun, its strength
     sun: [f32; 4],
+    /// sun colour, shadows on
+    sun_col: [f32; 4],
+    /// fog colour, density
     fog: [f32; 4],
+    /// time, sky turn, sky brightness, sky's last mip level
     params: [f32; 4],
+    light_vp: [[f32; 4]; 4],
+    /// shadow map texel, soft shadows, lights in use, reflection strength
+    shadow: [f32; 4],
+    sh: [[f32; 4]; 9],
+    lpos: [[f32; 4]; MAX_LIGHTS],
+    lcol: [[f32; 4]; MAX_LIGHTS],
 }
 
-const SHADER: &str = r#"
-struct U { vp: mat4x4<f32>, cam: vec4<f32>, right: vec4<f32>, up: vec4<f32>, fwd: vec4<f32>, sun: vec4<f32>, fog: vec4<f32>, params: vec4<f32> };
-@group(0) @binding(0) var<uniform> u: U;
-@group(0) @binding(1) var tex: texture_2d_array<f32>;
-@group(0) @binding(4) var ctex: texture_2d_array<f32>;
-@group(0) @binding(2) var samp: sampler;
+/// Post-processing settings for one frame.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostU {
+    /// 1/width, 1/height, width, height (of the scene)
+    size: [f32; 4],
+    /// where the sun is on screen (u, v), how much of it shows
+    sun: [f32; 4],
+    /// ambient occlusion, bloom, light shafts, sharpen (0/1)
+    flags: [f32; 4],
+    lift: [f32; 4],
+    gamma: [f32; 4],
+    gain: [f32; 4],
+    /// vignette, bloom strength, light shaft strength, sharpen amount
+    misc: [f32; 4],
+    sun_col: [f32; 4],
+    right: [f32; 4],
+    up: [f32; 4],
+    fwd: [f32; 4],
+    /// grading on, exposure, ambient occlusion strength, -
+    misc2: [f32; 4],
+}
 
+/// The graphics effects in use (Graphics settings; each preset starts from its own set).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fx {
+    /// Shadow map size (pixels square).
+    pub shadow_res: u32,
+    pub soft_shadows: bool,
+    pub ssao: bool,
+    pub bloom: bool,
+    pub rays: bool,
+    pub grading: bool,
+    pub vignette: bool,
+}
+
+impl Fx {
+    pub const ALL: Fx = Fx { shadow_res: 2048, soft_shadows: true, ssao: true, bloom: true, rays: true, grading: true, vignette: true };
+    /// Cheap: hard 4-tap shadows at 1024, no ambient occlusion or light shafts.
+    pub const CHEAP: Fx = Fx { shadow_res: 1024, soft_shadows: false, ssao: false, bloom: true, rays: false, grading: true, vignette: true };
+}
+
+const U_DECL: &str = r#"
+struct U { vp: mat4x4<f32>, cam: vec4<f32>, right: vec4<f32>, up: vec4<f32>, fwd: vec4<f32>, sun: vec4<f32>, sun_col: vec4<f32>, fog: vec4<f32>, params: vec4<f32>, light_vp: mat4x4<f32>, shadow: vec4<f32>, sh: array<vec4<f32>, 9>, lpos: array<vec4<f32>, 12>, lcol: array<vec4<f32>, 12> };
+@group(0) @binding(0) var<uniform> u: U;
+struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, joints: array<mat4x4<f32>, 72> };
+@group(0) @binding(3) var<storage, read> insts: array<Inst>;
 struct VIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32> };
+struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32, @location(5) uv: vec2<f32> };
+fn skin_matrix(v: SIn, ii: u32) -> mat4x4<f32> {
+  return insts[ii].joints[v.j.x] * v.w.x + insts[ii].joints[v.j.y] * v.w.y + insts[ii].joints[v.j.z] * v.w.z + insts[ii].joints[v.j.w] * v.w.w;
+}
+"#;
+
+const SHADER: &str = r#"
+@group(0) @binding(1) var tex: texture_2d_array<f32>;
+@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(4) var ctex: texture_2d_array<f32>;
+@group(0) @binding(5) var ntex: texture_2d_array<f32>;
+@group(0) @binding(6) var sky: texture_2d<f32>;
+@group(0) @binding(7) var skysamp: sampler;
+@group(0) @binding(8) var shadow_map: texture_depth_2d;
+@group(0) @binding(9) var shadow_samp: sampler_comparison;
+
+const PI: f32 = 3.14159265;
+
 struct VOut { @builtin(position) clip: vec4<f32>, @location(0) wpos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32>, @location(5) rim: vec4<f32> };
 
 @vertex fn vs(v: VIn) -> VOut {
@@ -67,59 +147,209 @@ struct VOut { @builtin(position) clip: vec4<f32>, @location(0) wpos: vec3<f32>, 
   return o;
 }
 
-fn fogit(c: vec3<f32>, wpos: vec3<f32>) -> vec3<f32> {
-  let d = length(wpos - u.cam.xyz);
-  let f = clamp((d - u.params.y) / (u.params.z - u.params.y), 0.0, 1.0) * u.fog.w;
-  return mix(c, u.fog.rgb, f);
+// where a direction lands in the sky picture (turned so its sun matches the map's sunlight)
+fn sky_uv(d: vec3<f32>) -> vec2<f32> {
+  let c = cos(u.params.y);
+  let s = sin(u.params.y);
+  let x = d.x * c - d.z * s;
+  let z = d.x * s + d.z * c;
+  return vec2<f32>(0.5 + atan2(x, z) / (2.0 * PI), acos(clamp(d.y, -1.0, 1.0)) / PI);
 }
 
-@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
+// ambient light from the whole sky (spherical harmonics, already divided by pi)
+fn sky_light(n: vec3<f32>) -> vec3<f32> {
+  var e = u.sh[0].rgb * 0.282095;
+  e += u.sh[1].rgb * (0.488603 * n.y) + u.sh[2].rgb * (0.488603 * n.z) + u.sh[3].rgb * (0.488603 * n.x);
+  e += u.sh[4].rgb * (1.092548 * n.x * n.y) + u.sh[5].rgb * (1.092548 * n.y * n.z) + u.sh[6].rgb * (0.315392 * (3.0 * n.z * n.z - 1.0));
+  e += u.sh[7].rgb * (1.092548 * n.x * n.z) + u.sh[8].rgb * (0.546274 * (n.x * n.x - n.z * n.z));
+  return max(e, vec3<f32>(0.0));
+}
+
+fn fogit(c: vec3<f32>, wpos: vec3<f32>) -> vec3<f32> {
+  let d = length(wpos - u.cam.xyz);
+  // thicker low down: depth to the haze without hiding anyone up close
+  let low = exp(-max(wpos.y, 0.0) * 0.12);
+  let f = 1.0 - exp(-d * u.fog.w * (0.55 + 0.9 * low));
+  return mix(c, u.fog.rgb, clamp(f, 0.0, 0.85));
+}
+
+// soft sun shadows: a dozen taps over a disc, or four for the cheap setting
+fn sun_shadow(wp: vec3<f32>, n: vec3<f32>) -> f32 {
+  if (u.sun_col.w < 0.5) { return 1.0; }
+  let ndl = dot(n, normalize(u.sun.xyz));
+  let p = u.light_vp * vec4<f32>(wp + n * (0.03 + 0.06 * (1.0 - abs(ndl))), 1.0);
+  let s = p.xyz / p.w;
+  let uv = vec2<f32>(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5);
+  if (uv.x <= 0.001 || uv.x >= 0.999 || uv.y <= 0.001 || uv.y >= 0.999 || s.z >= 1.0) { return 1.0; }
+  let z = s.z - 0.0008;
+  let t = u.shadow.x;
+  if (u.shadow.y > 0.5) {
+    var taps = array<vec2<f32>, 12>(
+      vec2<f32>(-0.326, -0.406), vec2<f32>(-0.840, -0.074), vec2<f32>(-0.696, 0.457), vec2<f32>(-0.203, 0.621),
+      vec2<f32>(0.962, -0.195), vec2<f32>(0.473, -0.480), vec2<f32>(0.519, 0.767), vec2<f32>(0.185, -0.893),
+      vec2<f32>(0.507, 0.064), vec2<f32>(0.896, 0.412), vec2<f32>(-0.322, -0.933), vec2<f32>(-0.792, -0.598));
+    var sum = 0.0;
+    for (var k = 0; k < 12; k = k + 1) {
+      sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + taps[k] * t * 2.4, z);
+    }
+    return sum / 12.0;
+  }
+  var s4 = textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2<f32>(-0.5, -0.5) * t, z);
+  s4 = s4 + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2<f32>(0.5, -0.5) * t, z);
+  s4 = s4 + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2<f32>(-0.5, 0.5) * t, z);
+  s4 = s4 + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2<f32>(0.5, 0.5) * t, z);
+  return s4 * 0.25;
+}
+
+// a normal map applied without stored tangents (screen-space derivatives of the surface)
+fn perturb(n: vec3<f32>, dp1: vec3<f32>, dp2: vec3<f32>, duv1: vec2<f32>, duv2: vec2<f32>, m: vec3<f32>) -> vec3<f32> {
+  let dp2perp = cross(dp2, n);
+  let dp1perp = cross(n, dp1);
+  let t = dp2perp * duv1.x + dp1perp * duv2.x;
+  let b = dp2perp * duv1.y + dp1perp * duv2.y;
+  let l = max(dot(t, t), dot(b, b));
+  if (l < 1e-14) { return n; }
+  let inv = inverseSqrt(l);
+  return normalize(t * (m.x * inv) + b * (m.y * inv) + n * m.z);
+}
+
+fn hash21(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
+fn vnoise(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let w = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash21(i), hash21(i + vec2<f32>(1.0, 0.0)), w.x), mix(hash21(i + vec2<f32>(0.0, 1.0)), hash21(i + vec2<f32>(1.0, 1.0)), w.x), w.y);
+}
+
+fn shade(i: VOut) -> vec4<f32> {
   let layer = i.ex.x;
   let mat = i.ex.y;
-  // world surfaces use the level's textures, fighters their own set (both sampled: the choice
-  // depends on the surface, and sampling must not)
-  let t0 = textureSample(tex, samp, i.uv, i32(clamp(layer, 0.0, 7.0) + 0.5));
+  // every texture is sampled (and the derivatives taken) before any branch
+  let li = i32(clamp(layer, 0.0, 16.0) + 0.5);
+  let t0 = textureSample(tex, samp, i.uv, li);
+  let nt = textureSample(ntex, samp, i.uv, li);
   let t1 = textureSample(ctex, samp, i.uv, i32(max(layer, 0.0) + 0.5));
-  let t = select(t0, t1, mat > 0.25 && mat < 0.75);
+  let dp1 = dpdx(i.wpos);
+  let dp2 = dpdy(i.wpos);
+  let duv1 = dpdx(i.uv);
+  let duv2 = dpdy(i.uv);
+  let is_char = mat > 0.25 && mat < 0.75;
+  let world_tex = layer >= 0.0 && !is_char;
+  // the level's own materials: the map's palette colour times soft brightness detail
+  let is_level = world_tex && (li <= 5 || li >= 14);
   var base = i.col;
-  if (layer >= 0.0) { base = base * t; }
+  if (layer >= 0.0) { base = base * select(t0, t1, is_char); }
+  if (is_level) {
+    base = vec4<f32>(i.col.rgb * t0.rgb * 2.0, 1.0);
+    // large-scale colour drift and patches of grime and wear, so no tile repeats show
+    let wp = vec2<f32>(i.wpos.x + i.wpos.y * 0.71, i.wpos.z - i.wpos.y * 0.53);
+    let drift = 0.65 * vnoise(wp * 0.11) + 0.35 * vnoise(wp * 0.37 + vec2<f32>(17.0, 3.0));
+    base = vec4<f32>(base.rgb * (0.87 + 0.26 * drift), 1.0);
+    let grime = smoothstep(0.58, 0.86, vnoise(wp * 0.65 + vec2<f32>(5.0, 11.0))) * 0.35;
+    let grime_col = base.rgb * vec3<f32>(0.8, 0.77, 0.73);
+    base = vec4<f32>(mix(base.rgb, grime_col, grime), 1.0);
+  }
+  if (is_char) {
+    // the fighters keep the strongest colours in the scene
+    let l = dot(base.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    base = vec4<f32>(max(mix(vec3<f32>(l), base.rgb, 1.15), vec3<f32>(0.0)), base.a);
+  }
+  if (world_tex && t0.a < 0.5 && mat < 1.5) { discard; }
   if (mat > 2.5) {
     let d = length(i.uv * 2.0 - 1.0);
     let a = clamp(1.0 - d, 0.0, 1.0);
     return vec4<f32>(fogit(base.rgb, i.wpos), base.a * a * a);
   }
-  var c = base.rgb;
-  if (mat < 1.5) {
-    let n = normalize(i.nrm);
-    let l = normalize(u.sun.xyz);
-    let ndl = max(dot(n, l), 0.0);
-    let sunvis = i.ex.z;
-    let hemi = mix(vec3<f32>(0.30, 0.25, 0.24), vec3<f32>(0.48, 0.52, 0.66), n.y * 0.5 + 0.5);
-    let sunc = vec3<f32>(1.35, 1.12, 0.86);
-    let v = normalize(u.cam.xyz - i.wpos);
-    let h = normalize(l + v);
-    let spec = pow(max(dot(n, h), 0.0), 40.0) * i.ex.w * sunvis * ndl;
-    c = base.rgb * (hemi + sunc * ndl * sunvis) + sunc * spec;
+  if (mat > 1.5) {
+    return vec4<f32>(fogit(base.rgb, i.wpos), base.a);
+  }
+  let v = normalize(u.cam.xyz - i.wpos);
+  var ng = normalize(i.nrm);
+  if (dot(ng, v) < 0.0) { ng = -ng; } // two-sided: banners and leaves
+  var n = ng;
+  var rough = clamp(1.0 - i.ex.w * 0.3, 0.22, 0.9);
+  var metal = select(0.0, 0.75, i.ex.w > 1.4);
+  if (world_tex) {
+    var m = vec3<f32>(nt.r * 2.0 - 1.0, -(nt.g * 2.0 - 1.0), 0.0);
+    if (is_level) { m = vec3<f32>(m.xy * 0.4, 0.0); } // soft relief: stylised, not photographic
+    m.z = sqrt(max(1.0 - dot(m.xy, m.xy), 0.0));
+    n = perturb(ng, dp1, dp2, duv1, duv2, m);
+    rough = clamp(nt.b, 0.08, 1.0);
+    metal = nt.a;
+  }
+  if (is_char) { rough = 0.62; metal = 0.0; }
+  let albedo = base.rgb;
+  let l = normalize(u.sun.xyz);
+  let sh = sun_shadow(i.wpos, ng);
+  let ndl = max(dot(n, l), 0.0);
+  let ndv = max(dot(n, v), 0.001);
+  let h = normalize(l + v);
+  let ndh = max(dot(n, h), 0.0);
+  let vdh = max(dot(v, h), 0.0);
+  let a = rough * rough;
+  let a2 = a * a;
+  let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+  let dist_term = a2 / (PI * dd * dd);
+  let k = (rough + 1.0) * (rough + 1.0) / 8.0;
+  let geo = (ndl / (ndl * (1.0 - k) + k)) * (ndv / (ndv * (1.0 - k) + k));
+  let f0 = mix(vec3<f32>(0.04), albedo, metal);
+  let fres = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - vdh, 5.0);
+  let spec = dist_term * geo * fres / (4.0 * ndl * ndv + 0.0001);
+  let kd = (vec3<f32>(1.0) - fres) * (1.0 - metal);
+  let sunc = u.sun_col.rgb * u.sun.w;
+  var c = (kd * albedo + spec * PI) * sunc * ndl * sh;
+  // the sky: soft light from all around, and reflections (blurrier on rough surfaces)
+  // baked occlusion, softened on the level (60% weaker)
+  let ao = select(i.ex.z, 1.0 - (1.0 - i.ex.z) * 0.4, is_level);
+  let fr = f0 + (max(vec3<f32>(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
+  let r = reflect(-v, n);
+  var env = textureSampleLevel(sky, skysamp, sky_uv(r), rough * u.params.w).rgb * u.params.z;
+  env = env * mix(0.22, 1.0, smoothstep(-0.25, 0.15, r.y));
+  // light bounced up from the sunlit ground (undersides of ledges and balconies aren't black)
+  let bounce = u.sun_col.rgb * (u.sun.w * 0.11 * max(-n.y, 0.0) * max(l.y, 0.0));
+  // (the sky fill is generous: shaded sides stay mid-tone, never black)
+  c = c + (sky_light(n) * 1.45 + u.fog.rgb * 0.22 + bounce) * albedo * (1.0 - metal) * ao + env * fr * ao * u.shadow.w * mix(0.55, 1.0, sh);
+  // braziers, torches and muzzle flashes
+  let nl = i32(u.shadow.z);
+  for (var q = 0; q < nl; q = q + 1) {
+    let lp = u.lpos[q];
+    let ld = lp.xyz - i.wpos;
+    let d2 = dot(ld, ld);
+    let dist = sqrt(d2);
+    if (dist < lp.w) {
+      let ln = ld / max(dist, 0.001);
+      let x = dist / lp.w;
+      let fall = pow(clamp(1.0 - x * x * x * x, 0.0, 1.0), 2.0) / (d2 + 1.0);
+      let lh = normalize(ln + v);
+      let sp = pow(max(dot(n, lh), 0.0), mix(8.0, 80.0, 1.0 - rough)) * (1.0 - rough) * 0.6;
+      c = c + (albedo * (1.0 - metal) * max(dot(n, ln), 0.0) + vec3<f32>(sp)) * u.lcol[q].rgb * fall;
+    }
   }
   var outc = fogit(c, i.wpos);
   if (i.rim.x + i.rim.y + i.rim.z > 0.0) {
     // team-coloured rim light: brightest at the silhouette, and the fog only dims it a
     // little, so players stand out against stone and through a couple of metres of haze
-    let n = normalize(i.nrm);
-    let v = normalize(u.cam.xyz - i.wpos);
-    let fr = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), i.rim.w);
+    let fr2 = pow(1.0 - clamp(dot(ng, v), 0.0, 1.0), i.rim.w);
     let d = length(i.wpos - u.cam.xyz);
-    let ff = clamp((d - u.params.y) / (u.params.z - u.params.y), 0.0, 1.0) * u.fog.w;
-    outc = outc + i.rim.rgb * (fr * (1.0 - ff * 0.35) + 0.012 * (1.0 - ff * 0.5));
+    let ff = clamp(1.0 - exp(-d * u.fog.w * 1.2), 0.0, 1.0);
+    outc = outc + i.rim.rgb * (fr2 * (1.0 - ff * 0.35) + 0.012 * (1.0 - ff * 0.5));
   }
   return vec4<f32>(outc, base.a);
 }
 
-struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, joints: array<mat4x4<f32>, 72> };
-@group(0) @binding(3) var<storage, read> insts: array<Inst>;
-struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32, @location(5) uv: vec2<f32> };
+// solid surfaces: colour, and in alpha how far away they are (for the effects after)
+@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
+  let s = shade(i);
+  return vec4<f32>(s.rgb, dot(i.wpos - u.cam.xyz, u.fwd.xyz));
+}
+
+// see-through things: colour and opacity (the target keeps its distance)
+@fragment fn fs_blend(i: VOut) -> @location(0) vec4<f32> {
+  return shade(i);
+}
+
 @vertex fn vs_skin(v: SIn, @builtin(instance_index) ii: u32) -> VOut {
-  let m = insts[ii].joints[v.j.x] * v.w.x + insts[ii].joints[v.j.y] * v.w.y + insts[ii].joints[v.j.z] * v.w.z + insts[ii].joints[v.j.w] * v.w.w;
+  let m = skin_matrix(v, ii);
   let wp = m * vec4<f32>(v.pos, 1.0);
   var o: VOut;
   o.clip = u.vp * vec4<f32>(wp.xyz, 1.0);
@@ -163,34 +393,161 @@ struct SkyOut { @builtin(position) clip: vec4<f32>, @location(0) ndc: vec2<f32> 
   o.ndc = p[vi];
   return o;
 }
-fn hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
-fn noise(p: vec2<f32>) -> f32 {
-  let i = floor(p); let f = fract(p);
-  let w = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash(i), hash(i + vec2<f32>(1.0, 0.0)), w.x), mix(hash(i + vec2<f32>(0.0, 1.0)), hash(i + vec2<f32>(1.0, 1.0)), w.x), w.y);
-}
-fn fbm(p: vec2<f32>) -> f32 {
-  var s = 0.0; var a = 0.5; var q = p;
-  for (var k = 0; k < 5; k = k + 1) { s = s + a * noise(q); q = q * 2.03; a = a * 0.5; }
-  return s;
-}
 @fragment fn fs_sky(i: SkyOut) -> @location(0) vec4<f32> {
   let d = normalize(u.fwd.xyz + u.right.xyz * i.ndc.x * u.right.w + u.up.xyz * i.ndc.y * u.up.w);
-  let y = d.y;
-  let zen = vec3<f32>(0.10, 0.16, 0.38);
-  let mid = vec3<f32>(0.42, 0.40, 0.60);
-  let hor = vec3<f32>(0.98, 0.62, 0.38);
-  var c = mix(hor, mid, smoothstep(0.0, 0.25, y));
-  c = mix(c, zen, smoothstep(0.25, 0.9, y));
-  if (y < 0.0) { c = mix(hor, u.fog.rgb, smoothstep(0.0, -0.2, y)); }
-  let l = normalize(u.sun.xyz);
-  let sd = max(dot(d, l), 0.0);
-  c = c + vec3<f32>(1.0, 0.7, 0.4) * pow(sd, 8.0) * 0.45 + vec3<f32>(1.0, 0.9, 0.7) * pow(sd, 300.0) * 3.0;
-  if (y > 0.0) {
-    let uv = d.xz / (y + 0.12) * 1.6 + vec2<f32>(u.params.x * 0.01, 0.0);
-    let cl = smoothstep(0.5, 0.85, fbm(uv));
-    let ccol = mix(vec3<f32>(0.95, 0.70, 0.62), vec3<f32>(1.0, 0.88, 0.75), pow(sd, 4.0));
-    c = mix(c, ccol, cl * smoothstep(0.0, 0.15, y) * 0.8);
+  var c = textureSampleLevel(sky, skysamp, sky_uv(d), 0.0).rgb * u.params.z;
+  // haze at the horizon, matching the fog
+  c = mix(c, u.fog.rgb, clamp(1.0 - smoothstep(-0.02, 0.14, d.y), 0.0, 1.0) * 0.4);
+  return vec4<f32>(c, 1000.0);
+}
+"#;
+
+/// Depth from the sun: everything solid casts a shadow (not particles, glows or leaves).
+const SHADOW_SHADER: &str = r#"
+@vertex fn vs_shadow(v: VIn) -> @builtin(position) vec4<f32> {
+  if (v.ex.y > 1.5 || (v.ex.x > 11.5 && v.ex.x < 12.5)) { return vec4<f32>(0.0, 0.0, -2.0, 1.0); }
+  return u.light_vp * vec4<f32>(v.pos, 1.0);
+}
+@vertex fn vs_skin_shadow(v: SIn, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
+  let wp = skin_matrix(v, ii) * vec4<f32>(v.pos, 1.0);
+  return u.light_vp * vec4<f32>(wp.xyz, 1.0);
+}
+"#;
+
+/// Effects after the scene: ambient occlusion, bloom, light shafts and the final picture.
+const POST_SHADER: &str = r#"
+struct P { size: vec4<f32>, sun: vec4<f32>, flags: vec4<f32>, lift: vec4<f32>, gamma: vec4<f32>, gain: vec4<f32>, misc: vec4<f32>, sun_col: vec4<f32>, right: vec4<f32>, up: vec4<f32>, fwd: vec4<f32>, misc2: vec4<f32> };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var ls: sampler;
+@group(0) @binding(2) var ta: texture_2d<f32>;
+@group(0) @binding(3) var tb: texture_2d<f32>;
+@group(0) @binding(4) var tc: texture_2d<f32>;
+@group(0) @binding(5) var td: texture_2d<f32>;
+
+struct FOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_full(@builtin(vertex_index) vi: u32) -> FOut {
+  var q = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var o: FOut;
+  o.clip = vec4<f32>(q[vi], 0.0, 1.0);
+  o.uv = vec2<f32>(q[vi].x * 0.5 + 0.5, 0.5 - q[vi].y * 0.5);
+  return o;
+}
+
+fn lum(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)); }
+
+// where a pixel is, relative to the camera, from its stored distance
+fn view_pos(uv: vec2<f32>, z: f32) -> vec3<f32> {
+  let nx = uv.x * 2.0 - 1.0;
+  let ny = 1.0 - uv.y * 2.0;
+  return (p.fwd.xyz + p.right.xyz * (nx * p.right.w) + p.up.xyz * (ny * p.up.w)) * z;
+}
+
+@fragment fn fs_ao(i: FOut) -> @location(0) vec4<f32> {
+  let z = textureSampleLevel(ta, ls, i.uv, 0.0).a;
+  if (z > 300.0 || z <= 0.0) { return vec4<f32>(1.0); }
+  let px = p.size.xy * 2.0;
+  let pc = view_pos(i.uv, z);
+  let zx = textureSampleLevel(ta, ls, i.uv + vec2<f32>(px.x, 0.0), 0.0).a;
+  let zy = textureSampleLevel(ta, ls, i.uv + vec2<f32>(0.0, px.y), 0.0).a;
+  var n = normalize(cross(view_pos(i.uv + vec2<f32>(px.x, 0.0), zx) - pc, view_pos(i.uv + vec2<f32>(0.0, px.y), zy) - pc));
+  if (dot(n, pc) > 0.0) { n = -n; }
+  let radius = 0.55;
+  // the radius on screen shrinks with distance
+  let ruv = radius / (z * p.right.w) * 0.5;
+  let jitter = fract(sin(dot(floor(i.uv * p.size.zw), vec2<f32>(12.9898, 78.233))) * 43758.5453) * 6.283;
+  var occ = 0.0;
+  for (var k = 0; k < 12; k = k + 1) {
+    let fk = f32(k);
+    let ang = fk * 2.39996 + jitter;
+    let rr = ruv * (fk + 0.5) / 12.0;
+    let suv = i.uv + vec2<f32>(cos(ang), sin(ang) * p.size.z / p.size.w) * rr;
+    let zs = textureSampleLevel(ta, ls, suv, 0.0).a;
+    let d = view_pos(suv, zs) - pc;
+    let dl = length(d);
+    if (dl > 0.001) {
+      occ = occ + max(dot(n, d / dl) - 0.12, 0.0) * (1.0 - smoothstep(radius * 0.5, radius * 1.6, dl));
+    }
+  }
+  let ao = clamp(1.0 - occ / 12.0 * 2.2, 0.0, 1.0);
+  return vec4<f32>(ao, ao, ao, 1.0);
+}
+
+// the bright parts, at a quarter size (bloom starts here)
+@fragment fn fs_bright(i: FOut) -> @location(0) vec4<f32> {
+  let o = p.size.xy;
+  var c = textureSampleLevel(ta, ls, i.uv + vec2<f32>(-o.x, -o.y), 0.0).rgb;
+  c += textureSampleLevel(ta, ls, i.uv + vec2<f32>(o.x, -o.y), 0.0).rgb;
+  c += textureSampleLevel(ta, ls, i.uv + vec2<f32>(-o.x, o.y), 0.0).rgb;
+  c += textureSampleLevel(ta, ls, i.uv + vec2<f32>(o.x, o.y), 0.0).rgb;
+  c = min(c * 0.25, vec3<f32>(40.0));
+  let l = lum(c);
+  let knee = clamp(l - 1.8, 0.0, 6.0);
+  return vec4<f32>(c * (knee / max(l, 0.0001)), 1.0);
+}
+
+fn blur(uv: vec2<f32>, dir: vec2<f32>) -> vec4<f32> {
+  var w = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+  var c = textureSampleLevel(ta, ls, uv, 0.0).rgb * w[0];
+  for (var k = 1; k < 5; k = k + 1) {
+    let o = dir * f32(k) * 1.6;
+    c += textureSampleLevel(ta, ls, uv + o, 0.0).rgb * w[k];
+    c += textureSampleLevel(ta, ls, uv - o, 0.0).rgb * w[k];
+  }
+  return vec4<f32>(c, 1.0);
+}
+@fragment fn fs_blur_h(i: FOut) -> @location(0) vec4<f32> { return blur(i.uv, vec2<f32>(p.size.x * 4.0, 0.0)); }
+@fragment fn fs_blur_v(i: FOut) -> @location(0) vec4<f32> { return blur(i.uv, vec2<f32>(0.0, p.size.y * 4.0)); }
+
+// light shafts: open sky near the sun, smeared towards it
+@fragment fn fs_rays(i: FOut) -> @location(0) vec4<f32> {
+  if (p.sun.z <= 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  let steps = 32;
+  let delta = (p.sun.xy - i.uv) / f32(steps) * 0.85;
+  var uv = i.uv;
+  var decay = 1.0;
+  var acc = 0.0;
+  for (var k = 0; k < steps; k = k + 1) {
+    uv = uv + delta;
+    let s = textureSampleLevel(ta, ls, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+    let sky = select(0.0, min(lum(s.rgb), 4.0), s.a > 900.0);
+    acc = acc + sky * decay;
+    decay = decay * 0.955;
+  }
+  let a = acc / f32(steps) * p.sun.z;
+  return vec4<f32>(a, a, a, 1.0);
+}
+
+fn aces(x: vec3<f32>) -> vec3<f32> {
+  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+@fragment fn fs_comp(i: FOut) -> @location(0) vec4<f32> {
+  let s = textureSampleLevel(ta, ls, i.uv, 0.0);
+  var c = s.rgb;
+
+  if (p.flags.x > 0.5 && s.a < 900.0) {
+    let ao = textureSampleLevel(tb, ls, i.uv, 0.0).r;
+    c = c * mix(1.0, ao, p.misc2.z);
+  }
+  if (p.flags.y > 0.5) {
+    c = c + textureSampleLevel(tc, ls, i.uv, 0.0).rgb * p.misc.y;
+  }
+  if (p.flags.z > 0.5) {
+    c = c + p.sun_col.rgb * textureSampleLevel(td, ls, i.uv, 0.0).r * p.misc.z;
+  }
+  c = aces(c * p.misc2.y);
+  if (p.misc2.x > 0.5) {
+    // the map's mood: lift / gamma / gain, saturation and contrast
+    c = max(p.gain.rgb * (c + p.lift.rgb * (vec3<f32>(1.0) - c)), vec3<f32>(0.0));
+    c = pow(c, vec3<f32>(1.0) / max(p.gamma.rgb, vec3<f32>(0.2)));
+    let l = lum(c);
+    c = mix(vec3<f32>(l), c, p.lift.w);
+    c = clamp((c - 0.5) * p.gamma.w + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+  }
+  if (p.misc.x > 0.0) {
+    let d = length((i.uv - 0.5) * vec2<f32>(1.0, p.size.w / p.size.z)) * 1.35;
+    c = c * (1.0 - p.misc.x * smoothstep(0.35, 1.05, d));
   }
   return vec4<f32>(c, 1.0);
 }
@@ -391,44 +748,45 @@ fn texel(layer: u32, x: u32, y: u32) -> [f32; 3] {
     }
 }
 
-fn build_textures() -> Vec<Vec<Vec<u8>>> {
-    // [layer][mip] -> rgba8 (sRGB bytes)
-    let mut out = Vec::new();
-    for layer in 0..LAYERS {
-        let mut lvl0 = vec![0u8; (TEX * TEX * 4) as usize];
-        for y in 0..TEX {
-            for x in 0..TEX {
-                let c = texel(layer, x, y);
-                let i = ((y * TEX + x) * 4) as usize;
-                for k in 0..3 {
-                    lvl0[i + k] = (c[k].clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
-                }
-                lvl0[i + 3] = 255;
-            }
+/// A layer the renderer paints itself (banner cloth, fabric): colour and a flat, rough surface.
+fn painted_layer(layer: u32) -> (Vec<u8>, Vec<u8>) {
+    let mut img = image::RgbaImage::new(TEX, TEX);
+    for y in 0..TEX {
+        for x in 0..TEX {
+            let c = texel(layer, x, y);
+            let b = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+            img.put_pixel(x, y, image::Rgba([b(c[0]), b(c[1]), b(c[2]), 255]));
         }
-        let mut mips = vec![lvl0];
-        let mut size = TEX;
-        while size > 1 {
-            let prev = mips.last().unwrap();
-            let ns = size / 2;
-            let mut m = vec![0u8; (ns * ns * 4) as usize];
-            for y in 0..ns {
-                for x in 0..ns {
-                    for k in 0..4 {
-                        let s = |xx: u32, yy: u32| prev[((yy * size + xx) * 4 + k) as usize] as u32;
-                        let v = s(2 * x, 2 * y) + s(2 * x + 1, 2 * y) + s(2 * x, 2 * y + 1) + s(2 * x + 1, 2 * y + 1);
-                        m[((y * ns + x) * 4 + k) as usize] = (v / 4) as u8;
-                    }
-                }
-            }
-            mips.push(m);
-            size = ns;
-        }
-        out.push(mips);
     }
-    out
+    let big = image::imageops::resize(&img, env::TEX, env::TEX, image::imageops::FilterType::Triangle);
+    let n = (env::TEX * env::TEX) as usize;
+    let mut surf = vec![0u8; n * 4];
+    for k in 0..n {
+        surf[k * 4] = 128;
+        surf[k * 4 + 1] = 128;
+        surf[k * 4 + 2] = 205;
+        surf[k * 4 + 3] = 0;
+    }
+    (big.into_raw(), surf)
 }
 
+/// The level's material layers with their mip levels: colour (sRGB, alpha cuts out leaves) and
+/// surface (normal x / y, roughness, metalness). The CC0 textures decode in parallel.
+fn build_world_layers() -> (Vec<Vec<Vec<u8>>>, Vec<Vec<Vec<u8>>>) {
+    let size = env::TEX;
+    let done: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)> = std::thread::scope(|s| {
+        let jobs: Vec<_> = (0..LAYERS)
+            .map(|l| {
+                s.spawn(move || {
+                    let (col, surf) = env::layer(l).unwrap_or_else(|| painted_layer(l));
+                    (env::mips(col, size), env::mips(surf, size))
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| (env::mips(vec![128; (size * size * 4) as usize], size), env::mips(vec![128; (size * size * 4) as usize], size)))).collect()
+    });
+    done.into_iter().unzip()
+}
 // ------------------------------------------------------------------ mesh building
 
 #[derive(Default)]
@@ -537,136 +895,379 @@ impl MB {
     }
 }
 
-fn mat_params(m: Mat) -> (f32, f32, f32) {
-    // layer, metres per texture repeat, shininess
-    match m {
-        Mat::Floor => (0.0, 4.0, 0.5),
-        Mat::Wall => (1.0, 3.0, 0.05),
-        Mat::Stone => (2.0, 3.0, 0.1),
-        Mat::Metal => (3.0, 2.2, 0.15),
-        Mat::Crate => (4.0, 1.5, 0.1),
-        Mat::Trim => (5.0, 2.0, 0.25),
+/// A prop placed in the level, its triangles moved into place.
+fn prop_into(mb: &mut MB, p: &crate::world::Prop, map: MapId) {
+    let (s, c) = p.yaw.sin_cos();
+    // the model's +x, +y, +z: across, up, out (its front faces yaw_fwd(yaw))
+    let ax = v3(c, 0.0, -s);
+    let az = v3(s, 0.0, c);
+    // the Courtyard's accent is blue: all its banners are blue
+    let team = match if map == MapId::Courtyard && p.team < 2 { 1 } else { p.team } {
+        0 => Some([0.78f32, 0.1, 0.09, 1.0]),
+        1 => Some([0.1, 0.2, 0.85, 1.0]),
+        _ => None,
+    };
+    for v in env::prop_mesh(p.kind) {
+        let q = v.pos * p.scale;
+        let pos = p.pos + ax * q.x + V3::UP * q.y + az * q.z;
+        let n = (ax * v.nrm.x + V3::UP * v.nrm.y + az * v.nrm.z).norm();
+        let col = match (v.cloth, team) {
+            (true, Some(t)) => t,
+            _ => [v.tint[0], v.tint[1], v.tint[2], 1.0],
+        };
+        mb.vert(pos, n, v.uv, col, [v.layer as f32, 0.0, 1.0, 0.3]);
+    }
+}
+
+/// Ivy down a wall: a wandering stem with leaves on both sides (CC0 Quaternius leaf texture).
+fn vine_into(mb: &mut MB, v: &Vine) {
+    let mut rng = Rng((v.seed as u64).wrapping_mul(2_654_435_761).wrapping_add(97) | 1);
+    let along = v3(v.out.z, 0.0, -v.out.x);
+    // leaf pictures in the atlas (u0, v0, u1, v1): two heart leaves and a long one
+    let rects = [[0.781f32, 0.078, 0.961, 0.268], [0.773, 0.312, 0.965, 0.566], [0.055, 0.049, 0.186, 0.43]];
+    let steps = ((v.len / 0.16).ceil() as usize).max(3);
+    let phase = rng.range(0.0, 6.28);
+    let drift = rng.range(-0.25, 0.25);
+    let stem_col = lin([58, 74, 34]);
+    let point = |t: f32| -> V3 { v.top + v.out * (0.035 + 0.02 * (t * 9.0 + phase).sin().abs()) - V3::UP * (v.len * t) + along * ((t * 6.5 + phase).sin() * 0.1 + drift * t) };
+    let leaf = |mb: &mut MB, rng: &mut Rng, c: V3, size: f32| {
+        let r = rects[(rng.f() * 3.0) as usize % 3];
+        let ang = rng.range(-0.9, 0.9);
+        // the leaf hangs downward, turned a little, tipped out from the wall
+        let down = (V3::UP * -ang.cos() + along * ang.sin()).norm();
+        let tip = (down + v.out * rng.range(0.15, 0.55)).norm();
+        let side = tip.cross(v.out).norm();
+        let n = side.cross(tip).norm();
+        let w = size * 0.5;
+        let h = size;
+        let p = [c - side * w, c + side * w, c + side * w + tip * h, c - side * w + tip * h];
+        let shade = rng.range(0.78, 1.08);
+        mb.quad(p, n, [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]], [shade, shade, shade, 1.0], [env::L_LEAVES as f32, 0.0, 1.0, 0.2]);
+    };
+    for k in 0..steps {
+        let t0 = k as f32 / steps as f32;
+        let t1 = (k + 1) as f32 / steps as f32;
+        mb.tube(point(t0), point(t1), 0.013, 0.011, along, 1.0, stem_col, -1.0, 0.1);
+        for _ in 0..2 {
+            let c = point(t0 + rng.range(0.0, 1.0) / steps as f32) + along * rng.range(-0.07, 0.07);
+            let size = rng.range(0.13, 0.21) * (1.0 - 0.35 * t0);
+            leaf(mb, &mut rng, c, size);
+        }
+    }
+    // a thicker clump along the top
+    for _ in 0..7 {
+        let c = v.top + v.out * 0.05 + along * rng.range(-0.45, 0.45) - V3::UP * rng.range(0.0, 0.25);
+        let size = rng.range(0.16, 0.24);
+        leaf(mb, &mut rng, c, size);
+    }
+}
+
+/// A stable random number for a block (where its texture starts, how it's turned).
+fn block_hash(b: &crate::math::Aabb) -> u32 {
+    let f = |v: f32| (v * 100.0).round() as i32 as u32;
+    let mut h = f(b.min.x).wrapping_mul(73_856_093) ^ f(b.min.y).wrapping_mul(19_349_663) ^ f(b.min.z).wrapping_mul(83_492_791) ^ f(b.max.x).wrapping_mul(2_654_435_761) ^ f(b.max.z).wrapping_mul(40_503);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1_e995);
+    h ^ (h >> 15)
+}
+
+/// How a box is drawn.
+struct BoxLook {
+    layer: f32,
+    tint: [f32; 4],
+    tile: f32,
+    shine: f32,
+    /// Edge bevel (0 for none).
+    bevel: f32,
+    uv_off: [f32; 2],
+    /// Quarter turns of the texture on its top (floors and tops don't all line up).
+    turn: u32,
+    top_only: bool,
+}
+
+impl BoxLook {
+    fn new(world: &World, s: env::Surface, b: &crate::math::Aabb, bevel: f32) -> BoxLook {
+        let h = block_hash(b);
+        let tile = env::layer_tile(s.layer);
+        BoxLook {
+            layer: s.layer as f32,
+            tint: lin(s.tint),
+            tile,
+            shine: s.shine,
+            bevel,
+            uv_off: [(h & 1023) as f32 / 1023.0, ((h >> 10) & 1023) as f32 / 1023.0],
+            turn: (h >> 20) & 3,
+            top_only: false,
+        }
+        .map_ok(world)
+    }
+    fn map_ok(self, _world: &World) -> BoxLook {
+        self
+    }
+    fn darker(mut self, k: f32) -> BoxLook {
+        for c in 0..3 {
+            self.tint[c] *= k;
+        }
+        self
+    }
+}
+
+/// Texture coordinates on a face: world-space, the same way up on every side as seen from
+/// outside (no mirrored faces), offset per block; tops turned per block.
+fn face_uv(n: V3, p: V3, lk: &BoxLook) -> [f32; 2] {
+    let (u, v) = if n.y > 0.5 {
+        (p.x, p.z)
+    } else if n.y < -0.5 {
+        (p.x, -p.z)
+    } else {
+        // the face's right, looking at it from outside
+        let right = v3(-n.z, 0.0, n.x);
+        (p.dot(right), -p.y)
+    };
+    let (u, v) = (u / lk.tile, v / lk.tile);
+    let (u, v) = if n.y.abs() > 0.5 {
+        match lk.turn {
+            1 => (-v, u),
+            2 => (-u, -v),
+            3 => (v, -u),
+            _ => (u, v),
+        }
+    } else {
+        (u, v)
+    };
+    [u + lk.uv_off[0], v + lk.uv_off[1]]
+}
+
+/// Ambient occlusion baked per vertex: wall bases and corners a little darker.
+fn vertex_ao(world: &World, n: V3, p: V3) -> f32 {
+    let mut ao = 1.0f32;
+    if n.y.abs() < 0.5 {
+        ao = 0.62 + 0.38 * (p.y / 1.8).clamp(0.0, 1.0);
+    } else if n.y > 0.5 {
+        let q = p + v3(0.0, 0.25, 0.0);
+        for d in [v3(1.0, 0.0, 0.0), v3(-1.0, 0.0, 0.0), v3(0.0, 0.0, 1.0), v3(0.0, 0.0, -1.0)] {
+            if let Some((t, _)) = world.raycast(q, d, 1.2) {
+                ao -= 0.15 * (1.0 - t / 1.2);
+            }
+        }
+    }
+    ao.max(0.45)
+}
+
+/// A box with bevelled edges: each face shrunk by the bevel, a slanted strip along every edge
+/// and a small triangle at every corner, so blocks read as cut stone instead of flat boxes.
+fn box_into(mb: &mut MB, world: &World, b: &crate::math::Aabb, lk: &BoxLook) {
+    let lo = [b.min.x, b.min.y, b.min.z];
+    let hi = [b.max.x, b.max.y, b.max.z];
+    let size = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    let bev = lk.bevel.min(size[0].min(size[1]).min(size[2]) * 0.3).max(0.0);
+    // faces: (axis, sign)
+    let faces = [(0usize, 1.0f32), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)];
+    let drawn = |a: usize, s: f32| -> bool {
+        if lk.top_only {
+            return a == 1 && s > 0.0;
+        }
+        !(a == 1 && s < 0.0 && lo[1] <= 0.01)
+    };
+    let mk = |c: [f32; 3]| v3(c[0], c[1], c[2]);
+    let unit = |a: usize, s: f32| {
+        let mut c = [0.0f32; 3];
+        c[a] = s;
+        mk(c)
+    };
+    let plane = |a: usize, s: f32| if s > 0.0 { hi[a] } else { lo[a] };
+    let inset = |a: usize, s: f32| if s > 0.0 { hi[a] - bev } else { lo[a] + bev };
+    // the range of axis k left on a face once the bevels on its sides are taken off
+    let range = |k: usize| {
+        let a0 = if bev > 0.0 && drawn(k, -1.0) { lo[k] + bev } else { lo[k] };
+        let a1 = if bev > 0.0 && drawn(k, 1.0) { hi[k] - bev } else { hi[k] };
+        (a0, a1)
+    };
+    let vert = |mb: &mut MB, p: V3, n: V3, uvn: V3| {
+        let ao = vertex_ao(world, uvn, p);
+        mb.vert(p, n, face_uv(uvn, p, lk), lk.tint, [lk.layer, 0.0, ao, lk.shine]);
+    };
+    for &(a, s) in faces.iter() {
+        if !drawn(a, s) {
+            continue;
+        }
+        let n = unit(a, s);
+        let (ku, kv) = ((a + 1) % 3, (a + 2) % 3);
+        let (u0, u1) = range(ku);
+        let (v0, v1) = range(kv);
+        let cell = 0.8;
+        let nu = (((u1 - u0) / cell).ceil() as usize).max(1);
+        let nv = (((v1 - v0) / cell).ceil() as usize).max(1);
+        let at = |i: usize, j: usize| {
+            let mut c = [0.0f32; 3];
+            c[a] = plane(a, s);
+            c[ku] = u0 + (u1 - u0) * i as f32 / nu as f32;
+            c[kv] = v0 + (v1 - v0) * j as f32 / nv as f32;
+            mk(c)
+        };
+        for j in 0..nv {
+            for i in 0..nu {
+                let q = [at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)];
+                for k in [0, 1, 2, 0, 2, 3] {
+                    vert(mb, q[k], n, n);
+                }
+            }
+        }
+    }
+    if bev <= 0.0 {
+        return;
+    }
+    // edge strips
+    for (i, &(a, sa)) in faces.iter().enumerate() {
+        for &(c, sc) in faces.iter().skip(i + 1) {
+            if a == c || !drawn(a, sa) || !drawn(c, sc) {
+                continue;
+            }
+            let e = 3 - a - c;
+            let (e0, e1) = range(e);
+            let pa = |ev: f32| {
+                let mut p = [0.0f32; 3];
+                p[a] = plane(a, sa);
+                p[c] = inset(c, sc);
+                p[e] = ev;
+                mk(p)
+            };
+            let pc = |ev: f32| {
+                let mut p = [0.0f32; 3];
+                p[a] = inset(a, sa);
+                p[c] = plane(c, sc);
+                p[e] = ev;
+                mk(p)
+            };
+            let na = unit(a, sa);
+            let n = (na + unit(c, sc)).norm();
+            // the texture as on the side face, so its pattern wraps over the edge
+            let uvn = if a == 1 { unit(c, sc) } else { na };
+            let q = [pa(e0), pa(e1), pc(e1), pc(e0)];
+            for k in [0, 1, 2, 0, 2, 3] {
+                vert(mb, q[k], n, uvn);
+            }
+        }
+    }
+    // corners
+    for sx in [-1.0f32, 1.0] {
+        for sy in [-1.0f32, 1.0] {
+            for sz in [-1.0f32, 1.0] {
+                if !(drawn(0, sx) && drawn(1, sy) && drawn(2, sz)) {
+                    continue;
+                }
+                let p0 = v3(plane(0, sx), inset(1, sy), inset(2, sz));
+                let p1 = v3(inset(0, sx), plane(1, sy), inset(2, sz));
+                let p2 = v3(inset(0, sx), inset(1, sy), plane(2, sz));
+                let n = v3(sx, sy, sz).norm();
+                let uvn = unit(0, sx);
+                for p in [p0, p1, p2] {
+                    vert(mb, p, n, uvn);
+                }
+            }
+        }
+    }
+}
+
+/// Trim that dresses the blocks up (looks only, nothing collides with it): caps along wall tops,
+/// plinths at their feet, bases and capitals on pillars, a band round the top of platforms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Trim {
+    Cap,
+    Plinth,
+    Base,
+    Capital,
+    Band,
+}
+
+fn trims(world: &World) -> Vec<(crate::math::Aabb, Mat, Trim)> {
+    use crate::math::Aabb;
+    let mut out = Vec::new();
+    let wraps = |b: &Aabb, p: V3| world.blocks.iter().any(|o| !std::ptr::eq(&o.b, b) && o.b.contains(p) && (o.b.max.x - o.b.min.x) > (b.max.x - b.min.x) + 0.1);
+    for bl in &world.blocks {
+        let b = bl.b;
+        if matches!(bl.mat, Mat::Floor | Mat::Crate) {
+            continue;
+        }
+        let (sx, sy, sz) = (b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z);
+        if sy < 0.7 || (bl.mat == Mat::Metal && sy < 2.0) {
+            continue; // steps, slabs, braziers
+        }
+        let thin = sx.min(sz);
+        let long = sx.max(sz);
+        let grounded = b.min.y <= 0.05;
+        let grow = |o: f32, y0: f32, y1: f32| Aabb::new(v3(b.min.x - o, y0, b.min.z - o), v3(b.max.x + o, y1, b.max.z + o));
+        if sy >= 1.8 && thin <= 1.25 && long >= 1.8 {
+            // a wall: a cap flush with its top, a plinth at its foot
+            out.push((grow(0.06, b.max.y - 0.16, b.max.y), bl.mat, Trim::Cap));
+            if grounded {
+                out.push((grow(0.035, b.min.y, b.min.y + 0.28), bl.mat, Trim::Plinth));
+            }
+        } else if sy >= 3.0 && long <= 2.2 && thin > 0.3 {
+            // a pillar or pilaster: base and capital (unless it already stands on / carries one)
+            let c = v3((b.min.x + b.max.x) * 0.5, 0.0, (b.min.z + b.max.z) * 0.5);
+            if grounded && !wraps(&b, v3(b.max.x + 0.15, b.min.y + 0.1, c.z)) {
+                out.push((grow(0.12, b.min.y, b.min.y + 0.38), bl.mat, Trim::Base));
+            }
+            if !wraps(&b, v3(b.max.x + 0.15, b.max.y - 0.1, c.z)) {
+                out.push((grow(0.12, b.max.y - 0.3, b.max.y), bl.mat, Trim::Capital));
+                out.push((grow(0.05, b.max.y - 0.44, b.max.y - 0.38), bl.mat, Trim::Capital));
+            }
+        } else if sy >= 0.9 && thin > 1.25 {
+            // a platform or tower: a band round its top edge, a plinth at its foot
+            out.push((grow(0.03, b.max.y - 0.16, b.max.y), bl.mat, Trim::Band));
+            if grounded {
+                out.push((grow(0.03, b.min.y, b.min.y + 0.22), bl.mat, Trim::Plinth));
+            }
+        }
+    }
+    out
+}
+
+/// Which surface a piece of trim uses: Arena's wall caps and bands are dark wood, Close
+/// Quarters' are iron, the Courtyard's marble; bases, plinths and capitals are the block's own
+/// stone, a shade darker.
+fn trim_surface(map: MapId, own: Mat, t: Trim) -> (env::Surface, f32) {
+    match t {
+        Trim::Cap | Trim::Band => match map {
+            MapId::Arena => (env::surface(map, Mat::Trim), 1.0),
+            MapId::CloseQuarters => (env::surface(map, Mat::Trim), 1.0),
+            MapId::Courtyard => (env::surface(map, Mat::Stone), 1.0),
+        },
+        _ => (env::surface(map, own), 0.84),
     }
 }
 
 fn build_world(world: &World) -> Vec<Vtx> {
     let mut mb = MB::default();
-    let sun = SUN.norm();
-    let shadow = |p: V3| -> f32 {
-        if world.raycast(p, sun, 90.0).is_some() { 0.0 } else { 1.0 }
-    };
-    let all: Vec<_> = world.blocks.iter().chain(world.deco.iter()).collect();
-    for bl in all {
+    let map = world.map;
+    for bl in world.blocks.iter().chain(world.deco.iter()) {
         let b = bl.b;
-        let (layer, tile, shine) = mat_params(bl.mat);
-        let sx = b.max.x - b.min.x;
         let sy = b.max.y - b.min.y;
-        let sz = b.max.z - b.min.z;
-        let defs: [(V3, V3, V3, V3); 6] = [
-            (v3(0.0, 1.0, 0.0), v3(b.min.x, b.max.y, b.min.z), v3(sx, 0.0, 0.0), v3(0.0, 0.0, sz)),
-            (v3(0.0, -1.0, 0.0), v3(b.min.x, b.min.y, b.min.z), v3(0.0, 0.0, sz), v3(sx, 0.0, 0.0)),
-            (v3(1.0, 0.0, 0.0), v3(b.max.x, b.min.y, b.min.z), v3(0.0, sy, 0.0), v3(0.0, 0.0, sz)),
-            (v3(-1.0, 0.0, 0.0), v3(b.min.x, b.min.y, b.min.z), v3(0.0, 0.0, sz), v3(0.0, sy, 0.0)),
-            (v3(0.0, 0.0, 1.0), v3(b.min.x, b.min.y, b.max.z), v3(sx, 0.0, 0.0), v3(0.0, sy, 0.0)),
-            (v3(0.0, 0.0, -1.0), v3(b.min.x, b.min.y, b.min.z), v3(0.0, sy, 0.0), v3(sx, 0.0, 0.0)),
-        ];
-        for (n, o, e1, e2) in defs.iter() {
-            if n.y < -0.5 && b.min.y <= 0.01 {
-                continue;
-            }
-            if bl.mat == Mat::Floor && n.y < 0.5 {
-                continue;
-            }
-            let cell = if bl.mat == Mat::Floor { 0.75 } else { 0.8 };
-            let nu = ((e1.len() / cell).ceil() as usize).max(1);
-            let nv = ((e2.len() / cell).ceil() as usize).max(1);
-            // vertex grid with baked light
-            let mut grid = vec![(V3::ZERO, 0.0f32, 1.0f32); (nu + 1) * (nv + 1)];
-            for j in 0..=nv {
-                for i in 0..=nu {
-                    let p = *o + *e1 * (i as f32 / nu as f32) + *e2 * (j as f32 / nv as f32);
-                    let sv = if n.dot(sun) > 0.0 { shadow(p + *n * 0.04) } else { 0.0 };
-                    let mut ao = 1.0f32;
-                    if n.y.abs() < 0.5 {
-                        ao = 0.55 + 0.45 * (p.y / 2.2).clamp(0.0, 1.0);
-                    } else if n.y > 0.5 {
-                        let q = p + v3(0.0, 0.25, 0.0);
-                        for d in [v3(1.0, 0.0, 0.0), v3(-1.0, 0.0, 0.0), v3(0.0, 0.0, 1.0), v3(0.0, 0.0, -1.0)] {
-                            if let Some((t, _)) = world.raycast(q, d, 1.2) {
-                                ao -= 0.16 * (1.0 - t / 1.2);
-                            }
-                        }
-                    }
-                    grid[j * (nu + 1) + i] = (p, sv, ao.max(0.4));
-                }
-            }
-            let uvf = |p: V3| -> [f32; 2] {
-                if n.y.abs() > 0.5 {
-                    [p.x / tile, p.z / tile]
-                } else if n.x.abs() > 0.5 {
-                    [p.z / tile, -p.y / tile]
-                } else {
-                    [p.x / tile, -p.y / tile]
-                }
-            };
-            let mut tint = [1.0f32, 1.0, 1.0];
-            if bl.mat == Mat::Metal && sy < 2.0 {
-                tint = [0.35, 0.33, 0.32]; // braziers: dark iron
-            }
-            for j in 0..nv {
-                for i in 0..nu {
-                    let idx = [j * (nu + 1) + i, j * (nu + 1) + i + 1, (j + 1) * (nu + 1) + i + 1, (j + 1) * (nu + 1) + i];
-                    for k in [0, 1, 2, 0, 2, 3] {
-                        let (p, sv, ao) = grid[idx[k]];
-                        let col = [tint[0] * ao, tint[1] * ao, tint[2] * ao, 1.0];
-                        mb.vert(p, *n, uvf(p), col, [layer, 0.0, sv, shine]);
-                    }
-                }
-            }
-        }
+        let surf = if bl.mat == Mat::Metal && sy < 2.0 { env::IRON } else { env::surface(map, bl.mat) };
+        let bevel = match bl.mat {
+            Mat::Floor => 0.0,
+            Mat::Trim | Mat::Crate => 0.03,
+            _ => 0.05,
+        };
+        let mut lk = BoxLook::new(world, surf, &b, bevel);
+        lk.top_only = bl.mat == Mat::Floor;
+        box_into(&mut mb, world, &b, &lk);
     }
-    // banners
-    for (c, n, team) in &world.banners {
-        let right = v3(n.z, 0.0, -n.x);
-        let w = 0.75;
-        let hgt = 1.7;
-        let col = if *team == 0 { lin([150, 34, 38]) } else { lin([46, 78, 160]) };
-        let p = *c + *n * 0.03;
-        mb.quad(
-            [p - right * w + v3(0.0, hgt, 0.0), p + right * w + v3(0.0, hgt, 0.0), p + right * w - v3(0.0, hgt, 0.0), p - right * w - v3(0.0, hgt, 0.0)],
-            *n,
-            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
-            col,
-            [6.0, 2.0, 1.0, 0.0],
-        );
-        let rod = M3 { x: right, y: V3::UP, z: *n };
-        mb.obox(p + v3(0.0, hgt + 0.05, 0.05), &rod, v3(w + 0.15, 0.05, 0.05), lin([220, 220, 220]), 5.0, 0.8);
+    for (b, own, t) in trims(world) {
+        let (surf, shade) = trim_surface(map, own, t);
+        let lk = BoxLook::new(world, surf, &b, 0.025).darker(shade);
+        box_into(&mut mb, world, &b, &lk);
     }
-    // distant mountains
-    let mut rng = Rng(424242);
-    let count = 90;
-    let mut hs: Vec<f32> = (0..count).map(|_| rng.range(8.0, 30.0)).collect();
-    for _ in 0..2 {
-        let c = hs.clone();
-        for k in 0..count {
-            hs[k] = (c[(k + count - 1) % count] + c[k] * 2.0 + c[(k + 1) % count]) * 0.25;
-        }
+    // set dressing: banners, barrels, weapon stands, rubble, torches (CC0 Quaternius)
+    for p in &world.props {
+        prop_into(&mut mb, p, map);
     }
-    for k in 0..count {
-        let a0 = k as f32 / count as f32 * PI * 2.0;
-        let a1 = (k + 1) as f32 / count as f32 * PI * 2.0;
-        let am = (a0 + a1) * 0.5;
-        let r = 210.0;
-        let h = hs[k] + rng.range(0.0, 6.0);
-        let col = lin([96, 84, 118]);
-        let ex = [-1.0, 2.0, 1.0, 0.0];
-        mb.vert(v3(a0.sin() * r, -2.0, a0.cos() * r), V3::UP, [0.0, 0.0], col, ex);
-        mb.vert(v3(am.sin() * r, h, am.cos() * r), V3::UP, [0.0, 0.0], col, ex);
-        mb.vert(v3(a1.sin() * r, -2.0, a1.cos() * r), V3::UP, [0.0, 0.0], col, ex);
+    for v in &world.vines {
+        vine_into(&mut mb, v);
     }
     mb.v
 }
-
 // ------------------------------------------------------------------ characters
 
 struct Look {
@@ -1108,15 +1709,37 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
             add_mb.billboard(cam, p.hand + p.weapon.z * (len * 0.6), 0.55 * sc * (0.8 + 0.2 * (time * 18.0).sin()), lina([255, 220, 150], 0.35));
         }
     }
-    // swing trail from recent blade positions
-    if w.is_melee() && (f.slashing() || f.fin > 0) && f.alive {
-        let len = match w {
-            Weapon::Dagger => 0.2,
-            Weapon::Greatsword => 0.78,
-            _ => 0.56,
+    // swing trail: drawn along the blade's arc only while it's really cutting (from the end of
+    // the wind-up, brightest at contact, thinning out through the follow-through)
+    let blade_len = match w {
+        Weapon::Dagger => 0.2,
+        Weapon::Greatsword => 0.78,
+        _ => 0.56,
+    };
+    let tip = 0.16 + blade_len * 2.0 + 0.05;
+    if w.is_melee() && f.alive {
+        // seconds to the game's hit (negative after it)
+        let until = if f.fin > 0 {
+            let s = finisher(f.fin);
+            Some((s.hit - f.fin_t / s.dur) * s.dur)
+        } else if f.slashing() {
+            Some(f.slash_t - w.slash_dur() * 0.72)
+        } else {
+            None
         };
-        let tip = 0.16 + len * 2.0 + 0.05;
-        st.trail.push_back((p.hand + p.weapon.z * (tip * 0.3), p.hand + p.weapon.z * tip, time));
+        if let Some(u) = until {
+            let k = if u > 0.0 { 1.0 - (u / 0.07).min(1.0) } else { 1.0 - (-u / 0.3).min(1.0) * 0.85 };
+            if k > 0.02 {
+                st.trail.push_back((p.hand + p.weapon.z * (tip * 0.3), p.hand + p.weapon.z * tip, time, k));
+            }
+            // the tell: a glint runs up the blade through a heavy's or a launcher's wind-up
+            let big = f.slash_idx == SLASH_HEAVY || f.slash_idx == 3 || w == Weapon::Greatsword || f.fin > 0;
+            if big && u > 0.02 {
+                let g = (u / 0.2).min(1.0);
+                let at = p.hand + p.weapon.z * (tip * (0.35 + 0.65 * (1.0 - g)));
+                add_mb.billboard(cam, at, 0.22 * sc, lina([255, 245, 215], 0.9 * g.sqrt()));
+            }
+        }
     }
     // the trail lingers a moment after the swing, then fades
     while st.trail.front().map_or(false, |e| time - e.2 > 0.2 || time < e.2) {
@@ -1125,10 +1748,10 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     let n = st.trail.len();
     let heavy = f.slash_idx >= 2 || w == Weapon::Greatsword;
     for k in 1..n {
-        let (b0, b1, tb) = st.trail[k - 1];
-        let (a0, a1, ta) = st.trail[k];
+        let (b0, b1, tb, kb) = st.trail[k - 1];
+        let (a0, a1, ta, ka) = st.trail[k];
         let age = |t0: f32| (1.0 - (time - t0) / 0.2).clamp(0.0, 1.0);
-        let al = 0.55 * age(ta).min(age(tb)) * (0.3 + 0.7 * k as f32 / n as f32);
+        let al = 0.7 * age(ta).min(age(tb)) * (0.3 + 0.7 * k as f32 / n as f32) * ka.min(kb);
         let c = if heavy { lina([255, 170, 80], al) } else { lina([150, 200, 255], al) };
         let nrm = (b1 - b0).cross(a0 - b0).norm();
         add_mb.quad([b0, b1, a1, a0], nrm, [[0.5, 0.5]; 4], c, [-1.0, 2.0, 1.0, 0.0]);
@@ -1213,33 +1836,156 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
     }
 }
 
-fn shadow_disc(mb: &mut MB, world: &World, pos: V3) {
-    let gy = world.ground_below(pos + v3(0.0, 0.1, 0.0));
-    let hgt = (pos.y - gy).max(0.0);
-    let rad = (0.6 - hgt * 0.05).max(0.25);
-    let a = (0.55 - hgt * 0.06).clamp(0.12, 0.55);
-    let c = v3(pos.x, gy + 0.025, pos.z);
-    let seg = 16;
-    let ex = [-1.0, 2.0, 1.0, 0.0];
-    for k in 0..seg {
-        let a0 = k as f32 / seg as f32 * 2.0 * PI;
-        let a1 = (k + 1) as f32 / seg as f32 * 2.0 * PI;
-        let p0 = c + v3(a0.cos() * rad, 0.0, a0.sin() * rad);
-        let p1 = c + v3(a1.cos() * rad, 0.0, a1.sin() * rad);
-        mb.vert(c, V3::UP, [0.5, 0.5], [0.0, 0.0, 0.0, a], ex);
-        mb.vert(p0, V3::UP, [0.5, 0.5], [0.0, 0.0, 0.0, 0.0], ex);
-        mb.vert(p1, V3::UP, [0.5, 0.5], [0.0, 0.0, 0.0, 0.0], ex);
-    }
-}
-
 // ------------------------------------------------------------------ GPU state
 
 struct Target {
     size: [u32; 2],
     multisampled: bool,
+    /// The scene in high dynamic range (alpha: how far away each pixel is).
     msaa_view: wgpu::TextureView,
     resolve_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    /// Ambient occlusion (half size), bloom (two quarter-size buffers), light shafts (quarter).
+    ao_view: wgpu::TextureView,
+    bloom_a: wgpu::TextureView,
+    bloom_b: wgpu::TextureView,
+    rays_view: wgpu::TextureView,
+    /// The finished picture the UI shows.
+    out_view: wgpu::TextureView,
+    bg_ao: wgpu::BindGroup,
+    bg_bright: wgpu::BindGroup,
+    bg_blur_h: wgpu::BindGroup,
+    bg_blur_v: wgpu::BindGroup,
+    bg_rays: wgpu::BindGroup,
+    bg_comp: wgpu::BindGroup,
+}
+
+/// The post-processing passes.
+struct Post {
+    layout: wgpu::BindGroupLayout,
+    ubuf: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    ao: wgpu::RenderPipeline,
+    bright: wgpu::RenderPipeline,
+    blur_h: wgpu::RenderPipeline,
+    blur_v: wgpu::RenderPipeline,
+    rays: wgpu::RenderPipeline,
+    comp: wgpu::RenderPipeline,
+}
+
+fn post_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, entry: &str, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("duel post"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState { module, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState { module, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+impl Post {
+    fn new(device: &wgpu::Device) -> Post {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("duel post shader"), source: wgpu::ShaderSource::Wgsl(POST_SHADER.into()) });
+        let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("duel post bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                tex_entry(2),
+                tex_entry(3),
+                tex_entry(4),
+                tex_entry(5),
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("duel post layout"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("duel post uniforms"), size: std::mem::size_of::<PostU>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("duel post sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Post {
+            ao: post_pipeline(device, &pl, &module, "fs_ao", AO_FMT),
+            bright: post_pipeline(device, &pl, &module, "fs_bright", COLOR_FMT),
+            blur_h: post_pipeline(device, &pl, &module, "fs_blur_h", COLOR_FMT),
+            blur_v: post_pipeline(device, &pl, &module, "fs_blur_v", COLOR_FMT),
+            rays: post_pipeline(device, &pl, &module, "fs_rays", COLOR_FMT),
+            comp: post_pipeline(device, &pl, &module, "fs_comp", OUT_FMT),
+            layout,
+            ubuf,
+            sampler,
+        }
+    }
+
+    fn bind(&self, device: &wgpu::Device, views: [&wgpu::TextureView; 4]) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("duel post bind"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views[0]) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(views[1]) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(views[2]) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(views[3]) },
+            ],
+        })
+    }
+}
+
+/// Draw one full-screen pass into `view`.
+fn post_pass(enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, pipe: &wgpu::RenderPipeline, bind: &wgpu::BindGroup) {
+    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("duel post pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, bind, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+/// The sun's view of the level: an orthographic box over the whole map.
+fn light_matrix(world: &World, sun: V3) -> glam::Mat4 {
+    let r = world.half * 1.45 + 4.0;
+    let (near, far) = (1.0f32, 170.0f32);
+    let centre = v3(0.0, 3.0, 0.0);
+    let l = sun.norm();
+    let eye = centre + l * 80.0;
+    let f = -l;
+    let up = if l.y.abs() > 0.98 { v3(0.0, 0.0, 1.0) } else { V3::UP };
+    let rt = f.cross(up).norm();
+    let u2 = rt.cross(f);
+    // rows: across, up, depth (0 at `near`, 1 at `far`), w
+    let rows = [
+        [rt.x / r, rt.y / r, rt.z / r, -rt.dot(eye) / r],
+        [u2.x / r, u2.y / r, u2.z / r, -u2.dot(eye) / r],
+        [f.x / (far - near), f.y / (far - near), f.z / (far - near), (-f.dot(eye) - near) / (far - near)],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let mut cols = [[0.0f32; 4]; 4];
+    for c in 0..4 {
+        for k in 0..4 {
+            cols[c][k] = rows[k][c];
+        }
+    }
+    glam::Mat4::from_cols_array_2d(&cols)
 }
 
 pub struct Gpu {
@@ -1269,6 +2015,25 @@ pub struct Gpu {
     pub quality: Quality,
     /// Dynamic resolution: the render size is multiplied by this (see DynRes).
     pub dyn_scale: f32,
+    /// Graphics effects in use (from Graphics settings).
+    pub fx: Fx,
+    bgl: wgpu::BindGroupLayout,
+    tex_view: wgpu::TextureView,
+    ntex_view: wgpu::TextureView,
+    ctex_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    sky_view: wgpu::TextureView,
+    sky_sampler: wgpu::Sampler,
+    /// Which map's sky is loaded.
+    sky_map: Option<MapId>,
+    sky_lods: f32,
+    shadow_view: wgpu::TextureView,
+    shadow_size: u32,
+    shadow_sampler: wgpu::Sampler,
+    shadow_bind: wgpu::BindGroup,
+    pipe_shadow: wgpu::RenderPipeline,
+    pipe_skin_shadow: wgpu::RenderPipeline,
+    post: Post,
 }
 
 struct Skin {
@@ -1373,17 +2138,20 @@ pub struct Quality {
     pub fx: f32,
     /// Shell casings and other small extras.
     pub extras: bool,
+    /// The effects this preset starts with (each can be switched in Graphics settings).
+    pub post: Fx,
 }
 
 impl Quality {
     pub const PRESETS: [(&'static str, Quality); 5] = [
-        ("Low", Quality { msaa: 1, scale: 0.6, fx: 0.35, extras: false }),
-        ("Medium", Quality { msaa: 1, scale: 0.85, fx: 0.7, extras: true }),
-        ("High", Quality { msaa: 4, scale: 1.0, fx: 1.0, extras: true }),
-        ("Ultra", Quality { msaa: 4, scale: 1.4, fx: 1.0, extras: true }),
+        ("Low", Quality { msaa: 1, scale: 0.6, fx: 0.35, extras: false, post: Fx { ssao: false, rays: false, soft_shadows: false, ..Fx::CHEAP } }),
+        ("Medium", Quality { msaa: 1, scale: 0.85, fx: 0.7, extras: true, post: Fx { ssao: false, ..Fx::ALL } }),
+        ("High", Quality { msaa: 4, scale: 1.0, fx: 1.0, extras: true, post: Fx::ALL }),
+        ("Ultra", Quality { msaa: 4, scale: 1.4, fx: 1.0, extras: true, post: Fx { shadow_res: 4096, ..Fx::ALL } }),
         // tuned for the Steam Deck's 1280x800 screen and GPU: no edge smoothing (its pixels are
-        // small), a slightly lower resolution and fewer particles, so 60 fps holds in a full lobby
-        ("Steam Deck", Quality { msaa: 1, scale: 0.9, fx: 0.6, extras: false }),
+        // small), a slightly lower resolution, fewer particles and only the cheap effects (hard
+        // 1024 shadows, bloom, grading, vignette, sharpen), so 60 fps holds in a full lobby
+        ("Steam Deck", Quality { msaa: 1, scale: 0.9, fx: 0.6, extras: false, post: Fx::CHEAP }),
     ];
 
     /// The preset the Steam Deck starts with.
@@ -1448,10 +2216,12 @@ impl DynRes {
 
 /// Every pipeline for one sample count: opaque, alpha, additive, sky, skinned.
 fn make_pipelines(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, samples: u32) -> [wgpu::RenderPipeline; 5] {
-    let alpha = wgpu::BlendState::ALPHA_BLENDING;
+    // see-through things blend their colour but leave the stored distance alone
+    let keep = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+    let alpha = wgpu::BlendState { color: wgpu::BlendState::ALPHA_BLENDING.color, alpha: keep };
     let add = wgpu::BlendState {
         color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+        alpha: keep,
     };
     [
         make_pipeline(device, layout, module, None, true, false, samples),
@@ -1486,7 +2256,7 @@ fn make_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &
         multisample: wgpu::MultisampleState { count: samples, mask: !0, alpha_to_coverage_enabled: false },
         fragment: Some(wgpu::FragmentState {
             module,
-            entry_point: Some(if sky { "fs_sky" } else { "fs" }),
+            entry_point: Some(if sky { "fs_sky" } else if blend.is_some() { "fs_blend" } else { "fs" }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState { format: COLOR_FMT, blend, write_mask: wgpu::ColorWrites::ALL })],
         }),
@@ -1495,62 +2265,134 @@ fn make_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &
     })
 }
 
+/// Depth-only pipelines drawing the level and the fighters from the sun.
+fn make_shadow_pipelines(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    let depth = wgpu::DepthStencilState {
+        format: DEPTH_FMT,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::Less),
+        stencil: Default::default(),
+        bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.5, clamp: 0.0 },
+    };
+    let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x4];
+    let vbl = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vtx>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs };
+    let sattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 4 => Uint32, 5 => Float32x2];
+    let sbl = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SkinVtx>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &sattrs };
+    let mk = |entry: &str, vb: wgpu::VertexBufferLayout| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("duel shadow"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState { module, entry_point: Some(entry), compilation_options: Default::default(), buffers: &[Some(vb)] },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(depth.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    (mk("vs_shadow", vbl), mk("vs_skin_shadow", sbl))
+}
+
+fn make_shadow_map(device: &wgpu::Device, size: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("duel shadow map"),
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FMT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
+/// A map's sky picture with its mip levels (half floats).
+fn make_sky(rs: &RenderState, map: MapId) -> (wgpu::TextureView, f32) {
+    let s = env::sky(map);
+    let tex = rs.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("duel sky"),
+        size: wgpu::Extent3d { width: s.w, height: s.h, depth_or_array_layers: 1 },
+        mip_level_count: s.mips.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (mip, data) in s.mips.iter().enumerate() {
+        let (w, h) = ((s.w >> mip).max(1), (s.h >> mip).max(1));
+        rs.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(data),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8 * w), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+    (tex.create_view(&Default::default()), (s.mips.len() as f32 - 1.0).max(0.0))
+}
+
+/// An RGBA8 texture array with mips, filled with `layers` ([layer][mip] bytes).
+fn upload_array(rs: &RenderState, label: &str, size: u32, format: wgpu::TextureFormat, layers: &[Vec<Vec<u8>>]) -> wgpu::TextureView {
+    let mips = layers.first().map_or(1, |l| l.len() as u32);
+    let tex = rs.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: layers.len().max(1) as u32 },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (layer, levels) in layers.iter().enumerate() {
+        for (mip, bytes) in levels.iter().enumerate() {
+            let s = (size >> mip).max(1);
+            rs.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip as u32, origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 }, aspect: wgpu::TextureAspect::All },
+                bytes,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * s), rows_per_image: Some(s) },
+                wgpu::Extent3d { width: s, height: s, depth_or_array_layers: 1 },
+            );
+        }
+    }
+    tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
+}
+
 impl Gpu {
+    /// The main bind group: uniforms, materials, fighters' textures, the sky and the shadow map.
+    fn make_bind(&self, device: &wgpu::Device) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("duel bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.tex_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: self.inst_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.ctex_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.ntex_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.sky_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sky_sampler) },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self.shadow_view) },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&self.shadow_sampler) },
+            ],
+        })
+    }
+
     pub fn new(rs: &RenderState, world: &World) -> Gpu {
         let device = &rs.device;
-        let queue = &rs.queue;
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("duel shader"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("duel shader"), source: wgpu::ShaderSource::Wgsl(format!("{U_DECL}{SHADER}").into()) });
 
-        // textures
-        let mips = (TEX as f32).log2() as u32 + 1;
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("duel textures"),
-            size: wgpu::Extent3d { width: TEX, height: TEX, depth_or_array_layers: LAYERS },
-            mip_level_count: mips,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let data = build_textures();
-        for (layer, levels) in data.iter().enumerate() {
-            for (mip, bytes) in levels.iter().enumerate() {
-                let s = (TEX >> mip).max(1);
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip as u32, origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 }, aspect: wgpu::TextureAspect::All },
-                    bytes,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * s), rows_per_image: Some(s) },
-                    wgpu::Extent3d { width: s, height: s, depth_or_array_layers: 1 },
-                );
-            }
-        }
-        let tex_view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        // the level's materials (colour, and normal + roughness + metalness)
+        let (cols, surfs) = build_world_layers();
+        let tex_view = upload_array(rs, "duel materials", env::TEX, wgpu::TextureFormat::Rgba8UnormSrgb, &cols);
+        let ntex_view = upload_array(rs, "duel surfaces", env::TEX, wgpu::TextureFormat::Rgba8Unorm, &surfs);
         // the fighters' textures
         let cdata = build_char_textures();
-        let cmips = cdata.first().map_or(1, |l| l.len() as u32);
-        let ctex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("fighter textures"),
-            size: wgpu::Extent3d { width: CHAR_TEX, height: CHAR_TEX, depth_or_array_layers: cdata.len().max(1) as u32 },
-            mip_level_count: cmips,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        for (layer, levels) in cdata.iter().enumerate() {
-            for (mip, bytes) in levels.iter().enumerate() {
-                let s = (CHAR_TEX >> mip).max(1);
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo { texture: &ctex, mip_level: mip as u32, origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 }, aspect: wgpu::TextureAspect::All },
-                    bytes,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * s), rows_per_image: Some(s) },
-                    wgpu::Extent3d { width: s, height: s, depth_or_array_layers: 1 },
-                );
-            }
-        }
-        let ctex_view = ctex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let ctex_view = upload_array(rs, "fighter textures", CHAR_TEX, wgpu::TextureFormat::Rgba8UnormSrgb, &cdata);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("duel sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -1559,48 +2401,59 @@ impl Gpu {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: 8,
+            // 16x anisotropic filtering: floors stay crisp at grazing angles, no shimmer
+            anisotropy_clamp: 16,
             ..Default::default()
         });
+        let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("duel sky sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("duel shadow sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let (sky_view, sky_lods) = make_sky(rs, world.map);
+        let shadow_size = Fx::ALL.shadow_res;
+        let shadow_view = make_shadow_map(device, shadow_size);
         let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("duel uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let both = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+        let tex_entry = |binding: u32, dim: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: dim, multisampled: false },
+            count: None,
+        };
+        let ubuf_entry = wgpu::BindGroupLayoutEntry { binding: 0, visibility: both, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let inst_entry = wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None };
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("duel bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
-                    count: None,
-                },
+                ubuf_entry,
+                tex_entry(1, wgpu::TextureViewDimension::D2Array),
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                inst_entry,
+                tex_entry(4, wgpu::TextureViewDimension::D2Array),
+                tex_entry(5, wgpu::TextureViewDimension::D2Array),
+                tex_entry(6, wgpu::TextureViewDimension::D2),
+                wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 8, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 9, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
             ],
         });
         let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1609,25 +2462,18 @@ impl Gpu {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("duel bind"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&ctex_view) },
-            ],
-        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("duel layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
-        let alpha = wgpu::BlendState::ALPHA_BLENDING;
-        let add = wgpu::BlendState {
-            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-        };
-        let _ = (alpha, add);
         let [pipe_opaque, pipe_alpha, pipe_add, pipe_sky, pipe_skin] = make_pipelines(device, &layout, &module, MSAA);
+        // the sun's view: its own small layout (uniforms and the fighters' joints)
+        let sbgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("duel shadow bgl"), entries: &[ubuf_entry, inst_entry] });
+        let sh_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("duel shadow shader"), source: wgpu::ShaderSource::Wgsl(format!("{U_DECL}{SHADOW_SHADER}").into()) });
+        let sh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("duel shadow layout"), bind_group_layouts: &[Some(&sbgl)], immediate_size: 0 });
+        let (pipe_shadow, pipe_skin_shadow) = make_shadow_pipelines(device, &sh_layout, &sh_module);
+        let shadow_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("duel shadow bind"),
+            layout: &sbgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() }],
+        });
         // the animated character (CC0 Quaternius mannequin)
         let skin = match Rig::load() {
             Ok(rig) => {
@@ -1662,15 +2508,22 @@ impl Gpu {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&static_buf, 0, bytemuck::cast_slice(&verts));
+        rs.queue.write_buffer(&static_buf, 0, bytemuck::cast_slice(&verts));
         let dyn_cap = 4 << 20;
         let dyn_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("duel dynamic"), size: dyn_cap, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        Gpu {
+        let post = Post::new(device);
+        // a placeholder until the real bind group is made just below
+        let placeholder = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("duel placeholder"),
+            layout: &sbgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() }],
+        });
+        let mut g = Gpu {
             pipe_opaque,
             pipe_alpha,
             pipe_add,
             pipe_sky,
-            bind,
+            bind: placeholder,
             ubuf,
             static_buf,
             static_count: verts.len() as u32,
@@ -1689,9 +2542,27 @@ impl Gpu {
             samples: MSAA,
             quality: Quality::PRESETS[2].1,
             dyn_scale: 1.0,
-        }
+            fx: Fx::ALL,
+            bgl,
+            tex_view,
+            ntex_view,
+            ctex_view,
+            sampler,
+            sky_view,
+            sky_sampler,
+            sky_map: Some(world.map),
+            sky_lods,
+            shadow_view,
+            shadow_size,
+            shadow_sampler,
+            shadow_bind,
+            pipe_shadow,
+            pipe_skin_shadow,
+            post,
+        };
+        g.bind = g.make_bind(device);
+        g
     }
-
     /// Switch the graphics preset; edge smoothing changes rebuild the pipelines.
     pub fn set_quality(&mut self, rs: &RenderState, q: Quality) {
         self.quality = q;
@@ -1714,10 +2585,10 @@ impl Gpu {
         }
         let samples = self.samples;
         let device = &rs.device;
-        let mk = |samples: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
+        let mk = |sz: [u32; 2], samples: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("duel target"),
-                size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+                size: wgpu::Extent3d { width: sz[0].max(1), height: sz[1].max(1), depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: samples,
                 dimension: wgpu::TextureDimension::D2,
@@ -1726,25 +2597,46 @@ impl Gpu {
                 view_formats: &[],
             })
         };
-        let resolve = mk(1, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
-        // without edge smoothing the scene is drawn straight into the texture that is shown
-        let msaa = if samples > 1 { mk(samples, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT) } else { resolve.clone() };
-        let depth = mk(samples, DEPTH_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let resolve = mk(size, 1, COLOR_FMT, rt);
+        // without edge smoothing the scene is drawn straight into the texture the effects read
+        let msaa = if samples > 1 { mk(size, samples, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT) } else { resolve.clone() };
+        let depth = mk(size, samples, DEPTH_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let half = [(size[0] / 2).max(1), (size[1] / 2).max(1)];
+        let quarter = [(size[0] / 4).max(1), (size[1] / 4).max(1)];
+        let view = |t: wgpu::Texture| t.create_view(&Default::default());
+        let resolve_view = view(resolve);
+        let ao_view = view(mk(half, 1, AO_FMT, rt));
+        let bloom_a = view(mk(quarter, 1, COLOR_FMT, rt));
+        let bloom_b = view(mk(quarter, 1, COLOR_FMT, rt));
+        let rays_view = view(mk(quarter, 1, COLOR_FMT, rt));
+        let out_view = view(mk(size, 1, OUT_FMT, rt));
+        let p = &self.post;
         let t = Target {
             size,
             multisampled: samples > 1,
-            msaa_view: msaa.create_view(&Default::default()),
-            resolve_view: resolve.create_view(&Default::default()),
-            depth_view: depth.create_view(&Default::default()),
+            msaa_view: view(msaa),
+            depth_view: view(depth),
+            bg_ao: p.bind(device, [&resolve_view, &resolve_view, &resolve_view, &resolve_view]),
+            bg_bright: p.bind(device, [&resolve_view, &resolve_view, &resolve_view, &resolve_view]),
+            bg_blur_h: p.bind(device, [&bloom_a, &bloom_a, &bloom_a, &bloom_a]),
+            bg_blur_v: p.bind(device, [&bloom_b, &bloom_b, &bloom_b, &bloom_b]),
+            bg_rays: p.bind(device, [&resolve_view, &resolve_view, &resolve_view, &resolve_view]),
+            bg_comp: p.bind(device, [&resolve_view, &ao_view, &bloom_a, &rays_view]),
+            resolve_view,
+            ao_view,
+            bloom_a,
+            bloom_b,
+            rays_view,
+            out_view,
         };
         let mut r = rs.renderer.write();
         match self.tex_id {
-            Some(id) => r.update_egui_texture_from_wgpu_texture(device, &t.resolve_view, wgpu::FilterMode::Linear, id),
-            None => self.tex_id = Some(r.register_native_texture(device, &t.resolve_view, wgpu::FilterMode::Linear)),
+            Some(id) => r.update_egui_texture_from_wgpu_texture(device, &t.out_view, wgpu::FilterMode::Linear, id),
+            None => self.tex_id = Some(r.register_native_texture(device, &t.out_view, wgpu::FilterMode::Linear)),
         }
         self.target = Some(t);
     }
-
     /// Render the scene and return the texture to show.
     pub fn render(&mut self, rs: &RenderState, g: &Game, cam: &Cam, rect: egui::Rect, ppp: f32, alpha: f32, local_override: Option<(usize, V3)>) -> Option<egui::TextureId> {
         if g.world.map != self.static_map {
@@ -1759,6 +2651,21 @@ impl Gpu {
             rs.queue.write_buffer(&self.static_buf, 0, bytemuck::cast_slice(&verts));
             self.static_count = verts.len() as u32;
             self.static_map = g.world.map;
+        }
+        // the map's sky (and its light), and the shadow map at the size the settings ask for
+        let want_shadow = self.fx.shadow_res.clamp(512, 4096);
+        if self.sky_map != Some(g.world.map) || want_shadow != self.shadow_size {
+            if self.sky_map != Some(g.world.map) {
+                let (v, lods) = make_sky(rs, g.world.map);
+                self.sky_view = v;
+                self.sky_lods = lods;
+                self.sky_map = Some(g.world.map);
+            }
+            if want_shadow != self.shadow_size {
+                self.shadow_view = make_shadow_map(&rs.device, want_shadow);
+                self.shadow_size = want_shadow;
+            }
+            self.bind = self.make_bind(&rs.device);
         }
         let sc = (self.quality.scale * self.dyn_scale.clamp(DynRes::MIN, 1.0)).clamp(0.3, 2.0);
         let w = ((rect.width() * ppp * sc).round() as u32).clamp(16, 8192);
@@ -1784,19 +2691,83 @@ impl Gpu {
                 vp[col][row] = rows[row][col];
             }
         }
-        let sun = SUN.norm();
-        let fog = lin([214, 160, 140]);
+        let sky = env::sky(g.world.map);
+        let sun = sky.sun_dir;
+        let light_vp = light_matrix(&g.world, sun);
+        let mut sh = [[0.0f32; 4]; 9];
+        for (k, c) in sky.sh.iter().enumerate() {
+            sh[k] = [c[0], c[1], c[2], 0.0];
+        }
+        // point lights: braziers and torches flicker, muzzle flashes pop; the nearest few
+        let mut lights: Vec<(V3, f32, [f32; 3])> = Vec::new();
+        let flicker = |t: f32, k: usize| 0.8 + 0.12 * (t * 11.0 + k as f32 * 1.7).sin() + 0.08 * (t * 23.3 + k as f32 * 4.1).sin();
+        for (k, b) in g.world.braziers.iter().enumerate() {
+            let f = flicker(g.time, k) * 7.0;
+            lights.push((*b + v3(0.0, 0.35, 0.0), 10.0, [1.0 * f, 0.52 * f, 0.2 * f]));
+        }
+        for (k, b) in g.world.torches.iter().enumerate() {
+            let f = flicker(g.time, k + 20) * 3.6;
+            lights.push((*b + v3(0.0, 0.15, 0.0), 7.0, [1.0 * f, 0.5 * f, 0.18 * f]));
+        }
+        for fl in &g.flashes {
+            let k = (fl.life / 0.06).clamp(0.0, 1.0) * 9.0;
+            lights.push((fl.pos, 5.0, [1.0 * k, 0.72 * k, 0.4 * k]));
+        }
+        lights.sort_by(|a, b| (a.0 - cam.pos).len().total_cmp(&(b.0 - cam.pos).len()));
+        lights.truncate(MAX_LIGHTS);
+        let mut lpos = [[0.0f32; 4]; MAX_LIGHTS];
+        let mut lcol = [[0.0f32; 4]; MAX_LIGHTS];
+        for (k, (p, r, c)) in lights.iter().enumerate() {
+            lpos[k] = [p.x, p.y, p.z, *r];
+            lcol[k] = [c[0], c[1], c[2], 0.0];
+        }
         let u = Uniforms {
             vp,
             cam: [c.x, c.y, c.z, 1.0],
             right: [cam.right.x, cam.right.y, cam.right.z, 1.0 / sx],
             up: [cam.up.x, cam.up.y, cam.up.z, 1.0 / sy],
             fwd: [cam.fwd.x, cam.fwd.y, cam.fwd.z, 0.0],
-            sun: [sun.x, sun.y, sun.z, 0.0],
-            fog: [fog[0], fog[1], fog[2], 0.8],
-            params: [g.time, 35.0, 260.0, 0.0],
+            sun: [sun.x, sun.y, sun.z, sky.sun_power],
+            sun_col: [sky.sun_col[0], sky.sun_col[1], sky.sun_col[2], 1.0],
+            fog: [sky.fog[0], sky.fog[1], sky.fog[2], sky.fog_density],
+            params: [g.time, sky.yaw, 1.0, self.sky_lods.min(7.0)],
+            light_vp: light_vp.to_cols_array_2d(),
+            shadow: [1.0 / self.shadow_size as f32, if self.fx.soft_shadows { 1.0 } else { 0.0 }, lights.len() as f32, 1.0],
+            sh,
+            lpos,
+            lcol,
         };
-        rs.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
+        // the effects after the scene
+        let sun_clip = {
+            let q = cam.pos + sun * 400.0;
+            let d = q - cam.pos;
+            let z = d.dot(cam.fwd);
+            if z > 0.0 { Some((0.5 + 0.5 * sx * d.dot(cam.right) / z, 0.5 - 0.5 * sy * d.dot(cam.up) / z)) } else { None }
+        };
+        let (sun_u, sun_v, sun_vis) = match sun_clip {
+            Some((x, y)) => {
+                let off = ((x - 0.5).abs().max((y - 0.5).abs()) - 0.5).max(0.0);
+                (x, y, (1.0 - off * 2.0).clamp(0.0, 1.0) * sun.dot(cam.fwd).clamp(0.0, 1.0))
+            }
+            None => (0.5, 0.5, 0.0),
+        };
+        let gr = sky.grade;
+        let fx = self.fx;
+        let pu = PostU {
+            size: [1.0 / w as f32, 1.0 / h as f32, w as f32, h as f32],
+            sun: [sun_u, sun_v, sun_vis, 0.0],
+            flags: [fx.ssao as u8 as f32, fx.bloom as u8 as f32, fx.rays as u8 as f32, 0.0],
+            lift: [gr.lift[0], gr.lift[1], gr.lift[2], gr.saturation],
+            gamma: [gr.gamma[0], gr.gamma[1], gr.gamma[2], gr.contrast],
+            gain: [gr.gain[0], gr.gain[1], gr.gain[2], 0.0],
+            misc: [if fx.vignette { 0.32 } else { 0.0 }, 0.14, 0.35, 0.0],
+            sun_col: [sky.sun_col[0], sky.sun_col[1], sky.sun_col[2], 0.0],
+            right: [cam.right.x, cam.right.y, cam.right.z, 1.0 / sx],
+            up: [cam.up.x, cam.up.y, cam.up.z, 1.0 / sy],
+            fwd: [cam.fwd.x, cam.fwd.y, cam.fwd.z, 0.0],
+            misc2: [fx.grading as u8 as f32, gr.exposure, 0.35, 0.0],
+        };
+        rs.queue.write_buffer(&self.post.ubuf, 0, bytemuck::bytes_of(&pu));        rs.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
 
         // ---- dynamic geometry
         let mut op = MB::default();
@@ -1818,7 +2789,7 @@ impl Gpu {
                 continue;
             }
             let posed = match (&self.skin, insts.len() < MAX_INST) {
-                (Some(sk), true) => character::animate(&sk.rig, &mut self.chars[i], f, pos, g.time, &g.tune),
+                (Some(sk), true) => character::animate_show(&sk.rig, &mut self.chars[i], f, pos, g.time, &g.tune),
                 _ => None,
             };
             match posed {
@@ -1859,7 +2830,6 @@ impl Gpu {
                 let a = 0.18 + 0.08 * (g.time * 12.0).sin();
                 ad.billboard(cam, pos + v3(0.0, 1.0, 0.0), 1.15, lina([140, 200, 255], a));
             }
-            shadow_disc(&mut al, &g.world, pos);
             // a scoped sniper's lens glints at whoever it's pointed at
             if i != g.local && f.alive && f.weapon == Weapon::Sniper && f.scope_t > 0.0 {
                 let eye = pos + v3(0.0, 1.62, 0.0);
@@ -1981,6 +2951,18 @@ impl Gpu {
             }
             ad.billboard(cam, *b + v3(0.0, 0.3, 0.0), 1.1, lina([255, 150, 60], 0.18));
         }
+        // torch flames: the same, smaller
+        for (ti, b) in g.world.torches.iter().enumerate() {
+            for k in 0..5 {
+                let ph = (g.time * 2.1 + k as f32 / 5.0 + ti as f32 * 0.41).fract();
+                let jx = (k as f32 * 12.9898 + ti as f32).sin() * 0.05;
+                let jz = (k as f32 * 78.233 + ti as f32).cos() * 0.05;
+                let p = *b + v3(jx * (1.0 - ph), ph * 0.38, jz * (1.0 - ph));
+                let col = if ph < 0.4 { [255, 205, 100] } else { [255, 125, 45] };
+                ad.billboard(cam, p, 0.13 * (1.0 - ph) + 0.03, lina(col, 0.9 * (1.0 - ph)));
+            }
+            ad.billboard(cam, *b + v3(0.0, 0.12, 0.0), 0.5, lina([255, 150, 60], 0.16));
+        }
 
         let n_op = op.v.len();
         let n_al = al.v.len();
@@ -2005,6 +2987,45 @@ impl Gpu {
         // ---- draw
         let t = self.target.as_ref()?;
         let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("duel frame") });
+        let a0 = n_op as u32;
+        let a1 = (n_op + n_al) as u32;
+        let a2 = (n_op + n_al + n_ad) as u32;
+        // 1. the sun's view: depth of everything solid, for the shadows
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("duel shadow pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.shadow_bind, &[]);
+            pass.set_pipeline(&self.pipe_shadow);
+            pass.set_vertex_buffer(0, self.static_buf.slice(..));
+            pass.draw(0..self.static_count, 0..1);
+            if a0 > 0 {
+                pass.set_vertex_buffer(0, self.dyn_buf.slice(..));
+                pass.draw(0..a0, 0..1);
+            }
+            if let (Some(sk), true) = (&self.skin, n_inst > 0) {
+                pass.set_pipeline(&self.pipe_skin_shadow);
+                for k in 0..n_inst {
+                    let (vb, ib, n) = match inst_body.get(k as usize).and_then(|&b| sk.bodies.get(b)) {
+                        Some((v, i, n)) => (v, i, *n),
+                        None => (&sk.vbuf, &sk.ibuf, sk.icount),
+                    };
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..n, 0, k..k + 1);
+                }
+            }
+        }
+        // 2. the scene, in high dynamic range
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("duel pass"),
@@ -2012,7 +3033,7 @@ impl Gpu {
                     view: &t.msaa_view,
                     depth_slice: None,
                     resolve_target: if t.multisampled { Some(&t.resolve_view) } else { None },
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: if t.multisampled { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1000.0 }), store: if t.multisampled { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_view,
@@ -2029,14 +3050,9 @@ impl Gpu {
             pass.set_pipeline(&self.pipe_opaque);
             pass.set_vertex_buffer(0, self.static_buf.slice(..));
             pass.draw(0..self.static_count, 0..1);
-            if !all.is_empty() {
+            if a0 > 0 {
                 pass.set_vertex_buffer(0, self.dyn_buf.slice(..));
-                let a0 = n_op as u32;
-                let a1 = (n_op + n_al) as u32;
-                let a2 = (n_op + n_al + n_ad) as u32;
-                if a0 > 0 {
-                    pass.draw(0..a0, 0..1);
-                }
+                pass.draw(0..a0, 0..1);
             }
             if let (Some(sk), true) = (&self.skin, n_inst > 0) {
                 pass.set_pipeline(&self.pipe_skin);
@@ -2053,9 +3069,6 @@ impl Gpu {
             }
             if !all.is_empty() {
                 pass.set_vertex_buffer(0, self.dyn_buf.slice(..));
-                let a0 = n_op as u32;
-                let a1 = (n_op + n_al) as u32;
-                let a2 = (n_op + n_al + n_ad) as u32;
                 if a1 > a0 {
                     pass.set_pipeline(&self.pipe_alpha);
                     pass.draw(a0..a1, 0..1);
@@ -2066,7 +3079,21 @@ impl Gpu {
                 }
             }
         }
-        rs.queue.submit(Some(enc.finish()));
+        // 3. the effects, then the finished picture
+        let p = &self.post;
+        if fx.ssao {
+            post_pass(&mut enc, &t.ao_view, &p.ao, &t.bg_ao);
+        }
+        if fx.bloom {
+            post_pass(&mut enc, &t.bloom_a, &p.bright, &t.bg_bright);
+            post_pass(&mut enc, &t.bloom_b, &p.blur_h, &t.bg_blur_h);
+            post_pass(&mut enc, &t.bloom_a, &p.blur_v, &t.bg_blur_v);
+        }
+        if fx.rays {
+            // (with the sun off screen the pass just clears them)
+            post_pass(&mut enc, &t.rays_view, &p.rays, &t.bg_rays);
+        }
+        post_pass(&mut enc, &t.out_view, &p.comp, &t.bg_comp);        rs.queue.submit(Some(enc.finish()));
         self.tex_id
     }
 }
@@ -2213,7 +3240,7 @@ mod final_kill_tests {
                     continue;
                 }
                 let pos = f.prev_pos.lerp(f.pos, alpha);
-                if let Some(p) = character::animate(rig, &mut self.chars[i], f, pos, g.time, &g.tune) {
+                if let Some(p) = character::animate_show(rig, &mut self.chars[i], f, pos, g.time, &g.tune) {
                     mb.v.clear();
                     coat_cloth(&mut mb, &p, &mut self.chars[i], g.time, &lk, g.tune.char_scale);
                 }

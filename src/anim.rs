@@ -1,4 +1,4 @@
-﻿//! Skinned character: loads a rigged glTF (Quaternius "Universal Animation Library", CC0),
+//! Skinned character: loads a rigged glTF (Quaternius "Universal Animation Library", CC0),
 //! samples and blends its animation clips, adds the moves the pack doesn't have (strafing,
 //! wall-runs, dashes, guard, sword combo swings, two-handed gun poses) by layering bone
 //! rotations and arm IK on the same skeleton, and produces the bone matrices for GPU skinning.
@@ -7,6 +7,9 @@ use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 
 pub static RIG_GLB: &[u8] = include_bytes!("../assets/UAL1_Standard.glb");
+/// The second library (CC0, same skeleton): the sword combo, heavy combo, block, dash-slash,
+/// knockback and shield-break reactions, hook.
+pub static MELEE_GLB: &[u8] = include_bytes!("../assets/UAL2_Standard.glb");
 
 #[derive(Clone, Copy, Debug)]
 pub struct Trs {
@@ -101,6 +104,56 @@ fn interval(times: &[f32], t: f32) -> (usize, usize, f32) {
     (i, i + 1, (t - times[i]) / span)
 }
 
+/// Animation clips of a glTF document. `map` turns its node index into ours (None: skip the
+/// channel). With `rotations_only`, bone translations are dropped (but the hips and root keep
+/// theirs), so clips from another file keep our skeleton's proportions.
+fn read_clips<'a>(doc: &'a gltf::Document, get: &(dyn Fn(gltf::Buffer<'a>) -> Option<&'a [u8]>), map: impl Fn(usize) -> Option<usize>, rotations_only: bool) -> HashMap<String, Clip> {
+    let mut clips = HashMap::new();
+    for anim in doc.animations() {
+        let mut channels = Vec::new();
+        let mut duration = 0.0f32;
+        for ch in anim.channels() {
+            let Some(node) = map(ch.target().node().index()) else { continue };
+            let r = ch.reader(get);
+            let Some(inputs) = r.read_inputs() else { continue };
+            let times: Vec<f32> = inputs.collect();
+            if let Some(&t) = times.last() {
+                duration = duration.max(t);
+            }
+            let values = match r.read_outputs() {
+                Some(gltf::animation::util::ReadOutputs::Translations(it)) => {
+                    let keep = !rotations_only || matches!(ch.target().node().name(), Some("pelvis") | Some("root"));
+                    if !keep {
+                        continue;
+                    }
+                    Values::T(it.map(Vec3::from).collect())
+                }
+                Some(gltf::animation::util::ReadOutputs::Rotations(it)) => Values::R(it.into_f32().map(|q| Quat::from_array(q).normalize()).collect()),
+                Some(gltf::animation::util::ReadOutputs::Scales(it)) => {
+                    if rotations_only {
+                        continue;
+                    }
+                    Values::S(it.map(Vec3::from).collect())
+                }
+                _ => continue,
+            };
+            // cubic-spline data has in/out tangents around each value: keep the values
+            let values = if ch.sampler().interpolation() == gltf::animation::Interpolation::CubicSpline {
+                match values {
+                    Values::T(v) => Values::T(v.chunks(3).map(|c| c[1]).collect()),
+                    Values::R(v) => Values::R(v.chunks(3).map(|c| c[1]).collect()),
+                    Values::S(v) => Values::S(v.chunks(3).map(|c| c[1]).collect()),
+                }
+            } else {
+                values
+            };
+            channels.push(Channel { node, times, values });
+        }
+        let name = anim.name().unwrap_or("").to_string();
+        clips.insert(name, Clip { duration: duration.max(0.01), channels });
+    }
+    clips
+}
 impl Rig {
     pub fn load() -> Result<Rig, String> {
         let g = gltf::Gltf::from_slice(RIG_GLB).map_err(|e| e.to_string())?;
@@ -168,37 +221,17 @@ impl Rig {
             }
         }
 
-        let mut clips = HashMap::new();
-        for anim in doc.animations() {
-            let mut channels = Vec::new();
-            let mut duration = 0.0f32;
-            for ch in anim.channels() {
-                let r = ch.reader(get);
-                let Some(inputs) = r.read_inputs() else { continue };
-                let times: Vec<f32> = inputs.collect();
-                if let Some(&t) = times.last() {
-                    duration = duration.max(t);
+        let mut clips = read_clips(doc, &get, |n| Some(n), false);
+        // the melee library's clips, on our nodes (matched by bone name)
+        if let Ok(m) = gltf::Gltf::from_slice(MELEE_GLB) {
+            if let Some(mblob) = m.blob.clone() {
+                let mget = |_b: gltf::Buffer| Some(mblob.as_slice());
+                let names: Vec<Option<String>> = m.document.nodes().map(|nd| nd.name().map(str::to_string)).collect();
+                let extra = read_clips(&m.document, &mget, |n| names.get(n).cloned().flatten().and_then(|name| node_by_name.get(&name).copied()), true);
+                for (k, c) in extra {
+                    clips.entry(k).or_insert(c);
                 }
-                let values = match r.read_outputs() {
-                    Some(gltf::animation::util::ReadOutputs::Translations(it)) => Values::T(it.map(Vec3::from).collect()),
-                    Some(gltf::animation::util::ReadOutputs::Rotations(it)) => Values::R(it.into_f32().map(|q| Quat::from_array(q).normalize()).collect()),
-                    Some(gltf::animation::util::ReadOutputs::Scales(it)) => Values::S(it.map(Vec3::from).collect()),
-                    _ => continue,
-                };
-                // cubic-spline data has in/out tangents around each value: keep the values
-                let values = if ch.sampler().interpolation() == gltf::animation::Interpolation::CubicSpline {
-                    match values {
-                        Values::T(v) => Values::T(v.chunks(3).map(|c| c[1]).collect()),
-                        Values::R(v) => Values::R(v.chunks(3).map(|c| c[1]).collect()),
-                        Values::S(v) => Values::S(v.chunks(3).map(|c| c[1]).collect()),
-                    }
-                } else {
-                    values
-                };
-                channels.push(Channel { node: ch.target().node().index(), times, values });
             }
-            let name = anim.name().unwrap_or("").to_string();
-            clips.insert(name, Clip { duration: duration.max(0.01), channels });
         }
 
         let mut rig = Rig { parent, rest, order, joints, inv_bind, node_by_name, node_names, clips, verts, indices, fix: Mat4::IDENTITY, fix_sign: Vec3::ONE };
@@ -380,6 +413,39 @@ mod rig_tests {
         for n in ["upperarm_r", "lowerarm_r", "hand_r", "Head"] {
             let p = g[rig.node(n).unwrap()].w_axis.truncate() * rig.fix_sign;
             println!("aim {n:12} ours = ({:.3}, {:.3}, {:.3})", p.x, p.y, p.z);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn print_melee_clips() {
+        let rig = Rig::load().expect("rig");
+        for name in ["Sword_Attack", "Sword_Regular_A", "Sword_Regular_A_Rec", "Sword_Regular_B", "Sword_Regular_B_Rec", "Sword_Regular_C", "Sword_Regular_Combo", "Sword_Heavy_Combo", "Sword_Block", "Sword_Dash", "Melee_Hook", "Melee_Hook_Rec", "Hit_Knockback", "Idle_Shield_Break", "Shield_OneShot", "Shield_Dash", "NinjaJump_Start", "Hit_Chest", "Hit_Head", "Punch_Cross"] {
+            let d = rig.duration(name);
+            let mut pose = Vec::new();
+            let pos_of = |pose: &Vec<Trs>, b: &str| rig.globals(pose)[rig.node(b).unwrap()].w_axis.truncate();
+            let mut prev: Option<(Vec3, Vec3, Vec3)> = None;
+            let mut speeds = Vec::new();
+            let n = (d * 60.0) as usize;
+            for k in 0..=n {
+                let tt = k as f32 / 60.0;
+                rig.sample(name, tt, false, &mut pose);
+                let h = pos_of(&pose, "hand_r");
+                let fr = pos_of(&pose, "foot_r");
+                let fl = pos_of(&pose, "foot_l");
+                if let Some((ph, pr, pl)) = prev {
+                    speeds.push((tt, (h - ph).length() * 60.0, (fr - pr).length() * 60.0, (fl - pl).length() * 60.0, h));
+                }
+                prev = Some((h, fr, fl));
+            }
+            let top = |f: &dyn Fn(&(f32, f32, f32, f32, Vec3)) -> f32| speeds.iter().fold((0.0f32, 0.0f32), |m, s| if f(s) > m.1 { (s.0, f(s)) } else { m });
+            let (th, vh) = top(&|s| s.1);
+            let (tr, vr) = top(&|s| s.2);
+            let (tl, vl) = top(&|s| s.3);
+            // hand speed curve, coarse
+            let curve: Vec<String> = speeds.iter().step_by(6).map(|s| format!("{:.0}", s.1 * 10.0)).collect();
+            let hy: Vec<String> = speeds.iter().step_by(6).map(|s| format!("{:.0}/{:.0}", s.4.y * 100.0, s.4.z * 100.0)).collect();
+            println!("{name}: {d:.2}s hand peak {th:.2}s ({vh:.1} m/s) footR {tr:.2}s ({vr:.1}) footL {tl:.2}s ({vl:.1})\n   hand speed x10 per 0.1s: {}\n   hand y/z cm: {}", curve.join(" "), hy.join(" "));
         }
     }
 }
