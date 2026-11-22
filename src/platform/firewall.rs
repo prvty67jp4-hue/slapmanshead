@@ -31,6 +31,7 @@ impl FwStatus {
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 /// PowerShell's -EncodedCommand wants the script as base64 of UTF-16LE (so paths with spaces or
 /// quotes need no escaping).
 fn encode_script(script: &str) -> String {
@@ -47,6 +48,13 @@ fn encode_script(script: &str) -> String {
     out
 }
 
+/// Is there a firewall here the game knows how to check (Windows Firewall)? Elsewhere the host
+/// screen doesn't mention one.
+pub fn applies() -> bool {
+    cfg!(windows)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
 fn exe_path() -> Option<String> {
     std::env::current_exe().ok().map(|p| p.to_string_lossy().replace('\'', "''"))
 }

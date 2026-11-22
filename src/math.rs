@@ -262,15 +262,38 @@ impl Rng {
     }
 }
 
-pub fn wrap_angle(mut a: f32) -> f32 {
+/// An angle brought into -PI..=PI. Never loops: a broken number (infinite or not a number)
+/// becomes 0, and a huge one wraps in one step (subtracting 2*PI from it in a loop would never
+/// change it, and that froze the game).
+pub fn wrap_angle(a: f32) -> f32 {
     use std::f32::consts::PI;
-    while a > PI {
-        a -= 2.0 * PI;
+    if !a.is_finite() {
+        return 0.0;
     }
-    while a < -PI {
-        a += 2.0 * PI;
+    if (-PI..=PI).contains(&a) {
+        return a;
     }
-    a
+    let w = (a as f64 + PI as f64).rem_euclid(2.0 * std::f64::consts::PI) - PI as f64;
+    (w as f32).clamp(-PI, PI)
+}
+
+#[cfg(test)]
+mod angle_tests {
+    use super::*;
+    use std::f32::consts::PI;
+
+    #[test]
+    fn wrapping_an_angle_always_ends_and_stays_in_range() {
+        for a in [0.0, 1.0, -1.0, PI, -PI, 3.5, -3.5, 7.0, -7.0, 100.0, -1e4, 1e9, -1e9, 3e38, f32::MAX, f32::MIN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let w = wrap_angle(a);
+            assert!(w.is_finite() && (-PI..=PI).contains(&w), "{a} -> {w}");
+            if a.is_finite() && a.abs() < 1e4 {
+                // still the same direction
+                assert!((w.sin() - a.sin()).abs() < 1e-3 && (w.cos() - a.cos()).abs() < 1e-3, "{a} -> {w}");
+            }
+        }
+        assert!((wrap_angle(3.5) - (3.5 - 2.0 * PI)).abs() < 1e-5);
+    }
 }
 
 pub fn approach(cur: f32, target: f32, step: f32) -> f32 {

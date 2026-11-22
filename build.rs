@@ -14,6 +14,10 @@ fn main() {
         println!("cargo:rustc-link-lib=delayimp");
         copy_next_to_exe("steam_api64.dll");
     }
+    if target.contains("linux") {
+        // Linux and the Steam Deck: look for libsteam_api.so next to the game, wherever it's put
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
 }
 
 /// OUT_DIR sits somewhere under target/<profile>/build/ (the exact depth depends on the Cargo

@@ -1,5 +1,6 @@
-# Builds Duel Rush for Windows and Mac every time you push, and puts both
-# downloads on the repo's "Releases" page under "Latest build".
+# Builds Duel Rush for Windows, Mac and Linux (which is also the native Steam Deck build)
+# every time you push, and puts the downloads on the repo's "Releases" page under
+# "Latest build".
 name: Build game
 
 on:
@@ -83,8 +84,48 @@ jobs:
           name: mac
           path: DuelRush-Mac.zip
 
+  linux:
+    # Built inside Valve's Steam Runtime 3 ("sniper") SDK, the system Steam runs Linux games in,
+    # so the same build runs natively on the Steam Deck (SteamOS) and on any Linux PC with Steam.
+    runs-on: ubuntu-latest
+    container: registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: System libraries (sound, controllers, windows)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev || true
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        env:
+          DUEL_NO_PAD: "1"
+        run: cargo test --release
+      - name: Package
+        run: |
+          mkdir -p "dist/Duel Rush"
+          cp target/release/duel_arena "dist/Duel Rush/duel_rush"
+          chmod +x "dist/Duel Rush/duel_rush"
+          # Steam library: the game looks for it next to itself ($ORIGIN, set in build.rs)
+          SO=$(find "$HOME/.cargo/registry/src" -path '*steamworks-sys*' -path '*redistributable_bin/linux64/*' -name libsteam_api.so | head -1)
+          echo "Steam library: $SO"
+          cp "$SO" "dist/Duel Rush/libsteam_api.so"
+          readelf -d "dist/Duel Rush/duel_rush" | grep -E 'RUNPATH|RPATH|steam_api'
+          tar -C dist -czf DuelRush-Linux.tar.gz "Duel Rush"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: DuelRush-Linux.tar.gz
+
   release:
-    needs: [windows, mac]
+    needs: [windows, mac, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -96,7 +137,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest DuelRush-Windows.zip DuelRush-Mac.zip \
+          gh release create latest DuelRush-Windows.zip DuelRush-Mac.zip DuelRush-Linux.tar.gz \
             --target "${{ github.sha }}" \
             --title "Latest build (#${{ github.run_number }})" \
-            --notes "Windows: unzip and run Duel Rush.exe (keep steam_api64.dll next to it) (More info -> Run anyway). Mac: unzip, right-click Duel Rush -> Open (or System Settings -> Privacy & Security -> Open Anyway). Both players need the same build to connect."
+            --notes "Windows: unzip and run Duel Rush.exe (keep steam_api64.dll next to it) (More info -> Run anyway). Mac: unzip, right-click Duel Rush -> Open (or System Settings -> Privacy & Security -> Open Anyway). Linux / Steam Deck: extract and run duel_rush (keep libsteam_api.so next to it); on a Deck, add it to Steam as a non-Steam game to play from Game Mode. Both players need the same build to connect."

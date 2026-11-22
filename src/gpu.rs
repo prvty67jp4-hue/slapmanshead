@@ -1,4 +1,4 @@
-﻿//! Hardware 3D renderer: textured, lit, depth-tested, multisampled. It draws into its own
+//! Hardware 3D renderer: textured, lit, depth-tested, multisampled. It draws into its own
 //! texture, which the UI then shows (so the HUD and menus stay on top).
 
 use crate::game::*;
@@ -1267,6 +1267,8 @@ pub struct Gpu {
     module: wgpu::ShaderModule,
     samples: u32,
     pub quality: Quality,
+    /// Dynamic resolution: the render size is multiplied by this (see DynRes).
+    pub dyn_scale: f32,
 }
 
 struct Skin {
@@ -1374,12 +1376,74 @@ pub struct Quality {
 }
 
 impl Quality {
-    pub const PRESETS: [(&'static str, Quality); 4] = [
+    pub const PRESETS: [(&'static str, Quality); 5] = [
         ("Low", Quality { msaa: 1, scale: 0.6, fx: 0.35, extras: false }),
         ("Medium", Quality { msaa: 1, scale: 0.85, fx: 0.7, extras: true }),
         ("High", Quality { msaa: 4, scale: 1.0, fx: 1.0, extras: true }),
         ("Ultra", Quality { msaa: 4, scale: 1.4, fx: 1.0, extras: true }),
+        // tuned for the Steam Deck's 1280x800 screen and GPU: no edge smoothing (its pixels are
+        // small), a slightly lower resolution and fewer particles, so 60 fps holds in a full lobby
+        ("Steam Deck", Quality { msaa: 1, scale: 0.9, fx: 0.6, extras: false }),
     ];
+
+    /// The preset the Steam Deck starts with.
+    pub const DECK: usize = 4;
+}
+
+/// Dynamic resolution: when frames come late for a moment, draw the 3D picture a little smaller
+/// (the HUD and text stay sharp); when they've been on time for a while, step back up. Each
+/// step up that has to be taken back makes the next try wait longer, so it settles instead of
+/// bouncing.
+#[derive(Clone, Debug)]
+pub struct DynRes {
+    pub scale: f32,
+    late: f32,
+    on_time: f32,
+    wait_up: f32,
+    /// A step up was just taken (if frames come late again soon, it was too much).
+    trial: f32,
+}
+
+impl Default for DynRes {
+    fn default() -> Self {
+        DynRes { scale: 1.0, late: 0.0, on_time: 0.0, wait_up: DynRes::WAIT_UP, trial: 0.0 }
+    }
+}
+
+impl DynRes {
+    pub const MIN: f32 = 0.6;
+    pub const STEP: f32 = 0.05;
+    /// Late frames for this long (seconds) before stepping down.
+    pub const LATE_FOR: f32 = 0.25;
+    pub const WAIT_UP: f32 = 3.0;
+
+    /// One frame took `frame_dt` seconds; the goal is `target_fps`. Returns the scale to draw at.
+    pub fn update(&mut self, frame_dt: f32, target_fps: f32) -> f32 {
+        let dt = if frame_dt.is_finite() { frame_dt.clamp(0.0, 0.25) } else { 0.0 };
+        let budget = 1.0 / target_fps.max(1.0);
+        self.trial = (self.trial - dt).max(0.0);
+        if dt > budget * 1.12 {
+            self.late += dt;
+            self.on_time = 0.0;
+            if self.late >= DynRes::LATE_FOR && self.scale > DynRes::MIN {
+                self.scale = (self.scale - DynRes::STEP).max(DynRes::MIN);
+                self.late = 0.0;
+                if self.trial > 0.0 {
+                    // the last step up was too much: wait longer before the next try
+                    self.wait_up = (self.wait_up * 2.0).min(60.0);
+                }
+            }
+        } else {
+            self.late = (self.late - dt * 0.5).max(0.0);
+            self.on_time += dt;
+            if self.on_time >= self.wait_up && self.scale < 1.0 {
+                self.scale = (self.scale + DynRes::STEP).min(1.0);
+                self.on_time = 0.0;
+                self.trial = 2.0;
+            }
+        }
+        self.scale
+    }
 }
 
 /// Every pipeline for one sample count: opaque, alpha, additive, sky, skinned.
@@ -1624,6 +1688,7 @@ impl Gpu {
             module,
             samples: MSAA,
             quality: Quality::PRESETS[2].1,
+            dyn_scale: 1.0,
         }
     }
 
@@ -1695,7 +1760,7 @@ impl Gpu {
             self.static_count = verts.len() as u32;
             self.static_map = g.world.map;
         }
-        let sc = self.quality.scale.clamp(0.3, 2.0);
+        let sc = (self.quality.scale * self.dyn_scale.clamp(DynRes::MIN, 1.0)).clamp(0.3, 2.0);
         let w = ((rect.width() * ppp * sc).round() as u32).clamp(16, 8192);
         let h = ((rect.height() * ppp * sc).round() as u32).clamp(16, 8192);
         self.ensure_target(rs, [w, h]);
@@ -2050,5 +2115,343 @@ mod cloth_tests {
         // running, it trails behind (towards -z)
         let hem_mid = st.cloth[(CLOTH_ROWS - 1) * CLOTH_COLS + CLOTH_COLS / 2];
         assert!(hem_mid.z < pos.z - 0.12, "trails behind when running: {hem_mid:?} vs {pos:?}");
+    }
+}
+
+#[cfg(test)]
+mod dynres_tests {
+    use super::*;
+
+    #[test]
+    fn late_frames_lower_the_resolution_and_on_time_ones_bring_it_back_without_bouncing() {
+        let mut d = DynRes::default();
+        // a heavy moment: 45 fps for two seconds
+        for _ in 0..90 {
+            d.update(1.0 / 45.0, 60.0);
+        }
+        assert!(d.scale < 0.9 && d.scale >= DynRes::MIN, "stepped down: {}", d.scale);
+        let low = d.scale;
+        // a single hitch doesn't move it
+        let mut e = DynRes::default();
+        e.update(0.1, 60.0);
+        for _ in 0..30 {
+            e.update(1.0 / 60.0, 60.0);
+        }
+        assert_eq!(e.scale, 1.0);
+        // steady 60 again: it climbs back over time
+        for _ in 0..(60 * 30) {
+            d.update(1.0 / 60.0, 60.0);
+        }
+        assert!(d.scale > low, "came back up: {}", d.scale);
+        assert!(d.update(f32::NAN, 60.0).is_finite());
+    }
+}
+
+/// The reported freeze: a bot's gunshot kills you as the match-winning kill. Every frame here is
+/// run the way the game runs one (the kill cam's clock, slow motion, the ticks, every fighter
+/// posed with its coat, the cameras, the career count) and none may take a second.
+#[cfg(test)]
+mod final_kill_tests {
+    use super::*;
+    use crate::career::Career;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Doing {
+        Standing,
+        InAir,
+        Dashing,
+        Sliding,
+        Scoped,
+        Reloading,
+    }
+
+    const FRAME: f32 = 1.0 / 60.0;
+
+    struct Run {
+        g: Game,
+        acc: f32,
+        chars: Vec<CharState>,
+        career: Career,
+        label: String,
+    }
+
+    impl Run {
+        /// One frame as the game draws it. Checks that nothing became a broken number.
+        fn frame(&mut self, inp: &mut Input) {
+            let g = &mut self.g;
+            g.view_alpha = (self.acc / TICK).clamp(0.0, 1.0);
+            g.advance(&mut self.acc, FRAME, inp);
+            // the career count (not saved: this is a test)
+            for ev in std::mem::take(&mut g.career) {
+                self.career.apply(ev);
+            }
+            // sounds go to the speakers with these values
+            for (_, at, pitch) in g.sounds.drain(..) {
+                assert!(pitch.is_finite() && pitch > 0.0, "{}: sound pitch {pitch}", self.label);
+                if let Some(p) = at {
+                    assert!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite(), "{}: sound at {p:?}", self.label);
+                }
+            }
+            let alpha = (self.acc / TICK).clamp(0.0, 1.0);
+            // the cameras: kill cam, or following your body
+            if let Some((pos, at)) = g.killcam_view(alpha) {
+                assert!((at - pos).len() > 0.5, "{}: kill cam too close", self.label);
+            }
+            let me = &g.f[g.local];
+            let (pivot, dir, d) = g.camera_rig(me.pos, me.yaw, me.pitch);
+            let _ = g.world.raycast(pivot - dir * d, dir, 300.0);
+            // everyone posed and dressed, as the renderer does
+            let rig = crate::anim::shared().expect("rig");
+            let lk = look(0);
+            let mut mb = MB { v: Vec::new() };
+            for (i, f) in g.f.iter().enumerate() {
+                let ok = |v: V3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+                assert!(ok(f.pos) && ok(f.vel) && f.yaw.is_finite() && f.pitch.is_finite(), "{}: fighter {i} broken: {:?} {:?} {} {}", self.label, f.pos, f.vel, f.yaw, f.pitch);
+                if !f.present || f.spectate {
+                    continue;
+                }
+                let pos = f.prev_pos.lerp(f.pos, alpha);
+                if let Some(p) = character::animate(rig, &mut self.chars[i], f, pos, g.time, &g.tune) {
+                    mb.v.clear();
+                    coat_cloth(&mut mb, &p, &mut self.chars[i], g.time, &lk, g.tune.char_scale);
+                }
+            }
+        }
+    }
+
+    /// Keep the scene set up for the final shot: you on 1 HP doing `doing`, the shooter in
+    /// front of you with `gun`, nobody else around.
+    fn stage(g: &mut Game, shooter: usize, gun: Weapon, doing: Doing, inp: &mut Input, k: usize) {
+        let me = g.local;
+        // somewhere 9 m away with a clear view of you (too far for blades)
+        let here = g.f[me].pos;
+        let there = g.f[shooter].pos;
+        let d = (there - here).flat().len();
+        let clear = |p: V3| g.world.line_clear(here + v3(0.0, 1.2, 0.0), p + v3(0.0, 1.5, 0.0));
+        let mut spot = None;
+        if d < 6.0 || d > 12.0 || !clear(there) {
+            let ground = if g.f[me].on_ground { here.y } else { there.y.min(here.y) };
+            for j in 0..16 {
+                let a = j as f32 * PI / 8.0;
+                let p = v3(here.x + a.sin() * 9.0, ground, here.z + a.cos() * 9.0);
+                if p.x.abs() < g.world.half - 1.0 && p.z.abs() < g.world.half - 1.0 && clear(p) && g.world.line_clear(p + v3(0.0, 0.3, 0.0), p + v3(0.0, 1.9, 0.0)) {
+                    spot = Some(p);
+                    break;
+                }
+            }
+        }
+        for s in 0..g.f.len() {
+            if s != me && s != shooter && g.f[s].present && g.f[s].alive {
+                // the others stand far away
+                g.f[s].pos = v3(-14.0 + s as f32 * 2.0, g.f[s].pos.y, -14.0);
+                g.f[s].vel = V3::ZERO;
+            }
+        }
+        let (f, b) = if me < shooter {
+            let (a, b) = g.f.split_at_mut(shooter);
+            (&mut a[me], &mut b[0])
+        } else {
+            let (a, b) = g.f.split_at_mut(me);
+            (&mut b[0], &mut a[shooter])
+        };
+        f.hp = 1.0;
+        f.spawn_prot = 0.0;
+        f.regen_left = 0.0;
+        b.spawn_prot = 0.0;
+        b.loadout.gun1 = gun;
+        b.loadout.gun2 = gun;
+        if b.cur == 0 {
+            b.cur = 1;
+        }
+        b.weapon = gun;
+        b.mag = [b.mag[0], 30, 30];
+        b.items = 0; // a gunshot, not a grenade
+        b.reload_t = 0.0;
+        if let Some(p) = spot {
+            b.pos = p;
+            b.prev_pos = p;
+            b.vel = V3::ZERO;
+        }
+        *inp = Input { yaw: f.yaw, pitch: f.pitch, ..Default::default() };
+        match doing {
+            Doing::Standing => {}
+            Doing::InAir => {
+                if f.on_ground {
+                    f.vel.y = 7.0;
+                    f.on_ground = false;
+                }
+            }
+            Doing::Dashing => {
+                inp.fwd = 1.0;
+                inp.dash = k % 40 == 0;
+            }
+            Doing::Sliding => {
+                inp.fwd = 1.0;
+                inp.crouch = true;
+            }
+            Doing::Scoped => {
+                f.loadout.gun2 = Weapon::Sniper;
+                f.cur = 2;
+                f.weapon = Weapon::Sniper;
+                f.scope_t = 1.0;
+                inp.guard = true;
+            }
+            Doing::Reloading => {
+                f.reload_t = 1.0;
+                inp.reload = true;
+            }
+        }
+    }
+
+    /// Play one final kill and what follows. Sends a beat after every frame.
+    fn play(mode: Mode, gun: Weapon, doing: Doing, beat: &mpsc::Sender<String>) {
+        let label = format!("{mode:?} / {gun:?} / {doing:?}");
+        let mut g = if mode == Mode::Gauntlet {
+            Game::gauntlet("P", 0)
+        } else {
+            let bots = if matches!(mode, Mode::Duel | Mode::Lms) { 1 } else { 3 };
+            Game::offline("P", bots, 1.0, mode, 3)
+        };
+        g.f[0].ready = true;
+        let n = g.f.len();
+        let mut run = Run { g, acc: 0.0, chars: (0..n).map(|_| CharState::new()).collect(), career: Career::default(), label: label.clone() };
+        let mut inp = Input::default();
+        let mut frames = 0usize;
+        let mut step = |run: &mut Run, inp: &mut Input| {
+            let t0 = Instant::now();
+            run.frame(inp);
+            let took = t0.elapsed();
+            assert!(took < Duration::from_secs(1), "{}: a frame took {took:?}", run.label);
+            frames += 1;
+            let _ = beat.send(format!("{} frame {frames} phase {:?} killcam {:?} slowmo {:.2}", run.label, run.g.mt.phase, run.g.killcam.as_ref().map(|k| k.t), run.g.slowmo));
+        };
+        // into the fight (the gauntlet's first wave comes after a short wait)
+        for _ in 0..(8.0 / FRAME) as usize {
+            step(&mut run, &mut inp);
+            let wave_in = mode != Mode::Gauntlet || (1..n).any(|s| run.g.f[s].present && run.g.f[s].alive);
+            if run.g.mt.phase == Phase::Fight && wave_in {
+                break;
+            }
+        }
+        assert_eq!(run.g.mt.phase, Phase::Fight, "{label}: never got into the fight");
+        // the shooter is one kill (or round) from winning
+        let shooter = (1..n).find(|&s| run.g.f[s].present && run.g.f[s].alive && !run.g.f[s].spectate).expect("a shooter");
+        let t = run.g.mt.target as i32;
+        match mode {
+            Mode::Ffa => run.g.f[shooter].kills = t - 1,
+            Mode::Tdm => {
+                let team = run.g.f[shooter].team as usize;
+                run.g.mt.team_score[team.min(1)] = (t - 1).max(0) as _;
+            }
+            Mode::Duel | Mode::Lms => run.g.f[shooter].wins = t - 1,
+            _ => {}
+        }
+        assert!(run.g.is_enemy(shooter, 0), "{label}: the shooter is on your side");
+        // the bot takes its shot (by itself: its own aim and trigger)
+        let mut ended = false;
+        for k in 0..(12.0 / FRAME) as usize {
+            stage(&mut run.g, shooter, gun, doing, &mut inp, k);
+            step(&mut run, &mut inp);
+            if run.g.mt.phase == Phase::MatchOver {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended, "{label}: the bot never landed the final shot");
+        assert!(!run.g.f[0].alive, "{label}: you were the one who fell");
+        let (victim, killer, w, _) = run.g.last_kill.expect("a last kill");
+        assert_eq!((victim, killer), (0, Some(shooter)), "{label}: the bot killed you");
+        assert!(w == gun as u8 || w == Weapon::Rocket as u8, "{label}: killed by a gunshot, got tool {w}");
+        assert!(run.g.killcam.is_some() && run.g.slowmo > 0.0, "{label}: the kill cam starts in slow motion");
+        assert_eq!(run.career.deaths, 1, "{label}: your death counted");
+        // the kill cam, the slow motion and the end screen, with you still holding keys
+        let kills_then: Vec<i32> = run.g.f.iter().map(|f| f.kills).collect();
+        for k in 0..(8.0 / FRAME) as usize {
+            inp = Input { yaw: run.g.f[0].yaw + 0.01 * k as f32, fwd: 1.0, fire: true, guard: k % 2 == 0, dash: k % 30 == 0, jump: k % 40 == 0, ..Default::default() };
+            step(&mut run, &mut inp);
+        }
+        assert_eq!(run.g.mt.phase, Phase::MatchOver, "{label}: the end screen stays up");
+        assert!(run.g.slowmo <= 0.0 && run.g.killcam_view(0.5).is_none(), "{label}: the kill cam finished");
+        let kills_now: Vec<i32> = run.g.f.iter().map(|f| f.kills).collect();
+        assert_eq!(kills_then, kills_now, "{label}: nobody scores after the match");
+        if mode != Mode::Gauntlet {
+            assert!(run.career.matches == 1, "{label}: the match counted");
+        }
+        // rematch: everyone back in
+        run.g.vote_rematch();
+        for _ in 0..(6.0 / FRAME) as usize {
+            inp = Input { yaw: run.g.f[0].yaw, ..Default::default() };
+            step(&mut run, &mut inp);
+        }
+        assert_ne!(run.g.mt.phase, Phase::MatchOver, "{label}: the rematch started");
+        assert!(run.g.killcam.is_none() && run.g.slowmo <= 0.0, "{label}: no kill cam left over");
+    }
+
+    /// 60 fps on a Steam Deck leaves 16.7 ms a frame for everything. The game's own work for a
+    /// frame (the ticks, eight fighters posed with their coats, the cameras) must stay a small
+    /// part of that, since the Deck's processor is slower than a desktop's.
+    #[test]
+    fn a_full_lobby_frame_fits_a_steam_deck_budget() {
+        let mut g = Game::offline("P", 7, 0.8, Mode::Ffa, 200);
+        g.f[0].ready = true;
+        let n = g.f.len();
+        let mut run = Run { g, acc: 0.0, chars: (0..n).map(|_| CharState::new()).collect(), career: Career::default(), label: "full lobby".into() };
+        let mut inp = Input::default();
+        for _ in 0..(5.0 / FRAME) as usize {
+            run.frame(&mut inp);
+        }
+        assert_eq!(run.g.mt.phase, Phase::Fight);
+        let mut times = Vec::new();
+        for _ in 0..(10.0 / FRAME) as usize {
+            inp = Input { yaw: run.g.f[0].yaw, ..Default::default() };
+            let t0 = Instant::now();
+            run.frame(&mut inp);
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(|a, b| a.total_cmp(b));
+        let avg = times.iter().sum::<f64>() / times.len() as f64;
+        let p99 = times[times.len() * 99 / 100];
+        eprintln!("full lobby frame: average {avg:.2} ms, 99th percentile {p99:.2} ms");
+        assert!(avg < 3.0, "average {avg:.2} ms (budget 3 ms here, about 6 on a Deck)");
+        assert!(p99 < 6.0, "99th percentile {p99:.2} ms");
+    }
+
+    #[test]
+    fn a_bot_shooting_you_for_the_win_never_freezes_a_frame() {
+        let mut cases = Vec::new();
+        for mode in [Mode::Ffa, Mode::Tdm, Mode::Duel, Mode::Lms, Mode::Gauntlet] {
+            for gun in [Weapon::Revolver, Weapon::Rifle, Weapon::Shotgun, Weapon::Smg, Weapon::HandCannon] {
+                cases.push((mode, gun, Doing::Standing));
+            }
+            for doing in [Doing::InAir, Doing::Dashing, Doing::Sliding, Doing::Scoped, Doing::Reloading] {
+                cases.push((mode, Weapon::Rifle, doing));
+            }
+        }
+        cases.push((Mode::Ffa, Weapon::Sniper, Doing::Standing));
+        let (tx, rx) = mpsc::channel::<String>();
+        let worker = std::thread::spawn(move || {
+            for (mode, gun, doing) in cases {
+                play(mode, gun, doing, &tx);
+            }
+        });
+        // a frame that never ends is a freeze: wait at most a second for each one
+        let mut last = String::from("start");
+        loop {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(m) => last = m,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if worker.is_finished() {
+                        break;
+                    }
+                    panic!("froze: no frame finished within a second after {last}");
+                }
+            }
+        }
+        if let Err(e) = worker.join() {
+            std::panic::resume_unwind(e);
+        }
     }
 }

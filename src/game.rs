@@ -1,4 +1,4 @@
-﻿use crate::bot::Bot;
+use crate::bot::Bot;
 use crate::math::*;
 pub use crate::world::MapId;
 use crate::world::{Mat, World};
@@ -1548,7 +1548,7 @@ pub struct Game {
     /// Slow motion left (real seconds).
     pub slowmo: f32,
     pub killcam: Option<KillCam>,
-    last_kill: Option<(usize, Option<usize>, u8, bool)>,
+    pub last_kill: Option<(usize, Option<usize>, u8, bool)>,
     pub rng: Rng,
     pub bots: Vec<Option<Bot>>,
     pub out_events: Vec<Ev>,
@@ -2832,6 +2832,133 @@ impl Game {
                 self.banner = None;
             }
         }
+    }
+
+    /// One drawn frame of play, `dt` seconds long: the kill cam's clock, slow motion, the hit
+    /// freeze, then as many fixed ticks as the time adds up to (at most 12, so a slow frame
+    /// never snowballs). `acc` carries the leftover time between frames; `inp`'s one-shot
+    /// presses are used up by the first tick. Returns how many ticks ran.
+    pub fn advance(&mut self, acc: &mut f32, dt: f32, inp: &mut Input) -> usize {
+        let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
+        if !acc.is_finite() {
+            *acc = 0.0;
+        }
+        if let Some(kc) = self.killcam.as_mut() {
+            kc.t += dt;
+        }
+        let mut scale = 1.0;
+        if self.slowmo > 0.0 {
+            self.slowmo -= dt;
+            scale = 0.25;
+        }
+        if self.hitstop > 0.0 {
+            self.hitstop -= dt;
+        } else {
+            *acc += dt * scale;
+        }
+        let mut steps = 0;
+        while *acc >= TICK && steps < 12 {
+            self.tick(inp);
+            self.view_alpha = 1.0;
+            // presses count once
+            inp.jump = false;
+            inp.dash = false;
+            inp.fire_pressed = false;
+            inp.reload = false;
+            inp.item = false;
+            inp.kick = false;
+            inp.finish = false;
+            inp.select = None;
+            *acc -= TICK;
+            steps += 1;
+        }
+        if steps == 12 {
+            *acc = 0.0;
+        }
+        steps
+    }
+
+    /// Test switch (DUEL_FINAL_SHOT): set up a bot's gunshot as the match-winning kill on you.
+    /// You're on 1 HP, the first enemy bot is one kill (or round) from winning, 9 m away with a
+    /// clear view of you and `gun` in hand.
+    pub fn stage_final_shot(&mut self, gun: Weapon) {
+        if self.mt.phase != Phase::Fight {
+            return;
+        }
+        let me = self.local;
+        let Some(sh) = (0..self.f.len()).find(|&s| s != me && self.f[s].present && self.f[s].alive && !self.f[s].spectate && self.f[s].is_bot && self.is_enemy(s, me)) else { return };
+        let t = self.mt.target as i32;
+        match self.mt.mode {
+            Mode::Ffa | Mode::Gladiator => self.f[sh].kills = self.f[sh].kills.max(t - 1),
+            Mode::Tdm => {
+                let team = (self.f[sh].team as usize).min(1);
+                self.mt.team_score[team] = self.mt.team_score[team].max((t - 1).max(0) as _);
+            }
+            Mode::Duel | Mode::Lms => self.f[sh].wins = self.f[sh].wins.max(t - 1),
+            _ => {}
+        }
+        let here = self.f[me].pos;
+        let there = self.f[sh].pos;
+        let d = (there - here).flat().len();
+        let clear = |p: V3| self.world.line_clear(here + v3(0.0, 1.2, 0.0), p + v3(0.0, 1.5, 0.0));
+        if d < 6.0 || d > 12.0 || !clear(there) {
+            let ground = if self.f[me].on_ground { here.y } else { there.y.min(here.y) };
+            for j in 0..16 {
+                let a = j as f32 * std::f32::consts::PI / 8.0;
+                let p = v3(here.x + a.sin() * 9.0, ground, here.z + a.cos() * 9.0);
+                if p.x.abs() < self.world.half - 1.0 && p.z.abs() < self.world.half - 1.0 && clear(p) && self.world.line_clear(p + v3(0.0, 0.3, 0.0), p + v3(0.0, 1.9, 0.0)) {
+                    self.f[sh].pos = p;
+                    self.f[sh].prev_pos = p;
+                    self.f[sh].vel = V3::ZERO;
+                    break;
+                }
+            }
+        }
+        for s in 0..self.f.len() {
+            if s != me && s != sh && self.f[s].present && self.f[s].alive {
+                self.f[s].pos = v3(-14.0 + s as f32 * 2.0, self.f[s].pos.y, -14.0);
+                self.f[s].vel = V3::ZERO;
+            }
+        }
+        let f = &mut self.f[me];
+        f.hp = f.hp.min(1.0);
+        f.spawn_prot = 0.0;
+        f.regen_left = 0.0;
+        let b = &mut self.f[sh];
+        b.spawn_prot = 0.0;
+        b.items = 0;
+        b.loadout.gun1 = gun;
+        b.loadout.gun2 = gun;
+        if b.cur == 0 {
+            b.cur = 1;
+        }
+        b.weapon = gun;
+        b.mag = [b.mag[0], 30, 30];
+        b.reload_t = 0.0;
+    }
+
+    /// The final kill cam's view while it runs: circling the fallen player in slow motion.
+    /// (camera position, the point it looks at)
+    pub fn killcam_view(&self, alpha: f32) -> Option<(V3, V3)> {
+        let kc = self.killcam.as_ref()?;
+        if !(kc.t < KILLCAM_TIME) || kc.victim >= self.f.len() || !self.f[kc.victim].present {
+            return None;
+        }
+        let v = &self.f[kc.victim];
+        let target = v.prev_pos.lerp(v.pos, alpha.clamp(0.0, 1.0)) + v3(0.0, 0.9, 0.0);
+        let a = v.yaw + 2.2 + kc.t * 0.55;
+        let mut out = v3(a.sin(), 0.0, a.cos());
+        let mut dist = (4.4 - kc.t * 0.35).max(1.0);
+        if let Some((t, _)) = self.world.raycast(target, (out + v3(0.0, 0.35, 0.0)).norm(), dist + 0.3) {
+            dist = (t - 0.3).max(1.0);
+        }
+        out = (out + v3(0.0, 0.35, 0.0)).norm();
+        let pos = target + out * dist;
+        let ok = |p: V3| p.x.is_finite() && p.y.is_finite() && p.z.is_finite();
+        if !ok(pos) || !ok(target) {
+            return None;
+        }
+        Some((pos, target))
     }
 
     /// Someone died (on this computer, or we were told). Feed line, and the score on the authority.

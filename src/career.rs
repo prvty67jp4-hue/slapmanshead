@@ -29,8 +29,7 @@ pub struct Career {
 }
 
 fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME"))?;
-    Some(PathBuf::from(base).join("DuelRush").join("career.txt"))
+    crate::platform::data_file("career.txt")
 }
 
 impl Career {
@@ -40,10 +39,7 @@ impl Career {
 
     pub fn save(&self) {
         if let Some(p) = path() {
-            if let Some(dir) = p.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(p, self.to_text());
+            let _ = crate::platform::save_file(&p, &self.to_text());
         }
     }
 

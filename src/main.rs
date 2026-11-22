@@ -1,9 +1,8 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod anim;
 mod audio;
 mod bot;
-mod firewall;
 mod career;
 mod character;
 mod chars;
@@ -11,14 +10,17 @@ mod game;
 mod gpu;
 mod math;
 mod net;
-mod steam;
+mod pad;
+mod platform;
 mod render;
+mod watchdog;
 mod world;
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, Stroke, Vec2, ViewportCommand};
 use game::*;
 use math::*;
 use net::{Incoming, Net};
+use platform::{firewall, steam};
 use render::Cam;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -73,7 +75,18 @@ struct Settings {
     net_test: bool,
     net_lag: f32,
     net_loss: f32,
+    /// Controller: look speed, invert up/down, aim assist (the aim slows over an enemy).
+    pad_sens: f32,
+    pad_invert: bool,
+    aim_assist: bool,
+    /// Text and HUD size (index into UI_SCALES): bigger for a TV across the room or a handheld.
+    ui_scale: usize,
+    /// Draw the 3D picture a little smaller when frames run late, to hold the frame rate.
+    dyn_res: bool,
 }
+
+/// Interface sizes: (name, zoom).
+const UI_SCALES: [(&str, f32); 3] = [("Normal", 1.0), ("Couch / TV", 1.3), ("Big TV", 1.6)];
 
 #[derive(Clone, Debug, PartialEq)]
 struct RecentServer {
@@ -298,6 +311,11 @@ impl Default for Settings {
             net_test: false,
             net_lag: 100.0,
             net_loss: 5.0,
+            pad_sens: 1.0,
+            pad_invert: false,
+            aim_assist: true,
+            ui_scale: 0,
+            dyn_res: false,
         }
     }
 }
@@ -343,8 +361,7 @@ fn preset_fov(text: &str) -> Option<f32> {
 }
 
 fn settings_path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME"))?;
-    Some(PathBuf::from(base).join("DuelRush").join("settings.txt"))
+    platform::data_file("settings.txt")
 }
 
 impl Settings {
@@ -394,6 +411,11 @@ impl Settings {
                             "net_loss" => s.net_loss = v.parse().unwrap_or(5.0f32).clamp(0.0, 30.0),
                             "cross_size" => s.cross_size = v.parse().unwrap_or(0.8f32).clamp(0.5, 2.0),
                             "cross_red" => s.cross_red = v != "0",
+                            "pad_sens" => s.pad_sens = v.parse().unwrap_or(1.0f32).clamp(0.2, 3.0),
+                            "pad_invert" => s.pad_invert = v == "1",
+                            "aim_assist" => s.aim_assist = v != "0",
+                            "ui_scale" => s.ui_scale = v.parse().unwrap_or(0usize).min(UI_SCALES.len() - 1),
+                            "dyn_res" => s.dyn_res = v == "1",
                             "aim_v" => aim_v = v.parse().unwrap_or(0),
                             "cross_color" => {
                                 let b: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -428,12 +450,28 @@ impl Settings {
                 s.cross_size = 0.8;
             }
         }
+        // the first start on a Steam Deck (or another handheld / TV device): big text, full screen,
+        // the Deck graphics preset, a steady 60 fps
+        if !saved && platform::system().couch() {
+            s.couch_defaults();
+        }
         // settings saved before the playtest update: quieter music by default
         if saved && aim_v < 3 && (s.music_volume - 0.5).abs() < 0.01 {
             s.music_volume = 0.3;
         }
         s
     }
+    /// Settings for a handheld or a TV: big text, full screen, the Steam Deck graphics preset,
+    /// 60 fps held by dynamic resolution.
+    fn couch_defaults(&mut self) {
+        self.ui_scale = 1;
+        self.fullscreen = true;
+        self.quality = gpu::Quality::DECK;
+        self.fps_cap = 60;
+        self.vsync = true;
+        self.dyn_res = true;
+    }
+
     fn save(&self) {
         if let Some(p) = settings_path() {
             if let Some(dir) = p.parent() {
@@ -449,6 +487,7 @@ impl Settings {
                 "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\naim_v=3\n",
                 self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8
             );
+            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8);
             for (k, (id, _)) in ACTIONS.iter().enumerate() {
                 text += &format!("bind.{id}={}\n", self.binds[k].id());
             }
@@ -456,7 +495,7 @@ impl Settings {
             for r in &self.recent {
                 text += &format!("recent={}|{}|{}|{}\n", clean(&r.addr), clean(&r.host), clean(&r.mode), r.when);
             }
-            let _ = std::fs::write(p, text);
+            let _ = platform::save_file(&p, &text);
         }
     }
 }
@@ -586,6 +625,35 @@ struct App {
     career: career::Career,
     cam_roll: std::cell::Cell<f32>,
     fov_speed: std::cell::Cell<f32>,
+    /// Notices when the game loop stalls and writes a hang report.
+    watchdog: watchdog::Watchdog,
+    /// Sounds played last frame (for a hang report).
+    last_sounds: Vec<String>,
+    /// Controllers: the hardware, this frame's state, menu moves, and whether the controller is
+    /// what's being played with (prompts show its buttons then).
+    pads: pad::Pads,
+    pad: pad::PadState,
+    pad_nav: pad::NavRepeat,
+    pad_active: bool,
+    /// Held controller movement and buttons for the next game input.
+    pad_held: PadHeld,
+    /// Quick chat open (D-pad down), with the line picked, and whether the stick is still pushed.
+    quick_chat: Option<usize>,
+    qc_stick_out: bool,
+    /// LB / RB in a menu with tabs: move this many tabs.
+    pad_tab: i32,
+    /// Dynamic resolution (holds the frame rate).
+    dynres: gpu::DynRes,
+}
+
+/// Controller movement and held buttons, merged into the game input.
+#[derive(Clone, Copy, Default)]
+struct PadHeld {
+    fwd: f32,
+    right: f32,
+    fire: bool,
+    guard: bool,
+    crouch: bool,
 }
 
 impl App {
@@ -673,6 +741,17 @@ impl App {
             career: career::Career::load(),
             cam_roll: std::cell::Cell::new(0.0),
             fov_speed: std::cell::Cell::new(0.0),
+            watchdog: watchdog::Watchdog::start(std::env::var_os("DUEL_HANG_REPORT").map(PathBuf::from).or_else(watchdog::report_path)),
+            last_sounds: Vec::new(),
+            pads: pad::Pads::new(),
+            pad: pad::PadState::default(),
+            pad_nav: pad::NavRepeat::default(),
+            pad_active: false,
+            pad_held: PadHeld::default(),
+            quick_chat: None,
+            qc_stick_out: false,
+            pad_tab: 0,
+            dynres: gpu::DynRes::default(),
         };
         // Steam (when it's running); tests stay on direct IP
         if (!app.autoplay && app.screenshot.is_none()) || std::env::var_os("DUEL_STEAM_PROBE").is_some() {
@@ -740,6 +819,9 @@ impl App {
                 g.f[0].is_bot = true;
                 g.f[0].ready = true;
                 g.bots[0] = Some(bot::Bot::new(0.8, 5));
+            } else if std::env::var_os("DUEL_HUMAN_READY").is_some() {
+                // test switch: a hands-off player who skips the loadout screen
+                g.f[0].ready = true;
             }
             app.autoplay = true;
             app.start_game(g, None);
@@ -854,7 +936,7 @@ impl App {
         ctx.send_viewport_cmd(ViewportCommand::CursorVisible(!on));
         let grab = if !on {
             egui::CursorGrab::None
-        } else if cfg!(target_os = "macos") {
+        } else if platform::mouse_hold() == platform::MouseHold::Locked {
             egui::CursorGrab::Locked
         } else {
             egui::CursorGrab::Confined
@@ -1367,6 +1449,9 @@ impl App {
 
     /// The firewall line for hosts, with a button to fix it when friends would be blocked.
     fn firewall_ui(&mut self, ui: &mut egui::Ui) {
+        if !firewall::applies() {
+            return;
+        }
         self.check_firewall();
         let status = self.fw_status.lock().ok().and_then(|g| *g);
         let note = self.fw_note.lock().ok().and_then(|g| g.clone());
@@ -1485,6 +1570,11 @@ impl App {
 
     /// Every setting, in tabs. Used on the main menu and in the pause menu.
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        // LB / RB on a controller step through the tabs
+        let step = std::mem::take(&mut self.pad_tab);
+        if step != 0 {
+            self.settings_tab = (self.settings_tab as i32 + step).rem_euclid(4) as u8;
+        }
         ui.horizontal(|ui| {
             for (k, t) in ["Game", "Controls", "Graphics", "Crosshair"].iter().enumerate() {
                 ui.selectable_value(&mut self.settings_tab, k as u8, egui::RichText::new(*t).size(17.0));
@@ -1539,6 +1629,25 @@ impl App {
                     self.settings.binds = default_binds();
                     self.rebinding = None;
                 }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Controller").size(18.0).color(ACCENT));
+                let pad_name = self.pads.name.clone();
+                ui.label(egui::RichText::new(match &pad_name {
+                    Some(n) => format!("Connected: {n}"),
+                    None => "No controller connected (Xbox, PlayStation, Switch Pro and Steam Deck controls all work).".to_string(),
+                }).size(13.5).color(Color32::from_gray(200)));
+                ui.add(egui::Slider::new(&mut self.settings.pad_sens, 0.2..=3.0).text("look speed"));
+                ui.checkbox(&mut self.settings.pad_invert, "Invert look up / down");
+                ui.checkbox(&mut self.settings.aim_assist, "Aim assist (the aim slows a little over an enemy)");
+                egui::CollapsingHeader::new("Controller layout").show(ui, |ui| {
+                    egui::Grid::new("padlayout").num_columns(2).spacing([14.0, 3.0]).striped(true).show(ui, |ui| {
+                        for (what, button) in pad::LAYOUT {
+                            ui.label(egui::RichText::new(what).size(14.0));
+                            ui.label(egui::RichText::new(button).size(14.0).strong());
+                            ui.end_row();
+                        }
+                    });
+                });
             }
             2 => {
                 ui.label("Quality preset");
@@ -1547,7 +1656,7 @@ impl App {
                         ui.selectable_value(&mut self.settings.quality, k, *n);
                     }
                 });
-                let q = gpu::Quality::PRESETS[self.settings.quality.min(3)].1;
+                let q = gpu::Quality::PRESETS[self.settings.quality.min(gpu::Quality::PRESETS.len() - 1)].1;
                 let what = format!(
                     "{}% resolution · edge smoothing {} · {} effects",
                     (q.scale * 100.0).round(),
@@ -1556,6 +1665,16 @@ impl App {
                 );
                 ui.label(egui::RichText::new(what).size(13.0).color(Color32::from_gray(180)));
                 ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Interface size");
+                    for (k, (n, _)) in UI_SCALES.iter().enumerate() {
+                        ui.selectable_value(&mut self.settings.ui_scale, k, *n);
+                    }
+                });
+                ui.checkbox(&mut self.settings.dyn_res, "Dynamic resolution (lowers the 3D detail for a moment to hold the frame rate)");
+                if platform::system().couch() && ui.button("Use the recommended Steam Deck settings").clicked() {
+                    self.settings.couch_defaults();
+                }
                 ui.checkbox(&mut self.settings.fullscreen, "Fullscreen (F11)");
                 ui.checkbox(&mut self.settings.vsync, "VSync (no tearing; caps to your screen's refresh rate)");
                 ui.horizontal(|ui| {
@@ -1773,8 +1892,7 @@ fn main() -> eframe::Result<()> {
     }
     if screenshot.is_some() {
         viewport = viewport.with_active(false);
-        #[cfg(windows)]
-        {
+        if platform::test_window_behind() {
             viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnBottom);
         }
     }
@@ -1800,9 +1918,75 @@ fn main() -> eframe::Result<()> {
 }
 
 impl eframe::App for App {
+    /// Controllers, read before egui sees this frame's input: in menus their moves become key
+    /// presses (arrows move between buttons, A presses, B goes back), so every menu works with
+    /// a controller exactly as with a keyboard.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        use pad::Nav;
+        let st = self.pads.poll();
+        self.pad = st;
+        // who's playing: the controller once it's touched, the mouse and keyboard once they are
+        if st.used() {
+            self.pad_active = true;
+        } else if raw.events.iter().any(|e| match e {
+            egui::Event::MouseMoved(d) => d.length() > 4.0,
+            egui::Event::Key { pressed: true, .. } | egui::Event::PointerButton { pressed: true, .. } => true,
+            _ => false,
+        }) {
+            self.pad_active = false;
+        }
+        if !st.connected {
+            return;
+        }
+        let navs = self.pad_nav.step(&st, self.frame_dt.clamp(0.001, 0.1));
+        let in_menus = !self.captured && self.quick_chat.is_none();
+        let focused = ctx.memory(|m| m.focused().is_some());
+        let mut keys: Vec<Key> = Vec::new();
+        for n in navs {
+            match n {
+                // pause in a match, resume from the pause menu, back out of a menu page
+                Nav::Menu => keys.push(Key::Escape),
+                _ if !in_menus => {}
+                // nothing selected yet: the first move selects the first button
+                Nav::Up | Nav::Down | Nav::Left | Nav::Right | Nav::Press if !focused => keys.push(Key::Tab),
+                Nav::Up => keys.push(Key::ArrowUp),
+                Nav::Down => keys.push(Key::ArrowDown),
+                Nav::Left => keys.push(Key::ArrowLeft),
+                Nav::Right => keys.push(Key::ArrowRight),
+                Nav::Press => keys.push(Key::Space),
+                Nav::Back => keys.push(Key::Escape),
+                Nav::PrevTab => self.pad_tab -= 1,
+                Nav::NextTab => self.pad_tab += 1,
+            }
+        }
+        for key in keys {
+            for pressed in [true, false] {
+                raw.events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE });
+            }
+        }
+        // the right stick scrolls long pages
+        if in_menus && st.ry.abs() > 0.1 {
+            raw.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, st.ry * 900.0 * self.frame_dt.clamp(0.001, 0.1)),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+    }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.request_repaint();
+        // interface size (Couch / TV makes text, menus and the HUD bigger)
+        let zoom = UI_SCALES[self.settings.ui_scale.min(UI_SCALES.len() - 1)].1;
+        if (ctx.zoom_factor() - zoom).abs() > 1e-3 {
+            ctx.set_zoom_factor(zoom);
+        }
+        // the freeze watchdog: we're alive (a minimised window rests on purpose)
+        self.watchdog.beat();
+        self.watchdog.hold(ctx.input(|i| i.viewport().minimized.unwrap_or(false)));
+        self.watchdog.stage("frame start");
         // frame-rate limit: wait out the rest of this frame's time
         if self.settings.fps_cap > 0 && self.screenshot.is_none() {
             if let Some(t0) = self.frame_start {
@@ -1861,10 +2045,12 @@ impl eframe::App for App {
         self.wall_t += dt;
         self.handle_screenshot(&ctx);
 
+        self.watchdog.stage("Steam");
         self.steam_frame(dt);
         // network + simulation
         let mut go_menu = false;
         if let Screen::Lobby { .. } = self.screen {
+            self.watchdog.stage("joining a lobby");
             self.update_lobby(&ctx, dt);
         }
 
@@ -1880,9 +2066,10 @@ impl eframe::App for App {
             };
             let want_capture = !self.paused && !self.match_over() && self.disconnected.is_none() && !self.autoplay && !choosing && !self.show_tuning;
             self.set_capture(&ctx, want_capture);
-            if want_capture && !cfg!(target_os = "macos") {
+            if want_capture && platform::mouse_hold() == platform::MouseHold::Confined {
                 ctx.send_viewport_cmd(ViewportCommand::CursorPosition(rect.center()));
             }
+            self.watchdog.stage("reading input");
             sample_keys(&ctx, &self.settings.binds);
             self.read_play_input(&ctx);
             self.step_play(dt);
@@ -1903,6 +2090,7 @@ impl eframe::App for App {
         }
 
         // ---- drawing
+        self.watchdog.stage("drawing the 3D picture");
         let painter = ui.painter().clone();
         let ppp = ctx.pixels_per_point();
         if self.gpu.is_none() {
@@ -1916,6 +2104,14 @@ impl eframe::App for App {
             if g3.quality != q {
                 g3.set_quality(rs, q);
             }
+            // dynamic resolution: hold the frame rate (60, or the chosen limit) during matches
+            let target = if self.settings.fps_cap > 0 { self.settings.fps_cap as f32 } else { 60.0 };
+            g3.dyn_scale = if self.settings.dyn_res && playing && self.screenshot.is_none() {
+                self.dynres.update(self.frame_dt, target)
+            } else {
+                self.dynres = gpu::DynRes::default();
+                1.0
+            };
         }
         let alpha = (self.acc / TICK).clamp(0.0, 1.0);
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
@@ -1929,6 +2125,7 @@ impl eframe::App for App {
                         painter.image(id, rect, full_uv, Color32::WHITE);
                     }
                 }
+                self.watchdog.stage("drawing the HUD");
                 self.draw_hud(&painter, rect, &cam, game);
                 if let Screen::Play { net, .. } = &self.screen {
                     self.draw_net_overlay(&painter, rect, game, net.as_ref());
@@ -1974,6 +2171,7 @@ impl eframe::App for App {
         self.gpu = gpu;
 
         // ---- UI overlays
+        self.watchdog.stage("menus and panels");
         match &self.screen {
             Screen::Menu(page) => {
                 let page = *page;
@@ -1994,6 +2192,7 @@ impl eframe::App for App {
         }
 
         // play queued sounds, in 3D from the camera
+        self.watchdog.stage("sound");
         let mut sounds: Vec<(Sfx, Option<V3>, f32)> = match &mut self.screen {
             Screen::Play { game, .. } => std::mem::take(&mut game.sounds),
             _ => Vec::new(),
@@ -2023,11 +2222,14 @@ impl eframe::App for App {
             if let Some((p, r, f)) = ears {
                 a.set_listener(p, r, f);
             }
-            for (s, at, pitch) in sounds {
+            for (s, at, pitch) in sounds.iter().copied() {
                 a.play(s, at, pitch);
             }
         }
+        self.last_sounds = sounds.iter().map(|(s, at, pitch)| format!("{s:?} at {at:?} pitch {pitch:.2}")).collect();
         self.prev_mods = ctx.input(|i| i.modifiers);
+        self.watchdog.snapshot(self.hang_snapshot(ears));
+        self.watchdog.stage("between frames (the window system or the graphics driver)");
     }
 
     fn on_exit(&mut self) {
@@ -2041,6 +2243,60 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// What the game looks like right now, in words, for a hang report.
+    fn hang_snapshot(&self, ears: Option<(V3, V3, V3)>) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let screen = match &self.screen {
+            Screen::Menu(_) => "menu".to_string(),
+            Screen::Lobby { .. } => "joining a lobby".to_string(),
+            Screen::Play { game, net } => format!("playing ({:?}, {:?}, {:?} map, {})", game.mt.mode, game.kind, game.world.map, if net.is_some() { "online" } else { "offline" }),
+        };
+        let _ = writeln!(s, "screen: {screen}");
+        let _ = writeln!(s, "paused: {}  mouse captured: {}  fps: {:.0}  last frame: {:.1} ms  disconnected: {:?}", self.paused, self.captured, self.fps, self.frame_dt * 1000.0, self.disconnected);
+        match ears {
+            Some((p, _, f)) => {
+                let _ = writeln!(s, "camera: at ({:.2}, {:.2}, {:.2}) looking ({:.2}, {:.2}, {:.2})  aim yaw {:.3} pitch {:.3}", p.x, p.y, p.z, f.x, f.y, f.z, self.aim_yaw, self.aim_pitch);
+            }
+            None => {
+                let _ = writeln!(s, "camera: menu camera");
+            }
+        }
+        if let Screen::Play { game: g, .. } = &self.screen {
+            let _ = writeln!(s, "phase: {:?}  timer: {:.1}  round: {}  match number: {}  game time: {:.2}", g.mt.phase, g.mt.timer, g.mt.round, g.mt.number, g.time);
+            match &g.killcam {
+                Some(k) => {
+                    let _ = writeln!(s, "kill cam: victim {} killer {:?} tool {} headshot {} t {:.2} of {:.1}", k.victim, k.killer, k.tool, k.head, k.t, KILLCAM_TIME);
+                }
+                None => {
+                    let _ = writeln!(s, "kill cam: none");
+                }
+            }
+            let _ = writeln!(s, "slow motion left: {:.2}  hit freeze left: {:.2}  leftover time: {:.4}", g.slowmo, g.hitstop, self.acc);
+            let _ = writeln!(s, "last kill: {:?}", g.last_kill);
+            for (i, f) in g.f.iter().enumerate().filter(|(_, f)| f.present) {
+                let _ = writeln!(
+                    s,
+                    "fighter {i}{}{} '{}': alive {} hp {:.0} at ({:.2}, {:.2}, {:.2}) vel ({:.1}, {:.1}, {:.1}) yaw {:.3} {:?} kills {} wins {} dash {:.2} slide {:.2} scope {:.2} reload {:.2} ground {} finisher {}",
+                    if i == g.local { " (you)" } else { "" },
+                    if f.is_bot { " (bot)" } else { "" },
+                    f.name, f.alive, f.hp, f.pos.x, f.pos.y, f.pos.z, f.vel.x, f.vel.y, f.vel.z, f.yaw, f.weapon, f.kills, f.wins, f.dash_t, f.sliding, f.scope_t, f.reload_t, f.on_ground, f.fin
+                );
+            }
+            let _ = writeln!(s, "banner: {:?}", g.banner.as_ref().map(|b| &b.0));
+            let _ = writeln!(s, "last events:");
+            for l in &g.feed {
+                let line = match &l.text {
+                    Some(t) => t.clone(),
+                    None => format!("{} [{}{}] {}", l.killer.as_ref().map_or("-", |k| k.0.as_str()), l.tool, if l.head { ", headshot" } else { "" }, l.victim.0),
+                };
+                let _ = writeln!(s, "  {line}");
+            }
+        }
+        let _ = writeln!(s, "sounds last frame: {}", if self.last_sounds.is_empty() { "none".to_string() } else { self.last_sounds.join("; ") });
+        s
+    }
+
     fn handle_screenshot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.screenshot.clone() else { return };
         let shot_frame: u32 = std::env::var("DUEL_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
@@ -2188,6 +2444,7 @@ impl App {
                 self.latch.select = Some(next as u8);
             }
         }
+        self.pad_input(captured);
         if toggle_pause && !self.match_over() && self.disconnected.is_none() {
             if self.paused && self.pause_settings {
                 self.pause_settings = false; // Esc steps back out of the settings first
@@ -2198,16 +2455,97 @@ impl App {
         }
     }
 
+    /// The controller in a match: sticks move and look, buttons do every action (see pad.rs for
+    /// the layout). D-pad down opens quick chat.
+    fn pad_input(&mut self, captured: bool) {
+        use pad::btn;
+        self.pad_held = PadHeld::default();
+        let st = self.pad;
+        if !st.connected || !captured || self.chat_open {
+            self.quick_chat = None;
+            return;
+        }
+        if st.down(btn::VIEW) {
+            self.show_scores = true;
+        }
+        let dt = self.frame_dt.clamp(0.0, 0.1);
+        let Screen::Play { game, .. } = &self.screen else { return };
+        // quick chat: the d-pad or stick picks a line, A sends it, B closes
+        if let Some(mut k) = self.quick_chat {
+            let n = pad::QUICK_CHAT.len();
+            // the stick steps once per push (back to the middle between steps)
+            let stick = if st.ly > 0.6 { -1 } else if st.ly < -0.6 { 1 } else { 0 };
+            let stick_step = if stick != 0 && !self.qc_stick_out { stick } else { 0 };
+            self.qc_stick_out = stick != 0;
+            if st.tapped(btn::UP) || stick_step < 0 {
+                k = (k + n - 1) % n;
+            }
+            if st.tapped(btn::DOWN) || stick_step > 0 {
+                k = (k + 1) % n;
+            }
+            self.quick_chat = Some(k);
+            if st.tapped(btn::A) {
+                self.chat_send = Some(pad::QUICK_CHAT[k].to_string());
+                self.quick_chat = None;
+            } else if st.tapped(btn::B) || st.tapped(btn::MENU) {
+                self.quick_chat = None;
+            }
+            return;
+        }
+        // look: a curve on the right stick, slowed a little over an enemy (aim assist)
+        let me = &game.f[game.local];
+        let assist = if self.settings.aim_assist && me.alive && !me.weapon.is_melee() && game.aim_enemy(game.local, self.aim_yaw, self.aim_pitch).is_some() { 0.35 } else { 0.0 };
+        let sens = self.settings.pad_sens / self.ads_zoom.get().max(1.0);
+        let (dyaw, dpitch) = pad::look(st.rx, st.ry, sens, self.settings.pad_invert, assist, dt);
+        self.aim_yaw = wrap_angle(self.aim_yaw + dyaw);
+        self.aim_pitch = (self.aim_pitch + dpitch).clamp(-1.4, 1.4);
+        self.pad_held = PadHeld { fwd: st.ly, right: st.lx, fire: st.down(btn::RT), guard: st.down(btn::LT), crouch: st.down(btn::B) };
+        let cur = me.cur;
+        let l = &mut self.latch;
+        l.jump |= st.tapped(btn::A);
+        l.dash |= st.tapped(btn::LB) || st.tapped(btn::L3);
+        l.fire_pressed |= st.tapped(btn::RT);
+        l.reload |= st.tapped(btn::X);
+        l.kick |= st.tapped(btn::RB);
+        l.finish |= st.tapped(btn::R3);
+        l.item |= st.tapped(btn::UP);
+        if st.down(btn::VIEW) && game.train.is_some() {
+            // Training: View + d-pad left / right steps through the lessons
+            if st.tapped(btn::LEFT) {
+                self.train_step -= 1;
+            }
+            if st.tapped(btn::RIGHT) {
+                self.train_step += 1;
+            }
+        } else {
+            if st.tapped(btn::LEFT) {
+                l.select = Some(0);
+            }
+            if st.tapped(btn::RIGHT) {
+                l.select = Some(if cur == 1 { 2 } else { 1 });
+            }
+        }
+        if st.tapped(btn::Y) {
+            l.select = Some(((cur + 1) % 3) as u8);
+        }
+        if st.tapped(btn::DOWN) {
+            self.quick_chat = Some(0);
+            self.qc_stick_out = true;
+        }
+    }
+
+
     fn current_input(&self, ctx_keys: &KeysHeld) -> Input {
         let mut inp = Input { yaw: self.aim_yaw, pitch: self.aim_pitch, ..Default::default() };
         if !self.captured {
             return inp;
         }
-        inp.fwd = (ctx_keys.w as i32 - ctx_keys.s as i32) as f32;
-        inp.right = (ctx_keys.d as i32 - ctx_keys.a as i32) as f32;
-        inp.fire = ctx_keys.fire;
-        inp.guard = ctx_keys.guard;
-        inp.crouch = ctx_keys.crouch;
+        let ph = self.pad_held;
+        inp.fwd = ((ctx_keys.w as i32 - ctx_keys.s as i32) as f32 + ph.fwd).clamp(-1.0, 1.0);
+        inp.right = ((ctx_keys.d as i32 - ctx_keys.a as i32) as f32 + ph.right).clamp(-1.0, 1.0);
+        inp.fire = ctx_keys.fire || ph.fire;
+        inp.guard = ctx_keys.guard || ph.guard;
+        inp.crouch = ctx_keys.crouch || ph.crouch;
         inp.jump = self.latch.jump;
         inp.dash = self.latch.dash;
         inp.fire_pressed = self.latch.fire_pressed;
@@ -2250,8 +2588,11 @@ impl App {
         let sim = self.net_sim();
         let fill_bots = self.settings.fill_bots;
         let fill_skill = BOT_LEVELS[self.settings.bot_level.min(BOT_LEVELS.len() - 1)].1;
+        self.watchdog.stage("Gauntlet leaderboard");
         self.gauntlet_frame();
+        self.watchdog.stage("career stats (saving)");
         self.career_frame();
+        self.watchdog.stage("network");
         let Screen::Play { game, net } = &mut self.screen else { return };
         if let Some(n) = net.as_mut() {
             n.sim = sim;
@@ -2389,40 +2730,60 @@ impl App {
                 game.feed.push(FeedLine { killer: Some(("Tester".into(), 0)), victim: ("Kiro".into(), 3), tool: "Sniper", head: false, text: None, life: 6.0 });
             }
         }
+        // test switch: a bot's gunshot as the match-winning kill on you, while you're doing
+        // something (DUEL_FINAL_DOING: air, dash, slide, scope, reload); rematch after it
+        if self.autoplay {
+            if let Ok(gun) = std::env::var("DUEL_FINAL_SHOT") {
+                let w = match gun.as_str() {
+                    "revolver" => Weapon::Revolver,
+                    "shotgun" => Weapon::Shotgun,
+                    "smg" => Weapon::Smg,
+                    "handcannon" => Weapon::HandCannon,
+                    "sniper" => Weapon::Sniper,
+                    _ => Weapon::Rifle,
+                };
+                game.stage_final_shot(w);
+                if game.mt.phase == Phase::Fight {
+                    let l = game.local;
+                    let f = &mut game.f[l];
+                    match std::env::var("DUEL_FINAL_DOING").unwrap_or_default().as_str() {
+                        "air" if f.on_ground => {
+                            f.vel.y = 7.0;
+                            f.on_ground = false;
+                        }
+                        "dash" => {
+                            inp.fwd = 1.0;
+                            inp.dash = (game.time * 2.0).fract() < 0.05;
+                        }
+                        "slide" => {
+                            inp.fwd = 1.0;
+                            inp.crouch = true;
+                        }
+                        "scope" => {
+                            f.loadout.gun2 = Weapon::Sniper;
+                            f.cur = 2;
+                            f.weapon = Weapon::Sniper;
+                            f.scope_t = 1.0;
+                            inp.guard = true;
+                        }
+                        "reload" => f.reload_t = f.reload_t.max(0.8),
+                        _ => {}
+                    }
+                }
+                if game.mt.phase == Phase::MatchOver && game.killcam.as_ref().map_or(false, |k| k.t > KILLCAM_TIME + 4.0) && !game.f[game.local].vote {
+                    game.vote_rematch();
+                }
+            }
+        }
         // game feel: a brief freeze when a sword hit lands, slow motion for the final kill
-        if let Some(kc) = game.killcam.as_mut() {
-            kc.t += dt;
-        }
-        let mut scale = 1.0;
-        if game.slowmo > 0.0 {
-            game.slowmo -= dt;
-            scale = 0.25;
-        }
         // the last picture showed everyone this far between ticks, from this camera
         game.view_alpha = (self.acc / TICK).clamp(0.0, 1.0);
         game.view_offset = self.cam_view_offset.get();
-        if game.hitstop > 0.0 {
-            game.hitstop -= dt;
-        } else {
-            self.acc += dt * scale;
-        }
-        let mut steps = 0;
-        while self.acc >= TICK && steps < 12 {
-            game.tick(&inp);
-            game.view_alpha = 1.0;
-            // edges are used once
-            inp.jump = false;
-            inp.dash = false;
-            inp.fire_pressed = false;
-            inp.reload = false;
-            inp.item = false;
-            inp.select = None;
+        self.watchdog.stage("game simulation");
+        let steps = game.advance(&mut self.acc, dt, &mut inp);
+        if steps > 0 {
+            // presses are used once
             self.latch = Latch::default();
-            self.acc -= TICK;
-            steps += 1;
-        }
-        if steps == 12 {
-            self.acc = 0.0;
         }
         if let Ok(page) = std::env::var("DUEL_GALLERY") {
             gallery_pose(game, page == "2");
@@ -2583,21 +2944,9 @@ impl App {
         // the camera follows the mouse right away, not at the next game tick
         let (yaw, pitch) = if f.is_bot { (f.yaw, f.pitch) } else { (self.aim_yaw, self.aim_pitch) };
         // final kill cam: circle the fallen player in slow motion
-        if let Some(kc) = &game.killcam {
-            if kc.t < KILLCAM_TIME && game.f[kc.victim].present {
-                let v = &game.f[kc.victim];
-                let target = v.prev_pos.lerp(v.pos, alpha) + v3(0.0, 0.9, 0.0);
-                let a = v.yaw + 2.2 + kc.t * 0.55;
-                let mut out = v3(a.sin(), 0.0, a.cos());
-                let mut dist = 4.4 - kc.t * 0.35;
-                if let Some((t, _)) = game.world.raycast(target, (out + v3(0.0, 0.35, 0.0)).norm(), dist + 0.3) {
-                    dist = (t - 0.3).max(1.0);
-                }
-                out = (out + v3(0.0, 0.35, 0.0)).norm();
-                let pos = target + out * dist;
-                let d = (target - pos).norm();
-                return (Cam::new(pos, d.x.atan2(d.z), d.y.asin(), 62.0, rect), body);
-            }
+        if let Some((pos, target)) = game.killcam_view(alpha) {
+            let d = (target - pos).norm();
+            return (Cam::new(pos, d.x.atan2(d.z), d.y.clamp(-1.0, 1.0).asin(), 62.0, rect), body);
         }
         // doing a finisher: a short cinematic cut-in from the side, slowly orbiting
         if f.alive && f.fin > 0 && f.fin_target < game.f.len() {
@@ -3220,8 +3569,15 @@ impl App {
         p.circle_filled(c, 1.6, Color32::from_rgb(230, 40, 40));
     }
 
+    /// The HUD's size: follows the window, and the Couch / TV interface size on top (the UI's
+    /// zoom already shrinks the area in points, so this brings the HUD up with it).
+    fn hud_scale(&self, rect: Rect) -> f32 {
+        let zoom = UI_SCALES[self.settings.ui_scale.min(UI_SCALES.len() - 1)].1;
+        ((rect.width() / 1280.0).min(rect.height() / 720.0) * zoom).clamp(0.62, 2.0)
+    }
+
     fn draw_net_overlay(&self, p: &egui::Painter, rect: Rect, g: &Game, n: Option<&Net>) {
-        let s = (rect.width() / 1280.0).min(rect.height() / 720.0).clamp(0.62, 1.5);
+        let s = self.hud_scale(rect);
         let x = rect.left() + 14.0 * s;
         let mut y = rect.top() + 14.0 * s;
         let warn = Color32::from_rgb(255, 170, 60);
@@ -3335,8 +3691,28 @@ impl App {
     fn draw_hud(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game) {
         let me = &g.f[g.local];
         let c = rect.center();
-        // everything scales with the window so nothing overlaps at small sizes
-        let s = (rect.width() / 1280.0).min(rect.height() / 720.0).clamp(0.62, 1.5);
+        // everything scales with the window so nothing overlaps at small sizes (and grows with
+        // the Couch / TV interface size)
+        let s = self.hud_scale(rect);
+        // quick chat (controller): the lines to pick from
+        if let Some(k) = self.quick_chat {
+            let x = rect.left() + 18.0 * s;
+            let mut y = rect.center().y - pad::QUICK_CHAT.len() as f32 * 13.0 * s;
+            let box_r = Rect::from_min_size(Pos2::new(x - 8.0 * s, y - 34.0 * s), Vec2::new(230.0 * s, (pad::QUICK_CHAT.len() as f32 * 26.0 + 64.0) * s));
+            p.rect_filled(box_r, 6.0 * s, Color32::from_rgba_unmultiplied(10, 8, 20, 220));
+            text_shadow(p, Pos2::new(x, y - 28.0 * s), Align2::LEFT_TOP, "QUICK CHAT", 15.0 * s, ACCENT);
+            for (i, line) in pad::QUICK_CHAT.iter().enumerate() {
+                let col = if i == k { Color32::WHITE } else { Color32::from_gray(170) };
+                if i == k {
+                    p.rect_filled(Rect::from_min_size(Pos2::new(x - 4.0 * s, y - 2.0 * s), Vec2::new(214.0 * s, 24.0 * s)), 4.0 * s, Color32::from_rgba_unmultiplied(255, 150, 70, 90));
+                }
+                text_shadow(p, Pos2::new(x + 4.0 * s, y), Align2::LEFT_TOP, line, 16.0 * s, col);
+                y += 26.0 * s;
+            }
+            let a = pad::button_name(pad::btn::A, self.pads.name.as_deref());
+            let b = pad::button_name(pad::btn::B, self.pads.name.as_deref());
+            text_shadow(p, Pos2::new(x, y + 4.0 * s), Align2::LEFT_TOP, &format!("{a}: send   {b}: close"), 12.5 * s, Color32::from_gray(190));
+        }
         let margin = 14.0 * s;
         if let Some(kc) = &g.killcam {
             if kc.t < KILLCAM_TIME {
@@ -3526,7 +3902,7 @@ impl App {
         if me.alive && me.fin == 0 {
             if let Some(t) = g.finish_target(g.local) {
                 if let Some(sp) = cam.project(g.f[t].pos + v3(0.0, 2.3, 0.0)) {
-                    let key = self.settings.binds[A_FINISH].name();
+                    let key = if self.pad_active { pad::button_name(pad::btn::R3, self.pads.name.as_deref()).to_string() } else { self.settings.binds[A_FINISH].name() };
                     let pulse = 0.75 + 0.25 * (g.time * 10.0).sin();
                     let text = format!("{key}  FINISH");
                     let gal = p.layout_no_wrap(text.clone(), FontId::proportional(14.0 * s), Color32::WHITE);
@@ -4026,7 +4402,11 @@ impl App {
         }
         // controls hint, only when it fits between the two bottom panels
         if self.captured && g.time < 12.0 {
-            let hint = "Esc: menu · Tab: players · 1/2/3: weapons · Shift: dash · Space at a wall: wall-run · Enter: chat";
+            let hint = if self.pad_active {
+                "Menu: pause · View: players · Y / d-pad: weapons · LB: dash · A at a wall: wall-run · D-pad down: quick chat"
+            } else {
+                "Esc: menu · Tab: players · 1/2/3: weapons · Shift: dash · Space at a wall: wall-run · Enter: chat"
+            };
             let gal = p.layout_no_wrap(hint.to_string(), FontId::proportional(13.0 * s), Color32::from_gray(220));
             let room = right.left() - left.right() - 16.0 * s;
             if gal.size().x <= room {
@@ -4122,7 +4502,10 @@ fn mode_picker(ui: &mut egui::Ui, mode: &mut u8) {
     ui.label(egui::RichText::new(format!("{}: {} (the limit below counts {})", m.name(), m.blurb(), m.goal_word())).size(13.0).color(Color32::from_gray(200)));
 }
 
+/// A menu panel. When it's taller than the room below `pos` (a short window, a handheld, or the
+/// Couch / TV interface size) its contents scroll, and the selected button scrolls into view.
 fn panel<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let room = (ctx.content_rect().bottom() - pos.y - 52.0).max(160.0);
         egui::Area::new(egui::Id::unique(id))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
@@ -4133,8 +4516,14 @@ fn panel<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, f: impl FnOnce
                     .inner_margin(20.0)
                     .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 150, 70, 90)))
                     .show(ui, |ui| {
-                        ui.set_width(width);
-                        f(ui)
+                        egui::ScrollArea::vertical()
+                            .id_salt(id)
+                            .max_height(room)
+                            .show(ui, |ui| {
+                                ui.set_width(width);
+                                f(ui)
+                            })
+                            .inner
                     })
                     .inner
             })
@@ -4175,12 +4564,25 @@ impl App {
         let sx = tpos.x + 330.0 * shine;
         p.line_segment([Pos2::new((sx - 40.0).max(tpos.x), line_y), Pos2::new((sx + 40.0).min(tpos.x + 330.0), line_y)], Stroke::new(2.5, Color32::from_rgba_unmultiplied(255, 210, 160, 200)));
         p.text(Pos2::new(rect.left() + 48.0, rect.top() + 116.0), Align2::LEFT_TOP, "blades · bullets · wall-runs   —   arena duels for up to 8", FontId::proportional(17.0), Color32::from_rgb(235, 220, 210));
-        p.text(Pos2::new(rect.right() - 16.0, rect.bottom() - 12.0), Align2::RIGHT_BOTTOM, "F11 fullscreen  ·  Settings has controls, graphics and crosshair", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(230, 220, 210, 160));
+        let corner = if self.pad_active {
+            let n = self.pads.name.as_deref();
+            format!("{}: select  ·  {}: back  ·  LB / RB: tabs  ·  {}: player list in a match", pad::button_name(pad::btn::A, n), pad::button_name(pad::btn::B, n), pad::button_name(pad::btn::VIEW, n))
+        } else {
+            "F11 fullscreen  ·  Settings has controls, graphics and crosshair".to_string()
+        };
+        p.text(Pos2::new(rect.right() - 16.0, rect.bottom() - 12.0), Align2::RIGHT_BOTTOM, corner, FontId::proportional(13.0), Color32::from_rgba_unmultiplied(230, 220, 210, 160));
         let mut next: Option<Page> = None;
         let mut action: Option<Box<dyn FnOnce(&mut App)>> = None;
         let pos = Pos2::new(rect.left() + 48.0, rect.top() + 150.0);
         let msg = self.menu_msg.clone();
         let mut quit = false;
+        // Esc (or B on a controller) steps back to the main page
+        if page != Page::Main && self.rebinding.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if page == Page::Settings {
+                self.settings.save();
+            }
+            next = Some(Page::Main);
+        }
         // recent servers, top right of the main page (when there's room)
         if page == Page::Main && rect.width() >= 980.0 && !self.settings.recent.is_empty() {
             let w = 330.0;
@@ -4450,6 +4852,18 @@ impl App {
                         }
                     });
                     ui.label("Every key can be changed in Settings > Controls (these are the defaults).");
+                    egui::CollapsingHeader::new("With a controller").default_open(self.pad_active).show(ui, |ui| {
+                        egui::Grid::new("howto-pad").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                            for (what, button) in pad::LAYOUT {
+                                ui.colored_label(ACCENT, button);
+                                ui.label(what);
+                                ui.end_row();
+                            }
+                            ui.colored_label(ACCENT, "View + d-pad left / right");
+                            ui.label("(Training) previous / next lesson");
+                            ui.end_row();
+                        });
+                    });
                     ui.label("New here? Pick Training on the main menu: a room with dummies that walks you through every move step by step.");
                     ui.label("The third katana hit is heavy: it breaks guards and launches. Headshots with the revolver do extra damage. Free-for-All: everyone for themselves. Team Deathmatch: Red vs Blue. First to the kill limit wins; you respawn after 3 seconds.");
                     if Self::big_button(ui, "Back") {
