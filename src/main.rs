@@ -9,6 +9,7 @@ mod game;
 mod gpu;
 mod math;
 mod net;
+mod steam;
 mod render;
 mod world;
 
@@ -36,6 +37,10 @@ struct Settings {
     join_addr: String,
     volume: f32,
     music_volume: f32,
+    /// Host through Steam when it's running (friends join from Steam, no port forwarding), and
+    /// whether the lobby is listed publicly or only for friends.
+    use_steam: bool,
+    steam_public: bool,
     /// Music on at all, and separately in the menus and in matches.
     music_on: bool,
     menu_music: bool,
@@ -260,6 +265,8 @@ impl Default for Settings {
             music_on: true,
             menu_music: true,
             match_music: true,
+            use_steam: true,
+            steam_public: true,
             loadout: Loadout::default(),
             binds: default_binds(),
             quality: 2,
@@ -307,6 +314,8 @@ impl Settings {
                             "volume" => s.volume = v.parse().unwrap_or(s.volume),
                             "music_volume" => s.music_volume = v.parse().unwrap_or(0.3f32).clamp(0.0, 1.0),
                             "music_on" => s.music_on = v != "0",
+                            "use_steam" => s.use_steam = v != "0",
+                            "steam_public" => s.steam_public = v != "0",
                             "menu_music" => s.menu_music = v != "0",
                             "match_music" => s.match_music = v != "0",
                             "loadout" => {
@@ -377,8 +386,8 @@ impl Settings {
             );
             let [r, g, b] = self.cross_color;
             text += &format!(
-                "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\naim_v=3\n",
-                self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8
+                "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\naim_v=3\n",
+                self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8
             );
             for (k, (id, _)) in ACTIONS.iter().enumerate() {
                 text += &format!("bind.{id}={}\n", self.binds[k].id());
@@ -402,6 +411,8 @@ enum Page {
     Join,
     Settings,
     HowTo,
+    /// Steam lobby browser.
+    Browse,
 }
 
 enum Screen {
@@ -486,6 +497,16 @@ struct App {
     /// "Next track" presses (steps through the tracks), and a short note on screen.
     track_skip: usize,
     music_note: Option<(&'static str, f32)>,
+    /// Steam, when it's running (None = direct IP only).
+    steam: Option<steam::Steam>,
+    browse: steam::BrowserFilter,
+    /// A Steam lobby to join as soon as we can (from "Join game" or the command line).
+    pending_lobby: Option<u64>,
+    steam_tick: f32,
+    browse_asked: bool,
+    /// Test switch DUEL_STEAM_SELFTEST: step and clock of the live Steam check.
+    selftest: u8,
+    selftest_t: f32,
 }
 
 impl App {
@@ -556,7 +577,28 @@ impl App {
             kick_back: 0.0,
             track_skip: 0,
             music_note: None,
+            steam: None,
+            browse: steam::BrowserFilter::default(),
+            pending_lobby: steam::lobby_from_args(&std::env::args().collect::<Vec<_>>()),
+            steam_tick: 0.0,
+            browse_asked: false,
+            selftest: 0,
+            selftest_t: 0.0,
         };
+        // Steam (when it's running); tests stay on direct IP
+        if (!app.autoplay && app.screenshot.is_none()) || std::env::var_os("DUEL_STEAM_PROBE").is_some() {
+            app.steam = steam::Steam::start();
+            if std::env::var_os("DUEL_STEAM_PROBE").is_some() {
+                eprintln!("steam: {}", match &app.steam { Some(s) => format!("running as {}", s.name), None => "not available, using direct IP".into() });
+            }
+            if std::env::var_os("DUEL_STEAM_SELFTEST").is_some() {
+                if let Some(st) = app.steam.as_mut() {
+                    st.create_lobby(true);
+                    app.selftest = 1;
+                    eprintln!("selftest: creating a public lobby");
+                }
+            }
+        }
         // test switches: DUEL_QUALITY=0..3, DUEL_PAGE=settings:<tab> | join | main, DUEL_RECENT=1 (sample list)
         if let Some(q) = std::env::var("DUEL_QUALITY").ok().and_then(|v| v.parse::<usize>().ok()) {
             app.settings.quality = q.min(gpu::Quality::PRESETS.len() - 1);
@@ -660,7 +702,19 @@ impl App {
 
     /// Open a lobby: you're in the arena at once (warm-up); friends drop in as they join.
     fn start_hosting(&mut self, port: u16) -> Result<(), String> {
-        let n = Net::host(port)?;
+        let via_steam = self.settings.use_steam && self.steam.is_some();
+        let mut n = match Net::host(port) {
+            Ok(n) => n,
+            // the port is taken, but Steam needs no port: any free one will do
+            Err(_) if via_steam => Net::host(0)?,
+            Err(e) => return Err(e),
+        };
+        if via_steam {
+            if let Some(st) = self.steam.as_mut() {
+                n.steam = Some(st.client.clone());
+                st.create_lobby(self.settings.steam_public);
+            }
+        }
         let mode = Mode::from_u8(self.settings.mode);
         let mut g = Game::new(Kind::Host, 0, mode, self.settings.rounds as u16);
         let name = clean_name(&self.settings.name, 0);
@@ -674,6 +728,9 @@ impl App {
             None => format!("port {port}"),
         };
         g.say(format!("Lobby open - same Wi-Fi: {addr}"));
+        if via_steam {
+            g.say("Opening a Steam lobby: friends can join from Steam, no port forwarding needed".into());
+        }
         self.lookup_public_ip();
         self.check_firewall();
         self.ip_announced = false;
@@ -684,6 +741,9 @@ impl App {
     fn leave_to_menu(&mut self) {
         if let Screen::Play { net: Some(net), .. } | Screen::Lobby { net, .. } = &mut self.screen {
             net.send_bye();
+        }
+        if let Some(st) = self.steam.as_mut() {
+            st.leave();
         }
         self.screen = Screen::Menu(Page::Main);
         self.paused = false;
@@ -744,6 +804,201 @@ impl App {
             }
             self.rebinding = None;
         }
+    }
+
+    /// Steam each frame: its callbacks, joins from the friends list, our lobby's details.
+    fn steam_frame(&mut self, dt: f32) {
+        let Some(st) = self.steam.as_mut() else { return };
+        let events = st.update();
+        for ev in events {
+            match ev {
+                steam::SteamEvent::Created(Ok(id)) => {
+                    let (mode, players) = match &self.screen {
+                        Screen::Play { game, net } => (game.mt.mode as u8, net.as_ref().map_or(1, |n| n.player_count())),
+                        _ => (self.settings.mode, 1),
+                    };
+                    if let Some(st) = self.steam.as_mut() {
+                        st.lobby_created(id, mode, players);
+                    }
+                    if let Screen::Play { game, .. } = &mut self.screen {
+                        game.say("Steam lobby open: friends can join from their friends list or Find Games".into());
+                    }
+                }
+                steam::SteamEvent::Created(Err(e)) => {
+                    if let Screen::Play { game, .. } = &mut self.screen {
+                        game.say(format!("Couldn't open a Steam lobby ({e}); friends can still join by IP"));
+                    }
+                }
+                steam::SteamEvent::JoinLobby(id) => self.pending_lobby = Some(id),
+                steam::SteamEvent::Entered(Ok(id)) => {
+                    let host = self.steam.as_mut().and_then(|s| s.entered(id));
+                    let client = self.steam.as_ref().map(|s| s.client.clone());
+                    match (host, client) {
+                        (Some(h), Some(cl)) => match Net::join_steam(cl, h) {
+                            Ok(n) => {
+                                self.menu_msg = None;
+                                self.screen = Screen::Lobby { net: n, waiting_since: 0.0 };
+                            }
+                            Err(e) => self.menu_msg = Some(e),
+                        },
+                        _ => self.menu_msg = Some("That Steam lobby has no host any more.".into()),
+                    }
+                }
+                steam::SteamEvent::Entered(Err(())) => {
+                    self.menu_msg = Some("Couldn't join that Steam lobby: it may be full or closed.".into());
+                    self.screen = Screen::Menu(Page::Browse);
+                }
+                steam::SteamEvent::LobbyList(_) => {}
+            }
+        }
+        // a friend clicked "Join game": leave what we're doing and go
+        if let Some(id) = self.pending_lobby.take() {
+            if matches!(self.screen, Screen::Play { .. } | Screen::Lobby { .. }) {
+                self.leave_to_menu();
+            }
+            if let Some(st) = self.steam.as_mut() {
+                st.join_lobby(id);
+                self.menu_msg = Some("Joining through Steam...".into());
+            }
+        }
+        if self.selftest > 0 {
+            self.steam_selftest(dt);
+        }
+        // keep our lobby's mode and head count current for the browser
+        self.steam_tick -= dt;
+        if self.steam_tick <= 0.0 {
+            self.steam_tick = 1.0;
+            if let (Some(st), Screen::Play { game, net: Some(n) }) = (self.steam.as_ref(), &self.screen) {
+                if n.is_host {
+                    st.update_lobby(game.mt.mode as u8, n.player_count());
+                }
+            }
+        }
+    }
+
+    /// Test switch: open a real lobby, find it in the lobby list, check the relay, close it.
+    fn steam_selftest(&mut self, dt: f32) {
+        let Some(st) = self.steam.as_mut() else { return };
+        self.selftest_t += dt;
+        match self.selftest {
+            1 => {
+                if let Some(id) = st.lobby {
+                    eprintln!("selftest: lobby {id} created; waiting for Steam to publish it");
+                    self.selftest = 2;
+                    self.selftest_t = 0.0;
+                } else if self.selftest_t > 20.0 {
+                    eprintln!("selftest: FAIL no lobby after 20 s");
+                    self.selftest = 9;
+                }
+            }
+            2 if self.selftest_t > 2.0 => {
+                st.refresh(None);
+                eprintln!("selftest: asking Steam for the lobby list");
+                self.selftest = 3;
+                self.selftest_t = 0.0;
+            }
+            3 if !st.refreshing => {
+                let mine = st.lobby.unwrap_or(0);
+                eprintln!("selftest: {} lobbies listed", st.rows.len());
+                match st.rows.iter().find(|r| r.id == mine) {
+                    Some(r) => eprintln!("selftest: PASS our lobby is listed: name {:?}, mode {}, map {:?}, players {}/{}", r.name, r.mode, r.map, r.players, r.max),
+                    None => eprintln!("selftest: our lobby isn't in the list (Steam may hide your own lobby)"),
+                }
+                let relay = st.client.networking_utils().relay_network_status();
+                eprintln!("selftest: relay network: {relay:?}");
+                self.selftest = 4;
+                self.selftest_t = 0.0;
+            }
+            3 if self.selftest_t > 15.0 => {
+                eprintln!("selftest: FAIL no lobby list after 15 s");
+                self.selftest = 4;
+            }
+            4 => {
+                // wait for the relay network to be ready (it measures the nearest relays first)
+                let relay = st.client.networking_utils().relay_network_status();
+                let ready = format!("{relay:?}").contains("Current");
+                if !ready && self.selftest_t < 40.0 {
+                    return;
+                }
+                eprintln!("selftest: relay network after {:.0} s: {relay:?}{}", self.selftest_t, if ready { " (PASS: relayed connections ready)" } else { "" });
+                st.leave();
+                eprintln!("selftest: left the lobby, done");
+                self.selftest = 9;
+            }
+            _ => {}
+        }
+    }
+
+    /// The Steam lobby browser: filters, the list, and Join.
+    fn browser_ui(&mut self, ui: &mut egui::Ui) -> Option<u64> {
+        let mut join = None;
+        let Some(st) = self.steam.as_mut() else {
+            ui.label("Steam isn't running, so there's no lobby list. Start Steam and restart the game, or use Join a Friend with an IP address.");
+            return None;
+        };
+        if st.rows.is_empty() && !st.refreshing && ui.ctx().input(|i| i.time) > 0.0 && !self.browse_asked {
+            self.browse_asked = true;
+            st.refresh(self.browse.mode);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Mode");
+            egui::ComboBox::from_id_salt("bmode")
+                .selected_text(self.browse.mode.map_or("Any".to_string(), |m| Mode::from_u8(m).name().to_string()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.browse.mode, None, "Any");
+                    for m in 0..6u8 {
+                        ui.selectable_value(&mut self.browse.mode, Some(m), Mode::from_u8(m).name());
+                    }
+                });
+            ui.label("Map");
+            egui::ComboBox::from_id_salt("bmap").selected_text(self.browse.map.clone().unwrap_or_else(|| "Any".into())).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.browse.map, None, "Any");
+                ui.selectable_value(&mut self.browse.map, Some("Arena".to_string()), "Arena");
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Max ping");
+            ui.add(egui::Slider::new(&mut self.browse.max_ping, 0..=400).step_by(10.0).custom_formatter(|v, _| if v <= 0.0 { "any".into() } else { format!("{v:.0} ms") }));
+            ui.checkbox(&mut self.browse.hide_full, "hide full");
+            ui.checkbox(&mut self.browse.hide_empty, "hide empty");
+        });
+        ui.horizontal(|ui| {
+            if ui.button(if st.refreshing { "Refreshing..." } else { "Refresh" }).clicked() && !st.refreshing {
+                st.refresh(self.browse.mode);
+            }
+            ui.label(egui::RichText::new(format!("{} lobbies", st.rows.len())).color(Color32::from_gray(170)));
+        });
+        ui.separator();
+        let rows: Vec<steam::LobbyRow> = st.rows.iter().filter(|r| self.browse.keep(r)).cloned().collect();
+        if rows.is_empty() {
+            ui.label(egui::RichText::new(if st.refreshing { "Looking for games..." } else { "No games match. Host one, or loosen the filters." }).color(Color32::from_gray(190)));
+        }
+        egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height() - 470.0).clamp(120.0, 360.0)).show(ui, |ui| {
+            egui::Grid::new("lobbies").num_columns(6).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
+                for h in ["Lobby", "Mode", "Map", "Players", "Ping", ""] {
+                    ui.label(egui::RichText::new(h).color(ACCENT));
+                }
+                ui.end_row();
+                for r in rows {
+                    ui.label(if r.name.is_empty() { "Lobby".to_string() } else { r.name.clone() });
+                    ui.label(Mode::from_u8(r.mode).name());
+                    ui.label(&r.map);
+                    ui.label(format!("{}/{}", r.players, r.max));
+                    let (pt, pc) = match r.ping {
+                        Some(p) if p <= 80 => (format!("{p} ms"), Color32::from_rgb(140, 230, 140)),
+                        Some(p) if p <= 160 => (format!("{p} ms"), Color32::from_rgb(255, 215, 120)),
+                        Some(p) => (format!("{p} ms"), Color32::from_rgb(255, 130, 110)),
+                        None => ("...".into(), Color32::from_gray(160)),
+                    };
+                    ui.colored_label(pc, pt);
+                    if ui.add_enabled(r.players < r.max, egui::Button::new("Join")).clicked() {
+                        join = Some(r.id);
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        join
     }
 
     /// Music switches: all music, menu music, match music, and skip to the next track.
@@ -1299,6 +1554,7 @@ impl eframe::App for App {
         self.wall_t += dt;
         self.handle_screenshot(&ctx);
 
+        self.steam_frame(dt);
         // network + simulation
         let mut go_menu = false;
         if let Screen::Lobby { .. } = self.screen {
@@ -3298,6 +3554,10 @@ impl App {
                     if Self::big_button(ui, "Join a Friend") {
                         next = Some(Page::Join);
                     }
+                    if self.steam.is_some() && Self::big_button(ui, "Find Games (Steam)") {
+                        self.browse_asked = false;
+                        next = Some(Page::Browse);
+                    }
                     if Self::big_button(ui, "How to Play") {
                         next = Some(Page::HowTo);
                     }
@@ -3335,6 +3595,20 @@ impl App {
                 }
                 Page::Host => {
                     ui.heading("Host a Lobby");
+                    match &self.steam {
+                        Some(st) => {
+                            ui.checkbox(&mut self.settings.use_steam, format!("Host through Steam as {} (friends join from Steam: no port forwarding)", st.name));
+                            if self.settings.use_steam {
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut self.settings.steam_public, true, "Listed in Find Games");
+                                    ui.radio_value(&mut self.settings.steam_public, false, "Friends only");
+                                });
+                            }
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("Steam isn't running: friends join by IP address (start Steam for one-click joins without port forwarding).").size(13.0).color(Color32::from_gray(185)));
+                        }
+                    }
                     self.lookup_public_ip();
                     let port = self.settings.port.trim().to_string();
                     let (public, public_text) = self.public_addr_text();
@@ -3374,6 +3648,20 @@ impl App {
                                     app.menu_msg = None;
                                 }
                                 Err(e) => app.menu_msg = Some(e),
+                            }
+                        }));
+                    }
+                    if Self::big_button(ui, "Back") {
+                        next = Some(Page::Main);
+                    }
+                }
+                Page::Browse => {
+                    ui.heading("Find Games");
+                    if let Some(id) = self.browser_ui(ui) {
+                        action = Some(Box::new(move |app: &mut App| {
+                            if let Some(st) = app.steam.as_mut() {
+                                st.join_lobby(id);
+                                app.menu_msg = Some("Joining through Steam...".into());
                             }
                         }));
                     }
@@ -3623,6 +3911,11 @@ impl App {
                 ui.heading("Paused");
                 if kind != Kind::Offline {
                     ui.label("The match keeps going while this menu is open!");
+                }
+                if let Some(st) = self.steam.as_ref().filter(|s| s.lobby.is_some()) {
+                    if ui.button("Invite Steam friends").clicked() {
+                        st.invite_friends();
+                    }
                 }
                 if kind == Kind::Host {
                     let (public, public_text) = self.public_addr_text();

@@ -10,6 +10,33 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 const MAGIC: [u8; 4] = *b"DRA7";
+/// The protocol version as text (Steam lobbies only list games that speak the same one).
+pub const PROTOCOL: &str = "DRA7";
+/// Steam message channels: game packets, and lobby-browser ping probes.
+pub const STEAM_GAME_CHANNEL: u32 = 0;
+pub const STEAM_PING_CHANNEL: u32 = 1;
+
+/// Steam players have no IP address here; each gets a made-up one built from their Steam ID
+/// (in a private IPv6 range), so the rest of the netcode treats them like anyone else.
+pub fn steam_addr(id: u64) -> SocketAddr {
+    let ip = std::net::Ipv6Addr::new(0xfd53, 0x7465, 0x616d, 0, (id >> 48) as u16, (id >> 32) as u16, (id >> 16) as u16, id as u16);
+    SocketAddr::new(std::net::IpAddr::V6(ip), 1)
+}
+
+/// The Steam ID behind a made-up address, if it is one.
+pub fn addr_steam(a: &SocketAddr) -> Option<u64> {
+    match a {
+        SocketAddr::V6(v6) if v6.port() == 1 => {
+            let s = v6.ip().segments();
+            if s[0] == 0xfd53 && s[1] == 0x7465 && s[2] == 0x616d && s[3] == 0 {
+                Some((s[4] as u64) << 48 | (s[5] as u64) << 32 | (s[6] as u64) << 16 | s[7] as u64)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 const K_HELLO: u8 = 1;
 const K_STATE: u8 = 2;
 const K_HOST: u8 = 3;
@@ -383,6 +410,8 @@ pub struct Net {
     seq: u32,
     rng: u64,
     host_link: Link,
+    /// Steam (when running): players reached through Steam's relay by Steam ID.
+    pub steam: Option<steamworks::Client>,
     counts: [usize; 4],
     rate_since: Instant,
     pub rates: Rates,
@@ -394,6 +423,20 @@ impl Net {
         let sock = UdpSocket::bind((ip.as_str(), port)).map_err(|e| format!("Couldn't open port {port}: {e}"))?;
         sock.set_nonblocking(true).map_err(|e| e.to_string())?;
         Ok(Net::make(sock, true, None, port))
+    }
+
+    /// Join a friend's game through Steam (relayed: nobody needs to forward ports).
+    pub fn join_steam(client: steamworks::Client, host: u64) -> Result<Net, String> {
+        let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+        sock.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let mut n = Net::make(sock, false, Some(steam_addr(host)), DEFAULT_PORT);
+        n.steam = Some(client);
+        Ok(n)
+    }
+
+    /// Whether we talk to the host through Steam.
+    pub fn via_steam(&self) -> bool {
+        self.host_addr.as_ref().is_some_and(|a| addr_steam(a).is_some()) || (self.is_host && self.steam.is_some())
     }
 
     pub fn join(addr: &str) -> Result<Net, String> {
@@ -436,6 +479,7 @@ impl Net {
             seq: 0,
             rng: 0x2545F4914F6CDD1D ^ (port as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (std::process::id() as u64) << 20,
             host_link: Link::new(),
+            steam: None,
             counts: [0; 4],
             rate_since: Instant::now(),
             rates: Rates::default(),
@@ -464,9 +508,23 @@ impl Net {
     /// Where we're connected (player) or listening (host).
     pub fn address(&self) -> String {
         match self.host_addr {
+            Some(a) if addr_steam(&a).is_some() => "the host through Steam (relayed)".into(),
             Some(a) => a.to_string(),
+            None if self.steam.is_some() => format!("port {} and Steam", self.port),
             None => format!("port {}", self.port),
         }
+    }
+
+    /// Send raw bytes to someone: Steam players through Steam, everyone else by UDP.
+    fn raw_send(&self, data: &[u8], to: SocketAddr) {
+        if let Some(id) = addr_steam(&to) {
+            if let Some(cl) = &self.steam {
+                let who = steamworks::networking_types::NetworkingIdentity::new_steam_id(steamworks::SteamId::from_raw(id));
+                let _ = cl.networking_messages().send_message_to_user(who, steamworks::networking_types::SendFlags::UNRELIABLE_NO_NAGLE, data, STEAM_GAME_CHANNEL);
+            }
+            return;
+        }
+        let _ = self.sock.send_to(data, to);
     }
 
     fn free_slot(&self) -> Option<usize> {
@@ -517,7 +575,7 @@ impl Net {
             self.out_q.push((Instant::now() + d, data, to));
             return;
         }
-        let _ = self.sock.send_to(&data, to);
+        self.raw_send(&data, to);
     }
 
     /// Send what the network test held back once its time is up.
@@ -527,7 +585,7 @@ impl Net {
         while i < self.out_q.len() {
             if self.out_q[i].0 <= now {
                 let (_, d, to) = self.out_q.swap_remove(i);
-                let _ = self.sock.send_to(&d, to);
+                self.raw_send(&d, to);
             } else {
                 i += 1;
             }
@@ -546,6 +604,31 @@ impl Net {
                 Err(_) => break, // e.g. "connection reset" on Windows when a peer isn't up yet
             };
             let data = buf[..n].to_vec();
+            match self.sim {
+                Some(sim) => {
+                    if self.rand() < sim.loss {
+                        continue;
+                    }
+                    let d = self.sim_delay(sim);
+                    self.in_q.push((now + d, data, from));
+                }
+                None => self.in_q.push((now, data, from)),
+            }
+        }
+        // and whatever came through Steam
+        let steam_in: Vec<(Vec<u8>, SocketAddr)> = match &self.steam {
+            Some(cl) => cl
+                .networking_messages()
+                .receive_messages_on_channel(STEAM_GAME_CHANNEL, 128)
+                .into_iter()
+                .filter_map(|m| {
+                    let id = m.identity_peer().steam_id()?.raw();
+                    Some((m.data().to_vec(), steam_addr(id)))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        for (data, from) in steam_in {
             match self.sim {
                 Some(sim) => {
                     if self.rand() < sim.loss {
@@ -599,7 +682,7 @@ impl Net {
             // the same game, another version: they can't understand each other, so say so
             if self.is_host {
                 let reply = vec![MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], K_VERSION];
-                let _ = self.sock.send_to(&reply, from);
+                self.raw_send(&reply, from);
             } else if Some(from) == self.host_addr && data.len() >= 5 && data[4] == K_VERSION {
                 out.push(Incoming::WrongVersion);
             }
@@ -1106,5 +1189,21 @@ mod packet_size_tests {
             assert!(data.len() <= MAX_PACKET, "packet of {} bytes", data.len());
             assert!(data.len() > 600, "still carries the match ({} bytes)", data.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod steam_addr_tests {
+    use super::*;
+
+    #[test]
+    fn steam_ids_round_trip_through_addresses() {
+        for id in [76561197960287930u64, 1, u64::MAX, 0x0110_0001_0000_0000] {
+            let a = steam_addr(id);
+            assert_eq!(addr_steam(&a), Some(id));
+        }
+        // real addresses aren't mistaken for Steam players
+        assert_eq!(addr_steam(&"192.168.1.20:27960".parse().unwrap()), None);
+        assert_eq!(addr_steam(&"[::1]:1".parse().unwrap()), None);
     }
 }
