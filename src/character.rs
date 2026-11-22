@@ -2,9 +2,9 @@
 //! then layers aiming, strafing, guard, sword swings and weapon holds on top.
 
 use crate::anim::{Rig, Trs, blend_into, blend_masked};
-use crate::game::{Capsule, FAN_THROW_TIME, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, THROW_TIME, Tuning, Weapon};
+use crate::game::{Capsule, FAN_THROW_TIME, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, THROW_TIME, Tuning, Weapon, finisher};
 use crate::math::{M3, V3, look_dir, v3, wrap_angle};
-use crate::render::sword_arm;
+use crate::render::{finisher_arm, finisher_body, sword_arm};
 use glam::{Mat4, Quat, Vec3};
 use std::collections::VecDeque;
 use std::f32::consts::PI;
@@ -423,7 +423,15 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
     if alive_upper {
         let pole_r = sh_r + Vec3::new(0.5, -0.6, -0.3);
         let pole_l = sh_l + Vec3::new(-0.5, -0.6, -0.3);
-        if melee && f.slash_t > 0.0 {
+        if melee && f.fin > 0 {
+            // a finisher: its own blade path, reaching in and out
+            let pr = (f.fin_t / finisher(f.fin).dur).clamp(0.0, 1.0);
+            let (arm, rk) = finisher_arm(f.fin as usize - 1, pr);
+            let dir = gv(arm.apply(v3(0.0, -1.0, 0.0))).normalize();
+            let target = sh_r + dir * reach * rk;
+            rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(target), to_model(sh_r + Vec3::new(0.2, -0.8, -0.6)));
+            weapon_dir = Some(dir);
+        } else if melee && f.slash_t > 0.0 {
             let p = 1.0 - f.slash_t / f.weapon.slash_dur();
             let arm = sword_arm(&M3::I, f.slash_idx, p);
             let dir = gv(arm.apply(v3(0.0, -1.0, 0.0))).normalize();
@@ -537,7 +545,11 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
         Some(m) => (m.retarget(rig, &pose), m.norm),
         None => (pose, 1.0),
     };
-    let world = Mat4::from_scale_rotation_translation(Vec3::splat(scale.clamp(0.2, 4.0) * norm), Quat::from_rotation_y(f.yaw) * lean, gv(pos));
+    // a finisher turns, leans and lifts the whole body
+    let (spin, fin_lean, lift) = if f.alive && f.fin > 0 { finisher_body(f.fin as usize - 1, (f.fin_t / finisher(f.fin).dur).clamp(0.0, 1.0)) } else { (0.0, 0.0, 0.0) };
+    let lean = lean * Quat::from_rotation_x(fin_lean);
+    let body_rot = Quat::from_rotation_y(f.yaw + spin) * lean;
+    let world = Mat4::from_scale_rotation_translation(Vec3::splat(scale.clamp(0.2, 4.0) * norm), body_rot, gv(pos) + Vec3::Y * lift);
     let palette = match model {
         Some(m) => rig.palette_with(&pose, world, &m.inv_bind),
         None => rig.palette(&pose, world),
@@ -549,7 +561,7 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
     let wp = |n: usize| ov(wm.transform_point3(g[n].w_axis.truncate()));
     let hand = wp(b.hand_r);
     let elbow = wp(b.lo_r);
-    let to_world_dir = |d: Vec3| ov((Quat::from_rotation_y(f.yaw) * lean) * d).norm();
+    let to_world_dir = |d: Vec3| ov(body_rot * d).norm();
     let z = match weapon_dir {
         Some(d) => to_world_dir(d),
         None => (hand - elbow).norm(),

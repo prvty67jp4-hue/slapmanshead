@@ -4,6 +4,7 @@ mod anim;
 mod audio;
 mod bot;
 mod firewall;
+mod career;
 mod character;
 mod chars;
 mod game;
@@ -35,6 +36,10 @@ struct Settings {
     mode: u8,
     /// Which map to play (Practice and hosting): world::MapId as a number.
     map: u8,
+    /// Hosting: fill the lobby with bots up to this many fighters (0 = no bots).
+    fill_bots: usize,
+    /// Best Gauntlet score on this computer.
+    gauntlet_best: u32,
     bots: usize,
     port: String,
     join_addr: String,
@@ -108,7 +113,7 @@ enum Bind {
     Unbound,
 }
 
-const N_ACTIONS: usize = 19;
+const N_ACTIONS: usize = 20;
 const A_FWD: usize = 0;
 const A_BACK: usize = 1;
 const A_LEFT: usize = 2;
@@ -128,6 +133,7 @@ const A_CHAT: usize = 15;
 const A_SLIDE: usize = 16;
 const A_MUSIC: usize = 17;
 const A_KICK: usize = 18;
+const A_FINISH: usize = 19;
 
 /// (saved id, what it does)
 const ACTIONS: [(&str, &str); N_ACTIONS] = [
@@ -150,6 +156,7 @@ const ACTIONS: [(&str, &str); N_ACTIONS] = [
     ("slide", "Slide (while running)"),
     ("music", "Music on / off"),
     ("kick", "Kick"),
+    ("finish", "Finisher"),
 ];
 
 fn default_binds() -> [Bind; N_ACTIONS] {
@@ -174,6 +181,7 @@ fn default_binds() -> [Bind; N_ACTIONS] {
         Key(egui::Key::C),
         Key(egui::Key::M),
         Key(egui::Key::F),
+        Key(egui::Key::E),
     ]
 }
 
@@ -264,6 +272,8 @@ impl Default for Settings {
             rounds: 15,
             mode: 0,
             map: 0,
+            fill_bots: 0,
+            gauntlet_best: 0,
             bots: 3,
             port: net::DEFAULT_PORT.to_string(),
             join_addr: String::new(),
@@ -356,6 +366,8 @@ impl Settings {
                             "rounds" => s.rounds = v.parse().unwrap_or(s.rounds).clamp(1, 50),
                             "mode" => s.mode = v.parse().unwrap_or(0u8).min(5),
                             "map" => s.map = v.parse().unwrap_or(0u8).min(2),
+                            "fill_bots" => s.fill_bots = v.parse().unwrap_or(0usize).min(8),
+                            "gauntlet_best" => s.gauntlet_best = v.parse().unwrap_or(0u32),
                             "bots" => s.bots = v.parse().unwrap_or(3usize).clamp(1, 7),
                             "port" => s.port = v.to_string(),
                             "join" => s.join_addr = v.to_string(),
@@ -428,8 +440,8 @@ impl Settings {
                 let _ = std::fs::create_dir_all(dir);
             }
             let mut text = format!(
-                "name={}\nsens={}\nfov={}\nbot={}\nrounds={}\nmode={}\nmap={}\nbots={}\nport={}\njoin={}\nvolume={}\nloadout={},{},{},{}\n",
-                self.name, self.sens, self.fov, self.bot_level, self.rounds, self.mode, self.map, self.bots, self.port, self.join_addr, self.volume,
+                "name={}\nsens={}\nfov={}\nbot={}\nrounds={}\nmode={}\nmap={}\nfill_bots={}\ngauntlet_best={}\nbots={}\nport={}\njoin={}\nvolume={}\nloadout={},{},{},{}\n",
+                self.name, self.sens, self.fov, self.bot_level, self.rounds, self.mode, self.map, self.fill_bots, self.gauntlet_best, self.bots, self.port, self.join_addr, self.volume,
                 self.loadout.melee as u8, self.loadout.gun1 as u8, self.loadout.gun2 as u8, self.loadout.to_bytes()[3]
             );
             let [r, g, b] = self.cross_color;
@@ -461,6 +473,8 @@ enum Page {
     HowTo,
     /// Steam lobby browser.
     Browse,
+    /// Career stats, finishers included.
+    Stats,
 }
 
 enum Screen {
@@ -477,6 +491,7 @@ struct Latch {
     reload: bool,
     item: bool,
     kick: bool,
+    finish: bool,
     select: Option<u8>,
 }
 
@@ -567,6 +582,8 @@ struct App {
     cam_spring_vel: std::cell::Cell<V3>,
     /// How far the drawn camera sits from the plain one (for shots to follow the crosshair).
     cam_view_offset: std::cell::Cell<V3>,
+    /// Career stats on this computer.
+    career: career::Career,
     cam_roll: std::cell::Cell<f32>,
     fov_speed: std::cell::Cell<f32>,
 }
@@ -653,6 +670,7 @@ impl App {
             cam_smooth_pos: std::cell::Cell::new(None),
             cam_spring_vel: std::cell::Cell::new(V3::ZERO),
             cam_view_offset: std::cell::Cell::new(V3::ZERO),
+            career: career::Career::load(),
             cam_roll: std::cell::Cell::new(0.0),
             fov_speed: std::cell::Cell::new(0.0),
         };
@@ -714,7 +732,7 @@ impl App {
                 None => Mode::Ffa,
             };
             let kills: u16 = std::env::var("DUEL_KILLS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
-            let mut g = Game::offline("Tester", nb, 0.6, mode, kills);
+            let mut g = if std::env::var_os("DUEL_GAUNTLET").is_some() { Game::gauntlet("Tester", 0) } else { Game::offline("Tester", nb, 0.6, mode, kills) };
             if let Some(m) = std::env::var("DUEL_MAP").ok().and_then(|v| v.parse::<u8>().ok()) {
                 g.set_map(MapId::from_u8(m));
             }
@@ -884,6 +902,50 @@ impl App {
         }
     }
 
+    /// Count what happened for the career stats (and the XP it earns).
+    fn career_frame(&mut self) {
+        let Screen::Play { game, .. } = &mut self.screen else { return };
+        if game.kind == Kind::Demo {
+            game.career.clear();
+            return;
+        }
+        let evs = std::mem::take(&mut game.career);
+        if evs.is_empty() {
+            return;
+        }
+        let level = self.career.level();
+        for ev in evs {
+            let xp = self.career.apply(ev);
+            if let CareerEv::Kill { finisher, .. } = ev {
+                if finisher > 0 {
+                    game.say(format!("+{xp} XP (finisher)"));
+                }
+            }
+        }
+        if self.career.level() > level {
+            game.say(format!("Level up! You are level {}", self.career.level()));
+        }
+        self.career.save();
+    }
+
+    /// Gauntlet: when a run ends, keep the best score and send it to the Steam leaderboard.
+    fn gauntlet_frame(&mut self) {
+        let Screen::Play { game, .. } = &mut self.screen else { return };
+        let Some(gt) = game.gauntlet.as_mut() else { return };
+        if !gt.over || gt.submitted {
+            return;
+        }
+        gt.submitted = true;
+        let score = gt.score;
+        if score > self.settings.gauntlet_best {
+            self.settings.gauntlet_best = score;
+            self.settings.save();
+        }
+        if let Some(st) = self.steam.as_ref() {
+            st.submit_gauntlet(score as i32);
+        }
+    }
+
     /// Steam each frame: its callbacks, joins from the friends list, our lobby's details.
     fn steam_frame(&mut self, dt: f32) {
         let Some(st) = self.steam.as_mut() else { return };
@@ -927,6 +989,14 @@ impl App {
                     self.screen = Screen::Menu(Page::Browse);
                 }
                 steam::SteamEvent::LobbyList(_) => {}
+                steam::SteamEvent::Board { rank, top } => {
+                    if let Screen::Play { game, .. } = &mut self.screen {
+                        if let Some(gt) = game.gauntlet.as_mut() {
+                            gt.rank = rank;
+                            gt.board = top;
+                        }
+                    }
+                }
             }
         }
         // a friend clicked "Join game": leave what we're doing and go
@@ -2089,6 +2159,9 @@ impl App {
             if b[A_KICK].tapped(i, prev) {
                 self.latch.kick = true;
             }
+            if b[A_FINISH].tapped(i, prev) {
+                self.latch.finish = true;
+            }
             if b[A_ITEM].tapped(i, prev) {
                 self.latch.item = true;
             }
@@ -2140,6 +2213,7 @@ impl App {
         inp.fire_pressed = self.latch.fire_pressed;
         inp.reload = self.latch.reload;
         inp.kick = self.latch.kick;
+        inp.finish = self.latch.finish;
         inp.item = self.latch.item;
         inp.select = self.latch.select;
         inp
@@ -2174,6 +2248,10 @@ impl App {
         let autostart = self.autostart;
         let train_step = std::mem::take(&mut self.train_step);
         let sim = self.net_sim();
+        let fill_bots = self.settings.fill_bots;
+        let fill_skill = BOT_LEVELS[self.settings.bot_level.min(BOT_LEVELS.len() - 1)].1;
+        self.gauntlet_frame();
+        self.career_frame();
         let Screen::Play { game, net } = &mut self.screen else { return };
         if let Some(n) = net.as_mut() {
             n.sim = sim;
@@ -2187,6 +2265,12 @@ impl App {
             for msg in n.poll() {
                 match msg {
                     Incoming::Join { slot, name } => {
+                        if game.f[slot].present && game.f[slot].is_bot {
+                            // a bot was in the only free place: it makes room
+                            let bn = game.f[slot].name.clone();
+                            game.remove_player(slot);
+                            game.say(format!("{bn} (bot) left to make room"));
+                        }
                         let name = clean_name(&name, slot);
                         let team = game.balance_team();
                         game.add_player(slot, &name, false, None, team);
@@ -2213,15 +2297,29 @@ impl App {
                     }
                     Incoming::Host(m) => apply_host_msg(game, m),
                     Incoming::HostLeft => {
-                        self.disconnected = Some("The host closed the lobby.".into());
+                        // carry on with a new host if we can
+                        if !net::migrate(game, n) && self.disconnected.is_none() {
+                            self.disconnected = Some("The host closed the lobby.".into());
+                        }
                     }
                     Incoming::Full | Incoming::WrongVersion => {}
                 }
+            }
+            // the host went quiet: after a few seconds the best-connected player takes over
+            if !n.is_host && n.last_recv.elapsed().as_secs_f32() > 3.0 && n.succession.is_some() && self.disconnected.is_none() {
+                net::migrate(game, n);
             }
             if !n.is_host && n.last_recv.elapsed().as_secs_f32() > 8.0 && self.disconnected.is_none() {
                 self.disconnected = Some("Lost connection to the host.".into());
             }
             if n.is_host {
+                // bots keep the lobby at the chosen size, stepping aside for real players
+                n.soft = (0..game.f.len()).filter(|&s| s != game.local && game.f[s].present && game.f[s].is_bot).collect();
+                if fill_bots > 0 && game.mt.phase != Phase::MatchOver {
+                    if let Some(msg) = game.fill_bots(fill_bots, fill_skill) {
+                        game.say(msg);
+                    }
+                }
                 for (s, ping) in n.pings() {
                     if game.f[s].present {
                         game.f[s].ping_ms = ping;
@@ -2499,6 +2597,44 @@ impl App {
                 let pos = target + out * dist;
                 let d = (target - pos).norm();
                 return (Cam::new(pos, d.x.atan2(d.z), d.y.asin(), 62.0, rect), body);
+            }
+        }
+        // doing a finisher: a short cinematic cut-in from the side, slowly orbiting
+        if f.alive && f.fin > 0 && f.fin_target < game.f.len() {
+            let t = &game.f[f.fin_target];
+            let tp = t.prev_pos.lerp(t.pos, alpha);
+            let mid = (body + tp) * 0.5 + v3(0.0, 1.1, 0.0);
+            let line = (tp - body).flat();
+            let line = if line.len() > 0.05 { line.norm() } else { yaw_fwd(f.yaw) };
+            let side = v3(line.z, 0.0, -line.x);
+            let pr = (f.fin_t / finisher(f.fin).dur).clamp(0.0, 1.0);
+            let o = 0.45 - 0.6 * pr;
+            let out = (side * o.cos() - line * (o.sin() * 0.8) + v3(0.0, 0.28, 0.0)).norm();
+            let mut dist = 3.3;
+            if let Some((hit, _)) = game.world.raycast(mid, out, dist + 0.3) {
+                dist = (hit - 0.3).max(0.9);
+            }
+            let pos = mid + out * dist;
+            let d = (mid - pos).norm();
+            return (Cam::new(pos, d.x.atan2(d.z), d.y.asin(), 56.0, rect), body);
+        }
+        // caught in a finisher: a low angle looking up at whoever is doing it
+        if let (true, Some(a)) = (f.alive, f.held_by) {
+            if a < game.f.len() {
+                let at = game.f[a].prev_pos.lerp(game.f[a].pos, alpha);
+                let line = (at - body).flat();
+                let line = if line.len() > 0.05 { line.norm() } else { yaw_fwd(f.yaw) };
+                let side = v3(line.z, 0.0, -line.x);
+                let look = at + v3(0.0, 1.55, 0.0);
+                let base = body + v3(0.0, 0.35, 0.0);
+                let out = (-line * 1.5 + side * 0.65).norm();
+                let mut dist = 1.7;
+                if let Some((hit, _)) = game.world.raycast(base, out, dist + 0.2) {
+                    dist = (hit - 0.2).max(0.5);
+                }
+                let pos = base + out * dist;
+                let d = (look - pos).norm();
+                return (Cam::new(pos, d.x.atan2(d.z), d.y.clamp(-1.0, 1.0).asin(), 62.0, rect), body);
             }
         }
         // watching: follow someone still fighting
@@ -2845,19 +2981,23 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
 
 /// Marks a headshot in a line of text (see `layout_pieces`).
 const HS_ICON: &str = "\u{1}";
+/// Marks an execution (a finisher) in the kill feed.
+const EXEC_ICON: &str = "\u{2}";
+const EXEC_RED: Color32 = Color32::from_rgb(235, 70, 60);
 const HS_GOLD: Color32 = Color32::from_rgb(255, 205, 70);
 
 /// A piece of a line: some text, or the headshot icon.
 enum Piece {
     Text(std::sync::Arc<egui::Galley>),
-    Icon(f32, Color32),
+    /// Width, colour, and which icon (0 headshot, 1 execution).
+    Icon(f32, Color32, u8),
 }
 
 impl Piece {
     fn width(&self) -> f32 {
         match self {
             Piece::Text(g) => g.size().x,
-            Piece::Icon(w, _) => *w,
+            Piece::Icon(w, _, _) => *w,
         }
     }
 }
@@ -2865,7 +3005,15 @@ impl Piece {
 fn layout_pieces(p: &egui::Painter, parts: Vec<(String, Color32)>, font: &FontId, size: f32, fade: impl Fn(Color32) -> Color32) -> Vec<Piece> {
     parts
         .into_iter()
-        .map(|(t, col)| if t == HS_ICON { Piece::Icon(size * 1.3, fade(col)) } else { Piece::Text(p.layout_no_wrap(t, font.clone(), fade(col))) })
+        .map(|(t, col)| {
+            if t == HS_ICON {
+                Piece::Icon(size * 1.3, fade(col), 0)
+            } else if t == EXEC_ICON {
+                Piece::Icon(size * 1.3, fade(col), 1)
+            } else {
+                Piece::Text(p.layout_no_wrap(t, font.clone(), fade(col)))
+            }
+        })
         .collect()
 }
 
@@ -2875,9 +3023,23 @@ fn draw_pieces(p: &egui::Painter, at: Pos2, pieces: Vec<Piece>, size: f32) {
         let w = pc.width();
         match pc {
             Piece::Text(g) => p.galley(Pos2::new(x, at.y), g, Color32::WHITE),
-            Piece::Icon(_, col) => headshot_icon(p, Pos2::new(x + w * 0.55, at.y + size * 0.62), size * 0.42, col),
+            Piece::Icon(_, col, 0) => headshot_icon(p, Pos2::new(x + w * 0.55, at.y + size * 0.62), size * 0.42, col),
+            Piece::Icon(_, col, _) => exec_icon(p, Pos2::new(x + w * 0.55, at.y + size * 0.62), size * 0.45, col),
         }
         x += w;
+    }
+}
+
+/// Two crossed blades: an execution.
+fn exec_icon(p: &egui::Painter, c: Pos2, r: f32, col: Color32) {
+    let dark = Color32::from_black_alpha(col.a() / 2);
+    for (a, b) in [(Vec2::new(-1.0, 1.0), Vec2::new(1.0, -1.0)), (Vec2::new(1.0, 1.0), Vec2::new(-1.0, -1.0))] {
+        p.line_segment([c + a * r + Vec2::splat(1.0), c + b * r + Vec2::splat(1.0)], Stroke::new(2.4, dark));
+        p.line_segment([c + a * r, c + b * r], Stroke::new(2.0, col));
+        // the guard across each blade, near its handle
+        let g = c + a * (r * 0.62);
+        let across = Vec2::new(b.y - a.y, a.x - b.x).normalized() * (r * 0.32);
+        p.line_segment([g - across, g + across], Stroke::new(1.8, col));
     }
 }
 
@@ -2982,7 +3144,7 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
             name.push_str("  (you)");
         } else if f.is_bot {
             name.push_str("  (bot)");
-        } else if f.slot == 0 && matches!(g.kind, Kind::Client) {
+        } else if f.slot == g.host_slot && matches!(g.kind, Kind::Client) {
             name.push_str("  (host)");
         }
         if g.mt.phase == Phase::Loadout && f.ready {
@@ -3005,7 +3167,7 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
         let score = if g.mt.mode.rounds() { f.wins } else { f.kills };
         text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, &format!("{}", score), 16.0, Color32::WHITE);
         text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, &format!("{}", f.deaths), 16.0, Color32::from_gray(200));
-        let ping = if f.is_bot || (f.slot == 0 && g.kind != Kind::Offline) || g.kind == Kind::Offline { "-".to_string() } else { format!("{}", f.ping_ms) };
+        let ping = if f.is_bot || (f.slot == g.local && g.kind == Kind::Host) || g.kind == Kind::Offline { "-".to_string() } else { format!("{}", f.ping_ms) };
         let pc = if f.ping_ms > 150 { Color32::from_rgb(255, 140, 120) } else if f.ping_ms > 80 { Color32::from_rgb(255, 220, 140) } else { Color32::from_rgb(160, 230, 160) };
         text_shadow(p, Pos2::new(r.right() - 45.0, y), Align2::CENTER_TOP, &ping, 16.0, pc);
         y += 28.0;
@@ -3182,7 +3344,8 @@ impl App {
                 p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
                 p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - bar_h), Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
                 let a = ((kc.t / 0.3).min(1.0) * 255.0) as u8;
-                text_shadow(p, Pos2::new(c.x, rect.top() + bar_h * 0.5), Align2::CENTER_CENTER, "FINAL KILL", 30.0 * s, Color32::from_rgba_unmultiplied(255, 150, 70, a));
+                let title = if kc.tool == "EXECUTED" { "EXECUTION" } else { "FINAL KILL" };
+                text_shadow(p, Pos2::new(c.x, rect.top() + bar_h * 0.5), Align2::CENTER_CENTER, title, 30.0 * s, Color32::from_rgba_unmultiplied(255, 150, 70, a));
                 let victim = &g.f[kc.victim].name;
                 let col = Color32::from_rgba_unmultiplied(240, 230, 220, a);
                 let mut parts: Vec<(String, Color32)> = Vec::new();
@@ -3356,6 +3519,22 @@ impl App {
             if g.headshot_t > 0.0 {
                 let a = (g.headshot_t / 0.7 * 255.0).min(255.0) as u8;
                 text_shadow(p, c - Vec2::new(0.0, (50.0 * s).max(ring_r + 14.0 * s)), Align2::CENTER_CENTER, "HEADSHOT", 16.0 * s, Color32::from_rgba_unmultiplied(255, 215, 50, a));
+            }
+        }
+
+        // ---- finisher prompt over an enemy you can finish
+        if me.alive && me.fin == 0 {
+            if let Some(t) = g.finish_target(g.local) {
+                if let Some(sp) = cam.project(g.f[t].pos + v3(0.0, 2.3, 0.0)) {
+                    let key = self.settings.binds[A_FINISH].name();
+                    let pulse = 0.75 + 0.25 * (g.time * 10.0).sin();
+                    let text = format!("{key}  FINISH");
+                    let gal = p.layout_no_wrap(text.clone(), FontId::proportional(14.0 * s), Color32::WHITE);
+                    let r = Rect::from_center_size(sp, gal.size() + Vec2::new(16.0 * s, 8.0 * s));
+                    p.rect_filled(r, 5.0 * s, Color32::from_rgba_unmultiplied(120, 15, 15, (200.0 * pulse) as u8));
+                    p.rect_stroke(r, 5.0 * s, Stroke::new(1.5 * s, Color32::from_rgba_unmultiplied(255, 120, 100, (255.0 * pulse) as u8)), egui::StrokeKind::Outside);
+                    p.galley(r.center() - gal.size() * 0.5, gal, Color32::WHITE);
+                }
             }
         }
 
@@ -3654,7 +3833,10 @@ impl App {
         p.rect_filled(sb, 8.0 * s, Color32::from_black_alpha(130));
         let red = player_color(0);
         let blue = player_color(1);
+        let gauntlet_left = (0..g.f.len()).filter(|&s| s != g.local && g.f[s].present && g.f[s].alive).count();
         let tt = match g.mt.phase {
+            Phase::Fight if g.gauntlet.as_ref().is_some_and(|gt| gt.break_t > 0.0) => "NEXT WAVE".into(),
+            Phase::Fight if g.mt.mode == Mode::Gauntlet => format!("{gauntlet_left} LEFT"),
             Phase::Fight if g.mt.mode.rounds() && g.mt.round_end > 0.0 => "NEXT ROUND".into(),
             Phase::Fight => {
                 let secs = g.mt.timer.max(0.0).ceil() as i32;
@@ -3666,9 +3848,20 @@ impl App {
             Phase::MatchOver => "OVER".into(),
         };
         text_shadow(p, sb.center() + Vec2::new(0.0, -6.0 * s), Align2::CENTER_CENTER, &tt, 18.0 * s, Color32::WHITE);
-        text_shadow(p, sb.center() + Vec2::new(0.0, 15.0 * s), Align2::CENTER_CENTER, &format!("{} · first to {} {}", g.mt.mode.name(), g.mt.target, g.mt.mode.goal_word()), 11.0 * s, Color32::from_gray(200));
+        let sub = match &g.gauntlet {
+            Some(gt) => format!("Gauntlet · best {}", gt.best),
+            None => format!("{} · first to {} {}", g.mt.mode.name(), g.mt.target, g.mt.mode.goal_word()),
+        };
+        text_shadow(p, sb.center() + Vec2::new(0.0, 15.0 * s), Align2::CENTER_CENTER, &sub, 11.0 * s, Color32::from_gray(200));
         let side_w = 120.0 * s;
         match g.mt.mode {
+            Mode::Gauntlet => {
+                let (wave, score) = g.gauntlet.as_ref().map_or((0, 0), |gt| (gt.wave, gt.score));
+                text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, -8.0 * s), Align2::LEFT_CENTER, "WAVE", 12.0 * s, Color32::from_gray(210));
+                text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, 10.0 * s), Align2::LEFT_CENTER, &format!("{wave}"), 19.0 * s, Color32::from_rgb(255, 190, 90));
+                text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, 8.0 * s), Align2::RIGHT_CENTER, "SCORE", 12.0 * s, Color32::from_gray(210));
+                text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, -10.0 * s), Align2::RIGHT_CENTER, &format!("{score}"), 19.0 * s, Color32::WHITE);
+            }
             Mode::Tdm | Mode::Ctf => {
                 text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, 0.0), Align2::LEFT_CENTER, "RED", 17.0 * s, red);
                 text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, 0.0), Align2::RIGHT_CENTER, "BLUE", 17.0 * s, blue);
@@ -3794,7 +3987,13 @@ impl App {
             } else {
                 if let Some((k, kc)) = &line.killer {
                     parts.push((k.clone(), player_color(*kc)));
-                    parts.push((format!("  [{}]", line.tool), Color32::from_gray(220)));
+                    if line.tool == "EXECUTED" {
+                        parts.push(("  ".into(), Color32::from_gray(220)));
+                        parts.push((EXEC_ICON.into(), EXEC_RED));
+                        parts.push((" EXECUTED".into(), EXEC_RED));
+                    } else {
+                        parts.push((format!("  [{}]", line.tool), Color32::from_gray(220)));
+                    }
                     if line.head {
                         parts.push((HS_ICON.into(), HS_GOLD));
                     }
@@ -4027,6 +4226,9 @@ impl App {
                         self.browse_asked = false;
                         next = Some(Page::Browse);
                     }
+                    if Self::big_button(ui, &format!("Stats  ·  level {}", self.career.level())) {
+                        next = Some(Page::Stats);
+                    }
                     if Self::big_button(ui, "How to Play") {
                         next = Some(Page::HowTo);
                     }
@@ -4035,6 +4237,35 @@ impl App {
                     }
                     if Self::big_button(ui, "Quit") {
                         quit = true;
+                    }
+                }
+                Page::Stats => {
+                    let cr = self.career.clone();
+                    ui.heading(format!("Level {}", cr.level()));
+                    ui.add(egui::ProgressBar::new(cr.level_progress()).text(format!("{} XP  ·  {} to the next level", cr.xp, career::XP_PER_LEVEL - cr.xp % career::XP_PER_LEVEL)));
+                    ui.add_space(6.0);
+                    ui.colored_label(ACCENT, "Combat");
+                    let kd = if cr.deaths == 0 { cr.kills as f32 } else { cr.kills as f32 / cr.deaths as f32 };
+                    ui.label(format!("Kills {}  ·  Deaths {}  ·  K/D {:.2}  ·  Headshots {}  ·  Matches {}  ·  Gauntlet waves {}", cr.kills, cr.deaths, kd, cr.headshots, cr.matches, cr.waves));
+                    ui.add_space(6.0);
+                    ui.colored_label(ACCENT, "Finishers");
+                    let share = if cr.kills > 0 { cr.finishers as f32 * 100.0 / cr.kills as f32 } else { 0.0 };
+                    ui.label(format!("Executions {}  ({share:.0}% of your kills)", cr.finishers));
+                    if let Some(k) = cr.favourite_finisher() {
+                        ui.label(format!("Favourite: {}", FINISHERS[k].name));
+                    }
+                    egui::Grid::new("finisher-stats").num_columns(4).spacing([14.0, 3.0]).show(ui, |ui| {
+                        for (k, st) in FINISHERS.iter().enumerate() {
+                            ui.label(st.name);
+                            ui.label(egui::RichText::new(st.weapon.map_or("aerial (any blade)", |w| w.name())).color(Color32::from_gray(180)));
+                            ui.label(format!("{}", cr.fin_by[k]));
+                            ui.label(if cr.unlocked(k) { egui::RichText::new("unlocked").color(Color32::from_rgb(140, 220, 160)) } else { egui::RichText::new(format!("level {}", st.unlock_level)).color(Color32::from_gray(150)) });
+                            ui.end_row();
+                        }
+                    });
+                    ui.label(egui::RichText::new("Finish a weakened (under 25% health) enemy who is staggered, guard-broken or launched: press E next to them.").size(12.5).color(Color32::from_gray(190)));
+                    if Self::big_button(ui, "Back") {
+                        next = Some(Page::Main);
                     }
                 }
                 Page::Practice => {
@@ -4049,6 +4280,15 @@ impl App {
                         }
                     });
                     ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
+                    if Self::big_button(ui, &format!("Gauntlet (solo waves)  ·  best {}", self.settings.gauntlet_best)) {
+                        action = Some(Box::new(|app: &mut App| {
+                            let name = clean_name(&app.settings.name, 0);
+                            let mut g = Game::gauntlet(&name, app.settings.gauntlet_best);
+                            g.set_map(MapId::from_u8(app.settings.map));
+                            app.settings.save();
+                            app.start_game(g, None);
+                        }));
+                    }
                     if Self::big_button(ui, "Fight!") {
                         action = Some(Box::new(|app: &mut App| {
                             let lvl = BOT_LEVELS[app.settings.bot_level].1;
@@ -4107,6 +4347,8 @@ impl App {
                     mode_picker(ui, &mut self.settings.mode);
                     map_picker(ui, &mut self.settings.map);
                     ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
+                    ui.add(egui::Slider::new(&mut self.settings.fill_bots, 0..=MAX_PLAYERS).text("fill with bots up to this many fighters (0 = none)"))
+                        .on_hover_text("Bots keep the lobby busy; each one leaves when a real player joins.");
                     ui.horizontal(|ui| {
                         ui.label("Port (UDP)");
                         ui.add(egui::TextEdit::singleline(&mut self.settings.port).desired_width(90.0));
@@ -4332,9 +4574,36 @@ impl App {
         if phase == Phase::MatchOver {
             let mut rematch = false;
             let mut vote = false;
+            let run = match &self.screen {
+                Screen::Play { game, .. } => game.gauntlet.clone(),
+                _ => None,
+            };
+            let has_steam = self.steam.is_some();
             panel(ctx, "over", Pos2::new(center.x, center.y + 60.0), 360.0, |ui| {
+                if let Some(gt) = &run {
+                    ui.heading(format!("Score {}", gt.score));
+                    ui.label(format!("Wave {}  ·  {} kills", gt.wave, gt.kills));
+                    if gt.new_best {
+                        ui.colored_label(Color32::from_rgb(255, 200, 90), "New best!");
+                    } else {
+                        ui.label(format!("Your best: {}", gt.best));
+                    }
+                    if !has_steam {
+                        ui.label(egui::RichText::new("Start Steam to put your score on the leaderboard.").size(12.5).color(Color32::from_gray(180)));
+                    } else if gt.board.is_empty() && gt.rank == 0 {
+                        ui.label(egui::RichText::new("Sending to the Steam leaderboard…").size(12.5).color(Color32::from_gray(180)));
+                    } else {
+                        if gt.rank > 0 {
+                            ui.label(format!("Steam leaderboard: #{}", gt.rank));
+                        }
+                        for (name, score, rank) in &gt.board {
+                            ui.label(egui::RichText::new(format!("#{rank}  {name}  {score}")).size(13.0));
+                        }
+                    }
+                    ui.add_space(6.0);
+                }
                 if kind == Kind::Offline {
-                    if App::big_button(ui, "Rematch") {
+                    if App::big_button(ui, if run.is_some() { "Try again" } else { "Rematch" }) {
                         vote = true;
                     }
                 } else {

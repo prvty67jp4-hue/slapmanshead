@@ -23,6 +23,9 @@ pub enum SteamEvent {
     /// A friend clicked "Join game" (or accepted an invite): join this lobby.
     JoinLobby(u64),
     LobbyList(Vec<u64>),
+    /// The Gauntlet leaderboard after sending a score: our global rank (0 if unknown) and the
+    /// top entries (name, score, rank).
+    Board { rank: i32, top: Vec<(String, i32, i32)> },
 }
 
 /// One row of the lobby browser.
@@ -158,6 +161,32 @@ impl Steam {
             if let Ok(mut e) = ev.lock() {
                 e.push(SteamEvent::Created(r.map(|l| l.raw()).map_err(|e| e.to_string())));
             }
+        });
+    }
+
+    /// Put a Gauntlet score on the Steam leaderboard (your best is kept) and fetch the top five.
+    pub fn submit_gauntlet(&self, score: i32) {
+        use steamworks::{LeaderboardDataRequest, LeaderboardDisplayType, LeaderboardSortMethod, UploadScoreMethod};
+        let ev = self.events.clone();
+        let client = self.client.clone();
+        self.client.user_stats().find_or_create_leaderboard("Gauntlet", LeaderboardSortMethod::Descending, LeaderboardDisplayType::Numeric, move |r| {
+            let Ok(Some(lb)) = r else {
+                if let Ok(mut e) = ev.lock() {
+                    e.push(SteamEvent::Board { rank: 0, top: Vec::new() });
+                }
+                return;
+            };
+            let (c2, ev2, lb2) = (client.clone(), ev.clone(), lb.clone());
+            client.user_stats().upload_leaderboard_score(&lb, UploadScoreMethod::KeepBest, score, &[], move |u| {
+                let rank = u.ok().flatten().map_or(0, |x| x.global_rank_new);
+                let c3 = c2.clone();
+                c2.user_stats().download_leaderboard_entries(&lb2, LeaderboardDataRequest::Global, 1, 5, 0, move |d| {
+                    let top = d.map(|v| v.into_iter().map(|e| (c3.friends().get_friend(e.user).name(), e.score, e.global_rank)).collect()).unwrap_or_default();
+                    if let Ok(mut e) = ev2.lock() {
+                        e.push(SteamEvent::Board { rank, top });
+                    }
+                });
+            });
         });
     }
 

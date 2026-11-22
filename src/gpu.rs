@@ -1109,7 +1109,7 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
         }
     }
     // swing trail from recent blade positions
-    if w.is_melee() && f.slashing() && f.alive {
+    if w.is_melee() && (f.slashing() || f.fin > 0) && f.alive {
         let len = match w {
             Weapon::Dagger => 0.2,
             Weapon::Greatsword => 0.78,

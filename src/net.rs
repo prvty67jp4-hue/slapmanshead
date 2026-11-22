@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
-const MAGIC: [u8; 4] = *b"DRA9";
+const MAGIC: [u8; 4] = *b"DRB1";
 /// The protocol version as text (Steam lobbies only list games that speak the same one).
 pub const PROTOCOL: &str = "DRA7";
 /// Steam message channels: game packets, and lobby-browser ping probes.
@@ -42,6 +42,10 @@ const K_STATE: u8 = 2;
 const K_HOST: u8 = 3;
 const K_BYE: u8 = 4;
 const K_FULL: u8 = 5;
+/// (host) who's connected and how well: the list everyone needs to pick a new host.
+const K_PEERS: u8 = 6;
+/// (player) "I'm back, in my old slot" to a player who took over as host.
+const K_REJOIN: u8 = 7;
 /// "I'm a different version": the packet is just the 4-byte mark and this kind.
 const K_VERSION: u8 = 8;
 pub const DEFAULT_PORT: u16 = 27960;
@@ -139,6 +143,8 @@ pub struct FState {
     pub flags2: u8,
     /// 1 kicking, 2 heavy charged, 4 charging, 8 dash-through, 16 greatsword plunge.
     pub flags3: u8,
+    /// Finisher style being played (number + 1; 0 = none).
+    pub fin: u8,
     pub slash_t: f32,
     pub slash_idx: u8,
     pub hurt_t: f32,
@@ -151,7 +157,7 @@ pub struct FState {
 impl FState {
     /// A living, running fighter at `pos` (for tests).
     pub fn test_state(pos: V3, vel: V3) -> FState {
-        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
+        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
     }
 }
 
@@ -166,6 +172,7 @@ fn write_fstate(w: &mut W, f: &Fighter) {
     w.u8(f.flags());
     w.u8(if f.spawn_prot > 0.0 { 1 } else { 0 } | if f.stagger_t > 0.0 { 2 } else { 0 } | if f.sliding > 0.0 { 4 } else { 0 } | if f.scope_t > 0.0 { 8 } else { 0 });
     w.u8(if f.kick_t > 0.0 { 1 } else { 0 } | if f.charged { 2 } else { 0 } | if f.charge_t > 0.2 { 4 } else { 0 } | if f.through_t > 0.0 { 8 } else { 0 } | if f.slam { 16 } else { 0 } | if f.throw_t > 0.0 { 32 } else { 0 } | if f.throw_fan { 64 } else { 0 });
+    w.u8(f.fin);
     w.f(f.slash_t);
     w.u8(f.slash_idx);
     w.f(f.hurt_t);
@@ -188,6 +195,7 @@ fn read_fstate(r: &mut R) -> Option<FState> {
         flags: r.u8()?,
         flags2: r.u8()?,
         flags3: r.u8()?,
+        fin: r.u8()?.min(crate::game::FINISHERS.len() as u8),
         slash_t: r.f()?,
         slash_idx: r.u8()?,
         hurt_t: r.f()?,
@@ -249,6 +257,11 @@ fn write_ev(w: &mut W, ev: &Ev) {
         }
         Ev::Ready => w.u8(7),
         Ev::Vote => w.u8(8),
+        Ev::Finisher { target, kind } => {
+            w.u8(10);
+            w.u8(*target);
+            w.u8(*kind);
+        }
     }
 }
 
@@ -266,6 +279,7 @@ fn read_ev(r: &mut R) -> Option<Ev> {
         7 => Ev::Ready,
         8 => Ev::Vote,
         9 => Ev::Deflect { by: r.u8()?, dmg: r.f()?.clamp(0.0, 60.0) },
+        10 => Ev::Finisher { target: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.clamp(1, crate::game::FINISHERS.len() as u8) },
         _ => return None,
     })
 }
@@ -391,6 +405,60 @@ pub struct Rates {
     pub kb_out: f32,
 }
 
+/// One player as the host sees them (for picking a new host).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerInfo {
+    pub slot: usize,
+    pub ping: u16,
+    pub addr: SocketAddr,
+}
+
+/// What a player knows to carry on if the host goes: the match's id, the host's slot, and every
+/// player's address and connection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Succession {
+    pub session: u32,
+    pub host_slot: usize,
+    pub peers: Vec<PeerInfo>,
+}
+
+impl Succession {
+    /// Who takes over: the player with the best connection to the host (lowest ping, then the
+    /// lowest slot), so every player picks the same one without asking.
+    pub fn successor(&self) -> Option<usize> {
+        self.peers.iter().filter(|p| p.slot != self.host_slot).min_by_key(|p| (p.ping, p.slot)).map(|p| p.slot)
+    }
+}
+
+fn write_addr(w: &mut W, a: &SocketAddr) {
+    match a {
+        SocketAddr::V4(v) => {
+            w.u8(4);
+            w.0.extend_from_slice(&v.ip().octets());
+        }
+        SocketAddr::V6(v) => {
+            w.u8(6);
+            w.0.extend_from_slice(&v.ip().octets());
+        }
+    }
+    w.u16(a.port());
+}
+
+fn read_addr(r: &mut R) -> Option<SocketAddr> {
+    let ip: std::net::IpAddr = match r.u8()? {
+        4 => {
+            let b = r.take(4)?;
+            std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).into()
+        }
+        6 => {
+            let b: [u8; 16] = r.take(16)?.try_into().ok()?;
+            std::net::Ipv6Addr::from(b).into()
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, r.u16()?))
+}
+
 struct Peer {
     addr: SocketAddr,
     slot: usize,
@@ -428,6 +496,17 @@ pub struct Net {
     counts: [usize; 4],
     rate_since: Instant,
     pub rates: Rates,
+    /// (host) this match's id; players rejoining a new host show it.
+    pub session: u32,
+    /// (player) the latest list from the host, to carry on without it.
+    pub succession: Option<Succession>,
+    peers_acc: f32,
+    /// (player) keep saying "I'm back" to a new host for this long.
+    rejoin_left: f32,
+    /// (player) the host already said goodbye (it says it several times).
+    bye_seen: bool,
+    /// (host) slots our bots are in: a joining player gets a free slot first, else a bot's.
+    pub soft: Vec<usize>,
 }
 
 impl Net {
@@ -496,7 +575,55 @@ impl Net {
             counts: [0; 4],
             rate_since: Instant::now(),
             rates: Rates::default(),
+            session: 0,
+            succession: None,
+            peers_acc: 0.0,
+            rejoin_left: 0.0,
+            bye_seen: false,
+            soft: Vec::new(),
         }
+        .seeded()
+    }
+
+    fn seeded(mut self) -> Net {
+        // a match id nobody else will have
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        self.rng ^= t;
+        self.session = ((self.rng >> 16) as u32) | 1;
+        self
+    }
+
+    /// (player) The host is gone: if we have the list, the best-connected player takes over.
+    /// When that's us, we start hosting on our own socket with everyone's last known address;
+    /// otherwise we start talking to them. Returns (old host slot, new host slot).
+    pub fn take_over(&mut self) -> Option<(usize, usize)> {
+        if self.is_host {
+            return None;
+        }
+        let s = self.succession.clone()?;
+        let next = s.successor()?;
+        if next == self.my_slot {
+            self.is_host = true;
+            self.host_addr = None;
+            self.session = s.session;
+            self.peers = s
+                .peers
+                .iter()
+                .filter(|p| p.slot != self.my_slot && p.slot != s.host_slot)
+                .map(|p| Peer { addr: p.addr, slot: p.slot, last_recv: Instant::now(), ping: p.ping as f32 / 1000.0, link: Link::new(), seq_out: 0 })
+                .collect();
+        } else {
+            let addr = s.peers.iter().find(|p| p.slot == next)?.addr;
+            self.host_addr = Some(addr);
+            self.session = s.session;
+            self.host_link = Link::new();
+            self.rejoin_left = 5.0;
+        }
+        self.last_recv = Instant::now();
+        self.succession = None;
+        self.echo = 0.0;
+        self.bye_seen = false;
+        Some((s.host_slot, next))
     }
 
     /// (slot, ping in ms) for every player connected to this host.
@@ -541,7 +668,9 @@ impl Net {
     }
 
     fn free_slot(&self) -> Option<usize> {
-        (1..MAX_PLAYERS).find(|s| !self.peers.iter().any(|p| p.slot == *s))
+        // (after a takeover the host isn't in slot 0, and slot 0 may be free again)
+        let open = |s: &usize| *s != self.my_slot && !self.peers.iter().any(|p| p.slot == *s);
+        (0..MAX_PLAYERS).find(|s| open(s) && !self.soft.contains(s)).or_else(|| (0..MAX_PLAYERS).find(open))
     }
 
     fn rand(&mut self) -> f32 {
@@ -721,8 +850,18 @@ impl Net {
                         out.push(Incoming::Host(m));
                     }
                 }
-                K_BYE => out.push(Incoming::HostLeft),
+                K_BYE => {
+                    if !self.bye_seen {
+                        self.bye_seen = true;
+                        out.push(Incoming::HostLeft);
+                    }
+                }
                 K_FULL => out.push(Incoming::Full),
+                K_PEERS => {
+                    if let Some(s) = parse_peers(&mut r) {
+                        self.succession = Some(s);
+                    }
+                }
                 _ => {}
             }
         }
@@ -774,7 +913,7 @@ impl Net {
                     if id > self.last_in[slot] {
                         self.last_in[slot] = id;
                         // pass on what others need to see; hit claims stay here until checked
-                        if matches!(ev, Ev::Shot { .. } | Ev::Grenade { .. } | Ev::Chat { .. }) {
+                        if matches!(ev, Ev::Shot { .. } | Ev::Grenade { .. } | Ev::Chat { .. } | Ev::Finisher { .. }) {
                             self.out.push_back((slot as u8, id, Instant::now(), ev.clone()));
                         }
                         fresh_evs.push(ev);
@@ -786,6 +925,27 @@ impl Net {
                 if let Some(i) = idx {
                     let slot = self.peers.remove(i).slot;
                     out.push(Incoming::Leave { slot });
+                }
+            }
+            K_REJOIN => {
+                let (Some(session), Some(slot), Some(name)) = (r.u32(), r.u8(), r.s()) else { return };
+                let slot = slot as usize;
+                if session != self.session || slot >= MAX_PLAYERS || slot == self.my_slot {
+                    return;
+                }
+                match self.peers.iter_mut().find(|p| p.slot == slot) {
+                    // their address as we see it (it may differ from what the old host saw)
+                    Some(p) => {
+                        p.addr = from;
+                        p.last_recv = Instant::now();
+                    }
+                    None => {
+                        self.peers.retain(|p| p.addr != from);
+                        let mut link = Link::new();
+                        link.see(seq);
+                        self.peers.push(Peer { addr: from, slot, last_recv: Instant::now(), ping: 0.05, link, seq_out: 0 });
+                        out.push(Incoming::Join { slot, name });
+                    }
                 }
             }
             _ => {}
@@ -931,6 +1091,25 @@ impl Net {
             }
         }
         if self.is_host {
+            // once a second, everyone gets the list they'd need to carry on without us
+            self.peers_acc += 1.0 / 60.0;
+            if self.peers_acc >= 1.0 && !self.peers.is_empty() {
+                self.peers_acc = 0.0;
+                let list: Vec<PeerInfo> = self.peers.iter().map(|p| PeerInfo { slot: p.slot, ping: (p.ping * 1000.0).round().min(9999.0) as u16, addr: p.addr }).collect();
+                let to: Vec<SocketAddr> = self.peers.iter().map(|p| p.addr).collect();
+                for a in to {
+                    let mut w = self.head(K_PEERS, a);
+                    w.u32(self.session);
+                    w.u8(self.my_slot as u8);
+                    w.u8(list.len() as u8);
+                    for p in &list {
+                        w.u8(p.slot as u8);
+                        w.u16(p.ping);
+                        write_addr(&mut w, &p.addr);
+                    }
+                    self.send_to(w.0, a);
+                }
+            }
             let targets: Vec<(SocketAddr, usize)> = self.peers.iter().map(|p| (p.addr, p.slot)).collect();
             let mut packets = Vec::new();
             for (addr, slot) in targets {
@@ -1002,6 +1181,16 @@ impl Net {
                 self.send_to(d, a);
             }
         } else if let Some(h) = self.host_addr {
+            if self.rejoin_left > 0.0 {
+                // a new host: tell them who we are (several times: the first may not get through
+                // until their side has sent us something)
+                self.rejoin_left -= 1.0 / 60.0;
+                let mut w = self.head(K_REJOIN, h);
+                w.u32(self.session);
+                w.u8(self.my_slot as u8);
+                w.s(&self.roster_names[self.my_slot.min(MAX_PLAYERS - 1)].clone());
+                self.send_to(w.0, h);
+            }
             let mut w = self.head(K_STATE, h);
             w.f(self.echo);
             write_fstate(&mut w, &g.f[g.local]);
@@ -1024,6 +1213,35 @@ impl Net {
         }
     }
 }
+fn parse_peers(r: &mut R) -> Option<Succession> {
+    let session = r.u32()?;
+    let host_slot = r.u8()? as usize;
+    let n = r.u8()? as usize;
+    let mut peers = Vec::new();
+    for _ in 0..n.min(MAX_PLAYERS) {
+        let slot = (r.u8()? as usize).min(MAX_PLAYERS - 1);
+        let ping = r.u16()?;
+        let addr = read_addr(r)?;
+        peers.push(PeerInfo { slot, ping, addr });
+    }
+    Some(Succession { session, host_slot: host_slot.min(MAX_PLAYERS - 1), peers })
+}
+
+/// The host is gone: carry the match on. The best-connected player becomes the host (their game
+/// turns into the host's, with everyone's scores, health and the round as they were; the old
+/// host's bots go with it), the others reconnect to them. False when there's nobody to take
+/// over (then the match is over for us).
+pub fn migrate(g: &mut Game, n: &mut Net) -> bool {
+    let humans: Vec<usize> = n.succession.as_ref().map(|s| s.peers.iter().map(|p| p.slot).collect()).unwrap_or_default();
+    let Some((old, next)) = n.take_over() else { return false };
+    if next == g.local {
+        g.become_host(old, &humans);
+    } else {
+        g.follow_new_host(old, next);
+    }
+    true
+}
+
 /// Copy a received state onto a fighter that lives on another computer.
 /// On the host (uthority), health and life stay the host's: a player can only come back to life once its respawn time is up.
 /// `sent` is the sender's clock when it sent this and `now` our game clock: together they let the
@@ -1117,6 +1335,11 @@ pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool, sent: f32, now
     f.charge_t = if s.flags3 & 4 != 0 { f.charge_t.max(0.25) } else { 0.0 };
     f.through_t = if s.flags3 & 8 != 0 { 0.1 } else { 0.0 };
     f.slam = s.flags3 & 16 != 0;
+    // a finisher plays out here from its start
+    if s.fin != f.fin {
+        f.fin = s.fin;
+        f.fin_t = 0.0;
+    }
     // a throw plays out here from its start
     if s.flags3 & 32 != 0 {
         if f.throw_t <= 0.0 {
@@ -1274,5 +1497,178 @@ mod melee_net_tests {
         write_fstate(&mut w, &f);
         let s = read_fstate(&mut R { b: &w.0, i: 0 }).expect("decodes");
         assert_eq!(s.flags3 & (1 | 2 | 4 | 16), 1 | 2 | 4 | 16);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::game::{Kind, Mode, Phase};
+
+    #[test]
+    fn successor_is_the_best_connected_player() {
+        let a = |p: u16| SocketAddr::from(([127, 0, 0, 1], p));
+        let s = Succession { session: 7, host_slot: 0, peers: vec![PeerInfo { slot: 1, ping: 80, addr: a(1) }, PeerInfo { slot: 2, ping: 25, addr: a(2) }, PeerInfo { slot: 3, ping: 25, addr: a(3) }] };
+        assert_eq!(s.successor(), Some(2), "lowest ping, then lowest slot");
+        // the list survives the trip
+        let mut w = W(Vec::new());
+        w.u32(s.session);
+        w.u8(0);
+        w.u8(3);
+        for p in &s.peers {
+            w.u8(p.slot as u8);
+            w.u16(p.ping);
+            write_addr(&mut w, &p.addr);
+        }
+        assert_eq!(parse_peers(&mut R { b: &w.0, i: 0 }), Some(s));
+    }
+
+    /// A host and two players on this computer; the host leaves mid-match and the game goes on.
+    #[test]
+    fn the_match_survives_the_host_leaving() {
+        let mut h = Net::host(0).expect("host");
+        let port = h.sock.local_addr().unwrap().port();
+        let mut hg = Game::new(Kind::Host, 0, Mode::Ffa, 50);
+        hg.add_player(0, "Host", true, None, 0);
+        hg.mt.phase = Phase::Fight;
+        hg.mt.timer = 300.0;
+        let mut nets = [Net::join(&format!("127.0.0.1:{port}")).unwrap(), Net::join(&format!("127.0.0.1:{port}")).unwrap()];
+        let names = ["Ann", "Bo"];
+        let mut games: [Option<Game>; 2] = [None, None];
+        let dt = 1.0 / 60.0;
+        let mut step = |h: Option<&mut (Net, Game)>, nets: &mut [Net; 2], games: &mut [Option<Game>; 2], hosts_seen: &mut [u32; 2]| {
+            if let Some((hn, hg)) = h {
+                for m in hn.poll() {
+                    match m {
+                        Incoming::Join { slot, name } => hg.add_player(slot, &name, false, None, 0),
+                        Incoming::PeerState { slot, st, sent, .. } if hg.f[slot].present => {
+                            let now = hg.time;
+                            apply_remote(&mut hg.f[slot], &st, true, sent, now);
+                        }
+                        _ => {}
+                    }
+                }
+                hn.send(hg, dt);
+            }
+            for k in 0..2 {
+                let n = &mut nets[k];
+                if games[k].is_none() {
+                    n.send_hello(names[k], dt);
+                }
+                for m in n.poll() {
+                    match m {
+                        Incoming::Host(msg) => {
+                            hosts_seen[k] += 1;
+                            let g = games[k].get_or_insert_with(|| Game::new(Kind::Client, msg.you, msg.mode, msg.target));
+                            crate::apply_host_msg(g, msg);
+                        }
+                        Incoming::HostLeft => {
+                            if let Some(g) = games[k].as_mut() {
+                                assert!(migrate(g, n), "someone takes over");
+                            }
+                        }
+                        Incoming::Join { slot, name } => {
+                            if let Some(g) = games[k].as_mut() {
+                                if !g.f[slot].present {
+                                    g.add_player(slot, &name, false, None, 0);
+                                }
+                            }
+                        }
+                        Incoming::PeerState { slot, st, sent, .. } => {
+                            if let Some(g) = games[k].as_mut() {
+                                if g.f[slot].present {
+                                    let now = g.time;
+                                    apply_remote(&mut g.f[slot], &st, true, sent, now);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(g) = games[k].as_ref() {
+                    n.send(g, dt);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        };
+        let mut seen = [0u32; 2];
+        let mut host = Some((h, hg));
+        for frame in 0..200 {
+            if frame == 60 {
+                // the host keeps score: give the players something to keep
+                let (_, hg) = host.as_mut().unwrap();
+                for s in 1..3 {
+                    if hg.f[s].present {
+                        hg.f[s].kills = s as i32 * 2;
+                        hg.f[s].hp = 40.0 + s as f32;
+                    }
+                }
+            }
+            step(host.as_mut(), &mut nets, &mut games, &mut seen);
+        }
+        assert!(games.iter().all(|g| g.is_some()), "both players joined");
+        assert!(nets.iter().all(|n| n.succession.is_some()), "both know who would take over");
+        // the host leaves
+        let (mut hn, _) = host.take().unwrap();
+        hn.send_bye();
+        drop(hn);
+        let before = seen;
+        for _ in 0..150 {
+            step(None, &mut nets, &mut games, &mut seen);
+        }
+        let hosts: Vec<usize> = (0..2).filter(|&k| nets[k].is_host).collect();
+        assert_eq!(hosts.len(), 1, "exactly one player hosts now");
+        let (nh, other) = (hosts[0], 1 - hosts[0]);
+        assert_eq!(games[nh].as_ref().unwrap().kind, Kind::Host);
+        assert!(seen[other] > before[other] + 20, "the other player hears from the new host: {} -> {}", before[other], seen[other]);
+        for k in 0..2 {
+            let g = games[k].as_ref().unwrap();
+            assert!(!g.f[0].present, "the old host is gone");
+            assert_eq!(g.banner.as_ref().map(|b| b.0.as_str()), Some("Host has been usurped"));
+            for s in 1..3 {
+                assert_eq!(g.f[s].kills, s as i32 * 2, "scores kept (slot {s} on player {k})");
+            }
+        }
+        // health carries on from where the old host left it
+        let g = games[nh].as_ref().unwrap();
+        for s in 1..3 {
+            assert!((g.f[s].hp - (40.0 + s as f32)).abs() < 0.01, "health kept: {}", g.f[s].hp);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bot_slot_tests {
+    use super::*;
+
+    #[test]
+    fn players_get_a_free_slot_before_a_bots() {
+        let mut n = Net::host(0).expect("host");
+        n.soft = vec![1, 2, 3];
+        assert_eq!(n.free_slot(), Some(4), "a free slot first");
+        // everything else taken: a bot's slot it is
+        n.soft = (1..MAX_PLAYERS).collect();
+        assert_eq!(n.free_slot(), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod finisher_net_tests {
+    use super::*;
+
+    #[test]
+    fn finishers_cross_the_network() {
+        let mut w = W(Vec::new());
+        write_ev(&mut w, &Ev::Finisher { target: 3, kind: 5 });
+        match read_ev(&mut R { b: &w.0, i: 0 }) {
+            Some(Ev::Finisher { target: 3, kind: 5 }) => {}
+            e => panic!("{e:?}"),
+        }
+        let mut f = Fighter::new("x", 1, true);
+        f.alive = true;
+        f.fin = 7;
+        let mut w = W(Vec::new());
+        write_fstate(&mut w, &f);
+        assert_eq!(read_fstate(&mut R { b: &w.0, i: 0 }).unwrap().fin, 7);
     }
 }

@@ -309,6 +309,8 @@ pub fn kill_tool(w: u8) -> &'static str {
         "Kick"
     } else if w == COMBO_TOOL {
         "Combo KO"
+    } else if w == EXEC_TOOL {
+        "EXECUTED"
     } else if w < N_WEAPONS {
         Weapon::from_u8(w).name()
     } else {
@@ -319,6 +321,53 @@ pub fn kill_tool(w: u8) -> &'static str {
 // ---- melee depth: guard meter, kicks, deflects, charged heavies
 /// A kick, as a "weapon" number (kill feed, host checks).
 pub const KICK_TOOL: u8 = 21;
+/// A finisher, as a "weapon" number (kill feed: EXECUTED).
+pub const EXEC_TOOL: u8 = 23;
+/// Finishers: how close, and how hurt the target must be (and staggered, guard-broken or launched).
+pub const FINISH_RANGE: f32 = 2.6;
+pub const FINISH_HP: f32 = 25.0;
+/// What a finisher gives back.
+pub const FINISH_HEAL: f32 = 50.0;
+
+/// One finisher animation. `weapon` None is the aerial one (any blade, target in the air).
+/// `unlock_level` is the career level it becomes available at (all 1 for now; they're meant
+/// to become cosmetics).
+pub struct FinisherStyle {
+    pub name: &'static str,
+    pub weapon: Option<Weapon>,
+    /// Seconds it lasts, and when (share of that) the blow lands.
+    pub dur: f32,
+    pub hit: f32,
+    pub unlock_level: u32,
+}
+
+pub const FINISHERS: [FinisherStyle; 10] = [
+    FinisherStyle { name: "Throat Cut", weapon: Some(Weapon::Dagger), dur: 0.7, hit: 0.55, unlock_level: 1 },
+    FinisherStyle { name: "Twin Stab", weapon: Some(Weapon::Dagger), dur: 0.8, hit: 0.72, unlock_level: 1 },
+    FinisherStyle { name: "Spinning Edge", weapon: Some(Weapon::Dagger), dur: 0.75, hit: 0.62, unlock_level: 1 },
+    FinisherStyle { name: "Quick Draw", weapon: Some(Weapon::Katana), dur: 0.8, hit: 0.55, unlock_level: 1 },
+    FinisherStyle { name: "Cross Cut", weapon: Some(Weapon::Katana), dur: 0.85, hit: 0.75, unlock_level: 1 },
+    FinisherStyle { name: "Rising Cleave", weapon: Some(Weapon::Katana), dur: 0.8, hit: 0.6, unlock_level: 1 },
+    FinisherStyle { name: "Overhead Crush", weapon: Some(Weapon::Greatsword), dur: 0.95, hit: 0.65, unlock_level: 1 },
+    FinisherStyle { name: "Impale", weapon: Some(Weapon::Greatsword), dur: 0.9, hit: 0.6, unlock_level: 1 },
+    FinisherStyle { name: "Wheel Cleave", weapon: Some(Weapon::Greatsword), dur: 0.95, hit: 0.7, unlock_level: 1 },
+    FinisherStyle { name: "Sky Splitter", weapon: None, dur: 0.9, hit: 0.7, unlock_level: 1 },
+];
+
+/// A finisher style (by its number + 1, as fighters carry it; 0 = none).
+pub fn finisher(kind: u8) -> &'static FinisherStyle {
+    &FINISHERS[(kind.max(1) as usize - 1).min(FINISHERS.len() - 1)]
+}
+
+/// Something to count in the career stats (handed to the menu side each frame).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CareerEv {
+    /// You got a kill: a headshot? a finisher (its style number + 1)?
+    Kill { head: bool, finisher: u8 },
+    Death,
+    WaveCleared,
+    MatchEnd,
+}
 /// A combo finished: the elimination hit's "weapon" (kill feed).
 pub const COMBO_TOOL: u8 = 22;
 /// Basic ground swings in a row before you have to mix in another move (or pause).
@@ -392,6 +441,8 @@ pub struct Input {
     pub crouch: bool,
     /// Pressed: kick.
     pub kick: bool,
+    /// Pressed: finisher (on a weakened, staggered enemy in reach).
+    pub finish: bool,
     pub yaw: f32,
     pub pitch: f32,
 }
@@ -865,6 +916,16 @@ pub struct Fighter {
     through_hit: u32,
     /// Greatsword: plunging down for a ground slam.
     pub slam: bool,
+    /// Doing a finisher: its style (number + 1, 0 = none), how far in, on whom, and whether the
+    /// blow has landed.
+    pub fin: u8,
+    pub fin_t: f32,
+    pub fin_target: usize,
+    fin_hit: bool,
+    /// Caught in someone's finisher: by whom (and for how much longer at most).
+    pub held_by: Option<usize>,
+    pub held_t: f32,
+    pub held_kind: u8,
     /// Basic ground swings in this string, and a short breather after the string runs out.
     pub basic_n: u8,
     pub slash_lock: f32,
@@ -1004,6 +1065,13 @@ impl Fighter {
             through_t: 0.0,
             through_hit: 0,
             slam: false,
+            fin: 0,
+            fin_t: 0.0,
+            fin_target: 0,
+            fin_hit: false,
+            held_by: None,
+            held_t: 0.0,
+            held_kind: 0,
             basic_n: 0,
             slash_lock: 0.0,
             burst_left: 0,
@@ -1176,6 +1244,8 @@ pub enum Mode {
     Gladiator = 3,
     Lms = 4,
     Ctf = 5,
+    /// Solo: survive waves of ever better bots (Practice only).
+    Gauntlet = 6,
 }
 
 impl Mode {
@@ -1187,6 +1257,7 @@ impl Mode {
             3 => Mode::Gladiator,
             4 => Mode::Lms,
             5 => Mode::Ctf,
+            6 => Mode::Gauntlet,
             _ => Mode::Ffa,
         }
     }
@@ -1198,6 +1269,7 @@ impl Mode {
             Mode::Gladiator => "Gladiator",
             Mode::Lms => "Last Man Standing",
             Mode::Ctf => "Capture the Flag",
+            Mode::Gauntlet => "Gauntlet",
         }
     }
     pub fn blurb(self) -> &'static str {
@@ -1208,6 +1280,7 @@ impl Mode {
             Mode::Gladiator => "melee weapons only, first to the kill limit",
             Mode::Lms => "rounds with no respawns, last one alive wins",
             Mode::Ctf => "Red vs Blue, bring the enemy flag to your base",
+            Mode::Gauntlet => "solo: survive waves of ever better bots for a high score",
         }
     }
     pub fn teams(self) -> bool {
@@ -1224,9 +1297,42 @@ impl Mode {
         match self {
             Mode::Duel | Mode::Lms => "round wins",
             Mode::Ctf => "captures",
+            Mode::Gauntlet => "score",
             _ => "kills",
         }
     }
+}
+
+/// Gauntlet: the wave you're on, your score, and how it went.
+#[derive(Clone, Debug, Default)]
+pub struct Gauntlet {
+    pub wave: u32,
+    pub score: u32,
+    pub kills: u32,
+    /// The pause before the next wave.
+    pub break_t: f32,
+    /// You fell: the run is over.
+    pub over: bool,
+    /// Your best score on this computer (from settings), and whether this run beat it.
+    pub best: u32,
+    pub new_best: bool,
+    /// The score was handed to the leaderboard.
+    pub submitted: bool,
+    /// Steam leaderboard: your rank (0 = none yet) and the top entries (name, score, rank).
+    pub rank: i32,
+    pub board: Vec<(String, i32, i32)>,
+}
+
+/// Bots in a Gauntlet wave and how good they are.
+pub fn gauntlet_wave(wave: u32) -> (usize, f32) {
+    let n = (1 + wave as usize / 2).min(6);
+    let skill = (0.25 + 0.075 * (wave.max(1) - 1) as f32).min(1.0);
+    (n, skill)
+}
+
+/// Points for a Gauntlet kill on `wave`.
+pub fn gauntlet_kill_points(wave: u32, head: bool) -> u32 {
+    100 + 25 * wave + if head { 50 } else { 0 }
 }
 
 /// A team's flag (Capture the Flag).
@@ -1386,6 +1492,8 @@ pub enum Ev {
     Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3, guard: f32 },
     /// From a player: "my bullet was sent back at me by `by`" (the host trusts self-inflicted hurt).
     Deflect { by: u8, dmg: f32 },
+    /// "I've started a finisher on `target`": their computer holds them for it.
+    Finisher { target: u8, kind: u8 },
     Grenade { p: V3, v: V3, kind: u8 },
     /// Only the host (or the game on this computer) decides deaths.
     Died { victim: u8, killer: u8, w: u8, head: bool },
@@ -1420,6 +1528,14 @@ pub struct Game {
     pub mt: MatchState,
     /// Duel: who's waiting, in order (host only).
     pub queue: VecDeque<usize>,
+    /// Which slot the host plays in (0 unless the host changed mid-match).
+    pub host_slot: usize,
+    /// Gauntlet (solo waves), when that's the mode.
+    pub gauntlet: Option<Gauntlet>,
+    /// Things for the career stats since the menu side last looked.
+    pub career: Vec<CareerEv>,
+    /// Our last finisher's style (the kill can be confirmed after it has finished playing).
+    pub last_finisher: u8,
     duel_loser: Option<usize>,
     pub grenades: Vec<Grenade>,
     pub particles: Vec<Particle>,
@@ -1703,6 +1819,10 @@ pub enum Act {
     Item { kind: u8 },
     /// A greatsword plunge hit the ground: shockwave.
     Slam,
+    /// A finisher starts (the victim is held for it).
+    FinishStart,
+    /// The finisher's blow lands.
+    Execute,
     /// A throwing star, turned this far (radians) from where you aim.
     Star { off: f32 },
 }
@@ -1738,6 +1858,10 @@ impl Game {
                 flags: [0, 1].map(|t| Flag { state: 0, carrier: 255, pos: flag_homes[t], timer: 0.0 }),
             },
             queue: VecDeque::new(),
+            host_slot: 0,
+            gauntlet: None,
+            career: Vec::new(),
+            last_finisher: 0,
             duel_loser: None,
             grenades: Vec::new(),
             particles: Vec::new(),
@@ -2016,6 +2140,91 @@ impl Game {
         g
     }
 
+    /// Gauntlet: just you; the waves come once you've picked your loadout. `best` is your best
+    /// score so far.
+    pub fn gauntlet(name: &str, best: u32) -> Game {
+        let mut g = Game::new(Kind::Offline, 0, Mode::Gauntlet, 0);
+        g.add_player(0, name, true, None, 0);
+        g.gauntlet = Some(Gauntlet { best, ..Default::default() });
+        g.banner = Some(("GAUNTLET".into(), 2.5));
+        g
+    }
+
+    /// Gauntlet during the fight: send the waves, give a breather between them, end the run
+    /// when you fall.
+    fn update_gauntlet(&mut self, dt: f32) {
+        let Some(mut gt) = self.gauntlet.take() else { return };
+        let me = self.local;
+        if !gt.over {
+            // the fallen stay down until the wave is over
+            for s in 0..self.f.len() {
+                if s != me && self.f[s].present && !self.f[s].alive {
+                    self.f[s].respawn_t = 1e9;
+                }
+            }
+            if !self.f[me].alive {
+                gt.over = true;
+                gt.new_best = gt.score > gt.best;
+                gt.best = gt.best.max(gt.score);
+                self.start_killcam();
+                self.mt.phase = Phase::MatchOver;
+                self.mt.timer = 9999.0;
+                self.banner = Some((format!("GAUNTLET OVER - SCORE {}", gt.score), 9999.0));
+                self.sfx2d(Sfx::MatchOver);
+            } else if gt.break_t > 0.0 {
+                gt.break_t -= dt;
+                if gt.break_t <= 0.0 {
+                    self.spawn_wave(&mut gt);
+                }
+            } else {
+                let left = (0..self.f.len()).filter(|&s| s != me && self.f[s].present && self.f[s].alive).count();
+                if left == 0 {
+                    if gt.wave > 0 {
+                        // wave cleared: points, a breather, some health, armour and ammo back
+                        let bonus = 250 * gt.wave;
+                        gt.score += bonus;
+                        self.say(format!("Wave {} cleared! +{bonus}", gt.wave));
+                        self.career.push(CareerEv::WaveCleared);
+                        self.sfx2d(Sfx::Kill);
+                        let f = &mut self.f[me];
+                        f.hp = (f.hp + 40.0).min(MAX_HP);
+                        f.ap = (f.ap + 25.0).min(MAX_AP);
+                        f.items = f.items.max(1);
+                        for k in 1..3 {
+                            let w = f.slot_weapon(k);
+                            f.mag[k] = w.mag();
+                        }
+                    }
+                    gt.break_t = if gt.wave == 0 { 0.6 } else { 4.0 };
+                    self.banner = Some((format!("WAVE {}", gt.wave + 1), gt.break_t.max(1.5)));
+                }
+            }
+        }
+        self.gauntlet = Some(gt);
+    }
+
+    /// The next Gauntlet wave: clear away the last one, bring in more (and better) bots.
+    fn spawn_wave(&mut self, gt: &mut Gauntlet) {
+        let me = self.local;
+        for s in 0..self.f.len() {
+            if s != me && self.f[s].present {
+                self.remove_player(s);
+            }
+        }
+        gt.wave += 1;
+        let (n, skill) = gauntlet_wave(gt.wave);
+        let mut slot = 0;
+        for k in 0..n {
+            slot = (slot + 1..MAX_PLAYERS).find(|&s| s != me).unwrap_or(MAX_PLAYERS - 1);
+            self.add_player(slot, BOT_NAMES[(k + gt.wave as usize) % BOT_NAMES.len()], true, Some(skill), 1);
+            let f = &mut self.f[slot];
+            f.ready = true;
+            // later waves come armoured
+            f.ap = (10.0 * gt.wave as f32).min(MAX_AP);
+        }
+        self.sfx2d(Sfx::MatchStart);
+    }
+
     /// The menu backdrop: bots fighting each other.
     pub fn demo() -> Game {
         let mut g = Game::new(Kind::Demo, 0, Mode::Ffa, 15);
@@ -2057,6 +2266,128 @@ impl Game {
         } else if owned {
             let (p, y) = self.pick_spawn(slot);
             self.f[slot].respawn_at(p, y);
+        }
+    }
+
+    /// Who fighter `i` could finish right now: an enemy in reach, below a quarter health, and
+    /// staggered, guard-broken or launched (the nearest if several).
+    pub fn finish_target(&self, i: usize) -> Option<usize> {
+        let a = &self.f[i];
+        if !a.alive || a.fin > 0 || a.held_by.is_some() || a.stun_t > 0.0 {
+            return None;
+        }
+        let mut best: Option<(f32, usize)> = None;
+        for j in 0..self.f.len() {
+            let b = &self.f[j];
+            if !self.is_enemy(i, j) || !b.alive || b.spawn_prot > 0.0 || b.hp >= FINISH_HP || b.held_by.is_some() {
+                continue;
+            }
+            let launched = !b.on_ground && (b.stun_t > 0.0 || b.float_t > 0.0);
+            if !(b.stagger_t > 0.0 || b.guard_broke > 0.0 || launched) {
+                continue;
+            }
+            let d = b.pos - a.pos;
+            let dist = d.flat().len();
+            if dist > FINISH_RANGE || d.y.abs() > 3.0 || !self.world.line_clear(a.chest(), b.chest()) {
+                continue;
+            }
+            if best.map_or(true, |(bd, _)| dist < bd) {
+                best = Some((dist, j));
+            }
+        }
+        best.map(|(_, j)| j)
+    }
+
+    /// Hold fighter `t` for `attacker`'s finisher (on the computer that runs `t`).
+    fn hold(&mut self, t: usize, attacker: usize, kind: u8) {
+        let dur = finisher(kind).dur;
+        let f = &mut self.f[t];
+        if !f.alive {
+            return;
+        }
+        f.held_by = Some(attacker);
+        f.held_t = dur + 0.25;
+        f.held_kind = kind;
+        f.stun_t = f.stun_t.max(dur + 0.1);
+        f.slash_t = 0.0;
+        f.kick_t = 0.0;
+        f.guard = false;
+        f.wall = None;
+        f.vel.x = 0.0;
+        f.vel.z = 0.0;
+    }
+
+    /// (host) Keep the lobby at `target` fighters with bots: add one when there's room, and send
+    /// one away when there are more than that (a real player came in). Returns what happened.
+    pub fn fill_bots(&mut self, target: usize, skill: f32) -> Option<String> {
+        let present = self.present();
+        let bots: Vec<usize> = present.iter().copied().filter(|&s| s != self.local && self.f[s].is_bot && self.f[s].owned).collect();
+        if present.len() > target {
+            let s = *bots.last()?;
+            let nm = self.f[s].name.clone();
+            self.remove_player(s);
+            return Some(format!("{nm} (bot) left to make room"));
+        }
+        if present.len() < target.min(MAX_PLAYERS) {
+            let slot = (0..MAX_PLAYERS).find(|&s| !self.f[s].present && s != self.local)?;
+            let used: Vec<String> = present.iter().map(|&s| self.f[s].name.clone()).collect();
+            let name = BOT_NAMES.iter().find(|n| !used.iter().any(|u| u == *n)).copied().unwrap_or("Bot");
+            let team = self.balance_team();
+            self.add_player(slot, name, true, Some(skill), team);
+            self.f[slot].ready = true;
+            return Some(format!("{name} (bot) joined"));
+        }
+        None
+    }
+
+    /// (player) The host left and this computer takes over: the old host's fighter goes, its
+    /// bots become ours, and from now on health, deaths and the match are decided here. Everyone
+    /// else (`humans`) keeps playing from their own computer.
+    pub fn become_host(&mut self, old_host: usize, humans: &[usize]) {
+        self.kind = Kind::Host;
+        if old_host < self.f.len() && old_host != self.local && self.f[old_host].present {
+            self.remove_player(old_host);
+        }
+        for s in 0..self.f.len() {
+            let f = &mut self.f[s];
+            // their updates now come on other clocks: start their playback afresh
+            f.snaps.clear();
+            f.clock_off = None;
+            if s != self.local && f.present && !humans.contains(&s) {
+                // one of the old host's bots: ours to run now
+                f.owned = true;
+                f.is_bot = true;
+                f.ready = true;
+                self.bots[s] = Some(Bot::new(0.6, 977 + s as u64 * 31));
+            }
+        }
+        for h in self.history.iter_mut() {
+            h.clear();
+        }
+        for h in self.pose_history.iter_mut() {
+            h.clear();
+        }
+        // whoever is waiting for a duel, in slot order
+        self.queue = (0..self.f.len()).filter(|&s| self.f[s].present && !self.f[s].spectate && !self.mt.duel.contains(&(s as u8))).collect();
+        self.host_slot = self.local;
+        self.banner = Some(("Host has been usurped".into(), 2.5));
+        self.say("The host left: you are hosting now.".to_string());
+    }
+
+    /// (player) The host left and `new_host` takes over: their computer runs the match now.
+    pub fn follow_new_host(&mut self, old_host: usize, new_host: usize) {
+        if old_host < self.f.len() && old_host != self.local && self.f[old_host].present {
+            self.remove_player(old_host);
+        }
+        for f in self.f.iter_mut() {
+            f.snaps.clear();
+            f.clock_off = None;
+        }
+        self.host_slot = new_host;
+        self.banner = Some(("Host has been usurped".into(), 2.5));
+        if new_host < self.f.len() {
+            let nm = self.f[new_host].name.clone();
+            self.say(format!("The host left: {nm} is hosting now."));
         }
     }
 
@@ -2121,6 +2452,10 @@ impl Game {
     }
 
     pub fn is_enemy(&self, a: usize, b: usize) -> bool {
+        if self.mt.mode == Mode::Gauntlet {
+            // the waves are all against you, never each other
+            return a != b && self.f[b].present && !self.f[b].spectate && ((a == self.local) != (b == self.local));
+        }
         a != b && self.f[b].present && !self.f[b].spectate && (!self.mt.mode.teams() || self.f[a].team != self.f[b].team)
     }
 
@@ -2472,6 +2807,9 @@ impl Game {
                 ff.hurt_t -= dt;
             }
             ff.throw_t = (ff.throw_t - dt).max(0.0);
+            if ff.fin > 0 {
+                ff.fin_t += dt;
+            }
             ff.guard_t = if ff.guard { ff.guard_t + dt } else { 0.0 };
         }
 
@@ -2518,6 +2856,19 @@ impl Game {
             self.kill_name = self.f[victim].name.clone();
             self.sfx2d(Sfx::Kill);
         }
+        if k == Some(self.local) && victim != self.local {
+            let fin = if w == EXEC_TOOL { self.f[self.local].fin.max(self.last_finisher) } else { 0 };
+            self.career.push(CareerEv::Kill { head, finisher: fin });
+        }
+        if victim == self.local {
+            self.career.push(CareerEv::Death);
+        }
+        if let Some(gt) = self.gauntlet.as_mut() {
+            if k == Some(self.local) && victim != self.local && !gt.over {
+                gt.score += gauntlet_kill_points(gt.wave, head);
+                gt.kills += 1;
+            }
+        }
         if self.is_authority() && self.scoring() {
             self.f[victim].deaths += 1;
             if let Some(k) = k {
@@ -2543,6 +2894,7 @@ impl Game {
             Mode::Ffa | Mode::Gladiator => self.f.iter().any(|f| f.present && f.kills >= t),
             Mode::Tdm | Mode::Ctf => self.mt.team_score.iter().any(|&s| s as i32 >= t),
             Mode::Duel | Mode::Lms => self.f.iter().any(|f| f.present && f.wins >= t),
+            Mode::Gauntlet => false, // it ends when you fall
         };
         if won {
             self.end_match();
@@ -2591,6 +2943,7 @@ impl Game {
     }
 
     fn end_match(&mut self) {
+        self.career.push(CareerEv::MatchEnd);
         self.start_killcam();
         self.mt.phase = Phase::MatchOver;
         self.mt.timer = if self.kind == Kind::Demo { 5.0 } else { 9999.0 };
@@ -2630,6 +2983,7 @@ impl Game {
                     }
                 }
             }
+            Phase::Fight if self.mt.mode == Mode::Gauntlet => self.update_gauntlet(dt),
             Phase::Fight if self.mt.mode.rounds() => self.update_rounds(dt),
             Phase::Fight => {
                 self.mt.timer -= dt;
@@ -2835,6 +3189,17 @@ impl Game {
 
     /// Start (or restart) the match: scores reset and everyone respawns.
     pub fn start_match(&mut self) {
+        if self.mt.mode == Mode::Gauntlet {
+            // a new run: the bots go, the score starts again (the best is kept)
+            let best = self.gauntlet.as_ref().map_or(0, |g| g.best);
+            let me = self.local;
+            for s in 0..self.f.len() {
+                if s != me && self.f[s].present {
+                    self.remove_player(s);
+                }
+            }
+            self.gauntlet = Some(Gauntlet { best, ..Default::default() });
+        }
         self.mt.number += 1;
         self.killcam = None;
         self.slowmo = 0.0;
@@ -3121,6 +3486,52 @@ impl Game {
 
         ff.yaw = wrap_angle(inp.yaw);
         ff.pitch = inp.pitch.clamp(-1.45, 1.45);
+        // caught in a finisher: held still, facing whoever is doing it
+        if let Some(a) = ff.held_by {
+            ff.held_t -= dt;
+            let attacker_done = a < self.f.len() && self.f[a].fin == 0 && ff.held_t < finisher(ff.held_kind).dur - 0.3;
+            if ff.held_t <= 0.0 || attacker_done || !ff.alive {
+                ff.held_by = None;
+            } else {
+                ff.stun_t = ff.stun_t.max(0.1);
+                ff.vel.x *= 0.5;
+                ff.vel.z *= 0.5;
+                if a < self.f.len() {
+                    let d = self.f[a].pos - ff.pos;
+                    if d.flat().len() > 0.05 {
+                        ff.yaw = d.x.atan2(d.z);
+                    }
+                }
+            }
+        }
+        // doing a finisher: it plays out, nothing else until it's done
+        if ff.fin > 0 {
+            let style = finisher(ff.fin);
+            ff.fin_t += dt;
+            let t = ff.fin_target.min(self.f.len() - 1);
+            let tp = self.f[t].pos;
+            let d = (tp - ff.pos).flat();
+            let dir = if d.len() > 0.05 { d.norm() } else { ff.fwd() };
+            // step in close, at their height (an aerial one rises to meet them)
+            let spot = tp - dir * 1.05;
+            ff.pos = ff.pos.lerp(v3(spot.x, if style.weapon.is_none() { tp.y } else { ff.pos.y }, spot.z), 0.3);
+            ff.vel = V3::ZERO;
+            ff.yaw = dir.x.atan2(dir.z);
+            ff.guard = false;
+            ff.slash_t = 0.0;
+            if !ff.fin_hit && ff.fin_t >= style.dur * style.hit {
+                ff.fin_hit = true;
+                acts.push(Act::Execute);
+            }
+            if ff.fin_t >= style.dur || !ff.alive {
+                ff.fin = 0;
+            }
+            if style.weapon.is_none() && ff.fin == 0 {
+                ff.on_ground = false; // drop back down after an aerial one
+            }
+            self.f[i] = ff;
+            return acts;
+        }
         let fwd = yaw_fwd(ff.yaw);
         let right = yaw_right(ff.yaw);
         let can_act = !frozen && ff.stun_t <= 0.0;
@@ -3195,6 +3606,32 @@ impl Game {
             sounds.push(Sfx::ScopeIn);
         }
         ff.scope_t = if scoping { ff.scope_t + dt } else { 0.0 };
+
+        // finisher: on a weakened, staggered enemy in reach
+        if inp.finish && can_act && ff.fin == 0 && ff.held_by.is_none() {
+            self.f[i] = ff.clone();
+            if let Some(t) = self.finish_target(i) {
+                let b = &self.f[t];
+                let airborne = !b.on_ground && b.pos.y - self.world.ground_below(b.pos + v3(0.0, 0.2, 0.0)) > 0.8;
+                let blade = ff.loadout.melee;
+                let choices: Vec<usize> = (0..FINISHERS.len()).filter(|&k| if airborne { FINISHERS[k].weapon.is_none() } else { FINISHERS[k].weapon == Some(blade) }).collect();
+                let pick = choices[(self.rng.next_u32() as usize) % choices.len().max(1)];
+                ff.fin = pick as u8 + 1;
+                self.last_finisher = ff.fin;
+                ff.fin_t = 0.0;
+                ff.fin_target = t;
+                ff.fin_hit = false;
+                ff.cur = 0;
+                ff.weapon = blade;
+                ff.switch_t = 0.0;
+                ff.reload_t = 0.0;
+                cancel_slash(&mut ff);
+                ff.guard = false;
+                ff.charge_t = 0.0;
+                ff.charged = false;
+                acts.push(Act::FinishStart);
+            }
+        }
 
         // kick: quick and short, any weapon in hand
         if inp.kick && can_act && ff.kick_t <= 0.0 && ff.kick_cd <= 0.0 && !slash_locked && ff.dash_wind <= 0.0 && ff.switch_t <= 0.0 {
@@ -4085,6 +4522,18 @@ impl Game {
                 self.sfx(Sfx::Slash, p);
             }
             Act::Slam => self.resolve_slam(i),
+            Act::FinishStart => {
+                let (t, kind) = (self.f[i].fin_target, self.f[i].fin);
+                if self.f[t].owned {
+                    self.hold(t, i, kind);
+                }
+                if self.kind == Kind::Host || self.kind == Kind::Client {
+                    self.out_events.push(Ev::Finisher { target: t as u8, kind });
+                }
+                let p = self.f[i].pos;
+                self.sfx(Sfx::ChargeReady, p);
+            }
+            Act::Execute => self.execute(i),
             Act::Star { off } => self.throw_star(i, off),
             Act::Throw => {
                 let tp = self.f[i].pos + v3(0.0, 1.4, 0.0);
@@ -4694,6 +5143,14 @@ impl Game {
         if !self.f[victim].present || !self.f[victim].alive || self.f[victim].spawn_prot > 0.0 {
             return;
         }
+        // an execution: the one doing it gets health back and a full item stock
+        if w == EXEC_TOOL && amount >= LETHAL {
+            if let Some(a) = attacker.filter(|&a| a < self.f.len() && self.f[a].alive) {
+                let f = &mut self.f[a];
+                f.hp = (f.hp + FINISH_HEAL).min(MAX_HP);
+                f.items = f.items.max(2);
+            }
+        }
         // blade combos: hits in a row, each landing while the target still reels from the last.
         // Each one staggers a little less (so a combo can't go on forever); the fifth is a KO.
         let (mut amount, mut stun, mut w) = (amount, stun, w);
@@ -4789,6 +5246,23 @@ impl Game {
         }
         let s = &self.f[shooter];
         if !s.alive {
+            return None;
+        }
+        if w == EXEC_TOOL {
+            // a finisher: they must have been close, and the target nearly beaten
+            if self.f[victim].hp > FINISH_HP + 10.0 {
+                return None;
+            }
+            let ping = s.ping_ms as f32 / 1000.0;
+            for back in [INTERP_DELAY, MAX_INTERP] {
+                let t = self.time - (ping + back + 0.015).clamp(0.0, 0.7);
+                let vp = self.pos_at(victim, t);
+                for sp in [self.pos_at(shooter, t), s.pos] {
+                    if (vp - sp).flat().len() <= FINISH_RANGE + 1.6 && (vp.y - sp.y).abs() <= 4.0 {
+                        return Some(ClaimCheck { head_ok: false, core_ok: true });
+                    }
+                }
+            }
             return None;
         }
         if w == KICK_TOOL {
@@ -4935,6 +5409,13 @@ impl Game {
             }
         }
         let mut stun = stun;
+        // hit by someone else in the middle of a finisher: it's cut short (fair in team fights)
+        if amount > 0.0 && self.f[victim].fin > 0 && attacker != Some(self.f[victim].fin_target) {
+            self.f[victim].fin = 0;
+            if victim == self.local {
+                self.say("Finisher interrupted!".to_string());
+            }
+        }
         if guard > 0.0 {
             let ff = &mut self.f[victim];
             ff.guard_hp -= guard.min(GUARD_MAX);
@@ -5113,6 +5594,39 @@ impl Game {
         for gi in explode.into_iter().rev() {
             let g = self.grenades.remove(gi);
             self.explode(g.pos, g.owner, g.kind);
+        }
+    }
+
+    /// The finisher's blow: the kill (checked by the host like any hit), a big hit-stop and a
+    /// flash, and the finisher's rewards on our side (guard and item back; the host gives the
+    /// health).
+    fn execute(&mut self, i: usize) {
+        let t = self.f[i].fin_target;
+        if t >= self.f.len() || !self.f[t].alive {
+            return;
+        }
+        let style = finisher(self.f[i].fin);
+        let a = self.f[i].chest();
+        let at = self.f[t].chest();
+        let dir = (at - a).flat().norm();
+        let knock = if style.weapon.is_none() { v3(0.0, -14.0, 0.0) } else { dir * 4.0 + v3(0.0, 2.5, 0.0) };
+        self.damage(i, t, LETHAL, knock, 0.8, false, at, EXEC_TOOL, a, dir);
+        self.burst(at, [200, 25, 35], 34, 6.0);
+        self.burst(at, [255, 235, 200], 14, 8.0);
+        self.sfx(Sfx::Flesh, at);
+        self.sfx(Sfx::GuardBreak, at);
+        if i == self.local {
+            self.f[i].guard_hp = GUARD_MAX;
+            self.f[i].items = self.f[i].items.max(2);
+            self.say(format!("EXECUTED! ({})", style.name));
+        }
+        if i == self.local || t == self.local {
+            self.hitstop = self.hitstop.max(0.14);
+            self.shake = self.shake.max(0.5);
+            self.parry_flash = 0.22;
+            if self.kind == Kind::Offline {
+                self.slowmo = self.slowmo.max(0.3);
+            }
         }
     }
 
@@ -5408,6 +5922,12 @@ impl Game {
                 } else if from == 0 && v == self.local && self.f[v].owned {
                     // the host confirmed we were hit
                     self.apply_hit_g(v, None, dmg, knock, stun, head, w, Some(o), guard.clamp(0.0, GUARD_MAX));
+                }
+            }
+            Ev::Finisher { target, kind } => {
+                let t = target as usize;
+                if t < self.f.len() && from < self.f.len() && self.f[t].owned && self.f[t].alive {
+                    self.hold(t, from, kind.clamp(1, FINISHERS.len() as u8));
                 }
             }
             Ev::Deflect { by, dmg } => {
@@ -6017,7 +6537,7 @@ mod movement_tests {
     fn speed(g: &Game) -> f32 {
         g.f[0].vel.flat().len()
     }
-    const FWD: Input = Input { fwd: 1.0, right: 0.0, jump: false, dash: false, fire: false, fire_pressed: false, guard: false, select: None, reload: false, item: false, crouch: false, kick: false, yaw: 0.0, pitch: 0.0 };
+    const FWD: Input = Input { fwd: 1.0, right: 0.0, jump: false, dash: false, fire: false, fire_pressed: false, guard: false, select: None, reload: false, item: false, crouch: false, kick: false, finish: false, yaw: 0.0, pitch: 0.0 };
 
     #[test]
     fn landing_from_a_dash_keeps_speed_then_eases() {
@@ -7175,5 +7695,207 @@ mod dash_charge_tests {
             g.tick(&fwd);
         }
         assert!((g.f[0].dash_charges - g.tune.dash_charges).abs() < 1e-3, "all back: {}", g.f[0].dash_charges);
+    }
+}
+
+#[cfg(test)]
+mod gauntlet_tests {
+    use super::*;
+
+    fn kill(g: &mut Game, victim: usize, head: bool) {
+        let at = g.f[victim].chest();
+        let o = g.f[0].chest();
+        g.f[victim].spawn_prot = 0.0;
+        g.damage(0, victim, LETHAL, V3::ZERO, 0.0, head, at, Weapon::Revolver as u8, o, v3(0.0, 0.0, 1.0));
+        g.tick(&Input::default());
+    }
+
+    #[test]
+    fn waves_get_bigger_and_better_and_the_run_ends_when_you_fall() {
+        let mut g = Game::gauntlet("P", 1000);
+        g.mt.phase = Phase::Fight;
+        g.f[0].spawn_prot = 0.0;
+        for _ in 0..(1.0 / TICK) as usize {
+            g.tick(&Input::default());
+        }
+        let gt = g.gauntlet.clone().unwrap();
+        assert_eq!(gt.wave, 1);
+        let bots: Vec<usize> = (1..g.f.len()).filter(|&s| g.f[s].present).collect();
+        assert_eq!(bots.len(), gauntlet_wave(1).0);
+        // the waves only ever fight you
+        assert!(g.is_enemy(bots[0], 0) && g.is_enemy(0, bots[0]));
+        // a headshot kill scores, clearing the wave scores more and gives a breather
+        kill(&mut g, bots[0], true);
+        let gt = g.gauntlet.clone().unwrap();
+        assert_eq!(gt.score, gauntlet_kill_points(1, true) + 250);
+        assert!(gt.break_t > 3.0, "a breather before the next wave");
+        for _ in 0..(4.5 / TICK) as usize {
+            g.tick(&Input::default());
+        }
+        let gt = g.gauntlet.clone().unwrap();
+        assert_eq!(gt.wave, 2);
+        let wave2: Vec<usize> = (1..g.f.len()).filter(|&s| g.f[s].present).collect();
+        assert_eq!(wave2.len(), gauntlet_wave(2).0);
+        assert!(gauntlet_wave(2).1 > gauntlet_wave(1).1 && gauntlet_wave(9).0 > gauntlet_wave(2).0, "bigger and better waves");
+        if wave2.len() >= 2 {
+            assert!(!g.is_enemy(wave2[0], wave2[1]), "bots don't fight each other");
+        }
+        // you fall: the run is over (no respawn), and the best is updated
+        g.f[0].hp = 1.0;
+        g.f[0].ap = 0.0;
+        let at = g.f[0].chest();
+        g.damage(wave2[0], 0, LETHAL, V3::ZERO, 0.0, false, at, Weapon::Revolver as u8, at, v3(0.0, 0.0, 1.0));
+        for _ in 0..(5.0 / TICK) as usize {
+            g.tick(&Input::default());
+        }
+        let gt = g.gauntlet.clone().unwrap();
+        assert!(gt.over && g.mt.phase == Phase::MatchOver && !g.f[0].alive);
+        assert_eq!(gt.best, 1000.max(gt.score));
+        // try again: a fresh run, the best kept
+        g.start_match();
+        let gt = g.gauntlet.clone().unwrap();
+        assert!(gt.wave == 0 && gt.score == 0 && !gt.over && gt.best == 1000.max(gauntlet_kill_points(1, true) + 250));
+        assert!((1..g.f.len()).all(|s| !g.f[s].present), "the old wave is gone");
+    }
+
+    #[test]
+    fn lobby_bots_fill_up_and_make_room() {
+        let mut g = Game::new(Kind::Host, 0, Mode::Ffa, 20);
+        g.add_player(0, "Host", true, None, 0);
+        for _ in 0..10 {
+            g.fill_bots(4, 0.5);
+        }
+        assert_eq!(g.present().len(), 4, "filled to four with bots");
+        // a real player arrives: one bot steps aside
+        let free = (0..MAX_PLAYERS).find(|&s| !g.f[s].present).unwrap();
+        g.add_player(free, "Friend", false, None, 0);
+        assert_eq!(g.present().len(), 5);
+        let msg = g.fill_bots(4, 0.5).expect("a bot leaves");
+        assert!(msg.contains("left"));
+        assert_eq!(g.present().len(), 4);
+        assert!(g.f[free].present && !g.f[free].is_bot, "the player stays");
+        // nobody to send away but people: nothing changes
+        let mut solo = Game::new(Kind::Host, 0, Mode::Ffa, 20);
+        solo.add_player(0, "Host", true, None, 0);
+        solo.add_player(1, "Friend", false, None, 0);
+        assert!(solo.fill_bots(1, 0.5).is_none());
+    }
+}
+
+#[cfg(test)]
+mod finisher_tests {
+    use super::*;
+
+    /// You (katana) facing a beaten enemy 1.6 m away, plus a third fighter off to the side.
+    fn setup() -> Game {
+        let mut g = Game::offline("A", 2, 0.5, Mode::Ffa, 50);
+        g.world = crate::game::lag_comp_tests::flat_world();
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = 99.0;
+        for i in 0..3 {
+            g.bots[i] = None;
+            g.f[i].is_bot = i != 0;
+            g.f[i].spawn_prot = 0.0;
+            g.f[i].ap = 0.0;
+            g.f[i].loadout.melee = Weapon::Katana;
+        }
+        g.f[0].pos = V3::ZERO;
+        g.f[0].yaw = 0.0;
+        g.f[0].hp = 40.0;
+        g.f[1].pos = v3(0.0, 0.0, 1.6);
+        g.f[1].yaw = std::f32::consts::PI;
+        g.f[2].pos = v3(6.0, 0.0, 0.0);
+        for i in 0..3 {
+            g.f[i].prev_pos = g.f[i].pos;
+            g.f[i].on_ground = true;
+        }
+        g.f[1].hp = 20.0;
+        g.f[1].stagger_t = 0.6;
+        g.f[1].stun_t = 0.6;
+        g
+    }
+
+    #[test]
+    fn only_beaten_staggered_enemies_in_reach_can_be_finished() {
+        let g = setup();
+        assert_eq!(g.finish_target(0), Some(1));
+        let mut h = setup();
+        h.f[1].hp = 30.0;
+        assert_eq!(h.finish_target(0), None, "not hurt enough");
+        let mut h = setup();
+        h.f[1].stagger_t = 0.0;
+        h.f[1].stun_t = 0.0;
+        assert_eq!(h.finish_target(0), None, "not staggered");
+        let mut h = setup();
+        h.f[1].stagger_t = 0.0;
+        h.f[1].guard_broke = 0.5;
+        assert_eq!(h.finish_target(0), Some(1), "guard-broken counts");
+        let mut h = setup();
+        h.f[1].pos = v3(0.0, 0.0, 4.0);
+        assert_eq!(h.finish_target(0), None, "out of reach");
+    }
+
+    #[test]
+    fn a_finisher_executes_heals_and_is_counted() {
+        let mut g = setup();
+        g.tick(&Input { finish: true, ..Default::default() });
+        let kind = g.f[0].fin;
+        assert!(kind > 0, "the finisher starts");
+        let style = finisher(kind);
+        assert_eq!(style.weapon, Some(Weapon::Katana), "a katana finisher");
+        assert!(style.dur < 1.0, "under a second");
+        assert_eq!(g.f[1].held_by, Some(0), "the victim is held");
+        let mut ticks = 0;
+        while g.f[0].fin > 0 && ticks < 200 {
+            g.tick(&Input::default());
+            ticks += 1;
+        }
+        assert!((ticks as f32 * TICK) < 1.0);
+        for _ in 0..30 {
+            g.tick(&Input::default());
+        }
+        assert!(!g.f[1].alive, "executed");
+        assert!(g.f[0].hp >= 40.0 + FINISH_HEAL - 1.0, "50 health back: {}", g.f[0].hp);
+        assert_eq!(g.f[0].guard_hp, GUARD_MAX);
+        assert!(g.feed.iter().any(|l| l.tool == "EXECUTED"));
+        assert!(g.career.iter().any(|e| matches!(e, CareerEv::Kill { finisher, .. } if *finisher == kind)));
+    }
+
+    #[test]
+    fn a_launched_target_gets_the_aerial_finisher() {
+        let mut g = setup();
+        g.f[1].pos = v3(0.0, 2.0, 1.6);
+        g.f[1].prev_pos = g.f[1].pos;
+        g.f[1].on_ground = false;
+        g.f[1].float_t = 0.8;
+        g.tick(&Input { finish: true, ..Default::default() });
+        assert!(g.f[0].fin > 0);
+        assert!(finisher(g.f[0].fin).weapon.is_none(), "the aerial one");
+    }
+
+    #[test]
+    fn being_hit_cuts_a_finisher_short() {
+        let mut g = setup();
+        g.tick(&Input { finish: true, ..Default::default() });
+        assert!(g.f[0].fin > 0);
+        // someone else hits you before the blow lands
+        let at = g.f[0].chest();
+        let o = g.f[2].chest();
+        g.damage(2, 0, 8.0, V3::ZERO, 0.0, false, at, Weapon::Revolver as u8, o, v3(-1.0, 0.0, 0.0));
+        assert_eq!(g.f[0].fin, 0, "interrupted");
+        for _ in 0..120 {
+            g.tick(&Input::default());
+        }
+        assert!(g.f[1].alive, "the target lives");
+    }
+
+    #[test]
+    fn the_host_checks_finisher_kills() {
+        let g = setup();
+        let (o, d) = (g.f[0].chest(), v3(0.0, 0.0, 1.0));
+        assert!(g.validate_claim(0, 1, EXEC_TOOL, LETHAL, o, d, false).is_some());
+        let mut healthy = setup();
+        healthy.f[1].hp = 90.0;
+        assert!(healthy.validate_claim(0, 1, EXEC_TOOL, LETHAL, o, d, false).is_none(), "no executing a healthy player");
     }
 }

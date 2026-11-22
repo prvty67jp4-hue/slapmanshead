@@ -333,6 +333,10 @@ impl Bot {
         } else if !melee && me.mag[me.cur] < me.weapon.mag() && self.rng.chance(dt) {
             inp.reload = true;
         }
+        // finish off a beaten, staggered enemy in reach (better bots spot it sooner)
+        if g.finish_target(i).is_some() && self.rng.chance(dt * (2.0 + 8.0 * s)) {
+            inp.finish = true;
+        }
         // patch up when hurt
         if me.items > 0 && ((me.loadout.item == 0 && me.hp < 45.0) || (me.loadout.item == 1 && me.ap < 10.0)) && self.rng.chance(dt * 2.0) {
             inp.item = true;
