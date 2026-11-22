@@ -53,6 +53,7 @@ const SHADER: &str = r#"
 struct U { vp: mat4x4<f32>, cam: vec4<f32>, right: vec4<f32>, up: vec4<f32>, fwd: vec4<f32>, sun: vec4<f32>, fog: vec4<f32>, params: vec4<f32> };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tex: texture_2d_array<f32>;
+@group(0) @binding(4) var ctex: texture_2d_array<f32>;
 @group(0) @binding(2) var samp: sampler;
 
 struct VIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32> };
@@ -75,7 +76,11 @@ fn fogit(c: vec3<f32>, wpos: vec3<f32>) -> vec3<f32> {
 @fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
   let layer = i.ex.x;
   let mat = i.ex.y;
-  let t = textureSample(tex, samp, i.uv, i32(max(layer, 0.0) + 0.5));
+  // world surfaces use the level's textures, fighters their own set (both sampled: the choice
+  // depends on the surface, and sampling must not)
+  let t0 = textureSample(tex, samp, i.uv, i32(clamp(layer, 0.0, 7.0) + 0.5));
+  let t1 = textureSample(ctex, samp, i.uv, i32(max(layer, 0.0) + 0.5));
+  let t = select(t0, t1, mat > 0.25 && mat < 0.75);
   var base = i.col;
   if (layer >= 0.0) { base = base * t; }
   if (mat > 2.5) {
@@ -105,14 +110,14 @@ fn fogit(c: vec3<f32>, wpos: vec3<f32>) -> vec3<f32> {
     let fr = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), i.rim.w);
     let d = length(i.wpos - u.cam.xyz);
     let ff = clamp((d - u.params.y) / (u.params.z - u.params.y), 0.0, 1.0) * u.fog.w;
-    outc = outc + i.rim.rgb * (fr * (1.0 - ff * 0.35) + 0.06 * (1.0 - ff * 0.5));
+    outc = outc + i.rim.rgb * (fr * (1.0 - ff * 0.35) + 0.012 * (1.0 - ff * 0.5));
   }
   return vec4<f32>(outc, base.a);
 }
 
 struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, joints: array<mat4x4<f32>, 72> };
 @group(0) @binding(3) var<storage, read> insts: array<Inst>;
-struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32 };
+struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32, @location(5) uv: vec2<f32> };
 @vertex fn vs_skin(v: SIn, @builtin(instance_index) ii: u32) -> VOut {
   let m = insts[ii].joints[v.j.x] * v.w.x + insts[ii].joints[v.j.y] * v.w.y + insts[ii].joints[v.j.z] * v.w.z + insts[ii].joints[v.j.w] * v.w.w;
   let wp = m * vec4<f32>(v.pos, 1.0);
@@ -120,8 +125,20 @@ struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location
   o.clip = u.vp * vec4<f32>(wp.xyz, 1.0);
   o.wpos = wp.xyz;
   o.nrm = normalize((m * vec4<f32>(v.nrm, 0.0)).xyz);
-  o.uv = vec2<f32>(0.0, 0.0);
-  o.col = select(insts[ii].tint1, insts[ii].tint0, v.mat == 0u);
+  let lay = v.mat >> 8u;
+  let low = v.mat & 255u;
+  o.uv = v.uv;
+  var ex = vec4<f32>(-1.0, 0.0, 1.0, 0.35);
+  if (lay < 255u) {
+    // a textured fighter: its own colours, the team colour only on its accent pieces (hood,
+    // shoulder guard or tunic), and a red wash when hurt
+    let acc = mix(vec3<f32>(1.0, 1.0, 1.0), insts[ii].tint0.rgb * 1.35, 0.62);
+    let base = select(vec3<f32>(1.0, 1.0, 1.0), acc, low == 1u);
+    o.col = vec4<f32>(mix(base, vec3<f32>(1.5, 0.35, 0.3), insts[ii].tint1.w), 1.0);
+    ex = vec4<f32>(f32(lay), 0.5, 1.0, 0.25);
+  } else {
+    o.col = vec4<f32>(select(insts[ii].tint1, insts[ii].tint0, low == 0u).rgb, 1.0);
+  }
   // the body part just hit flashes white: test the joint that moves this vertex most
   var jd = v.j.x; var wd = v.w.x;
   if (v.w.y > wd) { jd = v.j.y; wd = v.w.y; }
@@ -133,7 +150,7 @@ struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location
   if (fl.w > 0.0 && ((word >> (jd & 31u)) & 1u) == 1u) {
     o.col = vec4<f32>(mix(o.col.rgb, vec3<f32>(2.2, 2.2, 2.2), fl.w), o.col.a);
   }
-  o.ex = vec4<f32>(-1.0, 0.0, 1.0, 0.35);
+  o.ex = ex;
   o.rim = insts[ii].rim;
   return o;
 }
@@ -887,6 +904,154 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
         _ => {}
     }
 }
+/// The long coat as cloth: a grid of points hanging from a ring at the waist (open at the
+/// front), moved by gravity and the body's motion (verlet), held at their spacing, and pushed out
+/// of the legs and hips so it drapes over them. Team-coloured.
+const CLOTH_COLS: usize = 11;
+const CLOTH_ROWS: usize = 7;
+
+fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, sc: f32) {
+    let caps = &p.hit.caps;
+    let (hips, legs) = (caps[4], [caps[9], caps[10], caps[11], caps[12]]);
+    // the belt mostly stays level (it leans a little with the hips, not with the whole spine)
+    let up = ((hips.b - hips.a).norm() * 0.35 + v3(0.0, 0.65, 0.0)).norm();
+    let across = caps[11].a - caps[9].a; // left thigh -> right thigh
+    let mut right = across - up * across.dot(up);
+    if right.len() < 0.01 {
+        right = v3(1.0, 0.0, 0.0);
+    }
+    let right = right.norm();
+    let fwd = right.cross(up).norm();
+    let center = hips.b + up * (0.07 * sc);
+    let len = 0.68 * sc;
+    // the ring sits just outside the hips and thighs, so the body never fights the fabric
+    let (rx, rz) = (0.235 * sc, 0.2 * sc);
+    // the waist ring, from the right front, round the back, to the left front
+    let ring = |c: usize, flare: f32| -> V3 {
+        let a = (c as f32 / (CLOTH_COLS - 1) as f32 - 0.5) * 4.4; // radians from straight back
+        center + right * (-a.sin() * rx * flare) - fwd * (a.cos() * rz * flare)
+    };
+    let n = CLOTH_COLS * CLOTH_ROWS;
+    let idx = |r: usize, c: usize| r * CLOTH_COLS + c;
+    let feet = caps[10].b.y.min(caps[12].b.y) - 0.02;
+    let fresh = st.cloth.len() != n || (st.cloth[0] - ring(0, 1.0)).len() > 1.5;
+    if fresh {
+        st.cloth.clear();
+        for r in 0..CLOTH_ROWS {
+            for c in 0..CLOTH_COLS {
+                let k = r as f32 / (CLOTH_ROWS - 1) as f32;
+                st.cloth.push(ring(c, 1.0 + 0.25 * k) - up * (len * k));
+            }
+        }
+        st.cloth_prev = st.cloth.clone();
+        st.cloth_time = time;
+    }
+    let dt = (time - st.cloth_time).clamp(0.0, 0.05);
+    st.cloth_time = time;
+    if dt > 0.0 {
+        let steps = 3;
+        let h = dt / steps as f32;
+        let lv = len / (CLOTH_ROWS - 1) as f32;
+        let gravity = v3(0.0, -9.8, 0.0) * (h * h);
+        for _ in 0..steps {
+            for i in CLOTH_COLS..n {
+                let cur = st.cloth[i];
+                // a little air drag: heavy fabric, so it mostly hangs and trails a bit
+                let mut vel = (cur - st.cloth_prev[i]) * 0.994;
+                let vl = vel.len();
+                if vl > 0.12 {
+                    vel = vel * (0.12 / vl); // never faster than ~30 m/s: no blow-ups
+                }
+                st.cloth_prev[i] = cur;
+                st.cloth[i] = cur + vel + gravity;
+            }
+            for c in 0..CLOTH_COLS {
+                st.cloth[c] = ring(c, 1.0);
+                st.cloth_prev[c] = st.cloth[c];
+            }
+            for _ in 0..4 {
+                // hold the spacing: down the coat, and around it (flaring a little towards the hem)
+                for r in 1..CLOTH_ROWS {
+                    for c in 0..CLOTH_COLS {
+                        let (a, b) = (idx(r - 1, c), idx(r, c));
+                        let d = st.cloth[b] - st.cloth[a];
+                        let l = d.len().max(1e-5);
+                        let fix = d * ((l - lv) / l);
+                        if r == 1 {
+                            st.cloth[b] = st.cloth[b] - fix;
+                        } else {
+                            st.cloth[a] = st.cloth[a] + fix * 0.5;
+                            st.cloth[b] = st.cloth[b] - fix * 0.5;
+                        }
+                    }
+                    let flare = 1.0 + 0.3 * r as f32 / (CLOTH_ROWS - 1) as f32;
+                    for c in 0..CLOTH_COLS - 1 {
+                        let rest = (ring(c, flare) - ring(c + 1, flare)).len();
+                        let (a, b) = (idx(r, c), idx(r, c + 1));
+                        let d = st.cloth[b] - st.cloth[a];
+                        let l = d.len().max(1e-5);
+                        let fix = d * ((l - rest) / l) * 0.5;
+                        st.cloth[a] = st.cloth[a] + fix;
+                        st.cloth[b] = st.cloth[b] - fix;
+                    }
+                }
+                // drape over the legs and hips, never inside the body or below the feet
+                for i in CLOTH_COLS..n {
+                    let mut q = st.cloth[i];
+                    let before = q;
+                    for cap in legs.iter() {
+                        // pushed out sideways only (past a limb's ends the cloth would be flung up)
+                        let ab = cap.b - cap.a;
+                        let t = (q - cap.a).dot(ab) / ab.dot(ab).max(1e-6);
+                        if !(0.0..=1.0).contains(&t) {
+                            continue;
+                        }
+                        let near = cap.a + ab * t;
+                        let off = q - near;
+                        let rr = cap.r + 0.02 * sc;
+                        if off.len() < rr {
+                            q = near + if off.len() > 1e-4 { off.norm() } else { -fwd } * rr;
+                        }
+                    }
+                    let rel = q - center;
+                    let flat = rel - up * rel.dot(up);
+                    let (x, z) = (flat.dot(right) / rx, flat.dot(fwd) / rz);
+                    let d = (x * x + z * z).sqrt();
+                    if d < 0.9 && d > 1e-4 {
+                        let s = 0.9 / d;
+                        q = center + up * rel.dot(up) + right * (x * s * rx) + fwd * (z * s * rz);
+                    }
+                    q.y = q.y.max(feet);
+                    // heavy fabric never folds up above the row it hangs from (it can stream out
+                    // behind, not flip over)
+                    let above = st.cloth[i - CLOTH_COLS].y;
+                    q.y = q.y.min(above + 0.01);
+                    if (q - before).len() > 1e-5 {
+                        // touching the body: it slides along instead of bouncing off
+                        st.cloth_prev[i] = q - (st.cloth[i] - st.cloth_prev[i]) * 0.3;
+                    }
+                    st.cloth[i] = q;
+                }
+            }
+        }
+    }
+    // draw it, both sides lit by the same normal (the coat is thin)
+    let base = lin(lk.coat_dark);
+    let trim = lin(lk.coat);
+    for r in 0..CLOTH_ROWS - 1 {
+        for c in 0..CLOTH_COLS - 1 {
+            let q = [st.cloth[idx(r, c)], st.cloth[idx(r, c + 1)], st.cloth[idx(r + 1, c + 1)], st.cloth[idx(r + 1, c)]];
+            let nrm = (q[1] - q[0]).cross(q[3] - q[0]);
+            let nrm = if nrm.len() > 1e-6 { nrm.norm() } else { -fwd };
+            // the team colour runs along the hem
+            let col = if r == CLOTH_ROWS - 2 { trim } else { base };
+            let (u0, u1) = (c as f32 / (CLOTH_COLS - 1) as f32 * 2.0, (c + 1) as f32 / (CLOTH_COLS - 1) as f32 * 2.0);
+            let (v0, v1) = (r as f32 / (CLOTH_ROWS - 1) as f32, (r + 1) as f32 / (CLOTH_ROWS - 1) as f32);
+            mb.quad(q, nrm, [[u0, v0], [u1, v0], [u1, v1], [u0, v1]], col, [7.0, 0.0, 1.0, 0.05]);
+        }
+    }
+}
+
 /// Things attached to an animated character's bones: the weapon in the right hand, the sword's
 /// swing trail, hair, and the long coat.
 #[allow(clippy::too_many_arguments)]
@@ -896,12 +1061,20 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
         let l = lin(c);
         [l[0] + (1.0 - l[0]) * flash, l[1] + (0.3 - l[1]).max(0.0) * flash, l[2] + (0.3 - l[2]).max(0.0) * flash, 1.0]
     };
-    // hair cap
-    let hf = &p.head_frame;
-    mb.ellipsoid(p.head + (hf.y * 0.1 - hf.z * 0.015) * sc, hf, v3(0.105, 0.07, 0.115) * sc, tint(lk.hair), -1.0, 0.4, 0.0);
-    mb.ellipsoid(p.head + (hf.y * 0.05 - hf.z * 0.06) * sc, hf, v3(0.1, 0.085, 0.07) * sc, tint(lk.hair), -1.0, 0.4, 0.0);
-    // long coat from the waist, trailing behind with speed
-    if f.alive {
+    let dressed = crate::chars::shared().is_some();
+    if dressed {
+        // the fighters have real hair; the long coat is cloth that swings and drapes
+        if f.alive || f.death_t < 3.0 {
+            coat_cloth(mb, p, st, time, lk, sc);
+        }
+    } else {
+        // hair cap
+        let hf = &p.head_frame;
+        mb.ellipsoid(p.head + (hf.y * 0.1 - hf.z * 0.015) * sc, hf, v3(0.105, 0.07, 0.115) * sc, tint(lk.hair), -1.0, 0.4, 0.0);
+        mb.ellipsoid(p.head + (hf.y * 0.05 - hf.z * 0.06) * sc, hf, v3(0.1, 0.085, 0.07) * sc, tint(lk.hair), -1.0, 0.4, 0.0);
+    }
+    // long coat from the waist, trailing behind with speed (the plain mannequin's stiff one)
+    if f.alive && !dressed {
         let speed = f.vel.flat().len();
         let air = !f.on_ground && f.wall.is_none();
         let flap = 0.15 + (speed / 12.0).min(1.0) * 0.8 + (time * 9.0).sin() * 0.05 * (speed / RUN_SPEED).min(1.0) + if air { 0.3 } else { 0.0 };
@@ -1078,6 +1251,8 @@ pub struct Gpu {
     ubuf: wgpu::Buffer,
     static_buf: wgpu::Buffer,
     static_count: u32,
+    /// Which map the level mesh above was built from.
+    static_map: MapId,
     dyn_buf: wgpu::Buffer,
     dyn_cap: u64,
     target: Option<Target>,
@@ -1099,6 +1274,31 @@ struct Skin {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     icount: u32,
+    /// Each fighter's mesh (vertices, indices, index count); empty if they didn't load.
+    bodies: Vec<(wgpu::Buffer, wgpu::Buffer, u32)>,
+}
+
+/// The fighters' textures as layers with their mip levels (RGBA, CHAR_TEX square).
+const CHAR_TEX: u32 = 1024;
+fn build_char_textures() -> Vec<Vec<Vec<u8>>> {
+    use image::imageops::{FilterType, resize};
+    crate::chars::TEXTURES
+        .iter()
+        .map(|(_, bytes)| {
+            let img = image::load_from_memory(bytes).map(|i| i.to_rgba8()).unwrap_or_else(|_| image::RgbaImage::from_pixel(CHAR_TEX, CHAR_TEX, image::Rgba([190, 190, 190, 255])));
+            let mut img = if img.width() != CHAR_TEX || img.height() != CHAR_TEX { resize(&img, CHAR_TEX, CHAR_TEX, FilterType::Triangle) } else { img };
+            let mut levels = Vec::new();
+            loop {
+                levels.push(img.as_raw().clone());
+                let s = img.width();
+                if s <= 1 {
+                    break;
+                }
+                img = resize(&img, s / 2, s / 2, FilterType::Triangle);
+            }
+            levels
+        })
+        .collect()
 }
 
 /// Which skin joints make up each body part (head, chest, hips, left/right arm, left/right leg).
@@ -1134,7 +1334,7 @@ fn part_masks(rig: &Rig) -> [[u32; 3]; 7] {
 }
 
 fn make_skin_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, samples: u32) -> wgpu::RenderPipeline {
-    let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 4 => Uint32];
+    let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 4 => Uint32, 5 => Float32x2];
     let vbl = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SkinVtx>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("duel skinned"),
@@ -1262,6 +1462,31 @@ impl Gpu {
             }
         }
         let tex_view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        // the fighters' textures
+        let cdata = build_char_textures();
+        let cmips = cdata.first().map_or(1, |l| l.len() as u32);
+        let ctex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fighter textures"),
+            size: wgpu::Extent3d { width: CHAR_TEX, height: CHAR_TEX, depth_or_array_layers: cdata.len().max(1) as u32 },
+            mip_level_count: cmips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (layer, levels) in cdata.iter().enumerate() {
+            for (mip, bytes) in levels.iter().enumerate() {
+                let s = (CHAR_TEX >> mip).max(1);
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &ctex, mip_level: mip as u32, origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 }, aspect: wgpu::TextureAspect::All },
+                    bytes,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * s), rows_per_image: Some(s) },
+                    wgpu::Extent3d { width: s, height: s, depth_or_array_layers: 1 },
+                );
+            }
+        }
+        let ctex_view = ctex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("duel sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -1306,6 +1531,12 @@ impl Gpu {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
+                    count: None,
+                },
             ],
         });
         let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1322,6 +1553,7 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&ctex_view) },
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("duel layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
@@ -1339,7 +1571,19 @@ impl Gpu {
                 let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("character verts"), contents: bytemuck::cast_slice(&rig.verts), usage: wgpu::BufferUsages::VERTEX });
                 let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("character indices"), contents: bytemuck::cast_slice(&rig.indices), usage: wgpu::BufferUsages::INDEX });
                 let icount = rig.indices.len() as u32;
-                Some(Skin { rig, vbuf, ibuf, icount })
+                // the four fighters (CC0 Quaternius outfits, heads and hair on the same skeleton)
+                let bodies = crate::chars::shared()
+                    .map(|ms| {
+                        ms.iter()
+                            .map(|m| {
+                                let v = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("fighter verts"), contents: bytemuck::cast_slice(&m.verts), usage: wgpu::BufferUsages::VERTEX });
+                                let i = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("fighter indices"), contents: bytemuck::cast_slice(&m.indices), usage: wgpu::BufferUsages::INDEX });
+                                (v, i, m.indices.len() as u32)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(Skin { rig, vbuf, ibuf, icount, bodies })
             }
             Err(e) => {
                 eprintln!("character model not loaded: {e}");
@@ -1366,6 +1610,7 @@ impl Gpu {
             ubuf,
             static_buf,
             static_count: verts.len() as u32,
+            static_map: world.map,
             dyn_buf,
             dyn_cap,
             target: None,
@@ -1437,6 +1682,19 @@ impl Gpu {
 
     /// Render the scene and return the texture to show.
     pub fn render(&mut self, rs: &RenderState, g: &Game, cam: &Cam, rect: egui::Rect, ppp: f32, alpha: f32, local_override: Option<(usize, V3)>) -> Option<egui::TextureId> {
+        if g.world.map != self.static_map {
+            // another map: build its level mesh
+            let verts = build_world(&g.world);
+            self.static_buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("duel world"),
+                size: (verts.len() * std::mem::size_of::<Vtx>()).max(64) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            rs.queue.write_buffer(&self.static_buf, 0, bytemuck::cast_slice(&verts));
+            self.static_count = verts.len() as u32;
+            self.static_map = g.world.map;
+        }
         let sc = self.quality.scale.clamp(0.3, 2.0);
         let w = ((rect.width() * ppp * sc).round() as u32).clamp(16, 8192);
         let h = ((rect.height() * ppp * sc).round() as u32).clamp(16, 8192);
@@ -1480,6 +1738,7 @@ impl Gpu {
         let mut al = MB::default();
         let mut ad = MB::default();
         let mut insts: Vec<Vec<f32>> = Vec::new();
+        let mut inst_body: Vec<usize> = Vec::new();
         for (i, f) in g.f.iter().enumerate() {
             if !f.present || f.spectate {
                 continue;
@@ -1507,7 +1766,9 @@ impl Gpu {
                     };
                     let mut data = Vec::with_capacity(INST_FLOATS);
                     data.extend_from_slice(&tint(lk.coat));
-                    data.extend_from_slice(&tint(lk.pants));
+                    let pants = tint(lk.pants);
+                    // (a textured fighter reads the hurt flash from here)
+                    data.extend_from_slice(&[pants[0], pants[1], pants[2], flash * 1.6]);
                     let m = self.part_masks[(f.hit_part as usize).min(6)];
                     let strength = (f.flash_t / 0.12).clamp(0.0, 1.0) * 0.85;
                     data.extend_from_slice(&[f32::from_bits(m[0]), f32::from_bits(m[1]), f32::from_bits(m[2]), strength]);
@@ -1523,6 +1784,7 @@ impl Gpu {
                         data.extend_from_slice(&m.to_cols_array());
                     }
                     insts.push(data);
+                    inst_body.push(f.loadout.body as usize);
                     character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash, g.tune.char_scale);
                 }
                 None => fighter_mesh(&mut op, &mut ad, cam, f, pos, g.time),
@@ -1554,7 +1816,7 @@ impl Gpu {
         if g.mt.mode == Mode::Ctf {
             for t in 0..2usize {
                 let col = if t == 0 { [220, 50, 50] } else { [60, 110, 230] };
-                let base = flag_base(t);
+                let base = g.world.flag_base(t);
                 let seg = 24;
                 for k in 0..seg {
                     let a0 = k as f32 / seg as f32 * 2.0 * PI;
@@ -1713,10 +1975,15 @@ impl Gpu {
             }
             if let (Some(sk), true) = (&self.skin, n_inst > 0) {
                 pass.set_pipeline(&self.pipe_skin);
-                pass.set_vertex_buffer(0, sk.vbuf.slice(..));
-                pass.set_index_buffer(sk.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 for k in 0..n_inst {
-                    pass.draw_indexed(0..sk.icount, 0, k..k + 1);
+                    // each fighter's own mesh (the plain mannequin if they didn't load)
+                    let (vb, ib, n) = match inst_body.get(k as usize).and_then(|&b| sk.bodies.get(b)) {
+                        Some((v, i, n)) => (v, i, *n),
+                        None => (&sk.vbuf, &sk.ibuf, sk.icount),
+                    };
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..n, 0, k..k + 1);
                 }
             }
             if !all.is_empty() {
@@ -1736,5 +2003,52 @@ impl Gpu {
         }
         rs.queue.submit(Some(enc.finish()));
         self.tex_id
+    }
+}
+
+#[cfg(test)]
+mod cloth_tests {
+    use super::*;
+
+    #[test]
+    fn the_coat_hangs_and_swings_without_going_wild() {
+        let rig = crate::anim::shared().expect("rig");
+        let mut f = Fighter::new("t", 0, true);
+        f.present = true;
+        f.alive = true;
+        f.on_ground = true;
+        let mut st = CharState::new();
+        let lk = look(0);
+        let mut mb = MB { v: Vec::new() };
+        let mut pos = V3::ZERO;
+        for k in 0..240 {
+            let t = k as f32 / 120.0;
+            // stand a second, then run
+            if k > 120 {
+                f.vel = v3(0.0, 0.0, 7.2);
+                pos = pos + f.vel * (1.0 / 120.0);
+            }
+            let p = character::animate(rig, &mut st, &f, pos, t, &Tuning::default()).expect("posed");
+            mb.v.clear();
+            coat_cloth(&mut mb, &p, &mut st, t, &lk, 1.0);
+            let waist = p.hit.caps[4].b.y + 0.1;
+            let _ = waist;
+            let belt = st.cloth[..CLOTH_COLS].iter().fold(f32::MIN, |m, q| m.max(q.y));
+            for q in &st.cloth {
+                assert!(q.x.is_finite() && q.y.is_finite() && q.z.is_finite());
+                // (a knee coming up can lift the open front edge a little above the belt)
+                assert!(q.y <= belt + 0.15 && q.y >= -0.05, "coat between the belt and the floor (k {k}): {q:?}, belt {belt}");
+                assert!((*q - pos).flat().len() < 1.2, "stays with the body: {q:?}");
+            }
+            assert!(!mb.v.is_empty());
+            if k == 120 {
+                // standing still it hangs: the hem is well below the waist
+                let hem = st.cloth[st.cloth.len() - 1];
+                assert!(hem.y < waist - 0.45, "hangs down: {hem:?}");
+            }
+        }
+        // running, it trails behind (towards -z)
+        let hem_mid = st.cloth[(CLOTH_ROWS - 1) * CLOTH_COLS + CLOTH_COLS / 2];
+        assert!(hem_mid.z < pos.z - 0.12, "trails behind when running: {hem_mid:?} vs {pos:?}");
     }
 }

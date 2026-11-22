@@ -1,5 +1,6 @@
 ﻿use crate::bot::Bot;
 use crate::math::*;
+pub use crate::world::MapId;
 use crate::world::{Mat, World};
 use std::collections::VecDeque;
 
@@ -252,28 +253,31 @@ impl Weapon {
 pub const ITEM_NAMES: [&str; 3] = ["Medkit", "Armor Kit", "Grenades"];
 pub const ITEM_BLURBS: [&str; 3] = ["+50 health, twice a life", "+50 armor, twice a life", "two grenades a life"];
 
-/// What a player brings: a melee weapon, two guns and an item.
+/// What a player brings: a melee weapon, two guns, an item, and which fighter they play as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Loadout {
     pub melee: Weapon,
     pub gun1: Weapon,
     pub gun2: Weapon,
     pub item: u8,
+    /// The fighter (see crate::chars): 0 Ranger, 1 Huntress, 2 Brawler, 3 Striker.
+    pub body: u8,
 }
 
 impl Default for Loadout {
     fn default() -> Self {
-        Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 2 }
+        Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 2, body: 0 }
     }
 }
 
 impl Loadout {
     pub fn to_bytes(self) -> [u8; 4] {
-        [self.melee as u8, self.gun1 as u8, self.gun2 as u8, self.item]
+        // the fighter rides in the item byte's top half
+        [self.melee as u8, self.gun1 as u8, self.gun2 as u8, (self.item & 0x0f) | (self.body.min(15) << 4)]
     }
     /// Read and repair (a melee in the melee slot, guns in the gun slots).
     pub fn from_bytes(b: [u8; 4]) -> Loadout {
-        let mut l = Loadout { melee: Weapon::from_u8(b[0]), gun1: Weapon::from_u8(b[1]), gun2: Weapon::from_u8(b[2]), item: b[3].min(2) };
+        let mut l = Loadout { melee: Weapon::from_u8(b[0]), gun1: Weapon::from_u8(b[1]), gun2: Weapon::from_u8(b[2]), item: (b[3] & 0x0f).min(2), body: (b[3] >> 4).min(crate::chars::COUNT as u8 - 1) };
         if !l.melee.is_melee() {
             l.melee = Weapon::Katana;
         }
@@ -293,7 +297,7 @@ impl Loadout {
         let n = Weapon::GUNS.len();
         let a = rng.next_u32() as usize % n;
         let b = (a + 1 + rng.next_u32() as usize % (n - 1)) % n;
-        Loadout { melee: m, gun1: Weapon::GUNS[a], gun2: Weapon::GUNS[b], item: (rng.next_u32() % 3) as u8 }
+        Loadout { melee: m, gun1: Weapon::GUNS[a], gun2: Weapon::GUNS[b], item: (rng.next_u32() % 3) as u8, body: (rng.next_u32() % crate::chars::COUNT as u32) as u8 }
     }
 }
 
@@ -489,8 +493,9 @@ impl Default for Tuning {
             cam_roll: 6.0,
             land_dip: 0.18,
             fov_speed: 8.0,
-            rim: 0.7,
-            rim_width: 2.5,
+            // a thin outline: the fighters wear their own colours now
+            rim: 0.5,
+            rim_width: 4.0,
         }
     }
 }
@@ -1223,9 +1228,6 @@ pub struct Flag {
 
 pub const ROUND_TIME: f32 = 120.0;
 
-pub fn flag_base(team: usize) -> V3 {
-    if team == 0 { v3(0.0, 0.0, -21.5) } else { v3(0.0, 0.0, 21.5) }
-}
 
 pub const TEAM_NAMES: [&str; 2] = ["Red", "Blue"];
 
@@ -1696,6 +1698,7 @@ pub const BOT_NAMES: [&str; 7] = ["Ash", "Vex", "Kiro", "Nyx", "Rook", "Sable", 
 impl Game {
     pub fn new(kind: Kind, local_slot: usize, mode: Mode, target: u16) -> Game {
         let world = World::arena();
+        let flag_homes = world.flags;
         let f = (0..MAX_PLAYERS).map(|s| Fighter::new("", s, true)).collect();
         let bots = (0..MAX_PLAYERS).map(|_| None).collect();
         let (phase, timer) = match kind {
@@ -1718,7 +1721,7 @@ impl Game {
                 round: 0,
                 round_end: 0.0,
                 duel: [255, 255],
-                flags: [0, 1].map(|t| Flag { state: 0, carrier: 255, pos: flag_base(t), timer: 0.0 }),
+                flags: [0, 1].map(|t| Flag { state: 0, carrier: 255, pos: flag_homes[t], timer: 0.0 }),
             },
             queue: VecDeque::new(),
             duel_loser: None,
@@ -1777,17 +1780,39 @@ impl Game {
         }
     }
 
+    /// Play on another map: the level is rebuilt, the flags go home and everyone this computer
+    /// runs starts again at a spawn point there.
+    pub fn set_map(&mut self, map: MapId) {
+        if self.world.map == map {
+            return;
+        }
+        self.world = World::build(map);
+        self.mt.flags = [0, 1].map(|t| Flag { state: 0, carrier: 255, pos: self.world.flag_base(t), timer: 0.0 });
+        self.grenades.clear();
+        for i in 0..self.f.len() {
+            if self.f[i].present && self.f[i].owned && self.f[i].alive {
+                let (p, y) = self.pick_spawn(i);
+                self.f[i].respawn_at(p, y);
+            }
+        }
+        for h in self.history.iter_mut() {
+            h.clear();
+        }
+    }
+
     /// The training room: you, a katana and a rocket launcher, and three dummies that can't die.
+    /// It's laid out on the open courtyard (the long wall behind you is for wall-runs).
     pub fn training(name: &str) -> Game {
         let mut g = Game::new(Kind::Offline, 0, Mode::Ffa, 9999);
-        g.my_loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rocket, gun2: Weapon::Revolver, item: 2 };
+        g.set_map(MapId::Courtyard);
+        g.my_loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rocket, gun2: Weapon::Revolver, item: 2, body: 0 };
         g.add_player(0, name, true, None, 0);
         let homes = [v3(-3.5, 0.0, -6.0), v3(0.0, 0.0, -6.2), v3(3.5, 0.0, -6.0)];
         for (k, &h) in homes.iter().enumerate() {
             let s = k + 1;
             g.add_player(s, &format!("Dummy {}", s), true, Some(0.0), 0);
             g.bots[s] = None; // stands still
-            g.f[s].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0 };
+            g.f[s].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0, body: 0 };
             g.f[s].equip();
             g.f[s].respawn_at(h, 0.0);
             g.f[s].spawn_prot = 0.0;
@@ -2052,7 +2077,7 @@ impl Game {
         let ef = self.mt.flags[enemy];
         let mf = self.mt.flags[my];
         if ef.state == 1 && ef.carrier as usize == i {
-            return Some(flag_base(my));
+            return Some(self.world.flag_base(my));
         }
         if mf.state == 2 {
             return Some(mf.pos);
@@ -2735,7 +2760,7 @@ impl Game {
                     if c >= self.f.len() || !self.f[c].present || !self.f[c].alive || self.f[c].spectate {
                         fl.state = 2;
                         fl.timer = 20.0;
-                        fl.pos = if c < self.f.len() { self.f[c].pos } else { flag_base(t) };
+                        fl.pos = if c < self.f.len() { self.f[c].pos } else { self.world.flag_base(t) };
                         fl.carrier = 255;
                         if c < self.f.len() {
                             let n = self.f[c].name.clone();
@@ -2744,13 +2769,13 @@ impl Game {
                     } else {
                         fl.pos = self.f[c].pos;
                         let home = (self.f[c].team as usize).min(1);
-                        let near_home = (self.f[c].pos - flag_base(home)).flat().len() < 1.8;
+                        let near_home = (self.f[c].pos - self.world.flag_base(home)).flat().len() < 1.8;
                         if near_home && self.mt.flags[home].state == 0 {
                             self.mt.team_score[home] += 1;
                             let n = self.f[c].name.clone();
                             self.say(format!("{n} captured the {tname} flag!"));
                             self.banner = Some((format!("{} TEAM SCORES", TEAM_NAMES[home].to_uppercase()), 2.0));
-                            fl = Flag { state: 0, carrier: 255, pos: flag_base(t), timer: 0.0 };
+                            fl = Flag { state: 0, carrier: 255, pos: self.world.flag_base(t), timer: 0.0 };
                             self.sfx2d(Sfx::Kill);
                             self.mt.flags[t] = fl;
                             self.check_win();
@@ -2762,7 +2787,7 @@ impl Game {
                     if fl.state == 2 {
                         fl.timer -= dt;
                         if fl.timer <= 0.0 {
-                            fl = Flag { state: 0, carrier: 255, pos: flag_base(t), timer: 0.0 };
+                            fl = Flag { state: 0, carrier: 255, pos: self.world.flag_base(t), timer: 0.0 };
                             self.say(format!("The {tname} flag went home"));
                         }
                     }
@@ -2778,7 +2803,7 @@ impl Game {
                         let name = f.name.clone();
                         if (f.team as usize).min(1) == t {
                             if fl.state == 2 {
-                                fl = Flag { state: 0, carrier: 255, pos: flag_base(t), timer: 0.0 };
+                                fl = Flag { state: 0, carrier: 255, pos: self.world.flag_base(t), timer: 0.0 };
                                 self.say(format!("{name} returned the {tname} flag"));
                             }
                         } else {
@@ -2806,7 +2831,7 @@ impl Game {
         self.mt.round = 0;
         self.mt.round_end = 0.0;
         self.mt.duel = [255, 255];
-        self.mt.flags = [0, 1].map(|t| Flag { state: 0, carrier: 255, pos: flag_base(t), timer: 0.0 });
+        self.mt.flags = [0, 1].map(|t| Flag { state: 0, carrier: 255, pos: self.world.flag_base(t), timer: 0.0 });
         self.queue = self.present().into_iter().collect();
         self.duel_loser = None;
         self.banner = Some(("CHOOSE YOUR LOADOUT".into(), 2.5));
@@ -5515,6 +5540,8 @@ mod lag_comp_tests {
             deco: Vec::new(),
             braziers: Vec::new(),
             banners: Vec::new(),
+            map: MapId::Arena,
+            flags: [v3(0.0, 0.0, -21.5), v3(0.0, 0.0, 21.5)],
         }
     }
 
@@ -5524,7 +5551,7 @@ mod lag_comp_tests {
         g.world = flat_world();
         g.bots[1] = None;
         g.mt.phase = Phase::Fight;
-        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0 };
+        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0, body: 0 };
         g.f[0].pos = v3(0.0, 0.0, -10.0);
         g.f[1].pos = v3(0.0, 0.0, 0.0);
         g.f[0].spawn_prot = 0.0;
@@ -5633,10 +5660,10 @@ mod mode_tests {
         let mut g = game(Mode::Ctf, 1);
         let red = (0..g.f.len()).find(|&i| g.f[i].present && g.f[i].team == 0).unwrap();
         g.f[red].spawn_prot = 0.0;
-        g.f[red].pos = flag_base(1);
+        g.f[red].pos = g.world.flag_base(1);
         g.tick(&Input::default());
         assert_eq!(g.mt.flags[1].state, 1, "touching the enemy flag picks it up");
-        g.f[red].pos = flag_base(0);
+        g.f[red].pos = g.world.flag_base(0);
         g.tick(&Input::default());
         assert_eq!(g.mt.team_score[0], 1, "bringing it home scores");
         assert_eq!(g.mt.flags[1].state, 0, "and the flag goes back");
@@ -5825,7 +5852,7 @@ mod hitbox_tests {
         g.f[1].yaw = std::f32::consts::PI; // facing the shooter
         g.f[0].spawn_prot = 0.0;
         g.f[1].spawn_prot = 0.0;
-        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0 };
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
         g.f[1].equip();
         for _ in 0..30 {
             g.f[1].pos = v3(0.0, 0.0, 0.0);
@@ -5864,7 +5891,7 @@ mod hitbox_tests {
         g.mt.phase = Phase::Fight;
         for i in 0..2 {
             g.f[i].ap = 0.0; // no armour soaking up the counter
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = Weapon::Katana;
@@ -6185,10 +6212,10 @@ mod weapon_tests {
         g.world = crate::game::lag_comp_tests::flat_world();
         g.bots[1] = None;
         g.mt.phase = Phase::Fight;
-        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: gun, gun2: Weapon::Revolver, item: 0 };
+        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: gun, gun2: Weapon::Revolver, item: 0, body: 0 };
         g.f[0].equip();
         g.f[0].pos = v3(0.0, 0.0, -10.0);
-        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Smg, item: 0 };
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Smg, item: 0, body: 0 };
         g.f[1].equip();
         for i in 0..2 {
             g.f[i].spawn_prot = 0.0;
@@ -6309,7 +6336,7 @@ mod weapon_tests {
         assert!(r.dmg * r.head >= MAX_HP, "revolver headshot one-taps");
         // tapping (half a second apart): every shot dead-on
         let mut f = Fighter::new("x", 0, true);
-        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0 };
+        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
         f.equip();
         f.cur = 1;
         f.weapon = Weapon::Revolver;
@@ -6447,7 +6474,7 @@ mod melee_depth_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: blade, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0 };
+            g.f[i].loadout = Loadout { melee: blade, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = blade;
@@ -6687,7 +6714,7 @@ mod fairness_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = Weapon::Katana;
@@ -6828,7 +6855,7 @@ mod shuriken_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shuriken, gun2: Weapon::Rifle, item: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shuriken, gun2: Weapon::Rifle, item: 0, body: 0 };
             g.f[i].equip();
             g.f[i].ap = 0.0;
             g.f[i].spawn_prot = 0.0;
@@ -6908,5 +6935,125 @@ mod shuriken_tests {
         assert!(g.validate_claim(0, 1, Weapon::Shuriken as u8, s.dmg, at - d, d, false).is_some(), "a star that landed");
         assert!(g.validate_claim(0, 1, Weapon::Shuriken as u8, s.dmg * 4.0, at - d, d, false).is_none(), "no star does four times its damage");
         assert!(g.validate_claim(0, 1, Weapon::Shuriken as u8, s.dmg, at + v3(3.0, 0.0, 0.0) - d, d, false).is_none(), "a star that missed");
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    /// Distance in the ground plane from a point to a box's footprint.
+    fn foot_dist(p: V3, b: &Aabb) -> f32 {
+        let dx = (b.min.x - p.x).max(p.x - b.max.x).max(0.0);
+        let dz = (b.min.z - p.z).max(p.z - b.max.z).max(0.0);
+        (dx * dx + dz * dz).sqrt()
+    }
+
+    #[test]
+    fn arena_is_small_dense_and_vertical() {
+        let w = World::arena();
+        assert_eq!(w.map, MapId::Arena);
+        assert!((w.half * 2.0 - 30.0).abs() < 0.01, "30 x 30 m");
+        // anything standing on the ground that you can't just see over
+        let blockers: Vec<Aabb> = w.blocks.iter().map(|b| b.b).filter(|b| b.min.y < 2.0 && b.max.y > 1.0).collect();
+        let mut widest: f32 = 0.0;
+        let mut at = V3::ZERO;
+        let mut x = -w.half + 0.25;
+        while x < w.half {
+            let mut z = -w.half + 0.25;
+            while z < w.half {
+                let p = v3(x, 0.0, z);
+                if !blockers.iter().any(|b| foot_dist(p, b) <= 0.0) {
+                    let d = blockers.iter().map(|b| foot_dist(p, b)).fold(f32::MAX, f32::min);
+                    if d * 2.0 > widest {
+                        widest = d * 2.0;
+                        at = p;
+                    }
+                }
+                z += 0.5;
+            }
+            x += 0.5;
+        }
+        assert!(widest <= 8.5, "no open area more than ~8 m across: {widest:.1} m at {at:?}");
+        // three levels: the ground, about 3 m, and 5 m or more
+        let tops: Vec<f32> = w.blocks.iter().filter(|b| (b.b.max.x - b.b.min.x) * (b.b.max.z - b.b.min.z) >= 1.0).map(|b| b.b.max.y).collect();
+        assert!(tops.iter().any(|&t| (t - 3.0).abs() < 0.3), "a middle level");
+        assert!(tops.iter().any(|&t| (5.0..6.0).contains(&t)), "a top level");
+        // everyone spawns on solid ground, not inside anything
+        for &(p, _) in &w.spawn_points {
+            let body = Aabb::new(p + v3(-RADIUS, 0.05, -RADIUS), p + v3(RADIUS, HEIGHT, RADIUS));
+            assert!(!w.blocks.iter().any(|b| b.b.overlaps(&body)), "spawn {p:?} is clear");
+            assert!((w.ground_below(p + v3(0.0, 0.1, 0.0)) - p.y).abs() < 0.05, "spawn {p:?} stands on something");
+            assert!(p.x.abs() < w.half && p.z.abs() < w.half);
+        }
+        // the open courtyard is still there as a second map
+        let cy = World::build(MapId::Courtyard);
+        assert_eq!(cy.map, MapId::Courtyard);
+        assert!(cy.half > 20.0);
+        assert_eq!(MapId::Courtyard.name(), "Open Courtyard");
+    }
+
+    /// Run off platform P2 towards P1 (6.5 m away, both 3 m up), jumping at the edge.
+    fn leap(dash: bool) -> V3 {
+        let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
+        g.bots[1] = None;
+        g.f[1].pos = v3(13.0, 0.0, 10.0);
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = 99.0;
+        let yaw = -std::f32::consts::FRAC_PI_2; // facing -x
+        g.f[0].pos = v3(5.6, 3.0, -6.75);
+        g.f[0].prev_pos = g.f[0].pos;
+        g.f[0].yaw = yaw;
+        g.f[0].on_ground = true;
+        g.f[0].spawn_prot = 0.0;
+        let run = Input { fwd: 1.0, yaw, ..Default::default() };
+        for _ in 0..240 {
+            if g.f[0].pos.x < 2.25 {
+                break;
+            }
+            g.tick(&run);
+        }
+        g.tick(&Input { jump: true, ..run });
+        let mut dashed = false;
+        for _ in 0..240 {
+            let apex = g.f[0].vel.y <= 0.5;
+            if dash && !dashed && apex && !g.f[0].on_ground {
+                g.tick(&Input { dash: true, ..run });
+                dashed = true;
+                continue;
+            }
+            // over the far platform: pull back so you don't sail past it
+            let brake = dashed && g.f[0].pos.x < -5.2;
+            g.tick(&Input { fwd: if brake { -1.0 } else { 1.0 }, ..run });
+            if g.f[0].on_ground && g.f[0].air_t == 0.0 && g.f[0].pos.x < 1.5 {
+                break;
+            }
+        }
+        g.f[0].pos
+    }
+
+    #[test]
+    fn the_platform_gap_needs_a_dash() {
+        let plain = leap(false);
+        assert!(plain.y < 0.5, "a plain running jump falls short: landed at {plain:?}");
+        let dashed = leap(true);
+        assert!((dashed.y - 3.0).abs() < 0.2 && dashed.x <= -4.4, "a jump and an air dash make it: landed at {dashed:?}");
+    }
+
+    #[test]
+    fn stairs_lead_up_to_the_balcony() {
+        let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
+        g.bots[1] = None;
+        g.f[1].pos = v3(13.0, 0.0, 10.0);
+        g.mt.phase = Phase::Fight;
+        // walk up the stairs by the west corridor wall (facing -z)
+        g.f[0].pos = v3(-9.6, 0.0, -7.5);
+        g.f[0].prev_pos = g.f[0].pos;
+        g.f[0].spawn_prot = 0.0;
+        let up = Input { fwd: 1.0, yaw: std::f32::consts::PI, ..Default::default() };
+        for k in 0..(2.5 / TICK) as usize {
+            g.tick(&up);
+        }
+        assert!((g.f[0].pos.y - 3.0).abs() < 0.1 && g.f[0].pos.z < -12.4, "on the balcony: {:?}", g.f[0].pos);
     }
 }

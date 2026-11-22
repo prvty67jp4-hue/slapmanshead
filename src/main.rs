@@ -5,6 +5,7 @@ mod audio;
 mod bot;
 mod firewall;
 mod character;
+mod chars;
 mod game;
 mod gpu;
 mod math;
@@ -32,6 +33,8 @@ struct Settings {
     bot_level: usize,
     rounds: u8,
     mode: u8,
+    /// Which map to play (Practice and hosting): world::MapId as a number.
+    map: u8,
     bots: usize,
     port: String,
     join_addr: String,
@@ -260,6 +263,7 @@ impl Default for Settings {
             bot_level: 1,
             rounds: 15,
             mode: 0,
+            map: 0,
             bots: 3,
             port: net::DEFAULT_PORT.to_string(),
             join_addr: String::new(),
@@ -351,6 +355,7 @@ impl Settings {
                             "bot" => s.bot_level = v.parse().unwrap_or(s.bot_level).min(3),
                             "rounds" => s.rounds = v.parse().unwrap_or(s.rounds).clamp(1, 50),
                             "mode" => s.mode = v.parse().unwrap_or(0u8).min(5),
+                            "map" => s.map = v.parse().unwrap_or(0u8).min(1),
                             "bots" => s.bots = v.parse().unwrap_or(3usize).clamp(1, 7),
                             "port" => s.port = v.to_string(),
                             "join" => s.join_addr = v.to_string(),
@@ -423,9 +428,9 @@ impl Settings {
                 let _ = std::fs::create_dir_all(dir);
             }
             let mut text = format!(
-                "name={}\nsens={}\nfov={}\nbot={}\nrounds={}\nmode={}\nbots={}\nport={}\njoin={}\nvolume={}\nloadout={},{},{},{}\n",
-                self.name, self.sens, self.fov, self.bot_level, self.rounds, self.mode, self.bots, self.port, self.join_addr, self.volume,
-                self.loadout.melee as u8, self.loadout.gun1 as u8, self.loadout.gun2 as u8, self.loadout.item
+                "name={}\nsens={}\nfov={}\nbot={}\nrounds={}\nmode={}\nmap={}\nbots={}\nport={}\njoin={}\nvolume={}\nloadout={},{},{},{}\n",
+                self.name, self.sens, self.fov, self.bot_level, self.rounds, self.mode, self.map, self.bots, self.port, self.join_addr, self.volume,
+                self.loadout.melee as u8, self.loadout.gun1 as u8, self.loadout.gun2 as u8, self.loadout.to_bytes()[3]
             );
             let [r, g, b] = self.cross_color;
             text += &format!(
@@ -710,6 +715,9 @@ impl App {
             };
             let kills: u16 = std::env::var("DUEL_KILLS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
             let mut g = Game::offline("Tester", nb, 0.6, mode, kills);
+            if let Some(m) = std::env::var("DUEL_MAP").ok().and_then(|v| v.parse::<u8>().ok()) {
+                g.set_map(MapId::from_u8(m));
+            }
             if std::env::var_os("DUEL_HUMAN").is_none() {
                 g.f[0].is_bot = true;
                 g.f[0].ready = true;
@@ -780,11 +788,13 @@ impl App {
         if via_steam {
             if let Some(st) = self.steam.as_mut() {
                 n.steam = Some(st.client.clone());
+                st.map_name = MapId::from_u8(self.settings.map).name().to_string();
                 st.create_lobby(self.settings.steam_public);
             }
         }
         let mode = Mode::from_u8(self.settings.mode);
         let mut g = Game::new(Kind::Host, 0, mode, self.settings.rounds as u16);
+        g.set_map(MapId::from_u8(self.settings.map));
         let name = clean_name(&self.settings.name, 0);
         g.add_player(0, &name, true, None, 0);
         if self.autoplay {
@@ -1170,7 +1180,9 @@ impl App {
             ui.label("Map");
             egui::ComboBox::from_id_salt("bmap").selected_text(self.browse.map.clone().unwrap_or_else(|| "Any".into())).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.browse.map, None, "Any");
-                ui.selectable_value(&mut self.browse.map, Some("Arena".to_string()), "Arena");
+                for m in MapId::ALL {
+                    ui.selectable_value(&mut self.browse.map, Some(m.name().to_string()), m.name());
+                }
             });
         });
         ui.horizontal_wrapped(|ui| {
@@ -2676,7 +2688,7 @@ fn gallery_pose(g: &mut Game, page2: bool) {
         f.stun_t = 0.0;
         f.reload_t = 0.0;
         f.spawn_prot = 0.0;
-        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0 };
+        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0, body: (i % chars::COUNT) as u8 };
         f.cur = 2;
         f.weapon = Weapon::Revolver;
         let fwd = f.fwd();
@@ -2776,6 +2788,7 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
         return;
     }
     g.local = m.you;
+    g.set_map(MapId::from_u8(m.map));
     for e in &m.roster {
         let s = e.slot;
         if !g.f[s].present || g.f[s].name != e.name {
@@ -3818,6 +3831,13 @@ impl App {
 
 fn loadout_picker(ui: &mut egui::Ui, lo: &mut Loadout) {
     egui::Grid::new("loadout_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+        ui.colored_label(ACCENT, "Fighter");
+        ui.horizontal_wrapped(|ui| {
+            for k in 0..chars::COUNT as u8 {
+                ui.selectable_value(&mut lo.body, k, chars::name(k)).on_hover_text(chars::blurb(k));
+            }
+        });
+        ui.end_row();
         ui.colored_label(ACCENT, "Melee");
         ui.horizontal(|ui| {
             for w in Weapon::MELEE {
@@ -3853,7 +3873,9 @@ fn loadout_picker(ui: &mut egui::Ui, lo: &mut Loadout) {
         *lo = Loadout::from_bytes(lo.to_bytes());
     }
     ui.label(egui::RichText::new(format!(
-        "{}: {}  ·  {}: {}  ·  {}: {}  ·  {}: {}",
+        "{}: {}  ·  {}: {}  ·  {}: {}  ·  {}: {}  ·  {}: {}",
+        chars::name(lo.body),
+        chars::blurb(lo.body),
         lo.melee.name(),
         lo.melee.blurb(),
         lo.gun1.name(),
@@ -3863,6 +3885,17 @@ fn loadout_picker(ui: &mut egui::Ui, lo: &mut Loadout) {
         ITEM_NAMES[lo.item.min(2) as usize],
         ITEM_BLURBS[lo.item.min(2) as usize]
     )).size(13.0).color(Color32::from_gray(200)));
+}
+
+fn map_picker(ui: &mut egui::Ui, map: &mut u8) {
+    ui.label("Map");
+    ui.horizontal_wrapped(|ui| {
+        for m in MapId::ALL {
+            ui.selectable_value(map, m as u8, m.name()).on_hover_text(m.blurb());
+        }
+    });
+    let m = MapId::from_u8(*map);
+    ui.label(egui::RichText::new(format!("{}: {}", m.name(), m.blurb())).size(13.0).color(Color32::from_gray(200)));
 }
 
 fn mode_picker(ui: &mut egui::Ui, mode: &mut u8) {
@@ -3993,6 +4026,7 @@ impl App {
                 Page::Practice => {
                     ui.heading("Practice vs Bots");
                     mode_picker(ui, &mut self.settings.mode);
+                    map_picker(ui, &mut self.settings.map);
                     ui.add(egui::Slider::new(&mut self.settings.bots, 1..=7).text("bots"));
                     ui.label("Bot difficulty");
                     ui.horizontal(|ui| {
@@ -4006,7 +4040,8 @@ impl App {
                             let lvl = BOT_LEVELS[app.settings.bot_level].1;
                             let name = clean_name(&app.settings.name, 0);
                             let mode = Mode::from_u8(app.settings.mode);
-                            let g = Game::offline(&name, app.settings.bots, lvl, mode, app.settings.rounds as u16);
+                            let mut g = Game::offline(&name, app.settings.bots, lvl, mode, app.settings.rounds as u16);
+                            g.set_map(MapId::from_u8(app.settings.map));
                             app.settings.save();
                             app.start_game(g, None);
                         }));
@@ -4056,6 +4091,7 @@ impl App {
                     self.firewall_ui(ui);
                     ui.label(egui::RichText::new("Friends join your Internet address (UDP port forwarded to this PC). You can't join it yourself from home: test with a friend, or 127.0.0.1 from a second copy.").size(13.5).color(Color32::from_gray(200)));
                     mode_picker(ui, &mut self.settings.mode);
+                    map_picker(ui, &mut self.settings.map);
                     ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
                     ui.horizontal(|ui| {
                         ui.label("Port (UDP)");
@@ -4447,6 +4483,8 @@ mod aim_tests {
             deco: Vec::new(),
             braziers: Vec::new(),
             banners: Vec::new(),
+            map: crate::world::MapId::Arena,
+            flags: [V3::ZERO, V3::ZERO],
         }
     }
 

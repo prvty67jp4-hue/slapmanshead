@@ -1,9 +1,15 @@
-Third-party assets (all public domain, CC0 1.0 - https://creativecommons.org/publicdomain/zero/1.0/)
+﻿Third-party assets (all public domain, CC0 1.0 - https://creativecommons.org/publicdomain/zero/1.0/)
 No attribution is required for any of these; it's listed here anyway, with thanks.
 
 assets/UAL1_Standard.glb
   "Universal Animation Library [Standard]" by Quaternius (quaternius.com)
   Source: https://quaternius.itch.io/universal-animation-library
+
+assets/characters/*.gltf, *.bin, *.png (the four fighters: outfits, heads with faces, hair)
+  "Modular Character Outfits - Fantasy [Standard]" and "Universal Base Characters [Standard]"
+  by Quaternius (quaternius.com), CC0 - textures shrunk to 1024 px, heads cut from the base bodies
+  Sources: https://quaternius.itch.io/modular-character-outfits-fantasy
+           https://quaternius.itch.io/universal-base-characters
 
 assets/sfx/shotgun_*.wav, revolver_*.wav, smg_*.wav, rifle_*.wav
   "Gunshots" by kurt (OpenGameArt), CC0 - cut to single shots, resampled to 44.1 kHz mono

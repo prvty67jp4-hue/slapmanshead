@@ -44,6 +44,11 @@ pub struct CharState {
     crouch: f32,
     /// Recent blade positions (base, tip, age) for the swing trail.
     pub trail: VecDeque<(V3, V3, f32)>,
+    /// The long coat: cloth points (rows down from the waist), where they were last step, and
+    /// when it was last stepped.
+    pub cloth: Vec<V3>,
+    pub cloth_prev: Vec<V3>,
+    pub cloth_time: f32,
     scratch: Vec<Trs>,
     scratch2: Vec<Trs>,
 }
@@ -68,6 +73,9 @@ impl CharState {
             stop_k: 0.0,
             crouch: 0.0,
             trail: VecDeque::new(),
+            cloth: Vec::new(),
+            cloth_prev: Vec::new(),
+            cloth_time: 0.0,
             scratch: Vec::new(),
             scratch2: Vec::new(),
         }
@@ -522,10 +530,20 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
         lean = lean * Quat::from_rotation_x(feel.0) * Quat::from_rotation_z(feel.1);
     }
     // our yaw: forward = (sin yaw, 0, cos yaw)
-    let world = Mat4::from_scale_rotation_translation(Vec3::splat(scale.clamp(0.2, 4.0)), Quat::from_rotation_y(f.yaw) * lean, gv(pos));
-    let palette = rig.palette(&pose, world);
+    // the chosen fighter: the pose carried over to its own skeleton (its own bone lengths), sized
+    // to the rig's height so every fighter is the same target
+    let model = crate::chars::model(f.loadout.body);
+    let (pose, norm) = match model {
+        Some(m) => (m.retarget(rig, &pose), m.norm),
+        None => (pose, 1.0),
+    };
+    let world = Mat4::from_scale_rotation_translation(Vec3::splat(scale.clamp(0.2, 4.0) * norm), Quat::from_rotation_y(f.yaw) * lean, gv(pos));
+    let palette = match model {
+        Some(m) => rig.palette_with(&pose, world, &m.inv_bind),
+        None => rig.palette(&pose, world),
+    };
 
-    // ---- attachment points in world space
+    // ---- attachment points (and hit shapes) on that same skeleton, in world space
     let g = rig.globals(&pose);
     let wm = world * rig.fix;
     let wp = |n: usize| ov(wm.transform_point3(g[n].w_axis.truncate()));

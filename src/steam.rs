@@ -43,6 +43,8 @@ pub struct Steam {
     pub client: Client,
     pub me: u64,
     pub name: String,
+    /// The map our hosted lobby plays (shown in the browser).
+    pub map_name: String,
     /// The lobby we host or are in.
     pub lobby: Option<u64>,
     pub hosting: bool,
@@ -107,7 +109,7 @@ impl Steam {
         client.networking_utils().init_relay_network_access();
         let me = client.user().steam_id().raw();
         let name = client.friends().name();
-        Some(Steam { client, me, name, lobby: None, hosting: false, events, _callbacks: callbacks, rows: Vec::new(), refreshing: false, pings_sent: HashMap::new(), pings: HashMap::new() })
+        Some(Steam { client, me, name, map_name: "Arena".into(), lobby: None, hosting: false, events, _callbacks: callbacks, rows: Vec::new(), refreshing: false, pings_sent: HashMap::new(), pings: HashMap::new() })
     }
 
     /// Run Steam's callbacks, answer ping probes, and hand back what happened.
@@ -169,7 +171,7 @@ impl Steam {
         mm.set_lobby_data(l, "ver", net::PROTOCOL);
         mm.set_lobby_data(l, "name", &format!("{}'s lobby", self.name));
         mm.set_lobby_data(l, "host", &self.me.to_string());
-        mm.set_lobby_data(l, "map", "Arena");
+        mm.set_lobby_data(l, "map", &self.map_name);
         self.update_lobby(mode, players);
         self.set_presence(id);
     }

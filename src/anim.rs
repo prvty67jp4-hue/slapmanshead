@@ -50,8 +50,14 @@ pub struct SkinVtx {
     pub nrm: [f32; 3],
     pub joints: [u32; 4],
     pub weights: [f32; 4],
+    /// Low byte: material (or 1 = team-colour accent on a textured fighter); bits 8+: texture
+    /// layer of the fighters' texture set (255 = untextured).
     pub mat: u32,
+    pub uv: [f32; 2],
 }
+
+/// Texture layer meaning "no texture" (the plain mannequin).
+pub const NO_LAYER: u32 = 255;
 
 /// The character rig, loaded once and shared (the game poses hit capsules with it, the
 /// renderer draws with it).
@@ -69,6 +75,8 @@ pub struct Rig {
     pub joints: Vec<usize>,
     inv_bind: Vec<Mat4>,
     node_by_name: HashMap<String, usize>,
+    /// Each node's name ("" when it has none).
+    pub node_names: Vec<String>,
     pub clips: HashMap<String, Clip>,
     pub verts: Vec<SkinVtx>,
     pub indices: Vec<u32>,
@@ -103,6 +111,7 @@ impl Rig {
         let mut parent = vec![None; n];
         let mut rest = vec![Trs { t: Vec3::ZERO, r: Quat::IDENTITY, s: Vec3::ONE }; n];
         let mut node_by_name = HashMap::new();
+        let mut node_names = vec![String::new(); n];
         for node in doc.nodes() {
             for c in node.children() {
                 parent[c.index()] = Some(node.index());
@@ -111,6 +120,7 @@ impl Rig {
             rest[node.index()] = Trs { t: Vec3::from(t), r: Quat::from_array(r).normalize(), s: Vec3::from(s) };
             if let Some(name) = node.name() {
                 node_by_name.insert(name.to_string(), node.index());
+                node_names[node.index()] = name.to_string();
             }
         }
         // parents before children
@@ -149,7 +159,7 @@ impl Rig {
                 let mat = prim.material().index().unwrap_or(0) as u32;
                 for k in 0..pos.len() {
                     let j = jnt[k];
-                    verts.push(SkinVtx { pos: pos[k], nrm: nrm[k], joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32], weights: wts[k], mat });
+                    verts.push(SkinVtx { pos: pos[k], nrm: nrm[k], joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32], weights: wts[k], mat: (NO_LAYER << 8) | mat, uv: [0.0, 0.0] });
                 }
                 match r.read_indices() {
                     Some(ix) => indices.extend(ix.into_u32().map(|i| i + base)),
@@ -191,7 +201,7 @@ impl Rig {
             clips.insert(name, Clip { duration: duration.max(0.01), channels });
         }
 
-        let mut rig = Rig { parent, rest, order, joints, inv_bind, node_by_name, clips, verts, indices, fix: Mat4::IDENTITY, fix_sign: Vec3::ONE };
+        let mut rig = Rig { parent, rest, order, joints, inv_bind, node_by_name, node_names, clips, verts, indices, fix: Mat4::IDENTITY, fix_sign: Vec3::ONE };
         // which way does the model face, and which side is its right hand?
         let g = rig.globals(&rig.rest.clone());
         let p = |name: &str| rig.node(name).map(|n| g[n].w_axis.truncate());
@@ -211,6 +221,21 @@ impl Rig {
 
     pub fn rest_pose(&self) -> Vec<Trs> {
         self.rest.clone()
+    }
+
+    /// The rig's rest transform of one node (relative to its parent).
+    pub fn rest_local(&self, n: usize) -> Trs {
+        self.rest[n]
+    }
+
+    /// The rig's own inverse bind matrix for skin joint `k`.
+    pub fn palette_inv_bind(&self, k: usize) -> Mat4 {
+        self.inv_bind.get(k).copied().unwrap_or(Mat4::IDENTITY)
+    }
+
+    /// Names of the skin joints, in the order bone matrices are given to the GPU.
+    pub fn joint_names(&self) -> Vec<String> {
+        self.joints.iter().map(|&n| self.node_names[n].clone()).collect()
     }
 
     /// Pose of a clip at time `t` (looping or held at the end).
@@ -302,9 +327,15 @@ impl Rig {
 
     /// Bone matrices for skinning, with `world` (our space) applied.
     pub fn palette(&self, pose: &[Trs], world: Mat4) -> Vec<Mat4> {
+        self.palette_with(pose, world, &self.inv_bind)
+    }
+
+    /// Bone matrices for a mesh bound to another skeleton with the same bones (a fighter
+    /// model): its own inverse bind matrices, in this rig's joint order.
+    pub fn palette_with(&self, pose: &[Trs], world: Mat4, inv_bind: &[Mat4]) -> Vec<Mat4> {
         let g = self.globals(pose);
         let m = world * self.fix;
-        self.joints.iter().enumerate().map(|(j, &n)| m * g[n] * self.inv_bind[j]).collect()
+        self.joints.iter().enumerate().map(|(j, &n)| m * g[n] * inv_bind.get(j).copied().unwrap_or(Mat4::IDENTITY)).collect()
     }
 }
 

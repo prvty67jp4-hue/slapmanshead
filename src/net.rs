@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
-const MAGIC: [u8; 4] = *b"DRA8";
+const MAGIC: [u8; 4] = *b"DRA9";
 /// The protocol version as text (Steam lobbies only list games that speak the same one).
 pub const PROTOCOL: &str = "DRA7";
 /// Steam message channels: game packets, and lobby-browser ping probes.
@@ -43,7 +43,7 @@ const K_HOST: u8 = 3;
 const K_BYE: u8 = 4;
 const K_FULL: u8 = 5;
 /// "I'm a different version": the packet is just the 4-byte mark and this kind.
-const K_VERSION: u8 = 7;
+const K_VERSION: u8 = 8;
 pub const DEFAULT_PORT: u16 = 27960;
 const EVENT_WINDOW: f32 = 0.5;
 const MAX_EVENTS: usize = 48;
@@ -294,6 +294,8 @@ pub struct RosterEntry {
 pub struct HostMsg {
     pub you: usize,
     pub mode: Mode,
+    /// Which map (crate::world::MapId as a number).
+    pub map: u8,
     pub phase: Phase,
     pub timer: f32,
     pub target: u16,
@@ -796,6 +798,7 @@ impl Net {
         let you_ap = r.f()?;
         let you_alive = r.u8()? == 1;
         let mode = Mode::from_u8(r.u8()?);
+        let map = r.u8()?.min(1);
         let phase = Phase::from_u8(r.u8()?);
         let timer = r.f()?;
         let target = r.u16()?;
@@ -863,7 +866,7 @@ impl Net {
                 events.push((origin, ev));
             }
         }
-        Some(HostMsg { you, mode, phase, timer, target, team_score, number, round, round_end, duel, flags, you_hp, you_ap, you_alive, roster, fighters, events, sent, stale })
+        Some(HostMsg { you, mode, map, phase, timer, target, team_score, number, round, round_end, duel, flags, you_hp, you_ap, you_alive, roster, fighters, events, sent, stale })
     }
 
     pub fn send_hello(&mut self, name: &str, dt: f32) {
@@ -938,6 +941,7 @@ impl Net {
                 w.f(you.ap);
                 w.u8(you.alive as u8);
                 w.u8(g.mt.mode as u8);
+                w.u8(g.world.map as u8);
                 w.u8(g.mt.phase as u8);
                 w.f(g.mt.timer);
                 w.u16(g.mt.target);
