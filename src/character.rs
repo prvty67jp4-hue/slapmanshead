@@ -2,7 +2,7 @@
 //! then layers aiming, strafing, guard, sword swings and weapon holds on top.
 
 use crate::anim::{Rig, Trs, blend_into, blend_masked};
-use crate::game::{Capsule, Fighter, HitPose, Part, RUN_SPEED, Weapon};
+use crate::game::{Capsule, Fighter, HitPose, Part, RUN_SPEED, Tuning, Weapon};
 use crate::math::{M3, V3, look_dir, v3, wrap_angle};
 use crate::render::sword_arm;
 use glam::{Mat4, Quat, Vec3};
@@ -32,6 +32,16 @@ pub struct CharState {
     was_dashing: bool,
     was_alive: bool,
     body_yaw: f32,
+    // ---- feel: smoothed acceleration (for leaning), landings and stops
+    prev_vel: V3,
+    acc_f: f32,
+    acc_s: f32,
+    was_ground: bool,
+    fall_vy: f32,
+    land_k: f32,
+    land_age: f32,
+    stop_k: f32,
+    crouch: f32,
     /// Recent blade positions (base, tip, age) for the swing trail.
     pub trail: VecDeque<(V3, V3, f32)>,
     scratch: Vec<Trs>,
@@ -48,11 +58,76 @@ impl CharState {
             was_dashing: false,
             was_alive: true,
             body_yaw: 0.0,
+            prev_vel: V3::ZERO,
+            acc_f: 0.0,
+            acc_s: 0.0,
+            was_ground: true,
+            fall_vy: 0.0,
+            land_k: 0.0,
+            land_age: 1.0,
+            stop_k: 0.0,
+            crouch: 0.0,
             trail: VecDeque::new(),
             scratch: Vec::new(),
             scratch2: Vec::new(),
         }
     }
+}
+
+/// Track acceleration, landings and stops; returns the extra (forward, sideways) lean in
+/// radians and updates the crouch weight.
+fn feel_update(st: &mut CharState, f: &Fighter, dt: f32, tn: &Tuning) -> (f32, f32) {
+    let v = f.vel.flat();
+    if dt > 0.0 && f.alive {
+        let fwd = f.fwd();
+        let right = v3(fwd.z, 0.0, -fwd.x);
+        let a = (v - st.prev_vel) * (1.0 / dt);
+        let a = if a.len() > 400.0 { V3::ZERO } else { a }; // a teleport or respawn
+        let k = (dt * 12.0).min(1.0);
+        st.acc_f += (a.dot(fwd) - st.acc_f) * k;
+        st.acc_s += (a.dot(right) - st.acc_s) * k;
+        // a hard stop: braking quickly from a run, feet stay planted a moment
+        let sp = v.len();
+        let braking = f.on_ground && f.dash_t <= 0.0 && st.prev_vel.len() > 3.0 && a.dot(st.prev_vel.norm()) < -25.0;
+        let want = if braking { ((-a.dot(st.prev_vel.norm()) - 25.0) / 40.0).clamp(0.3, 1.0) * tn.skid.min(1.5) } else { 0.0 };
+        st.stop_k += (want.min(1.0) - st.stop_k) * (dt * if want > st.stop_k { 30.0 } else { 6.0 }).min(1.0);
+        if sp < 0.3 {
+            st.stop_k *= 1.0 - (dt * 4.0).min(1.0);
+        }
+        // landings, heavier from higher
+        if f.on_ground && !st.was_ground && st.fall_vy < -3.0 {
+            st.land_k = ((-st.fall_vy - 3.0) / 14.0).clamp(0.2, 1.0) * tn.land_squash;
+            st.land_age = 0.0;
+        }
+        if f.on_ground {
+            st.fall_vy = 0.0;
+        } else {
+            st.fall_vy = st.fall_vy.min(f.vel.y);
+        }
+        st.was_ground = f.on_ground;
+        st.land_age += dt;
+    }
+    st.prev_vel = v;
+    if !f.alive {
+        st.acc_f = 0.0;
+        st.acc_s = 0.0;
+        st.crouch = 0.0;
+        return (0.0, 0.0);
+    }
+    // landing squash: in fast, out over a quarter second or so (longer when heavy)
+    let hold = 0.18 + 0.22 * st.land_k.min(1.0);
+    let land = if st.land_age < 0.05 { st.land_age / 0.05 } else { (1.0 - (st.land_age - 0.05) / hold).max(0.0) };
+    let land_w = st.land_k * land * land.max(0.0);
+    let land_w = land_w.max(0.0);
+    let windup = if f.dash_wind > 0.0 { 0.9 } else { 0.0 };
+    let target = (land_w * 0.85).max(windup).max(st.stop_k * 0.35).min(1.0);
+    let rate = if target > st.crouch { 40.0 } else { 9.0 };
+    st.crouch += (target - st.crouch) * (dt * rate).min(1.0);
+    let grounded = f.on_ground && f.wall.is_none();
+    let lean_k = if grounded { tn.lean } else { tn.lean * 0.3 };
+    let pitch = (st.acc_f / 60.0).clamp(-1.0, 1.0) * 0.17 * lean_k + land_w.min(1.5) * 0.12 + windup * 0.12;
+    let roll = (st.acc_s / 40.0).clamp(-1.0, 1.0) * 0.2 * lean_k;
+    (pitch, roll)
 }
 
 /// What a posed character gives back to the renderer.
@@ -124,10 +199,14 @@ fn ours(rig: &Rig, axis: Vec3, angle: f32) -> Quat {
 }
 
 /// Pose a fighter. `pos` is where to draw it (interpolated), `dt` the frame time.
-pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32) -> Option<Posed> {
+/// `tn` sizes the whole character and sets how much it leans, squashes and plants its feet
+/// (the developer tuning panel changes them).
+pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning) -> Option<Posed> {
     let b = bones(rig)?;
+    let scale = tn.char_scale;
     let dt = (now - st.last_time).clamp(0.0, 0.1);
     st.last_time = now;
+    let feel = feel_update(st, f, dt, tn);
 
     // ---- choose the base clip
     let speed = f.vel.flat().len();
@@ -181,7 +260,9 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32) ->
     } else {
         st.cur.rate = want.rate;
     }
-    st.cur.t += dt * st.cur.rate;
+    // planting the feet on a hard stop: the stride all but freezes
+    let plant = if st.cur.looped && f.on_ground { 1.0 - st.stop_k * 0.8 } else { 1.0 };
+    st.cur.t += dt * st.cur.rate * plant;
     if let Some(p) = st.prev.as_mut() {
         p.t += dt * p.rate;
     }
@@ -200,6 +281,14 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32) ->
         blend_into(&mut prev_pose, &pose, st.fade);
         pose = prev_pose.clone();
         st.scratch = prev_pose;
+    }
+
+    // ---- crouch layer: landing squash, the dash wind-up, a planted stop
+    if f.alive && st.crouch > 0.01 && !(f.sliding > 0.0 && f.on_ground) {
+        rig.sample("Crouch_Idle_Loop", 0.2, true, &mut st.scratch2);
+        let tmp = std::mem::take(&mut st.scratch2);
+        blend_into(&mut pose, &tmp, st.crouch.min(1.0));
+        st.scratch2 = tmp;
     }
 
     let alive_upper = f.alive && f.stun_t <= 0.0;
@@ -365,8 +454,12 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32) ->
     } else if f.on_ground && speed > 1.0 {
         lean = Quat::from_rotation_x(0.06 * (speed / RUN_SPEED).min(1.3));
     }
+    if f.alive && f.wall.is_none() && !(f.sliding > 0.0 && f.on_ground) {
+        // lean into speeding up, slowing down and turning; tip forward into a hard landing
+        lean = lean * Quat::from_rotation_x(feel.0) * Quat::from_rotation_z(feel.1);
+    }
     // our yaw: forward = (sin yaw, 0, cos yaw)
-    let world = Mat4::from_rotation_translation(Quat::from_rotation_y(f.yaw) * lean, gv(pos));
+    let world = Mat4::from_scale_rotation_translation(Vec3::splat(scale.clamp(0.2, 4.0)), Quat::from_rotation_y(f.yaw) * lean, gv(pos));
     let palette = rig.palette(&pose, world);
 
     // ---- attachment points in world space
@@ -391,11 +484,12 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32) ->
     let hx = hy.cross(hz).norm();
     let _ = b.root;
     // hit shapes along the bones
-    let cap = |a: V3, b2: V3, r: f32, part: Part| Capsule { a, b: b2, r, part };
+    let sc = scale.clamp(0.2, 4.0);
+    let cap = |a: V3, b2: V3, r: f32, part: Part| Capsule { a, b: b2, r: r * sc, part };
     let (sh_l, sh_r) = (wp(b.up_l), wp(b.up_r));
     let hit = HitPose {
         caps: [
-            cap(head + hy * 0.04, head + hy * 0.17, 0.115, Part::Head),
+            cap(head + hy * (0.04 * sc), head + hy * (0.17 * sc), 0.115, Part::Head),
             cap(neck, head, 0.065, Part::Chest),
             cap(wp(b.spine2), wp(b.spine3), 0.16, Part::Chest),
             cap(sh_l, sh_r, 0.085, Part::Chest),
@@ -433,7 +527,7 @@ mod pose_tests {
             let mut st = CharState::new();
             let mut p = None;
             for k in 0..30 {
-                p = animate(&rig, &mut st, &f, v3(0.0, 0.0, 0.0), k as f32 * 0.016);
+                p = animate(&rig, &mut st, &f, v3(0.0, 0.0, 0.0), k as f32 * 0.016, &Tuning::default());
             }
             let p = p.unwrap();
             assert!(p.weapon.z.dot(f.fwd()) > 0.9, "weapon should point where the fighter faces");

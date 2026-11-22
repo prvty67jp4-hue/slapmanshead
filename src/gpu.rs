@@ -22,7 +22,8 @@ const SUN: V3 = v3(0.5, 0.62, 0.6);
 const MAX_JOINTS: usize = 72;
 const MAX_INST: usize = 16;
 /// Per character: two tints, the hit flash (three words of joint bits + strength), the joints.
-const INST_FLOATS: usize = 12 + MAX_JOINTS * 16;
+// tint0, tint1, flash, rim (4 floats each), then the joints
+const INST_FLOATS: usize = 16 + MAX_JOINTS * 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -55,12 +56,13 @@ struct U { vp: mat4x4<f32>, cam: vec4<f32>, right: vec4<f32>, up: vec4<f32>, fwd
 @group(0) @binding(2) var samp: sampler;
 
 struct VIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32> };
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) wpos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32> };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) wpos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32>, @location(5) rim: vec4<f32> };
 
 @vertex fn vs(v: VIn) -> VOut {
   var o: VOut;
   o.clip = u.vp * vec4<f32>(v.pos, 1.0);
   o.wpos = v.pos; o.nrm = v.nrm; o.uv = v.uv; o.col = v.col; o.ex = v.ex;
+  o.rim = vec4<f32>(0.0, 0.0, 0.0, 1.0);
   return o;
 }
 
@@ -94,10 +96,21 @@ fn fogit(c: vec3<f32>, wpos: vec3<f32>) -> vec3<f32> {
     let spec = pow(max(dot(n, h), 0.0), 40.0) * i.ex.w * sunvis * ndl;
     c = base.rgb * (hemi + sunc * ndl * sunvis) + sunc * spec;
   }
-  return vec4<f32>(fogit(c, i.wpos), base.a);
+  var outc = fogit(c, i.wpos);
+  if (i.rim.x + i.rim.y + i.rim.z > 0.0) {
+    // team-coloured rim light: brightest at the silhouette, and the fog only dims it a
+    // little, so players stand out against stone and through a couple of metres of haze
+    let n = normalize(i.nrm);
+    let v = normalize(u.cam.xyz - i.wpos);
+    let fr = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), i.rim.w);
+    let d = length(i.wpos - u.cam.xyz);
+    let ff = clamp((d - u.params.y) / (u.params.z - u.params.y), 0.0, 1.0) * u.fog.w;
+    outc = outc + i.rim.rgb * (fr * (1.0 - ff * 0.35) + 0.06 * (1.0 - ff * 0.5));
+  }
+  return vec4<f32>(outc, base.a);
 }
 
-struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, joints: array<mat4x4<f32>, 72> };
+struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, joints: array<mat4x4<f32>, 72> };
 @group(0) @binding(3) var<storage, read> insts: array<Inst>;
 struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32 };
 @vertex fn vs_skin(v: SIn, @builtin(instance_index) ii: u32) -> VOut {
@@ -121,6 +134,7 @@ struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location
     o.col = vec4<f32>(mix(o.col.rgb, vec3<f32>(2.2, 2.2, 2.2), fl.w), o.col.a);
   }
   o.ex = vec4<f32>(-1.0, 0.0, 1.0, 0.35);
+  o.rim = insts[ii].rim;
   return o;
 }
 
@@ -876,15 +890,16 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
 /// Things attached to an animated character's bones: the weapon in the right hand, the sword's
 /// swing trail, hair, and the long coat.
 #[allow(clippy::too_many_arguments)]
-fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, flash: f32) {
+#[allow(clippy::too_many_arguments)]
+fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, flash: f32, sc: f32) {
     let tint = |c: [u8; 3]| -> [f32; 4] {
         let l = lin(c);
         [l[0] + (1.0 - l[0]) * flash, l[1] + (0.3 - l[1]).max(0.0) * flash, l[2] + (0.3 - l[2]).max(0.0) * flash, 1.0]
     };
     // hair cap
     let hf = &p.head_frame;
-    mb.ellipsoid(p.head + hf.y * 0.1 - hf.z * 0.015, hf, v3(0.105, 0.07, 0.115), tint(lk.hair), -1.0, 0.4, 0.0);
-    mb.ellipsoid(p.head + hf.y * 0.05 - hf.z * 0.06, hf, v3(0.1, 0.085, 0.07), tint(lk.hair), -1.0, 0.4, 0.0);
+    mb.ellipsoid(p.head + (hf.y * 0.1 - hf.z * 0.015) * sc, hf, v3(0.105, 0.07, 0.115) * sc, tint(lk.hair), -1.0, 0.4, 0.0);
+    mb.ellipsoid(p.head + (hf.y * 0.05 - hf.z * 0.06) * sc, hf, v3(0.1, 0.085, 0.07) * sc, tint(lk.hair), -1.0, 0.4, 0.0);
     // long coat from the waist, trailing behind with speed
     if f.alive {
         let speed = f.vel.flat().len();
@@ -892,9 +907,9 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
         let flap = 0.15 + (speed / 12.0).min(1.0) * 0.8 + (time * 9.0).sin() * 0.05 * (speed / RUN_SPEED).min(1.0) + if air { 0.3 } else { 0.0 };
         let fwd = f.fwd();
         let side = v3(fwd.z, 0.0, -fwd.x);
-        let waist = p.waist - v3(0.0, 0.05, 0.0);
-        let hem = waist + v3(0.0, -0.58 + flap * 0.15, 0.0) - fwd * (0.06 + flap * 0.3);
-        mb.tube(waist, hem, 0.2, 0.31, side, 0.78, tint(lk.coat_dark), 7.0, 0.05);
+        let waist = p.waist - v3(0.0, 0.05 * sc, 0.0);
+        let hem = waist + (v3(0.0, -0.58 + flap * 0.15, 0.0) - fwd * (0.06 + flap * 0.3)) * sc;
+        mb.tube(waist, hem, 0.2 * sc, 0.31 * sc, side, 0.78, tint(lk.coat_dark), 7.0, 0.05);
     }
     // weapon
     weapon_mesh(mb, add_mb, cam, f, p.hand, &p.weapon, time);
@@ -1451,7 +1466,7 @@ impl Gpu {
                 continue;
             }
             let posed = match (&self.skin, insts.len() < MAX_INST) {
-                (Some(sk), true) => character::animate(&sk.rig, &mut self.chars[i], f, pos, g.time),
+                (Some(sk), true) => character::animate(&sk.rig, &mut self.chars[i], f, pos, g.time, &g.tune),
                 _ => None,
             };
             match posed {
@@ -1468,12 +1483,19 @@ impl Gpu {
                     let m = self.part_masks[(f.hit_part as usize).min(6)];
                     let strength = (f.flash_t / 0.12).clamp(0.0, 1.0) * 0.85;
                     data.extend_from_slice(&[f32::from_bits(m[0]), f32::from_bits(m[1]), f32::from_bits(m[2]), strength]);
+                    // rim light in the player's colour, brightened to full strength (dimmer on
+                    // yourself, so it doesn't distract)
+                    let rc = lin(lk.coat);
+                    let top = rc[0].max(rc[1]).max(rc[2]).max(0.05);
+                    let own = if i == g.local { 0.35 } else { 1.0 };
+                    let rk = g.tune.rim * own * if f.alive { 1.0 } else { 0.3 };
+                    data.extend_from_slice(&[rc[0] / top * rk, rc[1] / top * rk, rc[2] / top * rk, g.tune.rim_width.max(0.5)]);
                     for j in 0..MAX_JOINTS {
                         let m = p.palette.get(j).copied().unwrap_or(glam::Mat4::IDENTITY);
                         data.extend_from_slice(&m.to_cols_array());
                     }
                     insts.push(data);
-                    character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash);
+                    character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash, g.tune.char_scale);
                 }
                 None => fighter_mesh(&mut op, &mut ad, cam, f, pos, g.time),
             }

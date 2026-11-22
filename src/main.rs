@@ -285,6 +285,46 @@ impl Default for Settings {
     }
 }
 
+/// Saved tuning presets live in a folder next to the settings.
+fn preset_dir() -> Option<PathBuf> {
+    Some(settings_path()?.parent()?.join("presets"))
+}
+
+/// "Apply as new defaults" writes here; it's read when the game starts.
+fn tuning_defaults_path() -> Option<PathBuf> {
+    Some(settings_path()?.parent()?.join("tuning_defaults.txt"))
+}
+
+fn load_tuning_defaults() -> Tuning {
+    tuning_defaults_path().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| Tuning::from_text(&t)).unwrap_or_default()
+}
+
+/// A preset name made safe to use as a file name.
+fn preset_file_name(name: &str) -> String {
+    let s: String = name.chars().filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_')).take(40).collect();
+    let s = s.trim().to_string();
+    if s.is_empty() { "preset".into() } else { s }
+}
+
+/// The saved presets' names, sorted.
+fn preset_names() -> Vec<String> {
+    let Some(dir) = preset_dir() else { return Vec::new() };
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().to_string())).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// A preset file: the tuning lines plus the field of view.
+fn preset_text(t: &Tuning, fov: f32) -> String {
+    format!("{}fov={}\n", t.to_text(), fov)
+}
+
+fn preset_fov(text: &str) -> Option<f32> {
+    text.lines().find_map(|l| l.strip_prefix("fov=")).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite()).map(|v| v.clamp(60.0, 110.0))
+}
+
 fn settings_path() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME"))?;
     Some(PathBuf::from(base).join("DuelRush").join("settings.txt"))
@@ -507,6 +547,17 @@ struct App {
     /// Test switch DUEL_STEAM_SELFTEST: step and clock of the live Steam check.
     selftest: u8,
     selftest_t: f32,
+    /// Developer tuning panel (F4): the live values, whether it's open, preset name, last message.
+    tune: Tuning,
+    show_tuning: bool,
+    preset_name: String,
+    tune_msg: Option<String>,
+    /// Where the smoothed camera is (camera smoothing).
+    cam_smooth_pos: std::cell::Cell<Option<V3>>,
+    /// Spring follow speed, the wall-run roll and how wide the speed FOV is (smoothed).
+    cam_spring_vel: std::cell::Cell<V3>,
+    cam_roll: std::cell::Cell<f32>,
+    fov_speed: std::cell::Cell<f32>,
 }
 
 impl App {
@@ -584,6 +635,14 @@ impl App {
             browse_asked: false,
             selftest: 0,
             selftest_t: 0.0,
+            tune: load_tuning_defaults(),
+            show_tuning: false,
+            preset_name: "my preset".into(),
+            tune_msg: None,
+            cam_smooth_pos: std::cell::Cell::new(None),
+            cam_spring_vel: std::cell::Cell::new(V3::ZERO),
+            cam_roll: std::cell::Cell::new(0.0),
+            fov_speed: std::cell::Cell::new(0.0),
         };
         // Steam (when it's running); tests stay on direct IP
         if (!app.autoplay && app.screenshot.is_none()) || std::env::var_os("DUEL_STEAM_PROBE").is_some() {
@@ -615,6 +674,8 @@ impl App {
             app.settings.net_loss = it.next().unwrap_or(5.0);
         }
         app.show_debug = std::env::var_os("DUEL_DEBUG").is_some();
+        // test switch: DUEL_TUNING opens the tuning panel (and puts a dummy 15 m ahead)
+        app.show_tuning = std::env::var_os("DUEL_TUNING").is_some();
         if std::env::var_os("DUEL_RECENT").is_some() {
             let t = now_secs();
             app.settings.recent = vec![
@@ -874,6 +935,155 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Developer tuning panel (F4): live sliders, presets, defaults and measuring dummies.
+    fn tuning_ui(&mut self, ctx: &egui::Context, rect: Rect) {
+        enum Act {
+            Spawn(f32),
+            Remove,
+            Save,
+            Load(String),
+            Reset,
+            Defaults,
+        }
+        let mut act: Option<Act> = None;
+        let online = matches!(&self.screen, Screen::Play { net: Some(_), .. });
+        let mut open = true;
+        egui::Window::new("Tuning (F4)")
+            .open(&mut open)
+            .default_pos(Pos2::new(rect.right() - 420.0, rect.top() + 70.0))
+            .default_width(390.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Changes apply instantly. They only affect this computer.").size(13.0).color(Color32::from_gray(180)));
+                if online {
+                    ui.label(egui::RichText::new("Online: your movement changes only for you (others keep theirs).").size(13.0).color(Color32::from_rgb(255, 190, 110)));
+                }
+                egui::ScrollArea::vertical().max_height((rect.height() - 330.0).max(160.0)).show(ui, |ui| {
+                    let mut group = "";
+                    for f in TUNE_FIELDS.iter() {
+                        if f.group != group {
+                            group = f.group;
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(group).strong().color(ACCENT));
+                        }
+                        let mut v = (f.get)(&self.tune);
+                        let step = if f.max - f.min <= 1.0 { 0.005 } else { 0.05 };
+                        let r = ui.add(egui::Slider::new(&mut v, f.min..=f.max).step_by(step as f64).text(format!("{} ({})", f.label, f.unit)));
+                        if r.changed() {
+                            (f.set)(&mut self.tune, v);
+                        }
+                        if r.double_clicked() {
+                            (f.set)(&mut self.tune, (f.get)(&Tuning::default()));
+                        }
+                        if f.key == "cam_smooth" {
+                            ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("Field of view (°)"));
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new("Double-click a slider to put it back to the game's default.").size(12.0).color(Color32::from_gray(160)));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Preset");
+                    ui.add(egui::TextEdit::singleline(&mut self.preset_name).desired_width(150.0));
+                    if ui.button("Save Preset").clicked() {
+                        act = Some(Act::Save);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let names = preset_names();
+                    egui::ComboBox::from_id_salt("presets").selected_text("Load Preset...").show_ui(ui, |ui| {
+                        if names.is_empty() {
+                            ui.label("(no presets saved yet)");
+                        }
+                        for n in names {
+                            if ui.selectable_label(false, &n).clicked() {
+                                act = Some(Act::Load(n));
+                            }
+                        }
+                    });
+                    if ui.button("Reset").on_hover_text("Back to the game's built-in values").clicked() {
+                        act = Some(Act::Reset);
+                    }
+                    if ui.button("Apply as new defaults").on_hover_text("Start with these values every time").clicked() {
+                        act = Some(Act::Defaults);
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Spawn dummy at");
+                    for d in [5.0f32, 15.0, 30.0] {
+                        if ui.button(format!("{d:.0} m")).clicked() {
+                            act = Some(Act::Spawn(d));
+                        }
+                    }
+                    if ui.button("Remove").clicked() {
+                        act = Some(Act::Remove);
+                    }
+                });
+                if let Some(m) = &self.tune_msg {
+                    ui.label(egui::RichText::new(m).size(13.0).color(Color32::from_rgb(170, 230, 170)));
+                }
+            });
+        if !open {
+            self.show_tuning = false;
+        }
+        let Some(act) = act else { return };
+        self.tune_msg = Some(match act {
+            Act::Spawn(d) => match &mut self.screen {
+                Screen::Play { game, .. } => match game.spawn_dummy(d) {
+                    Ok(m) => m,
+                    Err(e) => e,
+                },
+                _ => String::new(),
+            },
+            Act::Remove => match &mut self.screen {
+                Screen::Play { game, .. } => format!("Removed {} dummies", game.remove_dummies()),
+                _ => String::new(),
+            },
+            Act::Save => {
+                let name = preset_file_name(&self.preset_name);
+                match preset_dir() {
+                    Some(dir) => {
+                        let _ = std::fs::create_dir_all(&dir);
+                        match std::fs::write(dir.join(format!("{name}.txt")), preset_text(&self.tune, self.settings.fov)) {
+                            Ok(()) => format!("Saved preset \"{name}\""),
+                            Err(e) => format!("Couldn't save: {e}"),
+                        }
+                    }
+                    None => "Couldn't find a folder to save in".into(),
+                }
+            }
+            Act::Load(name) => match preset_dir().and_then(|d| std::fs::read_to_string(d.join(format!("{name}.txt"))).ok()) {
+                Some(text) => {
+                    self.tune = Tuning::from_text(&text);
+                    if let Some(fov) = preset_fov(&text) {
+                        self.settings.fov = fov;
+                    }
+                    self.preset_name = name.clone();
+                    format!("Loaded preset \"{name}\"")
+                }
+                None => format!("Couldn't read preset \"{name}\""),
+            },
+            Act::Reset => {
+                self.tune = Tuning::default();
+                "Back to the built-in values".into()
+            }
+            Act::Defaults => match tuning_defaults_path() {
+                Some(p) => {
+                    if let Some(dir) = p.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    self.settings.save();
+                    match std::fs::write(p, preset_text(&self.tune, self.settings.fov)) {
+                        Ok(()) => "These are now your defaults (used every time the game starts)".into(),
+                        Err(e) => format!("Couldn't save: {e}"),
+                    }
+                }
+                None => "Couldn't find a folder to save in".into(),
+            },
+        });
     }
 
     /// Test switch: open a real lobby, find it in the lobby list, check the relay, close it.
@@ -1529,6 +1739,14 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(Key::F3)) && self.rebinding.is_none() {
             self.show_debug = !self.show_debug;
         }
+        if ctx.input(|i| i.key_pressed(Key::F4)) && self.rebinding.is_none() && matches!(self.screen, Screen::Play { .. }) {
+            self.show_tuning = !self.show_tuning;
+        }
+        // the tuning values are live: every game uses them at once
+        self.demo.tune = self.tune;
+        if let Screen::Play { game, .. } = &mut self.screen {
+            game.tune = self.tune;
+        }
         if ctx.input(|i| i.key_pressed(Key::F11)) && self.rebinding.is_none() {
             self.settings.fullscreen = !self.settings.fullscreen;
         }
@@ -1571,7 +1789,7 @@ impl eframe::App for App {
                 Screen::Play { game, .. } => game.mt.phase == Phase::Loadout && !game.f[game.local].ready,
                 _ => false,
             };
-            let want_capture = !self.paused && !self.match_over() && self.disconnected.is_none() && !self.autoplay && !choosing;
+            let want_capture = !self.paused && !self.match_over() && self.disconnected.is_none() && !self.autoplay && !choosing && !self.show_tuning;
             self.set_capture(&ctx, want_capture);
             if want_capture && !cfg!(target_os = "macos") {
                 ctx.send_viewport_cmd(ViewportCommand::CursorPosition(rect.center()));
@@ -1677,6 +1895,9 @@ impl eframe::App for App {
             }
             Screen::Play { .. } => {
                 go_menu |= self.play_overlay_ui(&ctx, rect);
+                if self.show_tuning {
+                    self.tuning_ui(&ctx, rect);
+                }
             }
         }
         if go_menu {
@@ -2081,6 +2302,9 @@ impl App {
         if let Ok(page) = std::env::var("DUEL_GALLERY") {
             gallery_pose(game, page == "2");
         }
+        if self.autoplay && self.show_tuning && std::env::var_os("DUEL_TUNING").is_some() && game.time > 1.0 && !game.f.iter().any(|f| f.present && f.name == "Dummy 15m") {
+            let _ = game.spawn_dummy(15.0);
+        }
         // test switch: hold a scoped sniper (to photograph the scope)
         if self.autoplay && std::env::var_os("DUEL_SCOPE_TEST").is_some() && game.time > 3.0 {
             let l = game.local;
@@ -2279,7 +2503,51 @@ impl App {
         }
         self.cam_dist.set(d);
         let mut pos = pivot - dir * d;
-        let (mut yaw, mut pitch) = (yaw, pitch);
+        let tn = game.tune;
+        // what the gun aims at: the camera always looks straight at it, so however the camera
+        // trails, bobs or dips, the crosshair stays exactly on target (aim never lags)
+        let aim_at = pos + dir * game.world.raycast(pos, dir, 300.0).map_or(300.0, |(t, _)| t.max(1.0));
+        // a light spring follow: the camera trails fast movement a touch (not when zoomed)
+        let tau = if zoom > 1.05 { 0.0 } else { tn.cam_smooth };
+        let dt = self.frame_dt.clamp(0.0, 0.1);
+        match self.cam_smooth_pos.get() {
+            Some(prev) if tau > 0.001 && (prev - pos).len() < 4.0 => {
+                // critically damped spring (no overshoot)
+                let omega = 2.0 / tau;
+                let x = omega * dt;
+                let ex = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
+                let change = prev - pos;
+                let vel = self.cam_spring_vel.get();
+                let temp = (vel + change * omega) * dt;
+                self.cam_spring_vel.set((vel - temp * omega) * ex);
+                let mut smooth = pos + (change + temp) * ex;
+                if (smooth - pos).len() > 1.5 {
+                    smooth = pos + (smooth - pos).norm() * 1.5;
+                }
+                pos = smooth;
+            }
+            _ => self.cam_spring_vel.set(V3::ZERO),
+        }
+        self.cam_smooth_pos.set(Some(pos));
+        let speed = f.vel.flat().len();
+        let run = tn.run_speed.max(1.0);
+        if f.alive {
+            // a small bob while running (one dip per step, a slight sway per stride)
+            if f.on_ground && f.wall.is_none() && f.sliding <= 0.0 && f.dash_t <= 0.0 && tn.cam_bob > 0.0 {
+                let k = (speed / run).clamp(0.0, 1.3);
+                let ph = f.walk_phase;
+                let r = yaw_right(yaw);
+                pos += V3::UP * ((ph * 2.0).cos() * tn.cam_bob * k) + r * (ph.sin() * tn.cam_bob * 0.5 * k);
+            }
+            // dip on a hard landing: down quickly, back up over a third of a second
+            if f.land_impact > 0.0 && f.land_t < 0.45 && tn.land_dip > 0.0 {
+                let t = f.land_t;
+                let curve = if t < 0.06 { t / 0.06 } else { (1.0 - (t - 0.06) / 0.38).max(0.0).powi(2) };
+                pos.y -= tn.land_dip * f.land_impact * curve;
+            }
+        }
+        let to_aim = (aim_at - pos).norm();
+        let (mut yaw, mut pitch) = (to_aim.x.atan2(to_aim.z), to_aim.y.clamp(-1.0, 1.0).asin());
         if game.shake > 0.0 {
             // trauma-style shake: strong hits shake much more than light ones
             let tr = game.shake.min(1.2);
@@ -2290,25 +2558,41 @@ impl App {
             yaw += n(1.1, 2.6) * 0.025 * k;
             pitch += n(1.5, 3.1) * 0.02 * k;
         }
-        // FOV kick: widens on dashes (and a little at full sprint or on walls)
-        let speed = f.vel.flat().len();
+        // FOV kick: a snap wider on dashes and wall runs...
         let want = if f.dash_t > 0.0 {
             14.0
         } else if f.wall.is_some() {
-            7.0
-        } else if speed > RUN_SPEED * 1.1 {
-            4.0
+            5.0
         } else {
             0.0
         };
         let cur = self.fov_kick.get();
         let rate = if want > cur { 22.0 } else { 5.0 };
-        let kick = cur + (want - cur) * (self.frame_dt * rate).min(1.0);
+        let kick = cur + (want - cur) * (dt * rate).min(1.0);
         self.fov_kick.set(kick);
+        // ...and a gradual widening the faster you go
+        let fast = if f.alive { ((speed - run) / run).clamp(0.0, 1.0) } else { 0.0 };
+        let cur = self.fov_speed.get();
+        let wide = cur + (fast * tn.fov_speed - cur) * (dt * if fast * tn.fov_speed > cur { 3.0 } else { 2.0 }).min(1.0);
+        self.fov_speed.set(wide);
         // zoom narrows the view: same centre, so the aim point doesn't move
-        let fov = self.settings.fov + kick;
+        let fov = (self.settings.fov + kick + wide).min(150.0);
         let fov = 2.0 * ((fov.to_radians() * 0.5).tan() / zoom).atan().to_degrees();
-        (Cam::new(pos, yaw, pitch, fov, rect), body)
+        let mut cam = Cam::new(pos, yaw, pitch, fov, rect);
+        // roll a little into a wall run (the top of the view leans towards the wall)
+        let want_roll = match f.wall {
+            Some(w) if f.alive && !w.vertical => yaw_right(f.yaw).dot(-w.normal).signum() * tn.cam_roll.to_radians(),
+            _ => 0.0,
+        };
+        let roll = self.cam_roll.get() + (want_roll - self.cam_roll.get()) * (dt * 7.0).min(1.0);
+        self.cam_roll.set(roll);
+        if roll.abs() > 1e-4 {
+            let (s, co) = roll.sin_cos();
+            let (r, u) = (cam.right, cam.up);
+            cam.right = r * co - u * s;
+            cam.up = u * co + r * s;
+        }
+        (cam, body)
     }
 }
 
@@ -3028,6 +3312,48 @@ impl App {
             if g.headshot_t > 0.0 {
                 let a = (g.headshot_t / 0.7 * 255.0).min(255.0) as u8;
                 text_shadow(p, c - Vec2::new(0.0, (50.0 * s).max(ring_r + 14.0 * s)), Align2::CENTER_CENTER, "HEADSHOT", 16.0 * s, Color32::from_rgba_unmultiplied(255, 215, 50, a));
+            }
+        }
+
+        // ---- dash: a burst of motion blur at the screen edges
+        let dash_k = if me.alive && me.dash_t > 0.0 { (me.dash_t / g.tune.dash_time.max(0.05)).clamp(0.0, 1.0).sqrt() * g.tune.dash_blur } else { 0.0 };
+        if dash_k > 0.02 {
+            let k = dash_k.min(1.5);
+            // smeared edges: a soft frame that fades towards the middle
+            let inner = rect.shrink2(rect.size() * (0.12 + 0.06 * k));
+            let edge = Color32::from_rgba_unmultiplied(225, 232, 240, (70.0 * k).min(120.0) as u8);
+            let clear = Color32::from_rgba_unmultiplied(225, 232, 240, 0);
+            let mut mesh = egui::Mesh::default();
+            let (o, i) = ([rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()], [inner.left_top(), inner.right_top(), inner.right_bottom(), inner.left_bottom()]);
+            for side in 0..4 {
+                let n = (side + 1) % 4;
+                let base = mesh.vertices.len() as u32;
+                mesh.colored_vertex(o[side], edge);
+                mesh.colored_vertex(o[n], edge);
+                mesh.colored_vertex(i[n], clear);
+                mesh.colored_vertex(i[side], clear);
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+            }
+            p.add(egui::Shape::mesh(mesh));
+            // long streaks rushing past
+            let half = rect.size() * 0.5;
+            let reach = half.length();
+            let frame = (g.time * 40.0) as u32;
+            for k2 in 0..56u32 {
+                let h = |salt: u32| -> f32 {
+                    let mut x = k2.wrapping_mul(2246822519) ^ frame.wrapping_mul(3266489917) ^ salt.wrapping_mul(668265263);
+                    x ^= x >> 15;
+                    x = x.wrapping_mul(0x2c1b3c6d);
+                    x ^= x >> 12;
+                    (x & 0xffff) as f32 / 65535.0
+                };
+                let ang = (k2 as f32 + h(1)) / 56.0 * std::f32::consts::TAU;
+                let d = Vec2::new(ang.cos(), ang.sin());
+                let r0 = reach * (0.55 + 0.25 * h(2) - 0.12 * k.min(1.0));
+                let r1 = reach * 1.05;
+                let a = ((40.0 + 90.0 * h(3)) * k.min(1.0)) as u8;
+                p.line_segment([c + d * r0, c + d * r1], Stroke::new((1.5 + 3.0 * h(4)) * s, Color32::from_rgba_unmultiplied(240, 246, 255, a)));
             }
         }
 

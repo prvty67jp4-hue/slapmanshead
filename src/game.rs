@@ -7,7 +7,8 @@ pub const RADIUS: f32 = 0.36;
 pub const HEIGHT: f32 = 1.8;
 pub const GRAVITY: f32 = 25.0;
 pub const JUMP_VEL: f32 = 9.4;
-pub const RUN_SPEED: f32 = 8.2;
+/// Base running speed: flow chains and dashes are where the real speed comes from.
+pub const RUN_SPEED: f32 = 7.2;
 pub const MAX_HP: f32 = 100.0;
 pub const MAX_AP: f32 = 50.0;
 pub const TICK: f32 = 1.0 / 120.0;
@@ -294,6 +295,170 @@ pub struct WallRun {
 
 /// Each chained move adds this much speed...
 pub const FLOW_STEP: f32 = 0.06;
+
+/// Feel settings the developer tuning panel (F4) changes live. The defaults are the game's own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tuning {
+    pub run_speed: f32,
+    /// Seconds from standing to full run speed.
+    pub accel_time: f32,
+    /// Seconds from full run speed to a stop.
+    pub stop_time: f32,
+    /// Steering in the air (m/s²).
+    pub air_control: f32,
+    pub gravity: f32,
+    /// Metres a jump rises.
+    pub jump_height: f32,
+    pub dash_speed: f32,
+    /// Seconds a dash lasts.
+    pub dash_time: f32,
+    /// Slowest wall run (you keep any faster entry speed).
+    pub wall_speed: f32,
+    /// Longest wall run (seconds; running up a wall lasts about half).
+    pub wall_time: f32,
+    /// Speed added per chained move.
+    pub flow_step: f32,
+    pub cam_dist: f32,
+    pub cam_height: f32,
+    pub shoulder: f32,
+    /// Seconds the camera takes to catch up (0 = locked on).
+    pub cam_smooth: f32,
+    /// Size of the characters (and their hit shapes).
+    pub char_scale: f32,
+    // ---- feel
+    /// Share of speed lost on a sharp turn above 80% speed.
+    pub turn_slow: f32,
+    /// Skid dust and planted feet when stopping (0 = off).
+    pub skid: f32,
+    /// How much characters lean into turns and speeding up / slowing down.
+    pub lean: f32,
+    /// How much a landing squashes the character (heavier from higher).
+    pub land_squash: f32,
+    /// The crouch before a ground dash (seconds; 0 = instant).
+    pub dash_windup: f32,
+    /// Streaks at the screen edges during a dash.
+    pub dash_blur: f32,
+    /// Camera bob while running (metres).
+    pub cam_bob: f32,
+    /// Camera roll on wall-runs (degrees).
+    pub cam_roll: f32,
+    /// Camera dip on hard landings (metres).
+    pub land_dip: f32,
+    /// Extra field of view at high speed (degrees).
+    pub fov_speed: f32,
+    /// Team-coloured rim light on players, and how thin it is.
+    pub rim: f32,
+    pub rim_width: f32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            run_speed: RUN_SPEED,
+            accel_time: 0.12,
+            stop_time: 0.1,
+            air_control: 22.0,
+            gravity: GRAVITY,
+            jump_height: JUMP_VEL * JUMP_VEL / (2.0 * GRAVITY),
+            dash_speed: 18.5,
+            dash_time: 0.2,
+            wall_speed: 10.0,
+            wall_time: 1.15,
+            flow_step: FLOW_STEP,
+            cam_dist: 3.2,
+            cam_height: 1.98,
+            shoulder: 0.78,
+            cam_smooth: 0.04,
+            char_scale: 1.0,
+            turn_slow: 0.3,
+            skid: 1.0,
+            lean: 1.0,
+            land_squash: 1.0,
+            dash_windup: 0.04,
+            dash_blur: 0.7,
+            cam_bob: 0.025,
+            cam_roll: 6.0,
+            land_dip: 0.18,
+            fov_speed: 8.0,
+            rim: 0.7,
+            rim_width: 2.5,
+        }
+    }
+}
+
+impl Tuning {
+    /// Take-off speed for the jump height under this gravity.
+    pub fn jump_vel(&self) -> f32 {
+        (2.0 * self.gravity * self.jump_height).max(0.0).sqrt()
+    }
+    pub fn accel(&self) -> f32 {
+        self.run_speed / self.accel_time.max(0.005)
+    }
+    pub fn decel(&self) -> f32 {
+        self.run_speed / self.stop_time.max(0.005)
+    }
+    /// `key=value` lines (for preset files).
+    pub fn to_text(&self) -> String {
+        TUNE_FIELDS.iter().map(|f| format!("{}={}\n", f.key, (f.get)(self))).collect()
+    }
+    /// Read `key=value` lines over the defaults (unknown keys are ignored, values kept in range).
+    pub fn from_text(text: &str) -> Tuning {
+        let mut t = Tuning::default();
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                if let (Some(f), Ok(v)) = (TUNE_FIELDS.iter().find(|f| f.key == k.trim()), v.trim().parse::<f32>()) {
+                    if v.is_finite() {
+                        (f.set)(&mut t, v.clamp(f.min, f.max));
+                    }
+                }
+            }
+        }
+        t
+    }
+}
+
+/// One slider of the tuning panel.
+pub struct TuneField {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub min: f32,
+    pub max: f32,
+    pub unit: &'static str,
+    pub group: &'static str,
+    pub get: fn(&Tuning) -> f32,
+    pub set: fn(&mut Tuning, f32),
+}
+
+pub const TUNE_FIELDS: [TuneField; 28] = [
+    TuneField { key: "run_speed", label: "Run speed", min: 4.0, max: 16.0, unit: "m/s", group: "Movement", get: |t| t.run_speed, set: |t, v| t.run_speed = v },
+    TuneField { key: "accel_time", label: "Ground acceleration time", min: 0.01, max: 0.6, unit: "s", group: "Movement", get: |t| t.accel_time, set: |t, v| t.accel_time = v },
+    TuneField { key: "stop_time", label: "Stopping time", min: 0.01, max: 0.8, unit: "s", group: "Movement", get: |t| t.stop_time, set: |t, v| t.stop_time = v },
+    TuneField { key: "air_control", label: "Air control", min: 0.0, max: 80.0, unit: "m/s²", group: "Movement", get: |t| t.air_control, set: |t, v| t.air_control = v },
+    TuneField { key: "gravity", label: "Gravity", min: 5.0, max: 60.0, unit: "m/s²", group: "Movement", get: |t| t.gravity, set: |t, v| t.gravity = v },
+    TuneField { key: "jump_height", label: "Jump height", min: 0.3, max: 5.0, unit: "m", group: "Movement", get: |t| t.jump_height, set: |t, v| t.jump_height = v },
+    TuneField { key: "dash_speed", label: "Dash speed", min: 6.0, max: 40.0, unit: "m/s", group: "Moves", get: |t| t.dash_speed, set: |t, v| t.dash_speed = v },
+    TuneField { key: "dash_time", label: "Dash length", min: 0.05, max: 0.6, unit: "s", group: "Moves", get: |t| t.dash_time, set: |t, v| t.dash_time = v },
+    TuneField { key: "wall_speed", label: "Wall-run speed (min)", min: 4.0, max: 24.0, unit: "m/s", group: "Moves", get: |t| t.wall_speed, set: |t, v| t.wall_speed = v },
+    TuneField { key: "wall_time", label: "Wall-run duration", min: 0.2, max: 3.0, unit: "s", group: "Moves", get: |t| t.wall_time, set: |t, v| t.wall_time = v },
+    TuneField { key: "flow_step", label: "Flow chain bonus (per move)", min: 0.0, max: 0.2, unit: "×", group: "Moves", get: |t| t.flow_step, set: |t, v| t.flow_step = v },
+    TuneField { key: "cam_dist", label: "Camera distance", min: 1.0, max: 8.0, unit: "m", group: "Camera", get: |t| t.cam_dist, set: |t, v| t.cam_dist = v },
+    TuneField { key: "cam_height", label: "Camera height", min: 1.2, max: 3.0, unit: "m", group: "Camera", get: |t| t.cam_height, set: |t, v| t.cam_height = v },
+    TuneField { key: "shoulder", label: "Shoulder offset", min: -1.5, max: 1.5, unit: "m", group: "Camera", get: |t| t.shoulder, set: |t, v| t.shoulder = v },
+    TuneField { key: "cam_smooth", label: "Camera smoothing", min: 0.0, max: 0.4, unit: "s", group: "Camera", get: |t| t.cam_smooth, set: |t, v| t.cam_smooth = v },
+    TuneField { key: "char_scale", label: "Character scale", min: 0.5, max: 2.0, unit: "×", group: "Characters", get: |t| t.char_scale, set: |t, v| t.char_scale = v },
+    TuneField { key: "turn_slow", label: "Sharp-turn slowdown", min: 0.0, max: 0.8, unit: "×", group: "Movement feel", get: |t| t.turn_slow, set: |t, v| t.turn_slow = v },
+    TuneField { key: "skid", label: "Stop skid (dust, planted feet)", min: 0.0, max: 2.0, unit: "×", group: "Movement feel", get: |t| t.skid, set: |t, v| t.skid = v },
+    TuneField { key: "dash_windup", label: "Dash anticipation crouch", min: 0.0, max: 0.12, unit: "s", group: "Movement feel", get: |t| t.dash_windup, set: |t, v| t.dash_windup = v },
+    TuneField { key: "dash_blur", label: "Dash edge blur", min: 0.0, max: 1.5, unit: "×", group: "Movement feel", get: |t| t.dash_blur, set: |t, v| t.dash_blur = v },
+    TuneField { key: "lean", label: "Lean into turns / speed", min: 0.0, max: 2.5, unit: "×", group: "Animation", get: |t| t.lean, set: |t, v| t.lean = v },
+    TuneField { key: "land_squash", label: "Landing squash", min: 0.0, max: 2.5, unit: "×", group: "Animation", get: |t| t.land_squash, set: |t, v| t.land_squash = v },
+    TuneField { key: "cam_bob", label: "Running bob", min: 0.0, max: 0.1, unit: "m", group: "Camera feel", get: |t| t.cam_bob, set: |t, v| t.cam_bob = v },
+    TuneField { key: "cam_roll", label: "Wall-run roll", min: 0.0, max: 15.0, unit: "°", group: "Camera feel", get: |t| t.cam_roll, set: |t, v| t.cam_roll = v },
+    TuneField { key: "land_dip", label: "Hard-landing dip", min: 0.0, max: 0.5, unit: "m", group: "Camera feel", get: |t| t.land_dip, set: |t, v| t.land_dip = v },
+    TuneField { key: "fov_speed", label: "FOV widening with speed", min: 0.0, max: 20.0, unit: "°", group: "Camera feel", get: |t| t.fov_speed, set: |t, v| t.fov_speed = v },
+    TuneField { key: "rim", label: "Player rim light", min: 0.0, max: 2.0, unit: "×", group: "Players", get: |t| t.rim, set: |t, v| t.rim = v },
+    TuneField { key: "rim_width", label: "Rim thinness", min: 1.0, max: 6.0, unit: "", group: "Players", get: |t| t.rim_width, set: |t, v| t.rim_width = v },
+];
 /// ...up to this many steps (+30%).
 pub const FLOW_MAX: u32 = 5;
 /// Moves count as chained if you weren't on the ground longer than this before them.
@@ -551,6 +716,17 @@ pub struct Fighter {
     pub regen_left: f32,
     /// How long the scope (right click with a gun) has been up; 0 when not aiming.
     pub scope_t: f32,
+    /// Crouching before a ground dash (time left), and the dash waiting to go.
+    pub dash_wind: f32,
+    dash_dir: Option<V3>,
+    dash_perfect: bool,
+    /// No second sharp-turn slowdown until this runs out.
+    turn_cd: f32,
+    /// How hard the last landing was (0..1, fades), for the camera dip.
+    pub land_impact: f32,
+    /// Speed on the last tick (skid dust when it drops fast).
+    prev_speed: f32,
+    skid_dust: f32,
     /// Whether the last hit taken was a headshot (for the kill feed).
     pub last_head: bool,
     pub last_attacker: Option<usize>,
@@ -657,6 +833,13 @@ impl Fighter {
             perfect_t: 0.0,
             regen_left: 0.0,
             scope_t: 0.0,
+            dash_wind: 0.0,
+            dash_dir: None,
+            dash_perfect: false,
+            turn_cd: 0.0,
+            land_impact: 0.0,
+            prev_speed: 0.0,
+            skid_dust: 0.0,
             last_head: false,
             last_attacker: None,
             net_pos: V3::ZERO,
@@ -732,7 +915,10 @@ impl Fighter {
 
     /// Speed bonus from chained moves (1.0 to 1.3).
     pub fn flow_mult(&self) -> f32 {
-        1.0 + FLOW_STEP * self.flow.min(FLOW_MAX) as f32
+        self.flow_mult_by(FLOW_STEP)
+    }
+    pub fn flow_mult_by(&self, step: f32) -> f32 {
+        1.0 + step * self.flow.min(FLOW_MAX) as f32
     }
 
     /// A move in a chain: counts if you were barely on the ground before it, else starts a new one.
@@ -1117,6 +1303,8 @@ pub struct Game {
     pub heal_pop: f32,
     /// Upward aim kick from the last shot, for the screen to apply to the mouse aim.
     pub aim_kick: f32,
+    /// Feel settings (the developer tuning panel changes them live).
+    pub tune: Tuning,
 }
 
 /// Moves the player has pulled off in the training room.
@@ -1366,6 +1554,7 @@ impl Game {
             parry_flash: 0.0,
             heal_pop: 0.0,
             aim_kick: 0.0,
+            tune: Tuning::default(),
         }
     }
 
@@ -1391,6 +1580,41 @@ impl Game {
         g.banner = Some(("TRAINING".into(), 2.0));
         g.train = Some(Training { lesson: 0, stats: TrainStats::default(), base: TrainStats::default(), done_t: 0.0, combo: 0, combo_t: 0.0, combo_dmg: 0.0, best_combo: 0, homes });
         g
+    }
+
+    /// Developer tool: a still target `dist` metres straight ahead of the local player (games on
+    /// this computer only). Uses a free slot, or replaces the last such dummy.
+    pub fn spawn_dummy(&mut self, dist: f32) -> Result<String, String> {
+        if self.kind != Kind::Offline {
+            return Err("Dummies can only be added to games on this computer (Practice or Training).".into());
+        }
+        let me = self.local;
+        let slot = (0..MAX_PLAYERS)
+            .find(|&s| !self.f[s].present)
+            .or_else(|| (0..MAX_PLAYERS).rev().find(|&s| s != me && self.f[s].name.starts_with("Dummy")))
+            .ok_or("No room: the game is full.")?;
+        let fwd = yaw_fwd(self.f[me].yaw);
+        let mut at = self.f[me].pos + fwd * dist;
+        // stand it on whatever is there
+        at.y = self.world.ground_below(at + v3(0.0, 6.0, 0.0)).max(0.0);
+        let team = if self.mt.mode.teams() { 1 - self.f[me].team.min(1) } else { 0 };
+        let name = format!("Dummy {:.0}m", dist);
+        self.add_player(slot, &name, true, Some(0.0), team);
+        self.bots[slot] = None; // it just stands there
+        let yaw = (-fwd.x).atan2(-fwd.z);
+        self.f[slot].respawn_at(at, yaw);
+        self.f[slot].spawn_prot = 0.0;
+        self.f[slot].ready = true;
+        Ok(format!("{name} placed"))
+    }
+
+    /// Remove every dummy added with `spawn_dummy`.
+    pub fn remove_dummies(&mut self) -> usize {
+        let ids: Vec<usize> = (0..MAX_PLAYERS).filter(|&s| s != self.local && self.f[s].present && self.f[s].name.starts_with("Dummy ") && self.f[s].name.ends_with('m')).collect();
+        for &s in &ids {
+            self.remove_player(s);
+        }
+        ids.len()
     }
 
     /// Count a move for the training lessons (only the local player, only in training).
@@ -1433,9 +1657,11 @@ impl Game {
                 // face the player
                 let d = self.f[me].pos - self.f[i].pos;
                 self.f[i].yaw = d.x.atan2(d.z);
+                // the three training dummies go back to their spots (measuring dummies stay put)
                 let home = t.homes[(i - 1).min(2)];
+                let own = (1..=3).contains(&i) && !self.f[i].name.ends_with('m');
                 let ff = &mut self.f[i];
-                if ff.on_ground && ff.float_t <= 0.0 && ff.stun_t <= 0.0 && (ff.pos - home).flat().len() > 4.0 {
+                if own && ff.on_ground && ff.float_t <= 0.0 && ff.stun_t <= 0.0 && (ff.pos - home).flat().len() > 4.0 {
                     ff.pos = home;
                     ff.prev_pos = home;
                     ff.vel = V3::ZERO;
@@ -1705,12 +1931,29 @@ impl Game {
         if self.kind == Kind::Demo {
             return;
         }
+        let skid_k = self.tune.skid;
+        let mut dust: Vec<(V3, V3)> = Vec::new();
         for i in 0..self.f.len() {
             let f = &mut self.f[i];
             if !f.present || !f.alive || f.spectate {
                 f.was_ground = true;
+                f.prev_speed = 0.0;
                 continue;
             }
+            // a hard stop scuffs up a little dust at the feet
+            let sp = f.vel.flat().len();
+            let braking = f.on_ground && f.wall.is_none() && f.sliding <= 0.0 && f.dash_t <= 0.0 && f.prev_speed > 4.0 && (f.prev_speed - sp) > 20.0 * dt;
+            if braking && skid_k > 0.0 {
+                f.skid_dust += dt * skid_k;
+                while f.skid_dust > 0.02 {
+                    f.skid_dust -= 0.02;
+                    let back = if f.prev_speed > 0.1 { f.vel.flat() * (1.0 / sp.max(0.1)) } else { V3::ZERO };
+                    dust.push((f.pos + v3(0.0, 0.05, 0.0), back));
+                }
+            } else {
+                f.skid_dust = 0.0;
+            }
+            f.prev_speed = sp;
             let mut out = None;
             if f.on_ground {
                 if !f.was_ground && f.fall_vy < -5.5 {
@@ -1741,6 +1984,14 @@ impl Game {
                     s = Sfx::StepWood;
                 }
                 self.sfx(s, p);
+            }
+        }
+        for (p, d) in dust {
+            for _ in 0..2 {
+                let v = d * self.rng.range(0.5, 1.8) + v3(self.rng.range(-0.6, 0.6), self.rng.range(0.2, 0.9), self.rng.range(-0.6, 0.6));
+                let life = self.rng.range(0.3, 0.55);
+                let size = self.rng.range(0.10, 0.2);
+                self.particles.push(Particle { pos: p + v3(self.rng.range(-0.15, 0.15), 0.0, self.rng.range(-0.15, 0.15)), vel: v, life, max_life: life, size, color: [150, 140, 122], gravity: 1.2 });
             }
         }
     }
@@ -2481,6 +2732,8 @@ impl Game {
         let mut acts = Vec::new();
         let mut ff = self.f[i].clone();
         let mut sounds: Vec<Sfx> = Vec::new();
+        let tn = self.tune;
+        let run = tn.run_speed;
 
         ff.fire_cd = (ff.fire_cd - dt).max(0.0);
         ff.switch_t = (ff.switch_t - dt).max(0.0);
@@ -2509,12 +2762,13 @@ impl Game {
         ff.land_t += dt;
         ff.flow_pop = (ff.flow_pop - dt).max(0.0);
         ff.perfect_t = (ff.perfect_t - dt).max(0.0);
+        ff.turn_cd = (ff.turn_cd - dt).max(0.0);
         // carried speed: held for a moment after landing, then eased off
         if ff.carry_t > 0.0 {
             ff.carry_t -= dt;
         } else if ff.carry > 0.0 {
             ff.carry -= 14.0 * dt;
-            if ff.carry <= RUN_SPEED * 0.5 {
+            if ff.carry <= run * 0.5 {
                 ff.carry = 0.0;
             }
         }
@@ -2532,7 +2786,7 @@ impl Game {
             ff.death_t += dt;
             ff.vel.x *= 1.0 - (4.0 * dt).min(1.0);
             ff.vel.z *= 1.0 - (4.0 * dt).min(1.0);
-            ff.vel.y -= GRAVITY * dt;
+            ff.vel.y -= tn.gravity * dt;
             self.collide(&mut ff, dt);
             self.f[i] = ff;
             return acts;
@@ -2550,7 +2804,7 @@ impl Game {
         if !can_act {
             wish = V3::ZERO;
         }
-        let flow_k = ff.flow_mult();
+        let flow_k = ff.flow_mult_by(tn.flow_step);
         let grounded_before = ff.on_ground;
         // jumping or dashing right as you land: a little extra
         let perfect_window = ff.on_ground && ff.land_t < PERFECT_WINDOW && ff.last_air > 0.25;
@@ -2615,15 +2869,39 @@ impl Game {
         }
         ff.scope_t = if scoping { ff.scope_t + dt } else { 0.0 };
 
-        // dash / tumble
-        if ff.dash_buf > 0.0 && can_act && ff.dash_cd <= 0.0 && ff.wall.is_none() && !slash_locked {
+        // dash / tumble. A ground dash crouches for a split second first (the anticipation),
+        // then bursts out.
+        let mut fire_dash: Option<V3> = None;
+        if ff.dash_wind > 0.0 {
+            ff.dash_wind -= dt;
+            if !can_act || ff.wall.is_some() {
+                ff.dash_wind = 0.0;
+                ff.dash_dir = None;
+            } else if ff.dash_wind <= 0.0 {
+                ff.dash_wind = 0.0;
+                fire_dash = ff.dash_dir.take();
+            }
+        }
+        let wants_dash = ff.dash_buf > 0.0 && can_act && ff.dash_cd <= 0.0 && ff.wall.is_none() && !slash_locked && ff.dash_wind <= 0.0;
+        if wants_dash && ff.on_ground && tn.dash_windup > 0.0 && fire_dash.is_none() {
             let dir = if wish.len() > 0.1 { wish.norm() } else { fwd };
+            ff.dash_wind = tn.dash_windup;
+            ff.dash_dir = Some(dir);
+            ff.dash_perfect = perfect_window;
+            ff.dash_buf = 0.0;
+            cancel_slash(&mut ff);
+            // sink into the crouch: brake a little
+            ff.vel.x *= 0.85;
+            ff.vel.z *= 0.85;
+        } else if wants_dash || fire_dash.is_some() {
+            let perfect_window = if fire_dash.is_some() { ff.dash_perfect } else { perfect_window };
+            let dir = fire_dash.unwrap_or(if wish.len() > 0.1 { wish.norm() } else { fwd });
             let mut dashed = false;
             if ff.on_ground {
                 let boost = if perfect_window { 1.12 } else { 1.0 };
-                ff.vel = dir * (18.5 * flow_k * boost) + v3(0.0, 2.2, 0.0);
+                ff.vel = dir * (tn.dash_speed * flow_k * boost) + v3(0.0, 2.2, 0.0);
                 ff.on_ground = false;
-                ff.dash_t = 0.2;
+                ff.dash_t = tn.dash_time;
                 ff.dash_cd = 0.38;
                 ff.ground_dash_t = 0.32; // a slash now becomes a rising launcher
                 ff.sliding = 0.0;
@@ -2634,9 +2912,9 @@ impl Game {
                 }
                 dashed = true;
             } else if !ff.air_dash {
-                ff.vel = dir * (15.0 * flow_k) + v3(0.0, 3.5, 0.0);
+                ff.vel = dir * (tn.dash_speed * 0.81 * flow_k) + v3(0.0, 3.5, 0.0);
                 ff.air_dash = true;
-                ff.dash_t = 0.18;
+                ff.dash_t = tn.dash_time * 0.9;
                 ff.dash_cd = 0.32;
                 dashed = true;
             }
@@ -2656,7 +2934,7 @@ impl Game {
             }
         }
 
-        let mut speed = RUN_SPEED * flow_k;
+        let mut speed = run * flow_k;
         if ff.guard {
             speed = 4.5;
         }
@@ -2668,7 +2946,7 @@ impl Game {
         if let Some(mut w) = ff.wall {
             w.t += dt;
             let touching = self.touching_wall(ff.pos).map_or(false, |n| n.dot(w.normal) > 0.7);
-            let max_t = if w.vertical { 0.55 } else { 1.15 };
+            let max_t = if w.vertical { tn.wall_time * 0.48 } else { tn.wall_time };
             if inp.jump && can_act {
                 // wall jump off the wall run: away from the wall, steered by where you look
                 let look_along = (fwd - w.normal * fwd.dot(w.normal)).flat();
@@ -2712,7 +2990,7 @@ impl Game {
             if ff.on_ground && ff.dash_t <= 0.0 {
                 // out of a ground dash: keep the speed a moment, then ease off
                 let flat = ff.vel.flat().len();
-                ff.carry = flat.min(RUN_SPEED * 1.7 * flow_k);
+                ff.carry = flat.min(run * 1.7 * flow_k);
                 ff.carry_t = MOMENTUM_HOLD;
             }
         } else if ff.on_ground {
@@ -2742,10 +3020,20 @@ impl Game {
                 ff.vel.z = d.z * sp;
                 if !inp.crouch || ff.sliding <= 0.0 || sp < 4.0 || !can_act {
                     ff.sliding = 0.0;
-                    ff.carry = sp.min(RUN_SPEED * 1.7 * flow_k);
+                    ff.carry = sp.min(run * 1.7 * flow_k);
                     ff.carry_t = 0.15;
                 }
             } else {
+                // a sharp turn at speed costs momentum for a moment
+                let sp = cur.len();
+                if tn.turn_slow > 0.0 && ff.turn_cd <= 0.0 && sp > run * 0.8 && wish.len() > 0.5 && cur.norm().dot(wish.norm()) < 0.2 {
+                    ff.vel.x *= 1.0 - tn.turn_slow;
+                    ff.vel.z *= 1.0 - tn.turn_slow;
+                    ff.carry = 0.0;
+                    ff.turn_cd = 0.3;
+                }
+                let cur = ff.vel.flat();
+                let speed = speed * (1.0 - tn.turn_slow * 0.5 * (ff.turn_cd / 0.3));
                 // run, holding on to carried speed (it eases off rather than snapping back)
                 let cap = speed.max(ff.carry);
                 let target = wish * cap;
@@ -2753,11 +3041,11 @@ impl Game {
                 let carrying = ff.carry > speed;
                 let slowing = target.len() + 0.01 < cur.len();
                 let acc = if wish.len() > 0.1 {
-                    if carrying && slowing { 30.0 } else { 120.0 }
+                    if carrying && slowing { 30.0 } else { tn.accel() }
                 } else if carrying {
                     25.0
                 } else {
-                    80.0
+                    tn.decel()
                 } * dt;
                 let step = if diff.len() > acc { diff.norm() * acc } else { diff };
                 ff.vel.x += step.x;
@@ -2775,12 +3063,12 @@ impl Game {
                         s.slide_jumps += 1
                     }
                 });
-                ff.vel.y = JUMP_VEL;
+                ff.vel.y = tn.jump_vel();
                 if perfect_window {
                     // a perfectly timed bounce
-                    ff.vel.y = JUMP_VEL * 1.12;
+                    ff.vel.y = tn.jump_vel() * 1.12;
                     let flat = ff.vel.flat();
-                    let boosted = (flat.len() * 1.08).min(RUN_SPEED * 2.2);
+                    let boosted = (flat.len() * 1.08).min(run * 2.2);
                     if flat.len() > 0.1 {
                         let f2 = flat.norm() * boosted;
                         ff.vel.x = f2.x;
@@ -2806,7 +3094,7 @@ impl Game {
         } else if ff.jump_buf > 0.0 && ff.coyote > 0.0 && can_act && ff.vel.y <= 0.5 {
             // jump just after running off a ledge
             self.note(i, |s| s.jumps += 1);
-            ff.vel.y = JUMP_VEL;
+            ff.vel.y = tn.jump_vel();
             ff.jump_buf = 0.0;
             ff.coyote = 0.0;
             sounds.push(Sfx::Jump);
@@ -2816,7 +3104,7 @@ impl Game {
                 let target = wish * speed.max(ff.vel.flat().len().min(12.0 * flow_k));
                 let cur = ff.vel.flat();
                 let diff = target - cur;
-                let acc = 22.0 * dt;
+                let acc = tn.air_control * dt;
                 let step = if diff.len() > acc { diff.norm() * acc } else { diff };
                 ff.vel.x += step.x;
                 ff.vel.z += step.z;
@@ -2844,7 +3132,7 @@ impl Game {
                     let vertical = into > 0.75;
                     let dir = if fwd.dot(tangent) >= 0.0 { tangent } else { -tangent };
                     // run along it as fast as you arrived (at least 10)
-                    let entry = ff.vel.flat().len().clamp(10.0, 22.0);
+                    let entry = ff.vel.flat().len().clamp(tn.wall_speed, tn.wall_speed.max(22.0));
                     ff.wall = Some(WallRun { normal: n, dir, t: 0.0, vertical, speed: entry });
                     ff.chain();
                     self.note(i, |s| if vertical { s.wallclimbs += 1 } else { s.wallruns += 1 });
@@ -2859,18 +3147,21 @@ impl Game {
         if gravity && ff.wall.is_none() {
             // launched fighters hang in the air a moment so they can be juggled
             let k = if ff.float_t > 0.0 && ff.vel.y < 3.0 { 0.35 } else { 1.0 };
-            ff.vel.y -= GRAVITY * k * dt;
+            ff.vel.y -= tn.gravity * k * dt;
         }
         ff.vel.y = ff.vel.y.max(-40.0);
 
+        let vy_before = ff.vel.y;
         self.collide(&mut ff, dt);
         if ff.on_ground && !grounded_before {
+            // how hard: nothing for a hop, full for a long fall
+            ff.land_impact = ((-vy_before - 5.0) / 15.0).clamp(0.0, 1.0);
             // landed: from a dash, wall-jump or air dash you keep your speed a moment
             ff.last_air = ff.air_t;
             ff.land_t = 0.0;
             let flat = ff.vel.flat().len();
-            if ff.from_move && flat > RUN_SPEED * flow_k * 0.95 {
-                ff.carry = flat.min(RUN_SPEED * 1.7 * flow_k);
+            if ff.from_move && flat > run * flow_k * 0.95 {
+                ff.carry = flat.min(run * 1.7 * flow_k);
                 ff.carry_t = MOMENTUM_HOLD;
                 self.note(i, |s| s.momentum += 1);
             }
@@ -2932,7 +3223,8 @@ impl Game {
                     if inp.fire_pressed {
                         ff.slash_queued = true;
                     }
-                    if ff.slash_queued && ff.slash_t < dur * 0.36 {
+                    // a slash pressed in the dash's crouch waits for the burst (then it's the launcher)
+                    if ff.slash_queued && ff.slash_t < dur * 0.36 && ff.dash_wind <= 0.0 {
                         ff.slash_queued = false;
                         let chain = ff.slash_t > 0.0 || ff.combo_window > 0.0;
                         let butterfly = ff.guard || ff.bfly_t > 0.0;
@@ -3059,31 +3351,35 @@ impl Game {
     /// Over-the-right-shoulder camera: the point it orbits around, the look direction and how far
     /// back it can sit before hitting a wall (camera collision).
     pub fn camera_rig(&self, pos: V3, yaw: f32, pitch: f32) -> (V3, V3, f32) {
-        const SHOULDER: f32 = 0.78;
-        const HEIGHT: f32 = 1.98;
-        const BACK: f32 = 3.2;
+        let (shoulder, height, back_dist) = (self.tune.shoulder, self.tune.cam_height, self.tune.cam_dist.max(0.5));
         const PAD: f32 = 0.35;
         let dir = look_dir(yaw, pitch);
         let right = yaw_right(yaw);
         let head = pos + v3(0.0, 1.6, 0.0);
-        // keep the shoulder point out of walls on the right
-        let mut side = SHOULDER;
-        if let Some((t, _)) = self.world.raycast(head, right, SHOULDER + PAD) {
+        // keep the shoulder point out of walls on that side (a negative offset is the left shoulder)
+        let side_dir = if shoulder >= 0.0 { right } else { -right };
+        let mut side = shoulder.abs();
+        if let Some((t, _)) = self.world.raycast(head, side_dir, side + PAD) {
             side = (t - PAD).max(0.0);
         }
-        let mut pivot = head + right * side;
-        if let Some((t, _)) = self.world.raycast(pivot, V3::UP, HEIGHT - 1.6 + PAD) {
-            pivot.y += (t - PAD).max(0.0);
+        let mut pivot = head + side_dir * side;
+        let lift = height - 1.6;
+        if lift > 0.0 {
+            if let Some((t, _)) = self.world.raycast(pivot, V3::UP, lift + PAD) {
+                pivot.y += (t - PAD).max(0.0).min(lift);
+            } else {
+                pivot.y += lift;
+            }
         } else {
-            pivot.y += HEIGHT - 1.6;
+            pivot.y += lift;
         }
         // pull the camera in when anything is behind it (a few rays, so the edge of the
         // view doesn't poke through walls either)
         let back = -dir;
         let cam_up = dir.cross(right).norm();
-        let mut dist = BACK;
+        let mut dist = back_dist;
         for off in [V3::ZERO, right * PAD, -right * PAD, cam_up * PAD, -cam_up * PAD] {
-            if let Some((t, _)) = self.world.raycast(pivot + off, back, BACK + PAD) {
+            if let Some((t, _)) = self.world.raycast(pivot + off, back, back_dist + PAD) {
                 dist = dist.min((t - PAD).max(0.15));
             }
         }
@@ -3099,7 +3395,7 @@ impl Game {
                 self.hit_poses[i] = None;
                 continue;
             }
-            let posed = rig.and_then(|r| crate::character::animate(r, &mut self.anim[i], f, f.pos, self.time));
+            let posed = rig.and_then(|r| crate::character::animate(r, &mut self.anim[i], f, f.pos, self.time, &self.tune));
             self.hit_poses[i] = Some(match posed {
                 Some(p) => p.hit,
                 None => HitPose::standing(f.pos, f.yaw),
@@ -4202,9 +4498,6 @@ mod lag_comp_tests {
             g.f[1].pos = v3(k as f32 * 0.1, 0.0, 0.0);
             g.f[1].vel = V3::ZERO;
             g.tick(&Input { yaw: 0.0, ..Default::default() });
-            if k % 10 == 0 || k > 55 {
-                println!("k {k} t {:.3} pos {:?} hist {:?} pose-hips {:?} posehist {:?}", g.time, g.f[1].pos, g.history[1].back(), g.hit_poses[1].map(|p| p.caps[4].a), g.pose_history[1].back().map(|e| (e.0, e.1.caps[4].a)));
-            }
             g.f[1].pos = v3(k as f32 * 0.1, 0.0, 0.0);
         }
         g.f[0].ping_ms = 200;
@@ -4662,10 +4955,75 @@ mod movement_tests {
     }
 
     #[test]
+    fn ground_has_weight_and_turns_cost_speed() {
+        let mut g = arena();
+        let tn = g.tune;
+        // about 0.12 s to reach full speed
+        let mut t_full = None;
+        for k in 0..60 {
+            g.tick(&FWD);
+            if t_full.is_none() && g.f[0].vel.flat().len() > tn.run_speed * 0.97 {
+                t_full = Some((k + 1) as f32 * TICK);
+            }
+        }
+        let t_full = t_full.expect("reaches full speed");
+        assert!((0.08..=0.17).contains(&t_full), "full speed after {t_full}s");
+        assert!((g.f[0].vel.flat().len() - RUN_SPEED).abs() < 0.2, "base run speed 7.2");
+        // about 0.1 s to stop
+        let mut t_stop = None;
+        for k in 0..60 {
+            g.tick(&Input { fwd: 0.0, ..FWD });
+            if t_stop.is_none() && g.f[0].vel.flat().len() < 0.2 {
+                t_stop = Some((k + 1) as f32 * TICK);
+            }
+        }
+        let t_stop = t_stop.expect("stops");
+        assert!((0.06..=0.14).contains(&t_stop), "stopped after {t_stop}s");
+        // a sharp turn at full speed bleeds speed for a moment
+        run(&mut g, 0.4, FWD);
+        let before = g.f[0].vel.flat().len();
+        g.tick(&Input { fwd: -1.0, ..FWD });
+        let after = g.f[0].vel.flat().len();
+        assert!(after < before * (1.0 - tn.turn_slow * 0.8), "sharp turn slows: {before} -> {after}");
+        // the dash crouches for a split second, then bursts well beyond running speed
+        let mut g = arena();
+        run(&mut g, 0.4, FWD);
+        g.tick(&Input { dash: true, ..FWD });
+        assert!(g.f[0].dash_wind > 0.0 && g.f[0].dash_t <= 0.0, "anticipation first");
+        let mut peak: f32 = 0.0;
+        for _ in 0..20 {
+            g.tick(&FWD);
+            peak = peak.max(g.f[0].vel.flat().len());
+        }
+        assert!(peak > RUN_SPEED * 1.8, "dash bursts out: {peak}");
+        // landing from higher hits harder
+        let mut g = arena();
+        g.f[0].pos.y = 1.5;
+        g.f[0].on_ground = false;
+        for _ in 0..120 {
+            g.tick(&Input { fwd: 0.0, ..FWD });
+        }
+        let low = g.f[0].land_impact;
+        g.f[0].pos.y = 9.0;
+        g.f[0].on_ground = false;
+        for _ in 0..240 {
+            g.tick(&Input { fwd: 0.0, ..FWD });
+        }
+        assert!(g.f[0].land_impact > low + 0.3, "higher fall, harder landing: {low} vs {}", g.f[0].land_impact);
+    }
+
+    #[test]
     fn chained_moves_build_flow_and_reset() {
         let mut g = arena();
         run(&mut g, 0.4, FWD);
-        g.tick(&Input { dash: true, ..FWD }); // ground dash
+        g.tick(&Input { dash: true, ..FWD }); // ground dash (after its short crouch)
+        for _ in 0..30 {
+            if g.f[0].dash_t > 0.0 {
+                break;
+            }
+            g.tick(&FWD);
+        }
+        assert!(g.f[0].dash_t > 0.0, "the dash bursts out after its wind-up");
         assert_eq!(g.f[0].flow, 1);
         // land from the dash hop, then jump straight away
         for _ in 0..120 {
@@ -4897,5 +5255,82 @@ mod weapon_tests {
         assert_eq!(Weapon::Smg.zoom(), 1.0, "no zoom on the SMG");
         assert_eq!(Weapon::Sniper.zoom(), 3.0);
         assert!(Weapon::Smg.gun().spread_still <= 0.02 * 0.61);
+    }
+}
+
+#[cfg(test)]
+mod tuning_tests {
+    use super::*;
+
+    fn flat() -> Game {
+        let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
+        g.world = crate::game::lag_comp_tests::flat_world();
+        g.bots[1] = None;
+        g.mt.phase = Phase::Fight;
+        g.f[0].pos = V3::ZERO;
+        g.f[0].spawn_prot = 0.0;
+        g.f[1].pos = v3(30.0, 0.0, 30.0);
+        g
+    }
+
+    #[test]
+    fn presets_round_trip_and_stay_in_range() {
+        let mut t = Tuning::default();
+        t.run_speed = 11.5;
+        t.cam_dist = 4.25;
+        t.char_scale = 1.3;
+        assert_eq!(Tuning::from_text(&t.to_text()), t);
+        let wild = Tuning::from_text("run_speed=999\ngravity=-5\nnonsense=1\njump_height=abc");
+        assert_eq!(wild.run_speed, 16.0, "clamped to the slider range");
+        assert_eq!(wild.gravity, 5.0);
+        assert_eq!(wild.jump_height, Tuning::default().jump_height, "bad values are ignored");
+        // the defaults are the game''s own numbers
+        let d = Tuning::default();
+        assert!((d.jump_vel() - JUMP_VEL).abs() < 1e-3);
+        assert!((d.accel() - 60.0).abs() < 1e-3 && (d.decel() - 72.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn run_speed_and_jump_height_take_effect() {
+        let fwd = Input { fwd: 1.0, ..Default::default() };
+        let mut g = flat();
+        g.tune.run_speed = 12.0;
+        for _ in 0..90 {
+            g.tick(&fwd);
+        }
+        assert!((g.f[0].vel.flat().len() - 12.0).abs() < 0.2, "runs at the new speed: {}", g.f[0].vel.flat().len());
+        let mut g = flat();
+        g.tune.jump_height = 3.0;
+        for _ in 0..30 {
+            g.tick(&Input::default());
+        }
+        g.tick(&Input { jump: true, ..Default::default() });
+        let mut top: f32 = 0.0;
+        for _ in 0..200 {
+            g.tick(&Input::default());
+            top = top.max(g.f[0].pos.y);
+        }
+        assert!((top - 3.0).abs() < 0.15, "jumps 3 m high: {top}");
+    }
+
+    #[test]
+    fn camera_distance_takes_effect() {
+        let mut g = flat();
+        let (_, _, near) = g.camera_rig(V3::ZERO, 0.0, 0.0);
+        g.tune.cam_dist = 6.0;
+        let (_, _, far) = g.camera_rig(V3::ZERO, 0.0, 0.0);
+        assert!((near - 3.2).abs() < 1e-3 && (far - 6.0).abs() < 1e-3, "{near} -> {far}");
+    }
+
+    #[test]
+    fn dummies_stand_where_asked() {
+        let mut g = flat();
+        g.f[0].yaw = 0.0;
+        g.spawn_dummy(15.0).unwrap();
+        let d = g.f.iter().find(|f| f.present && f.name == "Dummy 15m").expect("placed");
+        assert!((d.pos - v3(0.0, 0.0, 15.0)).len() < 0.01, "15 m straight ahead: {:?}", d.pos);
+        assert!(d.fwd().dot(v3(0.0, 0.0, -1.0)) > 0.99, "facing us");
+        assert_eq!(g.remove_dummies(), 1);
+        assert!(!g.f.iter().any(|f| f.present && f.name.starts_with("Dummy 15")));
     }
 }
