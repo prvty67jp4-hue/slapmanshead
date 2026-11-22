@@ -1024,6 +1024,13 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
             mb.ellipsoid(hand + wf.apply(v3(0.0, 0.12, 0.33)), wf, v3(0.03, 0.03, 0.006), lin([120, 170, 220]), -1.0, 3.0, 0.0);
             mb.tube(hand + wf.apply(v3(0.035, 0.04, 0.02)), hand + wf.apply(v3(0.09, 0.0, 0.02)), 0.008, 0.008, wf.y, 1.0, gunmetal, -1.0, 1.6);
         }
+        Weapon::Shuriken => {
+            // a star held between the fingers, ready to throw
+            let c = hand + wf.apply(v3(0.0, 0.05, 0.08));
+            mb.obox(c, wf, v3(0.1, 0.006, 0.024), steel, -1.0, 2.5);
+            mb.obox(c, wf, v3(0.024, 0.006, 0.1), steel, -1.0, 2.5);
+            mb.ellipsoid(c, wf, v3(0.03, 0.01, 0.03), gunmetal, -1.0, 1.0, 0.0);
+        }
         Weapon::Rocket => {
             mb.tube(hand + wf.apply(v3(0.0, 0.1, -0.45)), hand + wf.apply(v3(0.0, 0.1, 0.5)), 0.075, 0.075, wf.x, 1.0, lin([62, 74, 58]), -1.0, 0.6);
             mb.tube(hand + wf.apply(v3(0.0, 0.1, 0.5)), hand + wf.apply(v3(0.0, 0.1, 0.57)), 0.09, 0.09, wf.x, 1.0, lin([40, 40, 44]), -1.0, 1.0);
@@ -1574,7 +1581,24 @@ impl Gpu {
                 ad.billboard(cam, top - v3(0.0, 0.25, 0.0), 0.7, lina(col, 0.25));
             }
         }
-        for gr in &g.grenades {            if gr.kind == 1 {
+        for gr in &g.grenades {
+            if gr.kind == 2 {
+                // a throwing star, spinning flat as it flies, with a faint streak behind. Fresh
+                // from the hand it's drawn where the hand let go, easing onto its true path.
+                let age = STAR_LIFE - gr.fuse;
+                let k = (1.0 - age / STAR_VIS_TIME).clamp(0.0, 1.0);
+                let pos = gr.pos + gr.vis * (k * k);
+                let spin = M3::rot_y(gr.fuse * 45.0);
+                let steel = lin([190, 196, 210]);
+                op.obox(pos, &spin, v3(0.12, 0.008, 0.028), steel, -1.0, 2.5);
+                op.obox(pos, &spin, v3(0.028, 0.008, 0.12), steel, -1.0, 2.5);
+                op.ellipsoid(pos, &spin, v3(0.035, 0.012, 0.035), lin([60, 62, 70]), -1.0, 1.0, 0.0);
+                let d = gr.vel.norm();
+                let tail = (age * STAR_SPEED).min(0.9);
+                ad.beam(cam, pos - d * tail, pos, 0.03, lina([210, 230, 255], 0.35));
+                continue;
+            }
+            if gr.kind == 1 {
                 let d = gr.vel.norm();
                 op.tube(gr.pos - d * 0.35, gr.pos + d * 0.2, 0.06, 0.04, V3::UP.cross(d), 1.0, lin([70, 80, 64]), -1.0, 0.8);
                 ad.billboard(cam, gr.pos - d * 0.45, 0.35, lina([255, 180, 80], 0.9));

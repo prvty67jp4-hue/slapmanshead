@@ -560,6 +560,8 @@ struct App {
     cam_smooth_pos: std::cell::Cell<Option<V3>>,
     /// Spring follow speed, the wall-run roll and how wide the speed FOV is (smoothed).
     cam_spring_vel: std::cell::Cell<V3>,
+    /// How far the drawn camera sits from the plain one (for shots to follow the crosshair).
+    cam_view_offset: std::cell::Cell<V3>,
     cam_roll: std::cell::Cell<f32>,
     fov_speed: std::cell::Cell<f32>,
 }
@@ -645,6 +647,7 @@ impl App {
             tune_msg: None,
             cam_smooth_pos: std::cell::Cell::new(None),
             cam_spring_vel: std::cell::Cell::new(V3::ZERO),
+            cam_view_offset: std::cell::Cell::new(V3::ZERO),
             cam_roll: std::cell::Cell::new(0.0),
             fov_speed: std::cell::Cell::new(0.0),
         };
@@ -2285,6 +2288,9 @@ impl App {
             game.slowmo -= dt;
             scale = 0.25;
         }
+        // the last picture showed everyone this far between ticks, from this camera
+        game.view_alpha = (self.acc / TICK).clamp(0.0, 1.0);
+        game.view_offset = self.cam_view_offset.get();
         if game.hitstop > 0.0 {
             game.hitstop -= dt;
         } else {
@@ -2293,6 +2299,7 @@ impl App {
         let mut steps = 0;
         while self.acc >= TICK && steps < 12 {
             game.tick(&inp);
+            game.view_alpha = 1.0;
             // edges are used once
             inp.jump = false;
             inp.dash = false;
@@ -2454,6 +2461,7 @@ impl App {
     }
 
     fn play_camera(&self, game: &Game, rect: Rect) -> (Cam, V3) {
+        self.cam_view_offset.set(V3::ZERO);
         if std::env::var_os("DUEL_GALLERY").is_some() {
             let l = game.local;
             return (Cam::new(v3(0.0, 2.0, 5.2), 0.0, -0.08, 96.0, rect), game.f[l].pos);
@@ -2511,6 +2519,7 @@ impl App {
         }
         self.cam_dist.set(d);
         let mut pos = pivot - dir * d;
+        let ideal_pos = pos;
         let tn = game.tune;
         // what the gun aims at: the camera always looks straight at it, so however the camera
         // trails, bobs or dips, the crosshair stays exactly on target (aim never lags)
@@ -2554,6 +2563,8 @@ impl App {
                 pos.y -= tn.land_dip * f.land_impact * curve;
             }
         }
+        // shots leave along this exact line (see Game::shot_ray)
+        self.cam_view_offset.set(pos - ideal_pos);
         let to_aim = (aim_at - pos).norm();
         let (mut yaw, mut pitch) = (to_aim.x.atan2(to_aim.z), to_aim.y.clamp(-1.0, 1.0).asin());
         if game.shake > 0.0 {
@@ -2725,6 +2736,18 @@ fn gallery_pose(g: &mut Game, page2: bool) {
                     f.cur = 1;
                     f.weapon = Weapon::Rifle;
                     f.pitch = 0.3;
+                }
+                6 | 7 if page2 => {
+                    // throwing stars mid-throw: a burst (6) and the wide fan (7)
+                    f.loadout.gun1 = Weapon::Shuriken;
+                    f.cur = 1;
+                    f.weapon = Weapon::Shuriken;
+                    f.throw_fan = i == 7;
+                    let total = if f.throw_fan { FAN_THROW_TIME } else { THROW_TIME };
+                    // (driven by a frame count: the clock may stand still on this screen)
+                    static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let n = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) / 2;
+                    f.throw_t = total * (1.0 - (n % 24) as f32 / 24.0).max(0.02);
                 }
                 6 => {
                     f.loadout.gun1 = Weapon::Rocket;
@@ -3320,6 +3343,23 @@ impl App {
             if g.headshot_t > 0.0 {
                 let a = (g.headshot_t / 0.7 * 255.0).min(255.0) as u8;
                 text_shadow(p, c - Vec2::new(0.0, (50.0 * s).max(ring_r + 14.0 * s)), Align2::CENTER_CENTER, "HEADSHOT", 16.0 * s, Color32::from_rgba_unmultiplied(255, 215, 50, a));
+            }
+        }
+
+        // ---- blade combo: hits in a row (the fifth is a KO)
+        let mc = g.my_combo;
+        if me.alive && mc.n >= 2 && g.time - mc.last < 1.2 {
+            let fade = (1.0 - (g.time - mc.last - 0.8).max(0.0) / 0.4).clamp(0.0, 1.0);
+            let a = (255.0 * fade) as u8;
+            let y = c.y - 46.0 * s;
+            let hot = mc.n + 1 >= COMBO_KO;
+            let col = if hot { Color32::from_rgba_unmultiplied(255, 120, 60, a) } else { Color32::from_rgba_unmultiplied(255, 220, 140, a) };
+            text_shadow(p, Pos2::new(c.x, y), Align2::CENTER_CENTER, &format!("{} HIT COMBO", mc.n), 15.0 * s, col);
+            for k in 0..COMBO_KO {
+                let x = c.x + (k as f32 - (COMBO_KO as f32 - 1.0) * 0.5) * 11.0 * s;
+                let filled = k < mc.n;
+                let pc = if filled { col } else { Color32::from_rgba_unmultiplied(255, 255, 255, a / 4) };
+                p.circle_filled(Pos2::new(x, y + 13.0 * s), 3.2 * s, pc);
             }
         }
 

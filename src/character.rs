@@ -2,7 +2,7 @@
 //! then layers aiming, strafing, guard, sword swings and weapon holds on top.
 
 use crate::anim::{Rig, Trs, blend_into, blend_masked};
-use crate::game::{Capsule, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, Tuning, Weapon};
+use crate::game::{Capsule, FAN_THROW_TIME, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, THROW_TIME, Tuning, Weapon};
 use crate::math::{M3, V3, look_dir, v3, wrap_angle};
 use crate::render::sword_arm;
 use glam::{Mat4, Quat, Vec3};
@@ -128,6 +128,20 @@ fn feel_update(st: &mut CharState, f: &Fighter, dt: f32, tn: &Tuning) -> (f32, f
     let pitch = (st.acc_f / 60.0).clamp(-1.0, 1.0) * 0.17 * lean_k + land_w.min(1.5) * 0.12 + windup * 0.12;
     let roll = (st.acc_s / 40.0).clamp(-1.0, 1.0) * 0.2 * lean_k;
     (pitch, roll)
+}
+
+/// The throw's three parts from its progress (0..1): pulling the hand in across the chest,
+/// whipping it out, and bringing it back to the ready hold. Each 0..1.
+fn throw_phases(tp: f32) -> (f32, f32, f32) {
+    let smooth = |x: f32| {
+        let x = x.clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    };
+    let pull = smooth(tp / 0.15);
+    let w = ((tp - 0.12) / 0.43).clamp(0.0, 1.0);
+    let whip = 1.0 - (1.0 - w).powi(3);
+    let back = smooth((tp - 0.72) / 0.28);
+    (pull, whip, back)
 }
 
 /// What a posed character gives back to the renderer.
@@ -368,6 +382,24 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
     let to_ours = |v: Vec3| v * s;
     let gpos = |pose: &Vec<Trs>, n: usize| -> Vec3 { to_ours(rig.globals(pose)[n].w_axis.truncate()) };
 
+    // ---- throwing stars: how far through the throw (0..1), and the body twisting into it
+    let throw_p = if alive_upper && f.weapon == Weapon::Shuriken && f.throw_t > 0.0 {
+        let total = if f.throw_fan { FAN_THROW_TIME } else { THROW_TIME };
+        Some((1.0 - f.throw_t / total).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    let phases = throw_p.map(throw_phases);
+    if let Some((pull, whip, back)) = phases {
+        // wound up to the left, then the chest whips round to the right as the arm goes out
+        let (from, to) = if f.throw_fan { (-0.5, 0.45) } else { (-0.35, 0.3) };
+        let twist = (from * pull + (to - from) * whip) * (1.0 - back);
+        for (bone, share) in [(b.spine2, 0.4), (b.spine3, 0.6)] {
+            let g = rig.globals(&pose);
+            rig.rotate_global(&mut pose, &g, bone, ours(rig, Vec3::Y, twist * share));
+        }
+    }
+
     // ---- arms
     let aim = gv(look_dir(0.0, f.pitch.clamp(-1.3, 1.3)));
     let sh_r = gpos(&pose, b.up_r);
@@ -400,6 +432,8 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
             let down = Vec3::NEG_Y;
             let (hr, hl) = match f.weapon {
                 Weapon::Revolver => (sh_r + aim * reach * 0.9 - side * 0.06, None),
+                // throwing stars: one hand, drawn back a little, ready to flick
+                Weapon::Shuriken => (sh_r + aim * reach * 0.45 - Vec3::Y * 0.16 + side * 0.02, None),
                 // the hand cannon: both hands on it
                 Weapon::HandCannon => {
                     let hr = sh_r + aim * reach * 0.88 - side * 0.1;
@@ -420,6 +454,23 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
             };
             let reload = f.reload_t > 0.0;
             let hr = if reload { hr + down * 0.15 - aim * 0.05 } else { hr };
+            // the throw: the hand starts tucked in across the chest and whips out forward and
+            // to the side (the fan sweeps wider and flatter), elbow leading
+            let (hr, pole_r) = match phases {
+                Some((pull, whip, back)) => {
+                    // tucked in at the opposite side of the chest, then whipped out to a straight
+                    // arm in front and to the side, then back to the ready hold
+                    let (start, end) = if f.throw_fan {
+                        (chest - side * 0.26 + aim * 0.16 + Vec3::Y * 0.04, sh_r + aim * reach * 0.8 + side * reach * 0.5)
+                    } else {
+                        (chest - side * 0.2 + aim * 0.12 + Vec3::Y * 0.06, sh_r + aim * reach * 0.97 + side * reach * 0.2 + Vec3::Y * 0.03)
+                    };
+                    let arc = aim * (0.12 * (whip * PI).sin());
+                    let p = hr.lerp(start, pull).lerp(end, whip) + arc;
+                    (p.lerp(hr, back), sh_r + Vec3::new(0.7, -0.25, 0.05))
+                }
+                None => (hr, pole_r),
+            };
             rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(hr), to_model(pole_r));
             if let Some(hl) = hl {
                 let hl = if reload { hr + Vec3::new(-0.12, 0.05, 0.0) } else { hl };
@@ -545,6 +596,44 @@ mod pose_tests {
             assert!(p.weapon.z.dot(f.fwd()) > 0.9, "weapon should point where the fighter faces");
             assert!((p.hand - v3(0.0, 0.0, 0.0)).dot(f.fwd()) > 0.0, "hand should be in front");
             println!("{:?} yaw {:.2}: hand ({:.2},{:.2},{:.2}) weapon z ({:.2},{:.2},{:.2}) fwd ({:.2},{:.2})", w, yaw, p.hand.x, p.hand.y, p.hand.z, p.weapon.z.x, p.weapon.z.y, p.weapon.z.z, f.fwd().x, f.fwd().z);
+        }
+    }
+
+    #[test]
+    fn stars_are_thrown_from_the_chest_outwards() {
+        let rig = Rig::load().unwrap();
+        for fan in [false, true] {
+            let mut f = Fighter::new("t", 0, true);
+            f.present = true;
+            f.alive = true;
+            f.yaw = 0.0;
+            f.loadout.gun1 = Weapon::Shuriken;
+            f.cur = 1;
+            f.weapon = Weapon::Shuriken;
+            f.throw_fan = fan;
+            let total = if fan { FAN_THROW_TIME } else { THROW_TIME };
+            let right = v3(1.0, 0.0, 0.0); // yaw 0 faces +z; the right hand side is +x
+            let mut st = CharState::new();
+            let mut at = |t_left: f32, st: &mut CharState, k: f32| {
+                f.throw_t = t_left;
+                let mut p = None;
+                for j in 0..4 {
+                    p = animate(&rig, st, &f, V3::ZERO, k + j as f32 * 0.001, &Tuning::default());
+                }
+                p.unwrap()
+            };
+            // tucked in just after the start, fully out a little past the middle
+            let start = at(total * 0.86, &mut st, 1.0);
+            let end = at(total * 0.38, &mut st, 2.0);
+            let back = at(0.001, &mut st, 3.0);
+            assert!((back.hand - end.hand).len() > 0.15, "fan {fan}: and back to the ready hold");
+            let chest = (start.hit.caps[3].a + start.hit.caps[3].b) * 0.5;
+            // starts tucked in near the middle of the chest, ends out to the right and in front
+            assert!((start.hand - chest).dot(right) < 0.12, "fan {fan}: starts across the chest: {:?} vs chest {:?}", start.hand, chest);
+            assert!(end.hand.dot(right) > start.hand.dot(right) + 0.2, "fan {fan}: the arm goes outwards: {:?} -> {:?}", start.hand, end.hand);
+            assert!(end.hand.z > chest.z + 0.2, "fan {fan}: and forwards: hand z {} chest z {}", end.hand.z, chest.z);
+            // the hit shapes follow the arm (stars leave from that hand)
+            assert!((end.hit.caps[8].b - end.hand).len() < 0.05);
         }
     }
 }

@@ -1,4 +1,4 @@
-﻿use crate::game::{CHARGE_TIME, GUARD_MAX, Game, Input, KICK_RANGE, SCOPE_IN, Weapon};
+﻿use crate::game::{CHARGE_TIME, GUARD_MAX, Game, Input, KICK_RANGE, SCOPE_IN, STAR_SPEED, Weapon};
 use crate::math::*;
 
 /// A simple practice opponent.
@@ -84,7 +84,11 @@ impl Bot {
         };
         let en = &g.f[ti];
         let s = self.skill;
-        let lead = 0.05 + 0.12 * s;
+        let mut lead = 0.05 + 0.12 * s;
+        if me.weapon == Weapon::Shuriken {
+            // stars take a moment to arrive: aim where they'll be
+            lead += (g.f[ti].pos - me.pos).len() / STAR_SPEED * (0.5 + 0.5 * s);
+        }
         let target = if en.alive { en.chest() + v3(0.0, 0.1, 0.0) + en.vel * lead } else { en.pos };
         self.err_t -= dt;
         if self.err_t <= 0.0 {
@@ -130,6 +134,9 @@ impl Bot {
                     Weapon::HandCannon => {
                         if dist > 6.0 && dist < 26.0 { 2.1 } else { 0.9 }
                     }
+                    Weapon::Shuriken => {
+                        if dist < 18.0 { 2.2 } else { 0.5 }
+                    }
                     _ => {
                         if dist > 9.0 { 2.0 } else { 1.0 }
                     }
@@ -167,6 +174,7 @@ impl Bot {
                     Weapon::Rocket => 11.0,
                     Weapon::Sniper => 22.0,
                     Weapon::HandCannon => 12.0,
+                    Weapon::Shuriken => 8.0,
                     _ => 14.0,
                 };
                 inp.fwd = if dist > pref + 3.0 { 1.0 } else if dist < pref - 3.0 { -0.7 } else { 0.0 };
@@ -291,6 +299,15 @@ impl Bot {
                         inp.fwd = -0.6;
                     }
                 }
+                Weapon::Shuriken => {
+                    // up close: fan them; otherwise bursts
+                    let thresh = 0.06 + 0.08 * (1.0 - s);
+                    if dist < 5.0 && aim_off < 0.3 && self.rng.chance(dt * (1.0 + 3.0 * s)) {
+                        inp.guard = true;
+                    } else if aim_off < thresh && self.rng.chance(dt * (3.0 + 5.0 * s)) {
+                        inp.fire = true;
+                    }
+                }
                 Weapon::Sniper => {
                     // scope in, then take the shot once the scope is up
                     if dist > 4.0 {
@@ -303,7 +320,9 @@ impl Bot {
                 }
                 _ => {
                     let thresh = 0.05 + 0.08 * (1.0 - s);
-                    if aim_off < thresh && self.rng.chance(dt * (3.0 + 6.0 * s)) {
+                    // pistols: tap, wait for the aim to settle (better bots wait longer)
+                    let settled = me.weapon.spam().0 <= 0.0 || me.spread() < 0.02 + 0.05 * (1.0 - s);
+                    if aim_off < thresh && settled && self.rng.chance(dt * (3.0 + 6.0 * s)) {
                         inp.fire = true;
                     }
                 }

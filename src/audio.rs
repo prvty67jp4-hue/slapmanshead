@@ -93,6 +93,8 @@ fn props(s: Sfx) -> Props {
         Sfx::Deflect => pp(clips!["clang_2.ogg", "clang_1.ogg"], 0.9, 22.0, 1.55),
         Sfx::ChargeReady => pp(clips!["switch_blade.ogg"], 0.65, 8.0, 1.6),
         Sfx::Slam => pp(clips!["boom_crunch.ogg", "boom_2.ogg"], 0.95, 28.0, 0.8),
+        // a throwing star: a short, high, thin whip through the air
+        Sfx::Shuriken => pp(clips!["swing_1.wav", "swing_3.wav"], 0.5, 10.0, 1.75),
     }
 }
 
@@ -219,7 +221,7 @@ pub struct Audio {
 }
 
 /// Every sound, in the order of `Sfx`.
-pub const ALL: [Sfx; 47] = [
+pub const ALL: [Sfx; 48] = [
     Sfx::Shotgun,
     Sfx::Revolver,
     Sfx::Smg,
@@ -267,6 +269,7 @@ pub const ALL: [Sfx; 47] = [
     Sfx::Deflect,
     Sfx::ChargeReady,
     Sfx::Slam,
+    Sfx::Shuriken,
 ];
 
 fn mix_into(m: &Arc<Mutex<Mixer>>, frames: usize, channels: usize, rate: f32, mut write: impl FnMut(usize, f32)) {
