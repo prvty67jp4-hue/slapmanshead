@@ -12,7 +12,7 @@ pub struct Bot {
     err: V3,
     err_t: f32,
     choose_t: f32,
-    want: Weapon,
+    want: usize,
     last_pos: V3,
     stuck_t: f32,
     guard_t: f32,
@@ -36,7 +36,7 @@ impl Bot {
             err: V3::ZERO,
             err_t: 0.0,
             choose_t: 0.0,
-            want: Weapon::Revolver,
+            want: 1,
             last_pos: V3::ZERO,
             stuck_t: 0.0,
             guard_t: 0.0,
@@ -103,22 +103,34 @@ impl Bot {
         self.choose_t -= dt;
         if self.choose_t <= 0.0 {
             self.choose_t = 0.6 + self.rng.f() * 0.6;
-            let sword_range = 3.6 + self.style * 4.0;
-            self.want = if dist < sword_range {
-                Weapon::Sword
-            } else if dist < 10.0 && me.mag[1] > 0 {
-                Weapon::Shotgun
-            } else {
-                Weapon::Revolver
+            let sword_range = me.loadout.melee.melee_range() + 0.8 + self.style * 4.0;
+            // how well each gun suits this distance
+            let suit = |w: Weapon| -> f32 {
+                match w {
+                    Weapon::Shotgun | Weapon::Smg => {
+                        if dist < 12.0 { 2.0 } else { 0.5 }
+                    }
+                    Weapon::Rocket => {
+                        if dist > 5.0 && dist < 22.0 { 1.6 } else { 0.3 }
+                    }
+                    _ => {
+                        if dist > 9.0 { 2.0 } else { 1.0 }
+                    }
+                }
             };
-            if self.want != Weapon::Sword && me.mag[self.want as usize] == 0 && me.reload_t <= 0.0 {
-                // empty gun: pick the other one
-                self.want = if self.want == Weapon::Shotgun { Weapon::Revolver } else { Weapon::Shotgun };
-            }
+            self.want = if dist < sword_range {
+                0
+            } else {
+                let (a, b) = (me.slot_weapon(1), me.slot_weapon(2));
+                let sa = suit(a) * if me.mag[1] > 0 { 1.0 } else { 0.2 };
+                let sb = suit(b) * if me.mag[2] > 0 { 1.0 } else { 0.2 };
+                if sa >= sb { 1 } else { 2 }
+            };
         }
-        if me.weapon != self.want {
+        if me.cur != self.want {
             inp.select = Some(self.want as u8);
         }
+        let melee = me.weapon.is_melee();
 
         // movement
         self.strafe_t -= dt;
@@ -129,11 +141,15 @@ impl Bot {
         let fwd = yaw_fwd(inp.yaw);
         let _ = fwd;
         if visible {
-            if me.weapon == Weapon::Sword {
+            if melee {
                 inp.fwd = 1.0;
                 inp.right = self.strafe * 0.35;
             } else {
-                let pref = if me.weapon == Weapon::Shotgun { 6.0 } else { 13.0 };
+                let pref = match me.weapon {
+                    Weapon::Shotgun | Weapon::Smg => 6.0,
+                    Weapon::Rocket => 11.0,
+                    _ => 14.0,
+                };
                 inp.fwd = if dist > pref + 3.0 { 1.0 } else if dist < pref - 3.0 { -0.7 } else { 0.0 };
                 inp.right = self.strafe;
             }
@@ -167,7 +183,7 @@ impl Bot {
         if self.dash_t <= 0.0 && visible {
             self.dash_t = 1.5 + self.rng.f() * (3.5 - 2.0 * s);
             inp.dash = true;
-            if me.weapon == Weapon::Sword && dist > 3.0 {
+            if melee && dist > 3.0 {
                 inp.fwd = 1.0;
                 inp.right = 0.0;
             }
@@ -176,10 +192,10 @@ impl Bot {
         // attacking
         if visible && en.alive {
             match me.weapon {
-                Weapon::Sword => {
+                _ if melee => {
                     let facing_me = en.fwd().dot((me.pos - en.pos).flat().norm()) > 0.8;
                     self.guard_t -= dt;
-                    if en.weapon != Weapon::Sword && facing_me && dist > 3.0 && self.rng.chance(dt * 2.5 * s) {
+                    if !en.weapon.is_melee() && facing_me && dist > 3.0 && self.rng.chance(dt * 2.5 * s) {
                         self.guard_t = 0.4 + self.rng.f() * 0.6;
                     }
                     if en.slashing() && dist < 3.2 && self.rng.chance(dt * 6.0 * s) {
@@ -187,7 +203,7 @@ impl Bot {
                     }
                     if self.guard_t > 0.0 {
                         inp.guard = true;
-                    } else if dist < 2.8 && aim_off < 0.6 {
+                    } else if dist < me.weapon.melee_range() && aim_off < 0.6 {
                         inp.fire_pressed = self.rng.chance(dt * (4.0 + 6.0 * s));
                     }
                 }
@@ -198,11 +214,15 @@ impl Bot {
                     }
                 }
             }
-            if dist > 8.0 && dist < 18.0 && me.grenades > 0 && self.rng.chance(dt * 0.12) {
-                inp.grenade = true;
+            if me.loadout.item == 2 && dist > 8.0 && dist < 18.0 && me.items > 0 && self.rng.chance(dt * 0.12) {
+                inp.item = true;
             }
-        } else if me.weapon != Weapon::Sword && me.mag[me.weapon as usize] < me.weapon.mag() && self.rng.chance(dt) {
+        } else if !melee && me.mag[me.cur] < me.weapon.mag() && self.rng.chance(dt) {
             inp.reload = true;
+        }
+        // patch up when hurt
+        if me.items > 0 && ((me.loadout.item == 0 && me.hp < 45.0) || (me.loadout.item == 1 && me.ap < 10.0)) && self.rng.chance(dt * 2.0) {
+            inp.item = true;
         }
         inp
     }

@@ -1,4 +1,4 @@
-//! UDP lobby for up to 8 players. The host is the hub: every player sends its own fighter and
+﻿//! UDP lobby for up to 8 players. The host is the hub: every player sends its own fighter and
 //! events to the host, and the host sends everyone the whole match (players, scores, fighters and
 //! everybody else's events). Each player simulates its own fighter; hits are applied by the victim;
 //! the host keeps the scores.
@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Instant;
 
-const MAGIC: [u8; 4] = *b"DRA3";
+const MAGIC: [u8; 4] = *b"DRA4";
 const K_HELLO: u8 = 1;
 const K_STATE: u8 = 2;
 const K_HOST: u8 = 3;
@@ -110,6 +110,7 @@ pub struct FState {
     pub hurt_t: f32,
     pub recoil: f32,
     pub wall_n: V3,
+    pub loadout: [u8; 4],
 }
 
 fn write_fstate(w: &mut W, f: &Fighter) {
@@ -127,6 +128,9 @@ fn write_fstate(w: &mut W, f: &Fighter) {
     w.f(f.hurt_t);
     w.f(f.recoil);
     w.v(f.wall.map_or(V3::ZERO, |wr| wr.normal));
+    for b in f.loadout.to_bytes() {
+        w.u8(b);
+    }
 }
 
 fn read_fstate(r: &mut R) -> Option<FState> {
@@ -145,6 +149,7 @@ fn read_fstate(r: &mut R) -> Option<FState> {
         hurt_t: r.f()?,
         recoil: r.f()?,
         wall_n: r.v()?,
+        loadout: [r.u8()?, r.u8()?, r.u8()?, r.u8()?],
     })
 }
 
@@ -157,7 +162,7 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.u8(*wp);
             w.u8(*spark);
         }
-        Ev::Hit { victim, dmg, knock, stun, head, w: wp } => {
+        Ev::Hit { victim, dmg, knock, stun, head, w: wp, o, dir } => {
             w.u8(2);
             w.u8(*victim);
             w.f(*dmg);
@@ -165,28 +170,57 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.f(*stun);
             w.u8(*head as u8);
             w.u8(*wp);
+            w.v(*o);
+            w.v(*dir);
         }
-        Ev::Grenade { p, v } => {
+        Ev::Grenade { p, v, kind } => {
             w.u8(3);
             w.v(*p);
             w.v(*v);
+            w.u8(*kind);
         }
-        Ev::Died { killer, w: wp } => {
+        Ev::Died { victim, killer, w: wp } => {
             w.u8(4);
+            w.u8(*victim);
             w.u8(*killer);
             w.u8(*wp);
         }
+        Ev::Chat { text } => {
+            w.u8(5);
+            let b = text.as_bytes();
+            let n = b.len().min(200);
+            w.u8(n as u8);
+            w.0.extend_from_slice(&b[..n]);
+        }
+        Ev::Item { kind } => {
+            w.u8(6);
+            w.u8(*kind);
+        }
+        Ev::Ready => w.u8(7),
+        Ev::Vote => w.u8(8),
     }
 }
 
 fn read_ev(r: &mut R) -> Option<Ev> {
     Some(match r.u8()? {
         1 => Ev::Shot { o: r.v()?, e: r.v()?, w: r.u8()?, spark: r.u8()? },
-        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, 200.0), knock: r.v()?, stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()? },
-        3 => Ev::Grenade { p: r.v()?, v: r.v()? },
-        4 => Ev::Died { killer: r.u8()?, w: r.u8()? },
+        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, 200.0), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()? },
+        3 => Ev::Grenade { p: r.v()?, v: clamp_v(r.v()?, 40.0), kind: r.u8()?.min(1) },
+        4 => Ev::Died { victim: r.u8()?, killer: r.u8()?, w: r.u8()? },
+        5 => {
+            let n = r.u8()? as usize;
+            Ev::Chat { text: String::from_utf8_lossy(r.take(n)?).chars().take(100).collect() }
+        }
+        6 => Ev::Item { kind: r.u8()?.min(1) },
+        7 => Ev::Ready,
+        8 => Ev::Vote,
         _ => return None,
     })
+}
+
+fn clamp_v(v: V3, max: f32) -> V3 {
+    let l = v.len();
+    if l > max { v * (max / l) } else { v }
 }
 
 pub struct RosterEntry {
@@ -195,6 +229,9 @@ pub struct RosterEntry {
     pub team: u8,
     pub kills: i32,
     pub deaths: i32,
+    pub ping: u16,
+    pub ready: bool,
+    pub vote: bool,
 }
 
 /// Everything the host tells a player each update.
@@ -206,6 +243,10 @@ pub struct HostMsg {
     pub target: u16,
     pub team_score: [u16; 2],
     pub number: u32,
+    /// What the host thinks of you (it keeps everyone's health).
+    pub you_hp: f32,
+    pub you_ap: f32,
+    pub you_alive: bool,
     pub roster: Vec<RosterEntry>,
     pub fighters: Vec<(usize, FState)>,
     pub events: Vec<(usize, Ev)>,
@@ -230,6 +271,7 @@ struct Peer {
     addr: SocketAddr,
     slot: usize,
     last_recv: Instant,
+    ping: f32,
 }
 
 pub struct Net {
@@ -246,6 +288,8 @@ pub struct Net {
     pub port: u16,
     pub last_recv: Instant,
     pub my_slot: usize,
+    start: Instant,
+    echo: f32,
 }
 
 impl Net {
@@ -288,7 +332,14 @@ impl Net {
             port,
             last_recv: Instant::now(),
             my_slot: 0,
+            start: Instant::now(),
+            echo: 0.0,
         }
+    }
+
+    /// (slot, ping in ms) for every player connected to this host.
+    pub fn pings(&self) -> Vec<(usize, u16)> {
+        self.peers.iter().map(|p| (p.slot, (p.ping * 1000.0).round().min(9999.0) as u16)).collect()
     }
 
     pub fn player_count(&self) -> usize {
@@ -365,7 +416,7 @@ impl Net {
                     self.send_to(&w.0, from);
                     return;
                 };
-                self.peers.push(Peer { addr: from, slot, last_recv: Instant::now() });
+                self.peers.push(Peer { addr: from, slot, last_recv: Instant::now(), ping: 0.05 });
                 self.last_in[slot] = 0;
                 self.out.retain(|e| e.0 as usize != slot);
                 out.push(Incoming::Join { slot, name });
@@ -374,6 +425,11 @@ impl Net {
                 let Some(i) = idx else { return };
                 self.peers[i].last_recv = Instant::now();
                 let slot = self.peers[i].slot;
+                let Some(echo) = r.f() else { return };
+                if echo > 0.0 {
+                    let rtt = (self.start.elapsed().as_secs_f32() - echo).clamp(0.0, 2.0);
+                    self.peers[i].ping = self.peers[i].ping * 0.85 + rtt * 0.15;
+                }
                 let Some(st) = read_fstate(r) else { return };
                 let mut pairs = Vec::new();
                 if let Some(n) = r.u8() {
@@ -387,8 +443,10 @@ impl Net {
                 for (id, ev) in pairs {
                     if id > self.last_in[slot] {
                         self.last_in[slot] = id;
-                        // pass it on to everyone else
-                        self.out.push_back((slot as u8, id, Instant::now(), ev.clone()));
+                        // pass on what others need to see; hit claims stay here until checked
+                        if matches!(ev, Ev::Shot { .. } | Ev::Grenade { .. } | Ev::Chat { .. }) {
+                            self.out.push_back((slot as u8, id, Instant::now(), ev.clone()));
+                        }
                         fresh.push(ev);
                     }
                 }
@@ -406,6 +464,10 @@ impl Net {
 
     fn parse_host(&mut self, r: &mut R) -> Option<HostMsg> {
         let you = (r.u8()? as usize).min(MAX_PLAYERS - 1);
+        self.echo = r.f()?;
+        let you_hp = r.f()?;
+        let you_ap = r.f()?;
+        let you_alive = r.u8()? == 1;
         let mode = Mode::from_u8(r.u8()?);
         let phase = Phase::from_u8(r.u8()?);
         let timer = r.f()?;
@@ -420,7 +482,9 @@ impl Net {
             let team = r.u8()?;
             let kills = r.i16()? as i32;
             let deaths = r.i16()? as i32;
-            roster.push(RosterEntry { slot, name, team, kills, deaths });
+            let ping = r.u16()?;
+            let flags = r.u8()?;
+            roster.push(RosterEntry { slot, name, team, kills, deaths, ping, ready: flags & 1 != 0, vote: flags & 2 != 0 });
         }
         // a slot taken by someone new starts its event count again
         for e in &roster {
@@ -458,7 +522,7 @@ impl Net {
                 events.push((origin, ev));
             }
         }
-        Some(HostMsg { you, mode, phase, timer, target, team_score, number, roster, fighters, events })
+        Some(HostMsg { you, mode, phase, timer, target, team_score, number, you_hp, you_ap, you_alive, roster, fighters, events })
     }
 
     pub fn send_hello(&mut self, name: &str, dt: f32) {
@@ -520,6 +584,11 @@ impl Net {
             for p in &self.peers {
                 let mut w = W::head(K_HOST);
                 w.u8(p.slot as u8);
+                w.f(self.start.elapsed().as_secs_f32());
+                let you = &g.f[p.slot];
+                w.f(you.hp);
+                w.f(you.ap);
+                w.u8(you.alive as u8);
                 w.u8(g.mt.mode as u8);
                 w.u8(g.mt.phase as u8);
                 w.f(g.mt.timer);
@@ -536,6 +605,8 @@ impl Net {
                     w.u8(f.team);
                     w.i16(f.kills.clamp(-999, 9999) as i16);
                     w.i16(f.deaths.clamp(0, 9999) as i16);
+                    w.u16(f.ping_ms);
+                    w.u8((f.ready as u8) | ((f.vote as u8) << 1));
                 }
                 let others: Vec<usize> = present.iter().copied().filter(|&s| s != p.slot).collect();
                 w.u8(others.len() as u8);
@@ -554,6 +625,7 @@ impl Net {
             }
         } else if let Some(h) = self.host_addr {
             let mut w = W::head(K_STATE);
+            w.f(self.echo);
             write_fstate(&mut w, &g.f[g.local]);
             let evs = self.pick_events(None);
             w.u8(evs.len() as u8);
@@ -567,7 +639,8 @@ impl Net {
 }
 
 /// Copy a received state onto a fighter that lives on another computer.
-pub fn apply_remote(f: &mut Fighter, s: &FState) {
+/// On the host (uthority), health and life stay the host's: a player can only come back to life once its respawn time is up.
+pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool) {
     f.net_pos = s.pos;
     f.net_age = 0.0;
     if (f.pos - s.pos).len() > 6.0 {
@@ -577,10 +650,30 @@ pub fn apply_remote(f: &mut Fighter, s: &FState) {
     f.vel = s.vel;
     f.yaw = s.yaw;
     f.pitch = s.pitch;
-    f.hp = s.hp;
-    f.ap = s.ap;
     f.weapon = Weapon::from_u8(s.weapon);
-    let alive = s.flags & 1 != 0;
+    let lo = Loadout::from_bytes(s.loadout);
+    if lo != f.loadout {
+        f.loadout = lo;
+        f.items = f.items.min(2);
+    }
+    let reported = s.flags & 1 != 0;
+    let alive = if authority {
+        if f.alive {
+            true
+        } else if reported && f.respawn_t <= 0.5 {
+            // back from the dead: fresh health and items
+            f.hp = MAX_HP;
+            f.ap = MAX_AP;
+            f.items = 2;
+            true
+        } else {
+            false
+        }
+    } else {
+        f.hp = s.hp;
+        f.ap = s.ap;
+        reported
+    };
     if f.alive && !alive {
         f.death_t = 0.0;
     }

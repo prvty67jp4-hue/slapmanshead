@@ -715,9 +715,9 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
         (root.mul(&M3::rot_z(0.3)), root.mul(&M3::rot_z(-0.3)), 0.2, 0.2)
     } else {
         match f.weapon {
-            Weapon::Sword => {
+            w if w.is_melee() => {
                 if f.slash_t > 0.0 {
-                    let p = 1.0 - f.slash_t / SLASH_DUR;
+                    let p = 1.0 - f.slash_t / w.slash_dur();
                     (sword_arm(&root, f.slash_idx, p), root.mul(&M3::rot_x(-0.4)).mul(&M3::rot_z(-0.25)), 0.15, 0.6)
                 } else if f.guard {
                     (root.mul(&M3::rot_y(-0.7)).mul(&M3::rot_x(-PI * 0.5 + 0.2)), root.mul(&M3::rot_y(0.5)).mul(&M3::rot_x(-PI * 0.5 + 0.3)), 0.3, 0.9)
@@ -759,27 +759,37 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
     let wf = fore_r.mul(&M3::rot_x(PI * 0.5));
     let hand = hand_r;
     let steel = lin([200, 206, 218]);
+    let wood = lin([70, 46, 30]);
+    let gunmetal = lin([60, 62, 70]);
     match f.weapon {
-        Weapon::Sword => {
+        w if w.is_melee() => {
+            // (blade half-length, blade half-width, blade centre, guard width)
+            let (len, wid, guard) = match w {
+                Weapon::Dagger => (0.2, 0.025, 0.04),
+                Weapon::Greatsword => (0.78, 0.06, 0.12),
+                _ => (0.56, 0.03, 0.06),
+            };
             mb.obox(hand, &wf, v3(0.022, 0.022, 0.13), lin([30, 22, 22]), -1.0, 0.2);
-            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.14)), &wf, v3(0.06, 0.02, 0.02), lin([210, 170, 70]), -1.0, 1.0);
-            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.72)), &wf, v3(0.008, 0.03, 0.56), steel, -1.0, 2.5);
+            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.14)), &wf, v3(guard, 0.02, 0.02), lin([210, 170, 70]), -1.0, 1.0);
+            let blade = if w == Weapon::Greatsword { lin([170, 176, 190]) } else { steel };
+            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.16 + len)), &wf, v3(if w == Weapon::Greatsword { 0.015 } else { 0.008 }, wid, len), blade, -1.0, 2.5);
             if f.slash_t > 0.0 && f.alive {
-                let p = 1.0 - f.slash_t / SLASH_DUR;
+                let p = 1.0 - f.slash_t / w.slash_dur();
                 let steps = 8;
                 let mut prev: Option<(V3, V3)> = None;
                 let shoulder = at(v3(0.23, 1.4, 0.0));
+                let tip = 0.16 + len * 2.0 + 0.05;
                 for k in 0..=steps {
                     let q = (p - 0.4 * (1.0 - k as f32 / steps as f32)).max(0.0);
                     let ra = sword_arm(&root, f.slash_idx, q);
                     let fa = ra.mul(&M3::rot_x(-bend_r));
                     let hnd = shoulder + ra.apply(v3(0.0, -0.28, 0.0)) + fa.apply(v3(0.0, -0.26, 0.0));
                     let w2 = fa.mul(&M3::rot_x(PI * 0.5));
-                    let a0 = hnd + w2.apply(v3(0.0, 0.0, 0.35));
-                    let a1 = hnd + w2.apply(v3(0.0, 0.0, 1.3));
+                    let a0 = hnd + w2.apply(v3(0.0, 0.0, tip * 0.3));
+                    let a1 = hnd + w2.apply(v3(0.0, 0.0, tip));
                     if let Some((b0, b1)) = prev {
                         let al = 0.05 + 0.45 * k as f32 / steps as f32;
-                        let c = if f.slash_idx >= 2 { lina([255, 180, 90], al) } else { lina([170, 210, 255], al) };
+                        let c = if f.slash_idx >= 2 || w == Weapon::Greatsword { lina([255, 180, 90], al) } else { lina([170, 210, 255], al) };
                         let n = (b1 - b0).cross(a0 - b0).norm();
                         add_mb.quad([b0, b1, a1, a0], n, [[0.5, 0.5]; 4], c, [-1.0, 2.0, 1.0, 0.0]);
                     }
@@ -787,13 +797,13 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
                 }
             }
             if f.guard {
-                let c = hand + wf.apply(v3(0.0, 0.0, 0.6));
+                let c = hand + wf.apply(v3(0.0, 0.0, 0.2 + len));
                 add_mb.billboard(cam, c, 0.5 + (time * 20.0).sin().abs() * 0.08, lina([90, 150, 255], 0.5));
             }
         }
         Weapon::Shotgun => {
-            mb.obox(hand + wf.apply(v3(0.0, 0.06, 0.05)), &wf, v3(0.04, 0.06, 0.25), lin([70, 46, 30]), 4.0, 0.3);
-            mb.tube(hand + wf.apply(v3(0.0, 0.11, 0.0)), hand + wf.apply(v3(0.0, 0.11, 0.7)), 0.03, 0.03, wf.x, 1.0, lin([60, 62, 70]), -1.0, 1.5);
+            mb.obox(hand + wf.apply(v3(0.0, 0.06, 0.05)), &wf, v3(0.04, 0.06, 0.25), wood, 4.0, 0.3);
+            mb.tube(hand + wf.apply(v3(0.0, 0.11, 0.0)), hand + wf.apply(v3(0.0, 0.11, 0.7)), 0.03, 0.03, wf.x, 1.0, gunmetal, -1.0, 1.5);
             mb.tube(hand + wf.apply(v3(0.0, 0.06, 0.25)), hand + wf.apply(v3(0.0, 0.06, 0.55)), 0.035, 0.035, wf.x, 1.0, lin([80, 56, 36]), 4.0, 0.3);
         }
         Weapon::Revolver => {
@@ -801,9 +811,24 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
             mb.ellipsoid(hand + wf.apply(v3(0.0, 0.1, 0.07)), &wf, v3(0.035, 0.035, 0.05), lin([90, 92, 100]), -1.0, 1.5, 0.0);
             mb.tube(hand + wf.apply(v3(0.0, 0.11, 0.07)), hand + wf.apply(v3(0.0, 0.11, 0.32)), 0.018, 0.018, wf.x, 1.0, lin([120, 122, 132]), -1.0, 1.8);
         }
+        Weapon::Smg => {
+            mb.obox(hand + wf.apply(v3(0.0, 0.09, 0.12)), &wf, v3(0.035, 0.05, 0.18), lin([40, 42, 48]), -1.0, 1.0);
+            mb.obox(hand + wf.apply(v3(0.0, -0.04, 0.12)), &wf, v3(0.02, 0.09, 0.025), lin([30, 30, 34]), -1.0, 0.5);
+            mb.tube(hand + wf.apply(v3(0.0, 0.1, 0.28)), hand + wf.apply(v3(0.0, 0.1, 0.4)), 0.015, 0.015, wf.x, 1.0, gunmetal, -1.0, 1.5);
+        }
+        Weapon::Rifle => {
+            mb.obox(hand + wf.apply(v3(0.0, 0.06, 0.0)), &wf, v3(0.035, 0.06, 0.3), wood, 4.0, 0.3);
+            mb.tube(hand + wf.apply(v3(0.0, 0.1, 0.2)), hand + wf.apply(v3(0.0, 0.1, 0.95)), 0.018, 0.016, wf.x, 1.0, gunmetal, -1.0, 1.6);
+            mb.tube(hand + wf.apply(v3(0.0, 0.17, 0.05)), hand + wf.apply(v3(0.0, 0.17, 0.3)), 0.025, 0.025, wf.x, 1.0, lin([25, 25, 28]), -1.0, 2.0);
+        }
+        Weapon::Rocket => {
+            mb.tube(hand + wf.apply(v3(0.0, 0.12, -0.35)), hand + wf.apply(v3(0.0, 0.12, 0.55)), 0.075, 0.075, wf.x, 1.0, lin([62, 74, 58]), -1.0, 0.6);
+            mb.tube(hand + wf.apply(v3(0.0, 0.12, 0.55)), hand + wf.apply(v3(0.0, 0.12, 0.62)), 0.09, 0.09, wf.x, 1.0, lin([40, 40, 44]), -1.0, 1.0);
+            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.0)), &wf, v3(0.02, 0.06, 0.03), lin([30, 30, 34]), -1.0, 0.5);
+        }
+        _ => {}
     }
 }
-
 fn shadow_disc(mb: &mut MB, world: &World, pos: V3) {
     let gy = world.ground_below(pos + v3(0.0, 0.1, 0.0));
     let hgt = (pos.y - gy).max(0.0);
@@ -1096,6 +1121,13 @@ impl Gpu {
             shadow_disc(&mut al, &g.world, pos);
         }
         for gr in &g.grenades {
+            if gr.kind == 1 {
+                let d = gr.vel.norm();
+                op.tube(gr.pos - d * 0.35, gr.pos + d * 0.2, 0.06, 0.04, V3::UP.cross(d), 1.0, lin([70, 80, 64]), -1.0, 0.8);
+                ad.billboard(cam, gr.pos - d * 0.45, 0.35, lina([255, 180, 80], 0.9));
+                al.billboard(cam, gr.pos - d * 0.9, 0.3, lina([160, 160, 160], 0.4));
+                continue;
+            }
             op.ellipsoid(gr.pos, &M3::rot_y(gr.fuse * 9.0), v3(0.1, 0.11, 0.1), lin([45, 52, 45]), -1.0, 1.0, 0.0);
             if (gr.fuse * 10.0).sin() > 0.0 {
                 ad.billboard(cam, gr.pos + v3(0.0, 0.13, 0.0), 0.15, lina([255, 40, 30], 1.0));

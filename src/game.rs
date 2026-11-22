@@ -1,6 +1,7 @@
 ﻿use crate::bot::Bot;
 use crate::math::*;
 use crate::world::World;
+use std::collections::VecDeque;
 
 pub const RADIUS: f32 = 0.36;
 pub const HEIGHT: f32 = 1.8;
@@ -9,7 +10,6 @@ pub const JUMP_VEL: f32 = 9.4;
 pub const RUN_SPEED: f32 = 8.2;
 pub const MAX_HP: f32 = 100.0;
 pub const MAX_AP: f32 = 50.0;
-pub const SLASH_DUR: f32 = 0.36;
 pub const TICK: f32 = 1.0 / 120.0;
 pub const MAX_PLAYERS: usize = 8;
 pub const RESPAWN_TIME: f32 = 3.0;
@@ -18,58 +18,195 @@ pub const MATCH_TIME: f32 = 600.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Weapon {
-    Sword = 0,
-    Shotgun = 1,
-    Revolver = 2,
+    Dagger = 0,
+    Katana = 1,
+    Greatsword = 2,
+    Shotgun = 3,
+    Revolver = 4,
+    Smg = 5,
+    Rifle = 6,
+    Rocket = 7,
+}
+
+/// How a gun shoots.
+pub struct GunStats {
+    pub pellets: usize,
+    pub spread_still: f32,
+    pub spread_moving: f32,
+    pub dmg: f32,
+    pub range: f32,
+    pub head: f32,
+    pub knock: f32,
 }
 
 impl Weapon {
+    pub const MELEE: [Weapon; 3] = [Weapon::Dagger, Weapon::Katana, Weapon::Greatsword];
+    pub const GUNS: [Weapon; 5] = [Weapon::Shotgun, Weapon::Revolver, Weapon::Smg, Weapon::Rifle, Weapon::Rocket];
+
     pub fn from_u8(v: u8) -> Weapon {
         match v {
-            0 => Weapon::Sword,
-            1 => Weapon::Shotgun,
-            _ => Weapon::Revolver,
+            0 => Weapon::Dagger,
+            1 => Weapon::Katana,
+            2 => Weapon::Greatsword,
+            3 => Weapon::Shotgun,
+            4 => Weapon::Revolver,
+            5 => Weapon::Smg,
+            6 => Weapon::Rifle,
+            _ => Weapon::Rocket,
         }
     }
     pub fn name(self) -> &'static str {
         match self {
-            Weapon::Sword => "Katana",
+            Weapon::Dagger => "Dagger",
+            Weapon::Katana => "Katana",
+            Weapon::Greatsword => "Greatsword",
             Weapon::Shotgun => "Scattergun",
             Weapon::Revolver => "Revolver",
+            Weapon::Smg => "SMG",
+            Weapon::Rifle => "Rifle",
+            Weapon::Rocket => "Rocket Launcher",
         }
+    }
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Weapon::Dagger => "fast, short reach, light hits",
+            Weapon::Katana => "balanced",
+            Weapon::Greatsword => "slow, long reach, every hit breaks guards",
+            Weapon::Shotgun => "9 pellets, deadly up close",
+            Weapon::Revolver => "precise, big headshots",
+            Weapon::Smg => "hold to spray, 30 rounds",
+            Weapon::Rifle => "one heavy shot, huge headshots",
+            Weapon::Rocket => "explodes, rocket-jump with it",
+        }
+    }
+    pub fn is_melee(self) -> bool {
+        (self as u8) < 3
     }
     pub fn mag(self) -> u8 {
         match self {
-            Weapon::Sword => 0,
             Weapon::Shotgun => 5,
             Weapon::Revolver => 6,
+            Weapon::Smg => 30,
+            Weapon::Rifle => 5,
+            Weapon::Rocket => 1,
+            _ => 0,
         }
     }
     pub fn interval(self) -> f32 {
         match self {
-            Weapon::Sword => 0.0,
             Weapon::Shotgun => 0.85,
             Weapon::Revolver => 0.30,
+            Weapon::Smg => 0.075,
+            Weapon::Rifle => 1.0,
+            Weapon::Rocket => 0.9,
+            _ => 0.0,
         }
     }
     pub fn reload_time(self) -> f32 {
         match self {
-            Weapon::Sword => 0.0,
             Weapon::Shotgun => 1.9,
             Weapon::Revolver => 1.5,
+            Weapon::Smg => 1.8,
+            Weapon::Rifle => 2.2,
+            Weapon::Rocket => 2.0,
+            _ => 0.0,
+        }
+    }
+    pub fn gun(self) -> GunStats {
+        match self {
+            Weapon::Shotgun => GunStats { pellets: 9, spread_still: 0.075, spread_moving: 0.075, dmg: 7.5, range: 40.0, head: 1.5, knock: 1.1 },
+            Weapon::Smg => GunStats { pellets: 1, spread_still: 0.022, spread_moving: 0.045, dmg: 9.0, range: 80.0, head: 1.4, knock: 0.4 },
+            Weapon::Rifle => GunStats { pellets: 1, spread_still: 0.0015, spread_moving: 0.03, dmg: 48.0, range: 220.0, head: 2.0, knock: 3.0 },
+            _ => GunStats { pellets: 1, spread_still: 0.004, spread_moving: 0.018, dmg: 24.0, range: 150.0, head: 1.75, knock: 1.6 },
+        }
+    }
+    /// The most one hit can do (used by the host to throw out impossible hits).
+    pub fn max_hit(self) -> f32 {
+        match self {
+            Weapon::Dagger => 32.0 * 0.72,
+            Weapon::Katana => 32.0,
+            Weapon::Greatsword => 32.0 * 1.55,
+            Weapon::Rocket => 85.0,
+            w => {
+                let g = w.gun();
+                g.dmg * g.head
+            }
+        }
+    }
+    /// Length of one swing.
+    pub fn slash_dur(self) -> f32 {
+        match self {
+            Weapon::Dagger => 0.26,
+            Weapon::Greatsword => 0.52,
+            _ => 0.36,
+        }
+    }
+    pub fn melee_mult(self) -> f32 {
+        match self {
+            Weapon::Dagger => 0.72,
+            Weapon::Greatsword => 1.55,
+            _ => 1.0,
+        }
+    }
+    pub fn melee_range(self) -> f32 {
+        match self {
+            Weapon::Dagger => 2.3,
+            Weapon::Greatsword => 3.4,
+            _ => 2.8,
         }
     }
 }
 
-/// What killed someone, for the kill feed (0-2 weapons, 3 grenade).
-pub fn kill_tool(w: u8) -> &'static str {
-    match w {
-        0 => "Katana",
-        1 => "Scattergun",
-        2 => "Revolver",
-        3 => "Grenade",
-        _ => "?",
+pub const ITEM_NAMES: [&str; 3] = ["Medkit", "Armor Kit", "Grenades"];
+pub const ITEM_BLURBS: [&str; 3] = ["+50 health, twice a life", "+50 armor, twice a life", "two grenades a life"];
+
+/// What a player brings: a melee weapon, two guns and an item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loadout {
+    pub melee: Weapon,
+    pub gun1: Weapon,
+    pub gun2: Weapon,
+    pub item: u8,
+}
+
+impl Default for Loadout {
+    fn default() -> Self {
+        Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 2 }
     }
+}
+
+impl Loadout {
+    pub fn to_bytes(self) -> [u8; 4] {
+        [self.melee as u8, self.gun1 as u8, self.gun2 as u8, self.item]
+    }
+    /// Read and repair (a melee in the melee slot, guns in the gun slots).
+    pub fn from_bytes(b: [u8; 4]) -> Loadout {
+        let mut l = Loadout { melee: Weapon::from_u8(b[0]), gun1: Weapon::from_u8(b[1]), gun2: Weapon::from_u8(b[2]), item: b[3].min(2) };
+        if !l.melee.is_melee() {
+            l.melee = Weapon::Katana;
+        }
+        if l.gun1.is_melee() {
+            l.gun1 = Weapon::Shotgun;
+        }
+        if l.gun2.is_melee() || l.gun2 == l.gun1 {
+            l.gun2 = if l.gun1 == Weapon::Revolver { Weapon::Smg } else { Weapon::Revolver };
+        }
+        l
+    }
+    pub fn has(&self, w: Weapon) -> bool {
+        self.melee == w || self.gun1 == w || self.gun2 == w
+    }
+    pub fn random(rng: &mut Rng) -> Loadout {
+        let m = Weapon::MELEE[(rng.next_u32() % 3) as usize];
+        let a = (rng.next_u32() % 5) as usize;
+        let b = (a + 1 + (rng.next_u32() % 4) as usize) % 5;
+        Loadout { melee: m, gun1: Weapon::GUNS[a], gun2: Weapon::GUNS[b], item: (rng.next_u32() % 3) as u8 }
+    }
+}
+
+/// What killed someone, for the kill feed (weapons by number, 8 grenade).
+pub fn kill_tool(w: u8) -> &'static str {
+    if w == 8 { "Grenade" } else if w < 8 { Weapon::from_u8(w).name() } else { "?" }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -83,7 +220,7 @@ pub struct Input {
     pub guard: bool,
     pub select: Option<u8>,
     pub reload: bool,
-    pub grenade: bool,
+    pub item: bool,
     pub yaw: f32,
     pub pitch: f32,
 }
@@ -135,8 +272,13 @@ pub struct Fighter {
     pub air_dash: bool,
     pub wall: Option<WallRun>,
     pub wallruns_left: u8,
-    pub grenades: u8,
-    pub gren_cd: f32,
+    pub items: u8,
+    pub item_cd: f32,
+    pub loadout: Loadout,
+    pub cur: usize,
+    pub ready: bool,
+    pub vote: bool,
+    pub ping_ms: u16,
     pub walk_phase: f32,
     pub hurt_t: f32,
     pub stun_t: f32,
@@ -180,7 +322,7 @@ impl Fighter {
             alive: false,
             death_t: 0.0,
             on_ground: true,
-            weapon: Weapon::Revolver,
+            weapon: Weapon::Shotgun,
             mag: [0, Weapon::Shotgun.mag(), Weapon::Revolver.mag()],
             reload_t: 0.0,
             fire_cd: 0.0,
@@ -196,8 +338,13 @@ impl Fighter {
             air_dash: false,
             wall: None,
             wallruns_left: 2,
-            grenades: 2,
-            gren_cd: 0.0,
+            items: 2,
+            item_cd: 0.0,
+            loadout: Loadout::default(),
+            cur: 1,
+            ready: false,
+            vote: false,
+            ping_ms: 0,
             walk_phase: 0.0,
             hurt_t: 0.0,
             stun_t: 0.0,
@@ -226,6 +373,11 @@ impl Fighter {
         n.kills = self.kills;
         n.deaths = self.deaths;
         n.color_idx = self.color_idx;
+        n.loadout = self.loadout;
+        n.ready = self.ready;
+        n.vote = self.vote;
+        n.ping_ms = self.ping_ms;
+        n.equip();
         n.alive = true;
         n.spawn_prot = SPAWN_PROT;
         n.pos = p;
@@ -233,6 +385,25 @@ impl Fighter {
         n.prev_pos = p;
         n.yaw = yaw;
         *self = n;
+    }
+
+    pub fn slot_weapon(&self, i: usize) -> Weapon {
+        match i {
+            0 => self.loadout.melee,
+            1 => self.loadout.gun1,
+            _ => self.loadout.gun2,
+        }
+    }
+
+    /// Hand out the loadout: full magazines, item uses, first gun in hand.
+    pub fn equip(&mut self) {
+        self.loadout = Loadout::from_bytes(self.loadout.to_bytes());
+        self.mag = [0, self.loadout.gun1.mag(), self.loadout.gun2.mag()];
+        self.cur = 1;
+        self.weapon = self.loadout.gun1;
+        self.items = 2;
+        self.reload_t = 0.0;
+        self.slash_t = 0.0;
     }
 
     pub fn eye(&self) -> V3 {
@@ -306,17 +477,19 @@ pub const TEAM_NAMES: [&str; 2] = ["Red", "Blue"];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Warmup = 0,
-    Countdown = 1,
-    Fight = 2,
-    MatchOver = 3,
+    Loadout = 1,
+    Countdown = 2,
+    Fight = 3,
+    MatchOver = 4,
 }
 
 impl Phase {
     pub fn from_u8(v: u8) -> Phase {
         match v {
             0 => Phase::Warmup,
-            1 => Phase::Countdown,
-            2 => Phase::Fight,
+            1 => Phase::Loadout,
+            2 => Phase::Countdown,
+            3 => Phase::Fight,
             _ => Phase::MatchOver,
         }
     }
@@ -340,6 +513,8 @@ pub struct Grenade {
     pub vel: V3,
     pub fuse: f32,
     pub owner: usize,
+    /// 0 grenade, 1 rocket
+    pub kind: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -383,9 +558,24 @@ pub struct FeedLine {
 #[derive(Clone, Debug)]
 pub enum Ev {
     Shot { o: V3, e: V3, w: u8, spark: u8 },
-    Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8 },
-    Grenade { p: V3, v: V3 },
-    Died { killer: u8, w: u8 },
+    /// From a player: "I hit them" (the host checks it). From the host: "you were hit".
+    Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3 },
+    Grenade { p: V3, v: V3, kind: u8 },
+    /// Only the host (or the game on this computer) decides deaths.
+    Died { victim: u8, killer: u8, w: u8 },
+    Chat { text: String },
+    /// Used a medkit (0) or armor kit (1).
+    Item { kind: u8 },
+    Ready,
+    Vote,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatLine {
+    pub name: String,
+    pub color: u8,
+    pub text: String,
+    pub life: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -410,6 +600,11 @@ pub struct Game {
     pub bots: Vec<Option<Bot>>,
     pub out_events: Vec<Ev>,
     pub feed: Vec<FeedLine>,
+    pub chat: Vec<ChatLine>,
+    /// Where everyone was recently (for checking hits against the past).
+    pub history: Vec<VecDeque<(f32, V3)>>,
+    /// The loadout you'll respawn with.
+    pub my_loadout: Loadout,
     pub hitmarker: f32,
     pub hurt_flash: f32,
     pub shake: f32,
@@ -437,6 +632,7 @@ pub enum Act {
     Gun { w: Weapon },
     Slash,
     Throw,
+    Item { kind: u8 },
 }
 
 pub const BOT_NAMES: [&str; 7] = ["Ash", "Vex", "Kiro", "Nyx", "Rook", "Sable", "Juno"];
@@ -448,7 +644,7 @@ impl Game {
         let bots = (0..MAX_PLAYERS).map(|_| None).collect();
         let (phase, timer) = match kind {
             Kind::Demo => (Phase::Countdown, 0.3),
-            Kind::Offline => (Phase::Countdown, 3.0),
+            Kind::Offline => (Phase::Loadout, 120.0),
             Kind::Host | Kind::Client => (Phase::Warmup, 0.0),
         };
         Game {
@@ -465,6 +661,9 @@ impl Game {
             bots,
             out_events: Vec::new(),
             feed: Vec::new(),
+            chat: Vec::new(),
+            history: (0..MAX_PLAYERS).map(|_| VecDeque::new()).collect(),
+            my_loadout: Loadout::default(),
             hitmarker: 0.0,
             hurt_flash: 0.0,
             shake: 0.0,
@@ -485,7 +684,9 @@ impl Game {
             let s = b + 1;
             let team = (s % 2) as u8;
             g.add_player(s, BOT_NAMES[b], true, Some(skill), team);
+            g.f[s].ready = true;
         }
+        g.banner = Some(("CHOOSE YOUR LOADOUT".into(), 2.5));
         g
     }
 
@@ -510,7 +711,11 @@ impl Game {
         f.present = true;
         f.team = team;
         f.is_bot = bot_skill.is_some();
+        f.loadout = if f.is_bot { Loadout::random(&mut self.rng) } else if slot == self.local { self.my_loadout } else { Loadout::default() };
+        f.ready = f.is_bot;
+        f.equip();
         self.bots[slot] = bot_skill.map(|s| Bot::new(s, 1234 + slot as u64 * 77));
+        self.history[slot].clear();
         self.f[slot] = f;
         self.refresh_colors();
         if owned {
@@ -600,7 +805,7 @@ impl Game {
     }
 
     pub fn frozen(&self) -> bool {
-        self.mt.phase == Phase::Countdown || self.mt.phase == Phase::MatchOver
+        matches!(self.mt.phase, Phase::Loadout | Phase::Countdown | Phase::MatchOver)
     }
 
     pub fn scoring(&self) -> bool {
@@ -641,6 +846,9 @@ impl Game {
                 self.f[i].respawn_t -= dt;
                 if self.f[i].respawn_t <= 0.0 && self.mt.phase != Phase::MatchOver {
                     let (p, y) = self.pick_spawn(i);
+                    if i == self.local && !self.f[i].is_bot {
+                        self.f[i].loadout = self.my_loadout;
+                    }
                     self.f[i].respawn_at(p, y);
                     if self.f[i].is_bot {
                         if let Some(b) = self.bots[i].as_mut() {
@@ -665,22 +873,45 @@ impl Game {
                 self.do_action(i, a);
             }
             // slash hit timing
-            if self.f[i].slash_t > 0.0 && !self.f[i].slash_hit_done && self.f[i].slash_t < SLASH_DUR - 0.10 {
+            if self.f[i].slash_t > 0.0 && !self.f[i].slash_hit_done && self.f[i].slash_t < self.f[i].weapon.slash_dur() * 0.72 {
                 self.f[i].slash_hit_done = true;
                 self.resolve_slash(i);
             }
-            // death check
-            let ff = &mut self.f[i];
-            if ff.alive && ff.hp <= 0.0 {
-                ff.alive = false;
-                ff.death_t = 0.0;
-                ff.wall = None;
-                ff.respawn_t = RESPAWN_TIME;
-                let killer = ff.last_attacker;
-                let w = ff.last_weapon;
-                self.on_death(i, killer, w);
-                if self.kind == Kind::Host || self.kind == Kind::Client {
-                    self.out_events.push(Ev::Died { killer: killer.map_or(255, |k| k as u8), w });
+        }
+
+        // deaths are decided here only on the host (or a game on this computer)
+        if self.is_authority() {
+            for i in 0..self.f.len() {
+                let ff = &mut self.f[i];
+                if !ff.present {
+                    continue;
+                }
+                if !ff.owned && !ff.alive {
+                    ff.respawn_t -= dt;
+                }
+                if ff.alive && ff.hp <= 0.0 {
+                    ff.alive = false;
+                    ff.death_t = 0.0;
+                    ff.wall = None;
+                    ff.respawn_t = RESPAWN_TIME;
+                    let killer = ff.last_attacker;
+                    let w = ff.last_weapon;
+                    self.on_death(i, killer, w);
+                    if self.kind == Kind::Host {
+                        self.out_events.push(Ev::Died { victim: i as u8, killer: killer.map_or(255, |k| k as u8), w });
+                    }
+                }
+            }
+            // remember where everyone was, to check hits against the past
+            let now = self.time;
+            for i in 0..self.f.len() {
+                if self.f[i].present {
+                    let p = self.f[i].pos;
+                    let h = &mut self.history[i];
+                    h.push_back((now, p));
+                    while h.front().map_or(false, |e| now - e.0 > 1.2) {
+                        h.pop_front();
+                    }
                 }
             }
         }
@@ -713,6 +944,10 @@ impl Game {
 
         self.update_grenades(dt);
         self.update_fx(dt);
+        for c in self.chat.iter_mut() {
+            c.life -= dt;
+        }
+        self.chat.retain(|c| c.life > 0.0);
         self.refresh_colors();
         if self.is_authority() {
             self.update_match(dt);
@@ -804,6 +1039,15 @@ impl Game {
     fn update_match(&mut self, dt: f32) {
         match self.mt.phase {
             Phase::Warmup => {}
+            Phase::Loadout => {
+                self.mt.timer -= dt;
+                let humans_ready = self.f.iter().filter(|f| f.present).all(|f| f.ready);
+                if self.mt.timer <= 0.0 || humans_ready {
+                    self.mt.phase = Phase::Countdown;
+                    self.mt.timer = 3.0;
+                    self.banner = Some(("GET READY".into(), 2.0));
+                }
+            }
             Phase::Countdown => {
                 self.mt.timer -= dt;
                 if self.mt.timer <= 0.0 {
@@ -823,6 +1067,14 @@ impl Game {
                 self.mt.timer -= dt;
                 if self.kind == Kind::Demo && self.mt.timer <= 0.0 {
                     self.start_match();
+                    self.mt.phase = Phase::Countdown;
+                    self.mt.timer = 1.0;
+                }
+                // rematch vote: more than half of the people (bots don't vote)
+                let humans: Vec<&Fighter> = self.f.iter().filter(|f| f.present && !f.is_bot).collect();
+                let votes = humans.iter().filter(|f| f.vote).count();
+                if !humans.is_empty() && votes * 2 > humans.len() {
+                    self.start_match();
                 }
             }
         }
@@ -831,15 +1083,20 @@ impl Game {
     /// Start (or restart) the match: scores reset and everyone respawns.
     pub fn start_match(&mut self) {
         self.mt.number += 1;
-        self.mt.phase = Phase::Countdown;
-        self.mt.timer = 3.0;
+        self.mt.phase = Phase::Loadout;
+        self.mt.timer = if self.kind == Kind::Offline { 120.0 } else { 20.0 };
         self.mt.team_score = [0, 0];
-        self.banner = Some(("GET READY".into(), 2.0));
+        self.banner = Some(("CHOOSE YOUR LOADOUT".into(), 2.5));
         self.grenades.clear();
         for i in 0..self.f.len() {
             if self.f[i].present {
                 self.f[i].kills = 0;
                 self.f[i].deaths = 0;
+                self.f[i].vote = false;
+                self.f[i].ready = self.f[i].is_bot;
+                if i == self.local && !self.f[i].is_bot {
+                    self.f[i].loadout = self.my_loadout;
+                }
                 if self.f[i].owned {
                     let (p, y) = self.pick_spawn(i);
                     self.f[i].respawn_at(p, y);
@@ -857,9 +1114,16 @@ impl Game {
             let l = self.local;
             if self.f[l].present {
                 let (p, y) = self.pick_spawn(l);
+                if !self.f[l].is_bot {
+                    self.f[l].loadout = self.my_loadout;
+                }
+                self.f[l].ready = self.f[l].is_bot;
+                self.f[l].vote = false;
                 self.f[l].respawn_at(p, y);
+                if self.f[l].is_bot && self.kind == Kind::Client {
+                    self.out_events.push(Ev::Ready);
+                }
             }
-            self.banner = Some(("GET READY".into(), 2.0));
         }
         let was = self.mt.phase;
         self.mt.phase = phase;
@@ -869,9 +1133,10 @@ impl Game {
         if phase != was {
             match phase {
                 Phase::Fight => self.banner = Some(("FIGHT!".into(), 1.0)),
+                Phase::Loadout => self.banner = Some(("CHOOSE YOUR LOADOUT".into(), 2.5)),
+                Phase::Countdown => self.banner = Some(("GET READY".into(), 2.0)),
                 Phase::MatchOver => self.banner = Some((self.leader_text(), 9999.0)),
                 Phase::Warmup => self.banner = Some(("WARM-UP".into(), 2.0)),
-                _ => {}
             }
         }
     }
@@ -981,7 +1246,7 @@ impl Game {
         ff.fire_cd = (ff.fire_cd - dt).max(0.0);
         ff.switch_t = (ff.switch_t - dt).max(0.0);
         ff.dash_cd = (ff.dash_cd - dt).max(0.0);
-        ff.gren_cd = (ff.gren_cd - dt).max(0.0);
+        ff.item_cd = (ff.item_cd - dt).max(0.0);
         ff.hurt_t = (ff.hurt_t - dt).max(0.0);
         ff.stun_t = (ff.stun_t - dt).max(0.0);
         ff.combo_window = (ff.combo_window - dt).max(0.0);
@@ -1027,9 +1292,10 @@ impl Game {
 
         // weapon switching
         if let Some(s) = inp.select {
-            let w = Weapon::from_u8(s);
-            if w != ff.weapon && can_act {
-                ff.weapon = w;
+            let s = (s as usize).min(2);
+            if s != ff.cur && can_act {
+                ff.cur = s;
+                ff.weapon = ff.slot_weapon(s);
                 ff.switch_t = 0.22;
                 ff.reload_t = 0.0;
                 ff.slash_t = 0.0;
@@ -1037,14 +1303,17 @@ impl Game {
             }
         }
         // reloading
-        let wi = ff.weapon as usize;
+        let wi = ff.cur.min(2);
+        ff.weapon = ff.slot_weapon(wi);
+        let melee = ff.weapon.is_melee();
+        let dur = ff.weapon.slash_dur();
         if ff.reload_t > 0.0 {
             ff.reload_t -= dt;
             if ff.reload_t <= 0.0 {
                 ff.reload_t = 0.0;
                 ff.mag[wi] = ff.weapon.mag();
             }
-        } else if inp.reload && ff.weapon != Weapon::Sword && ff.mag[wi] < ff.weapon.mag() && can_act {
+        } else if inp.reload && !melee && ff.mag[wi] < ff.weapon.mag() && can_act {
             ff.reload_t = ff.weapon.reload_time();
             sounds.push(Sfx::Reload);
         }
@@ -1060,11 +1329,11 @@ impl Game {
                 ff.combo_window = 0.45;
             }
         };
-        if can_act && ff.weapon == Weapon::Sword && inp.guard && can_cancel {
+        if can_act && melee && inp.guard && can_cancel {
             cancel_slash(&mut ff);
             ff.bfly_t = 0.4; // butterfly: guard-cancel, then slash again
         }
-        ff.guard = can_act && ff.weapon == Weapon::Sword && inp.guard && !ff.slashing() && ff.switch_t <= 0.0;
+        ff.guard = can_act && melee && inp.guard && !ff.slashing() && ff.switch_t <= 0.0;
 
         // dash / tumble
         if ff.dash_buf > 0.0 && can_act && ff.dash_cd <= 0.0 && ff.wall.is_none() && !slash_locked {
@@ -1241,20 +1510,20 @@ impl Game {
         }
         if can_act && ff.switch_t <= 0.0 {
             match ff.weapon {
-                Weapon::Sword => {
+                _ if melee => {
                     if inp.fire_pressed {
                         ff.slash_queued = true;
                     }
-                    if ff.slash_queued && ff.slash_t < 0.13 {
+                    if ff.slash_queued && ff.slash_t < dur * 0.36 {
                         ff.slash_queued = false;
                         let chain = ff.slash_t > 0.0 || ff.combo_window > 0.0;
                         let butterfly = ff.guard || ff.bfly_t > 0.0;
                         let airborne = !ff.on_ground && ff.wall.is_none();
-                        let mut start = SLASH_DUR;
+                        let mut start = dur;
                         // slash kinds: 0/1 normal swings, 2 = air smash (down), 3 = rising launcher
                         let idx = if butterfly {
                             // slash out of a guard: quick, keeps alternating the first two swings
-                            start = SLASH_DUR - 0.06;
+                            start = dur * 0.83;
                             if chain && ff.slash_idx == 0 { 1 } else { 0 }
                         } else if ff.ground_dash_t > 0.0 {
                             3
@@ -1323,10 +1592,22 @@ impl Game {
                     }
                 }
             }
-            if inp.grenade && ff.grenades > 0 && ff.gren_cd <= 0.0 {
-                ff.grenades -= 1;
-                ff.gren_cd = 0.9;
-                acts.push(Act::Throw);
+            if inp.item && ff.items > 0 && ff.item_cd <= 0.0 {
+                match ff.loadout.item {
+                    2 => {
+                        ff.items -= 1;
+                        ff.item_cd = 0.9;
+                        acts.push(Act::Throw);
+                    }
+                    k => {
+                        let full = if k == 0 { ff.hp >= MAX_HP } else { ff.ap >= MAX_AP };
+                        if !full {
+                            ff.items -= 1;
+                            ff.item_cd = 1.0;
+                            acts.push(Act::Item { kind: k });
+                        }
+                    }
+                }
             }
         }
 
@@ -1417,13 +1698,34 @@ impl Game {
 
     fn do_action(&mut self, i: usize, a: Act) {
         match a {
+            Act::Item { kind } => {
+                self.use_item(i, kind);
+                if self.kind == Kind::Client && i == self.local {
+                    self.out_events.push(Ev::Item { kind });
+                }
+            }
+            Act::Gun { w: Weapon::Rocket } => {
+                let (o, dir) = self.shot_ray(i);
+                let v = dir * 34.0;
+                self.grenades.push(Grenade { pos: o, vel: v, fuse: 4.0, owner: i, kind: 1 });
+                if self.kind == Kind::Host || self.kind == Kind::Client {
+                    self.out_events.push(Ev::Grenade { p: o, v, kind: 1 });
+                }
+                self.sfx(Sfx::Shotgun, o);
+                for _ in 0..8 {
+                    let v = -dir * self.rng.range(2.0, 5.0) + v3(self.rng.range(-1.0, 1.0), self.rng.range(-1.0, 1.0), self.rng.range(-1.0, 1.0));
+                    self.particles.push(Particle { pos: o, vel: v, life: 0.3, max_life: 0.3, size: 0.25, color: [150, 150, 150], gravity: -1.0 });
+                }
+                if i == self.local {
+                    self.shake = self.shake.max(0.5);
+                }
+            }
             Act::Gun { w } => {
                 let (o, dir) = self.shot_ray(i);
                 let moving = self.f[i].vel.flat().len() > 1.0 || !self.f[i].on_ground;
-                let (pellets, spread, dmg, range) = match w {
-                    Weapon::Shotgun => (9, 0.075, 7.5, 40.0),
-                    _ => (1, if moving { 0.018 } else { 0.004 }, 24.0, 150.0),
-                };
+                let gs = w.gun();
+                let (pellets, dmg, range) = (gs.pellets, gs.dmg, gs.range);
+                let spread = if moving { gs.spread_moving } else { gs.spread_still };
                 let right = yaw_right(self.f[i].yaw);
                 let up = dir.cross(right).norm();
                 for _ in 0..pellets {
@@ -1432,14 +1734,18 @@ impl Game {
                     let d = (dir + right * (a.cos() * r) + up * (a.sin() * r)).norm();
                     self.fire_ray(i, o, d, dmg, range, w);
                 }
-                self.sfx(if w == Weapon::Shotgun { Sfx::Shotgun } else { Sfx::Revolver }, o);
+                self.sfx(if matches!(w, Weapon::Shotgun | Weapon::Rifle) { Sfx::Shotgun } else { Sfx::Revolver }, o);
                 // muzzle flash
                 for _ in 0..5 {
                     let v = dir * self.rng.range(2.0, 6.0) + v3(self.rng.range(-1.0, 1.0), self.rng.range(-1.0, 1.0), self.rng.range(-1.0, 1.0));
                     self.particles.push(Particle { pos: o, vel: v, life: 0.08, max_life: 0.08, size: 0.18, color: [255, 220, 120], gravity: 0.0 });
                 }
                 if i == self.local {
-                    self.shake = self.shake.max(if w == Weapon::Shotgun { 0.5 } else { 0.25 });
+                    self.shake = self.shake.max(match w {
+                        Weapon::Shotgun | Weapon::Rifle => 0.5,
+                        Weapon::Smg => 0.1,
+                        _ => 0.25,
+                    });
                 }
             }
             Act::Slash => {
@@ -1451,9 +1757,9 @@ impl Game {
                 let dir = look_dir(ff.yaw, ff.pitch + 0.15);
                 let p = ff.eye() + ff.fwd() * 0.5;
                 let v = dir * 17.0 + v3(0.0, 3.0, 0.0) + ff.vel * 0.4;
-                self.grenades.push(Grenade { pos: p, vel: v, fuse: 1.7, owner: i });
+                self.grenades.push(Grenade { pos: p, vel: v, fuse: 1.7, owner: i, kind: 0 });
                 if self.kind == Kind::Host || self.kind == Kind::Client {
-                    self.out_events.push(Ev::Grenade { p, v });
+                    self.out_events.push(Ev::Grenade { p, v, kind: 0 });
                 }
             }
         }
@@ -1485,8 +1791,13 @@ impl Game {
         let end = o + d * t;
         let mut spark = 0u8;
         if let Some((j, head)) = victim {
-            let falloff = if w == Weapon::Shotgun { (1.0 - (t - 8.0).max(0.0) / 22.0).max(0.25) } else { 1.0 };
-            let mut amount = dmg * falloff * if head { 1.75 } else { 1.0 };
+            let gs = w.gun();
+            let falloff = match w {
+                Weapon::Shotgun => (1.0 - (t - 8.0).max(0.0) / 22.0).max(0.25),
+                Weapon::Smg => (1.0 - (t - 20.0).max(0.0) / 60.0).max(0.5),
+                _ => 1.0,
+            };
+            let mut amount = dmg * falloff * if head { gs.head } else { 1.0 };
             let v = &self.f[j];
             let blocked = v.guard && v.fwd().dot(-d) > 0.45;
             if blocked {
@@ -1495,8 +1806,8 @@ impl Game {
             } else {
                 spark = 1;
             }
-            let knock = d.flat().norm() * if w == Weapon::Shotgun { 1.1 } else { 1.6 };
-            self.damage(shooter, j, amount, knock, 0.0, head && !blocked, end, w as u8);
+            let knock = d.flat().norm() * gs.knock;
+            self.damage(shooter, j, amount, knock, 0.0, head && !blocked, end, w as u8, o, d);
         } else if hit_world {
             spark = 3;
         }
@@ -1538,7 +1849,8 @@ impl Game {
             let b = &self.f[j];
             let d = b.pos - a.pos;
             let dist = d.flat().len();
-            if dist > 2.8 || d.y.abs() > if a.on_ground { 1.9 } else { 2.5 } {
+            let wpn = a.weapon;
+            if dist > wpn.melee_range() || d.y.abs() > if a.on_ground { 1.9 } else { 2.5 } {
                 continue;
             }
             if dist > 0.3 && fwd.dot(d.flat().norm()) < 0.25 {
@@ -1547,7 +1859,7 @@ impl Game {
             if !self.world.line_clear(a.chest(), b.chest()) {
                 continue;
             }
-            let heavy = a.slash_idx >= 2;
+            let heavy = (a.slash_idx >= 2 && wpn != Weapon::Dagger) || wpn == Weapon::Greatsword;
             let facing = b.fwd().dot(-d.flat().norm()) > 0.3;
             let hit_at = b.chest();
             if b.guard && facing && !heavy {
@@ -1570,11 +1882,13 @@ impl Game {
                 _ => (18.0, 4.0, 2.0, 0.12),
             };
             let guard_break = b.guard && facing && heavy;
+            let dmg = dmg * wpn.melee_mult();
+            let kb = kb * if wpn == Weapon::Greatsword { 1.3 } else { 1.0 };
             let knock = d.flat().norm() * kb + v3(0.0, up, 0.0);
             if a.slash_idx == 3 && i == self.local {
                 self.say("LAUNCH!".to_string());
             }
-            self.damage(i, j, if guard_break { dmg * 0.5 } else { dmg }, knock, if guard_break { 0.9 } else { stun }, false, hit_at, 0);
+            self.damage(i, j, if guard_break { dmg * 0.5 } else { dmg }, knock, if guard_break { 0.9 } else { stun }, false, hit_at, wpn as u8, a.chest(), d.norm());
             self.impact_fx(hit_at, 1);
             if self.kind == Kind::Host || self.kind == Kind::Client {
                 self.out_events.push(Ev::Shot { o: hit_at, e: hit_at, w: 0, spark: 1 });
@@ -1582,8 +1896,10 @@ impl Game {
         }
     }
 
-    /// Damage `victim`. If the victim lives on the other computer, the hit is sent there instead.
-    fn damage(&mut self, attacker: usize, victim: usize, amount: f32, knock: V3, stun: f32, head: bool, at: V3, w: u8) {
+    /// A hit seen on this computer. The host (or a game on this computer) applies it right away;
+    /// a player sends it to the host, which checks it against where the target was a moment ago.
+    #[allow(clippy::too_many_arguments)]
+    fn damage(&mut self, attacker: usize, victim: usize, amount: f32, knock: V3, stun: f32, head: bool, at: V3, w: u8, o: V3, dir: V3) {
         if self.f[victim].spawn_prot > 0.0 {
             return;
         }
@@ -1592,13 +1908,156 @@ impl Game {
             self.dmg_nums.push(DmgNum { pos: at + v3(0.0, 0.3, 0.0), amount: amount.round() as i32, life: 0.9, head });
             self.sfx(Sfx::Hit, at);
         }
-        if self.f[victim].owned {
-            self.apply_hit(victim, Some(attacker), amount, knock, stun, head, w);
+        if self.is_authority() {
+            self.authority_hit(victim, Some(attacker), amount, knock, stun, head, w);
         } else {
-            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w });
+            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir });
         }
     }
 
+    /// The host's (or this computer's) final word on a hit: health goes down here, and the
+    /// victim's computer is told so it can stagger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authority_hit(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8) {
+        if !self.f[victim].present || !self.f[victim].alive || self.f[victim].spawn_prot > 0.0 {
+            return;
+        }
+        if self.f[victim].owned {
+            self.apply_hit(victim, attacker, amount, knock, stun, head, w);
+        } else {
+            if matches!(self.mt.phase, Phase::Countdown | Phase::MatchOver | Phase::Loadout) {
+                return;
+            }
+            let ff = &mut self.f[victim];
+            let mut a = amount;
+            if ff.ap > 0.0 {
+                let absorbed = (a * 0.6).min(ff.ap);
+                ff.ap -= absorbed;
+                a -= absorbed;
+            }
+            ff.hp -= a;
+            ff.hurt_t = 0.25;
+            ff.last_weapon = w;
+            if let Some(at) = attacker {
+                ff.last_attacker = Some(at);
+            }
+            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o: V3::ZERO, dir: V3::ZERO });
+        }
+    }
+
+    /// Where a fighter was 	 seconds into the game (from the host's recent history).
+    pub fn pos_at(&self, slot: usize, t: f32) -> V3 {
+        let h = &self.history[slot];
+        let mut prev: Option<(f32, V3)> = None;
+        for &(ht, p) in h.iter() {
+            if ht >= t {
+                return match prev {
+                    Some((pt, pp)) if ht > pt => pp.lerp(p, (t - pt) / (ht - pt)),
+                    _ => p,
+                };
+            }
+            prev = Some((ht, p));
+        }
+        self.f[slot].pos
+    }
+
+    /// Lag compensation: does a player's reported hit hold up against where the target was when
+    /// that player saw it (their ping ago)? Also throws out impossible damage and weapons they
+    /// don't carry.
+    pub fn validate_claim(&self, shooter: usize, victim: usize, w: u8, dmg: f32, o: V3, dir: V3) -> bool {
+        if victim >= self.f.len() || !self.f[victim].present || !self.f[victim].alive || !self.is_enemy(shooter, victim) {
+            return false;
+        }
+        let s = &self.f[shooter];
+        if !s.alive {
+            return false;
+        }
+        let wpn = Weapon::from_u8(w);
+        if w >= 8 || !s.loadout.has(wpn) || wpn == Weapon::Rocket {
+            return false; // explosions are worked out by the host itself
+        }
+        if !(dmg > 0.0) || dmg > wpn.max_hit() * 1.05 {
+            return false;
+        }
+        let rewind = (s.ping_ms as f32 / 1000.0 + 0.06).clamp(0.0, 0.45);
+        let t = self.time - rewind;
+        let vp = self.pos_at(victim, t);
+        let sp_then = self.pos_at(shooter, t);
+        let sp_now = s.pos;
+        if wpn.is_melee() {
+            let reach = wpn.melee_range() + 1.6;
+            let ok = |sp: V3| (vp - sp).flat().len() <= reach && (vp.y - sp.y).abs() <= 3.0;
+            return ok(sp_then) || ok(sp_now);
+        }
+        let near = |sp: V3| (o - (sp + v3(0.0, 1.4, 0.0))).len() < 3.5;
+        if !(near(sp_then) || near(sp_now)) {
+            return false;
+        }
+        let d = dir.norm();
+        if d.len() < 0.5 {
+            return false;
+        }
+        let tol = 0.45;
+        let b = Aabb::new(vp + v3(-0.42 - tol, -tol, -0.42 - tol), vp + v3(0.42 + tol, 1.9 + tol, 0.42 + tol));
+        b.ray(o, d, wpn.gun().range + 2.0).is_some()
+    }
+
+    /// Medkit (0) or armor kit (1).
+    pub fn use_item(&mut self, i: usize, kind: u8) {
+        let ff = &mut self.f[i];
+        if kind == 0 {
+            ff.hp = (ff.hp + 50.0).min(MAX_HP);
+        } else {
+            ff.ap = (ff.ap + 50.0).min(MAX_AP);
+        }
+        let p = ff.chest();
+        self.burst(p, if kind == 0 { [90, 255, 120] } else { [120, 180, 255] }, 14, 2.5);
+        self.sfx(Sfx::Reload, p);
+    }
+
+    pub fn add_chat(&mut self, slot: usize, text: &str) {
+        let text: String = text.chars().filter(|c| !c.is_control()).take(100).collect();
+        if text.trim().is_empty() {
+            return;
+        }
+        let (name, color) = if slot < self.f.len() && self.f[slot].present { (self.f[slot].name.clone(), self.f[slot].color_idx) } else { ("?".into(), 0) };
+        self.chat.push(ChatLine { name, color, text, life: 12.0 });
+        if self.chat.len() > 8 {
+            self.chat.remove(0);
+        }
+    }
+
+    /// Something you typed: shown here and sent to everyone.
+    pub fn say_chat(&mut self, text: &str) {
+        let l = self.local;
+        self.add_chat(l, text);
+        if self.kind == Kind::Host || self.kind == Kind::Client {
+            self.out_events.push(Ev::Chat { text: text.chars().take(100).collect() });
+        }
+    }
+
+    /// You confirmed your loadout (in the loadout phase).
+    pub fn set_ready(&mut self, lo: Loadout) {
+        self.my_loadout = lo;
+        let l = self.local;
+        self.f[l].loadout = lo;
+        self.f[l].ready = true;
+        if self.f[l].alive && matches!(self.mt.phase, Phase::Warmup | Phase::Loadout | Phase::Countdown) {
+            self.f[l].equip();
+        }
+        if self.kind == Kind::Client {
+            self.out_events.push(Ev::Ready);
+        }
+    }
+
+    /// Vote for a rematch at the end of a match.
+    pub fn vote_rematch(&mut self) {
+        let l = self.local;
+        self.f[l].vote = true;
+        if self.kind == Kind::Client {
+            self.out_events.push(Ev::Vote);
+        }
+    }
     pub fn apply_hit(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, _head: bool, w: u8) {
         let ff = &mut self.f[victim];
         if !ff.alive || !ff.present || ff.spawn_prot > 0.0 {
@@ -1654,6 +2113,23 @@ impl Game {
         let mut explode = Vec::new();
         for (gi, g) in self.grenades.iter_mut().enumerate() {
             g.fuse -= dt;
+            if g.kind == 1 {
+                // rocket: straight line, bursts on whatever it touches
+                let np = g.pos + g.vel * dt;
+                let hit_wall = self.world.blocks.iter().any(|b| b.b.contains(np));
+                let hit_body = self.f.iter().any(|f| {
+                    f.present && f.alive && f.slot != g.owner && {
+                        let b = f.body_box();
+                        Aabb::new(b.min - v3(0.15, 0.15, 0.15), b.max + v3(0.15, 0.5, 0.15)).contains(np)
+                    }
+                });
+                if hit_wall || hit_body || g.fuse <= 0.0 {
+                    explode.push(gi);
+                } else {
+                    g.pos = np;
+                }
+                continue;
+            }
             g.vel.y -= GRAVITY * dt;
             for axis in 0..3 {
                 let mut np = g.pos;
@@ -1683,11 +2159,11 @@ impl Game {
         }
         for gi in explode.into_iter().rev() {
             let g = self.grenades.remove(gi);
-            self.explode(g.pos, g.owner);
+            self.explode(g.pos, g.owner, g.kind);
         }
     }
 
-    fn explode(&mut self, p: V3, owner: usize) {
+    fn explode(&mut self, p: V3, owner: usize, kind: u8) {
         self.sfx(Sfx::Boom, p);
         self.burst(p, [255, 170, 60], 40, 9.0);
         self.burst(p, [90, 90, 90], 20, 4.0);
@@ -1699,9 +2175,13 @@ impl Game {
         if (lp - p).len() < 14.0 {
             self.shake = self.shake.max(0.8);
         }
-        // only damage fighters this computer owns
+        // damage is worked out by the host (or this computer when playing alone)
+        if !self.is_authority() {
+            return;
+        }
+        let (radius, base, extra, w) = if kind == 1 { (4.5, 22.0, 58.0, Weapon::Rocket as u8) } else { (4.8, 18.0, 42.0, 8u8) };
         for j in 0..self.f.len() {
-            if !self.f[j].owned || !self.f[j].alive || !self.f[j].present || self.f[j].spawn_prot > 0.0 {
+            if !self.f[j].alive || !self.f[j].present || self.f[j].spawn_prot > 0.0 {
                 continue;
             }
             if j != owner && owner < self.f.len() && !self.is_enemy(owner, j) {
@@ -1709,20 +2189,23 @@ impl Game {
             }
             let c = self.f[j].chest();
             let d = (c - p).len();
-            let radius = 4.8;
             if d < radius && self.world.line_clear(p + v3(0.0, 0.2, 0.0), c) {
                 let k = 1.0 - d / radius;
-                let dmg = 18.0 + 42.0 * k;
-                let knock = (c - p).norm() * (6.0 + 8.0 * k) + v3(0.0, 4.0 * k + 2.0, 0.0);
+                let mut dmg = base + extra * k;
+                let mut knock = (c - p).norm() * (6.0 + 8.0 * k) + v3(0.0, 4.0 * k + 2.0, 0.0);
+                if j == owner {
+                    // your own blast hurts less and throws you further (rocket jump)
+                    dmg *= 0.35;
+                    knock = knock * 1.5 + v3(0.0, 3.0, 0.0);
+                }
                 if owner == self.local && j != self.local {
                     self.hitmarker = 0.25;
                     self.dmg_nums.push(DmgNum { pos: c + v3(0.0, 0.5, 0.0), amount: dmg.round() as i32, life: 0.9, head: false });
                 }
-                self.apply_hit(j, Some(owner), dmg, knock, 0.3, false, 3);
+                self.authority_hit(j, Some(owner), dmg, knock, 0.3, false, w);
             }
         }
     }
-
     fn update_fx(&mut self, dt: f32) {
         for p in self.particles.iter_mut() {
             p.life -= dt;
@@ -1767,21 +2250,54 @@ impl Game {
                 }
                 self.impact_fx(e, spark);
             }
-            Ev::Hit { victim, dmg, knock, stun, head, w } => {
+            Ev::Hit { victim, dmg, knock, stun, head, w, o, dir } => {
                 let v = victim as usize;
-                if v == self.local && self.f[v].owned {
-                    self.apply_hit(v, Some(from), dmg, knock, stun, head, w);
+                if v >= self.f.len() {
+                    return;
+                }
+                if self.kind == Kind::Host {
+                    // a player says they hit someone: check it against the recent past
+                    if from != 0 && self.validate_claim(from, v, w, dmg, o, dir) {
+                        self.authority_hit(v, Some(from), dmg, knock, stun, head, w);
+                    }
+                } else if from == 0 && v == self.local && self.f[v].owned {
+                    // the host confirmed we were hit
+                    self.apply_hit(v, None, dmg, knock, stun, head, w);
                 }
             }
-            Ev::Grenade { p, v } => {
-                self.grenades.push(Grenade { pos: p, vel: v, fuse: 1.7, owner: from });
+            Ev::Grenade { p, v, kind } => {
+                self.grenades.push(Grenade { pos: p, vel: v, fuse: if kind == 1 { 4.0 } else { 1.7 }, owner: from, kind });
             }
-            Ev::Died { killer, w } => {
-                if from < self.f.len() && self.f[from].present {
-                    self.f[from].alive = false;
-                    self.f[from].death_t = 0.0;
+            Ev::Died { victim, killer, w } => {
+                let v = victim as usize;
+                if self.kind == Kind::Client && from == 0 && v < self.f.len() && self.f[v].present {
+                    self.f[v].alive = false;
+                    self.f[v].death_t = 0.0;
+                    if v == self.local {
+                        self.f[v].respawn_t = RESPAWN_TIME;
+                        self.f[v].wall = None;
+                    }
                     let k = if (killer as usize) < self.f.len() { Some(killer as usize) } else { None };
-                    self.on_death(from, k, w);
+                    self.on_death(v, k, w);
+                }
+            }
+            Ev::Chat { text } => {
+                self.add_chat(from, &text);
+            }
+            Ev::Item { kind } => {
+                if self.kind == Kind::Host && from < self.f.len() && self.f[from].alive && self.f[from].items > 0 && kind < 2 && self.f[from].loadout.item == kind {
+                    self.f[from].items -= 1;
+                    self.use_item(from, kind);
+                }
+            }
+            Ev::Ready => {
+                if self.kind == Kind::Host && from < self.f.len() {
+                    self.f[from].ready = true;
+                }
+            }
+            Ev::Vote => {
+                if self.kind == Kind::Host && from < self.f.len() {
+                    self.f[from].vote = true;
                 }
             }
         }    }
@@ -1800,10 +2316,13 @@ mod k_style_tests {
         g.f[1].spawn_prot = 0.0;
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
+        g.f[1].loadout.melee = Weapon::Katana;
         g.f[0].pos = v3(-12.0, 0.0, 0.0);
         g.f[1].pos = v3(-10.4, 0.0, 0.0);
-        g.f[0].weapon = Weapon::Sword;
-        g.f[1].weapon = Weapon::Revolver;
+        g.f[0].cur = 0;
+        g.f[0].loadout.melee = Weapon::Katana;
+        g.f[1].cur = 2;
+        g.f[1].loadout.gun2 = Weapon::Revolver;
         // A faces B (+x)
         g.f[0].yaw = std::f32::consts::FRAC_PI_2;
         for _ in 0..30 {
@@ -1860,5 +2379,40 @@ mod k_style_tests {
         g.tick(&Input { yaw, guard: true, fire_pressed: true, ..Default::default() });
         assert!(g.f[0].slashing(), "slash straight out of the guard (butterfly)");
         assert_eq!(g.f[0].slash_idx, 1);
+    }
+}
+#[cfg(test)]
+mod lag_comp_tests {
+    use super::*;
+
+    #[test]
+    fn host_checks_hits_against_the_past() {
+        let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
+        g.bots[1] = None;
+        g.mt.phase = Phase::Fight;
+        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0 };
+        g.f[0].pos = v3(0.0, 0.0, -10.0);
+        g.f[1].pos = v3(0.0, 0.0, 0.0);
+        g.f[0].spawn_prot = 0.0;
+        g.f[1].spawn_prot = 0.0;
+        // the target runs sideways for half a second
+        for k in 0..60 {
+            g.f[1].pos = v3(k as f32 * 0.1, 0.0, 0.0);
+            g.f[1].vel = V3::ZERO;
+            g.tick(&Input { yaw: 0.0, ..Default::default() });
+            g.f[1].pos = v3(k as f32 * 0.1, 0.0, 0.0);
+        }
+        g.f[0].ping_ms = 200;
+        let o = g.f[0].pos + v3(0.0, 1.4, 0.0);
+        // where the target was about a quarter second ago (x ~ 3.4), not where it is now (x ~ 5.9)
+        let past = g.pos_at(1, g.time - 0.26);
+        assert!(past.x < 4.5, "history should remember the past, got {:?}", past);
+        let dir_past = (past + v3(0.0, 1.0, 0.0) - o).norm();
+        let dir_now = (g.f[1].pos + v3(0.0, 1.0, 0.0) - o).norm();
+        assert!(g.validate_claim(0, 1, Weapon::Rifle as u8, 48.0, o, dir_past), "a hit on what the shooter saw counts");
+        assert!(!g.validate_claim(0, 1, Weapon::Rifle as u8, 48.0, o, v3(-1.0, 0.0, 0.0)), "a miss is thrown out");
+        assert!(!g.validate_claim(0, 1, Weapon::Rifle as u8, 500.0, o, dir_past), "impossible damage is thrown out");
+        assert!(!g.validate_claim(0, 1, Weapon::Smg as u8, 9.0, o, dir_past), "a gun you don't carry is thrown out");
+        assert!(!g.validate_claim(0, 1, Weapon::Rifle as u8, 48.0, o + v3(30.0, 0.0, 0.0), dir_now), "shots from far away are thrown out");
     }
 }

@@ -32,6 +32,7 @@ struct Settings {
     port: String,
     join_addr: String,
     volume: f32,
+    loadout: Loadout,
 }
 
 impl Default for Settings {
@@ -47,6 +48,7 @@ impl Default for Settings {
             port: net::DEFAULT_PORT.to_string(),
             join_addr: String::new(),
             volume: 0.7,
+            loadout: Loadout::default(),
         }
     }
 }
@@ -75,6 +77,12 @@ impl Settings {
                             "port" => s.port = v.to_string(),
                             "join" => s.join_addr = v.to_string(),
                             "volume" => s.volume = v.parse().unwrap_or(s.volume),
+                            "loadout" => {
+                                let b: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                                if b.len() == 4 {
+                                    s.loadout = Loadout::from_bytes([b[0], b[1], b[2], b[3]]);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -89,8 +97,9 @@ impl Settings {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "name={}\nsens={}\nfov={}\nbot={}\nrounds={}\nmode={}\nbots={}\nport={}\njoin={}\nvolume={}\n",
-                self.name, self.sens, self.fov, self.bot_level, self.rounds, self.mode, self.bots, self.port, self.join_addr, self.volume
+                "name={}\nsens={}\nfov={}\nbot={}\nrounds={}\nmode={}\nbots={}\nport={}\njoin={}\nvolume={}\nloadout={},{},{},{}\n",
+                self.name, self.sens, self.fov, self.bot_level, self.rounds, self.mode, self.bots, self.port, self.join_addr, self.volume,
+                self.loadout.melee as u8, self.loadout.gun1 as u8, self.loadout.gun2 as u8, self.loadout.item
             );
             let _ = std::fs::write(p, text);
         }
@@ -121,7 +130,7 @@ struct Latch {
     dash: bool,
     fire_pressed: bool,
     reload: bool,
-    grenade: bool,
+    item: bool,
     select: Option<u8>,
 }
 
@@ -143,6 +152,12 @@ struct App {
     start_request: bool,
     autostart: usize,
     show_scores: bool,
+    chat_open: bool,
+    chat_text: String,
+    chat_send: Option<String>,
+    vote_request: bool,
+    ready_request: Option<Loadout>,
+    test_chat_done: bool,
     paused: bool,
     captured: bool,
     prev_shift: bool,
@@ -184,6 +199,12 @@ impl App {
             start_request: false,
             autostart: 0,
             show_scores: false,
+            chat_open: false,
+            chat_text: String::new(),
+            chat_send: None,
+            vote_request: false,
+            ready_request: None,
+            test_chat_done: false,
             paused: false,
             captured: false,
             prev_shift: false,
@@ -202,8 +223,11 @@ impl App {
             let nb: usize = std::env::var("DUEL_BOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
             let mode = if std::env::var_os("DUEL_TDM").is_some() { Mode::Tdm } else { Mode::Ffa };
             let mut g = Game::offline("Tester", nb, 0.6, mode, 15);
-            g.f[0].is_bot = true;
-            g.bots[0] = Some(bot::Bot::new(0.8, 5));
+            if std::env::var_os("DUEL_HUMAN").is_none() {
+                g.f[0].is_bot = true;
+                g.f[0].ready = true;
+                g.bots[0] = Some(bot::Bot::new(0.8, 5));
+            }
             app.autoplay = true;
             app.start_game(g, None);
         }
@@ -227,8 +251,13 @@ impl App {
         app
     }
 
-    fn start_game(&mut self, game: Game, net: Option<Net>) {
+    fn start_game(&mut self, mut game: Game, net: Option<Net>) {
         let l = game.local;
+        game.my_loadout = self.settings.loadout;
+        if game.f[l].present && !game.f[l].is_bot {
+            game.f[l].loadout = self.settings.loadout;
+            game.f[l].equip();
+        }
         self.aim_yaw = game.f[l].yaw;
         self.aim_pitch = 0.0;
         self.local_alive = game.f[l].alive;
@@ -349,7 +378,11 @@ impl eframe::App for App {
             if !focused && !self.paused && !self.autoplay {
                 self.paused = true;
             }
-            let want_capture = !self.paused && !self.match_over() && self.disconnected.is_none() && !self.autoplay;
+            let choosing = match &self.screen {
+                Screen::Play { game, .. } => game.mt.phase == Phase::Loadout && !game.f[game.local].ready,
+                _ => false,
+            };
+            let want_capture = !self.paused && !self.match_over() && self.disconnected.is_none() && !self.autoplay && !choosing;
             self.set_capture(&ctx, want_capture);
             if want_capture && !cfg!(target_os = "macos") {
                 ctx.send_viewport_cmd(ViewportCommand::CursorPosition(rect.center()));
@@ -498,12 +531,20 @@ impl App {
         let captured = self.captured;
         let sens = self.settings.sens * 0.0024;
         ctx.input(|i| {
+            if self.chat_open {
+                return; // typing: the chat box has the keyboard
+            }
             if i.key_pressed(Key::Escape) {
                 toggle_pause = true;
             }
             self.show_scores = i.key_down(Key::Tab);
-            if i.key_pressed(Key::Enter) {
+            if i.key_pressed(Key::F5) {
                 self.start_request = true;
+            }
+            if i.key_pressed(Key::Enter) || i.key_pressed(Key::T) {
+                self.chat_open = true;
+                self.chat_text.clear();
+                return;
             }
             if !captured {
                 return;
@@ -547,7 +588,7 @@ impl App {
                 self.latch.reload = true;
             }
             if tap(Key::G) || tap(Key::F) {
-                self.latch.grenade = true;
+                self.latch.item = true;
             }
             if i.key_pressed(Key::Num1) {
                 self.latch.select = Some(0);
@@ -594,7 +635,7 @@ impl App {
         inp.dash = self.latch.dash;
         inp.fire_pressed = self.latch.fire_pressed;
         inp.reload = self.latch.reload;
-        inp.grenade = self.latch.grenade;
+        inp.item = self.latch.item;
         inp.select = self.latch.select;
         inp
     }
@@ -602,6 +643,22 @@ impl App {
     fn step_play(&mut self, dt: f32) {
         let keys = self.keys_snapshot();
         let mut inp = self.current_input(&keys);
+        if self.chat_open {
+            inp = Input { yaw: self.aim_yaw, pitch: self.aim_pitch, ..Default::default() };
+        }
+        let mut chat_send = self.chat_send.take();
+        if self.autoplay && !self.test_chat_done {
+            if let Some(text) = std::env::var("DUEL_CHAT").ok() {
+                if let Screen::Play { game, .. } = &self.screen {
+                    if game.time > 4.0 {
+                        chat_send = Some(text);
+                        self.test_chat_done = true;
+                    }
+                }
+            }
+        }
+        let vote_req = std::mem::take(&mut self.vote_request);
+        let ready_req = self.ready_request.take();
         let start_req = std::mem::take(&mut self.start_request);
         let autostart = self.autostart;
         let Screen::Play { game, net } = &mut self.screen else { return };
@@ -626,7 +683,7 @@ impl App {
                     }
                     Incoming::PeerState { slot, st, events } => {
                         if game.f[slot].present {
-                            net::apply_remote(&mut game.f[slot], &st);
+                            net::apply_remote(&mut game.f[slot], &st, true);
                             for ev in events {
                                 game.handle_remote_event(slot, ev);
                             }
@@ -643,6 +700,11 @@ impl App {
                 self.disconnected = Some("Lost connection to the host.".into());
             }
             if n.is_host {
+                for (s, ping) in n.pings() {
+                    if game.f[s].present {
+                        game.f[s].ping_ms = ping;
+                    }
+                }
                 let ready = autostart > 0 && game.mt.phase == Phase::Warmup && n.player_count() >= autostart;
                 if (start_req && matches!(game.mt.phase, Phase::Warmup | Phase::MatchOver)) || ready {
                     game.start_match();
@@ -652,6 +714,20 @@ impl App {
             game.start_match();
         }
 
+        if let Some(text) = chat_send {
+            game.say_chat(&text);
+        }
+        if vote_req {
+            game.vote_rematch();
+        }
+        if let Some(lo) = ready_req {
+            if game.mt.phase == Phase::Fight || game.mt.phase == Phase::MatchOver {
+                game.my_loadout = lo; // takes effect at the next respawn
+                game.say("Loadout saved - you'll get it when you respawn".into());
+            } else {
+                game.set_ready(lo);
+            }
+        }
         if self.paused && game.kind == Kind::Offline {
             self.acc = 0.0;
             return;
@@ -665,7 +741,7 @@ impl App {
             inp.dash = false;
             inp.fire_pressed = false;
             inp.reload = false;
-            inp.grenade = false;
+            inp.item = false;
             inp.select = None;
             self.latch = Latch::default();
             self.acc -= TICK;
@@ -730,6 +806,9 @@ impl App {
             if self.autoplay {
                 g.f[you].is_bot = true;
                 g.bots[you] = Some(bot::Bot::new(0.8, 11 + you as u64));
+                let lo = Loadout::random(&mut g.rng);
+                g.f[you].loadout = lo;
+                g.set_ready(lo);
             }
             let host = g.f[0].name.clone();
             g.say(format!("Joined {host}'s lobby"));
@@ -859,6 +938,17 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
         g.f[s].team = e.team;
         g.f[s].kills = e.kills;
         g.f[s].deaths = e.deaths;
+        g.f[s].ping_ms = e.ping;
+        if s != g.local {
+            g.f[s].ready = e.ready;
+            g.f[s].vote = e.vote;
+        }
+    }
+    let l = g.local;
+    if m.you_alive && g.f[l].alive {
+        // the host keeps the health; ours follows it
+        g.f[l].hp = m.you_hp;
+        g.f[l].ap = m.you_ap;
     }
     for s in 0..g.f.len() {
         if g.f[s].present && s != g.local && !m.roster.iter().any(|e| e.slot == s) {
@@ -868,7 +958,7 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
     g.apply_match(m.mode, m.phase, m.timer, m.target, m.team_score, m.number);
     for (s, st) in &m.fighters {
         if *s != g.local && g.f[*s].present {
-            net::apply_remote(&mut g.f[*s], st);
+            net::apply_remote(&mut g.f[*s], st, false);
         }
     }
     for (origin, ev) in m.events {
@@ -904,7 +994,7 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
     if g.mt.mode == Mode::Ffa {
         rows.sort_by(|a, b| (-a.kills, a.deaths).cmp(&(-b.kills, b.deaths)));
     }
-    let w = 460.0;
+    let w = 540.0;
     let h = 70.0 + rows.len() as f32 * 28.0 + if g.mt.mode == Mode::Tdm { 30.0 } else { 0.0 };
     let r = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 110.0 + h * 0.5), Vec2::new(w, h));
     p.rect_filled(r, 10.0, Color32::from_rgba_unmultiplied(10, 8, 20, 215));
@@ -912,8 +1002,9 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
     let x0 = r.left() + 20.0;
     let mut y = r.top() + 16.0;
     text_shadow(p, Pos2::new(x0, y), Align2::LEFT_TOP, &format!("PLAYERS  ({}/8)", rows.len()), 16.0, ACCENT);
-    text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, "KILLS", 13.0, Color32::from_gray(200));
-    text_shadow(p, Pos2::new(r.right() - 45.0, y), Align2::CENTER_TOP, "DEATHS", 13.0, Color32::from_gray(200));
+    text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, "KILLS", 13.0, Color32::from_gray(200));
+    text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, "DEATHS", 13.0, Color32::from_gray(200));
+    text_shadow(p, Pos2::new(r.right() - 45.0, y), Align2::CENTER_TOP, "PING", 13.0, Color32::from_gray(200));
     y += 34.0;
     let mut last_team = 255u8;
     for f in rows {
@@ -934,10 +1025,19 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
         } else if f.slot == 0 && matches!(g.kind, Kind::Client) {
             name.push_str("  (host)");
         }
+        if g.mt.phase == Phase::Loadout && f.ready {
+            name.push_str("  - ready");
+        }
+        if g.mt.phase == Phase::MatchOver && f.vote {
+            name.push_str("  - rematch!");
+        }
         p.circle_filled(Pos2::new(x0 + 6.0, y + 9.0), 6.0, player_color(f.color_idx));
         text_shadow(p, Pos2::new(x0 + 20.0, y), Align2::LEFT_TOP, &name, 16.0, Color32::WHITE);
-        text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, &format!("{}", f.kills), 16.0, Color32::WHITE);
-        text_shadow(p, Pos2::new(r.right() - 45.0, y), Align2::CENTER_TOP, &format!("{}", f.deaths), 16.0, Color32::from_gray(200));
+        text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, &format!("{}", f.kills), 16.0, Color32::WHITE);
+        text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, &format!("{}", f.deaths), 16.0, Color32::from_gray(200));
+        let ping = if f.is_bot || (f.slot == 0 && g.kind != Kind::Offline) || g.kind == Kind::Offline { "-".to_string() } else { format!("{}", f.ping_ms) };
+        let pc = if f.ping_ms > 150 { Color32::from_rgb(255, 140, 120) } else if f.ping_ms > 80 { Color32::from_rgb(255, 220, 140) } else { Color32::from_rgb(160, 230, 160) };
+        text_shadow(p, Pos2::new(r.right() - 45.0, y), Align2::CENTER_TOP, &ping, 16.0, pc);
         y += 28.0;
     }
 }
@@ -992,18 +1092,25 @@ impl App {
             let col = Color32::from_rgba_unmultiplied(255, 255, 255, 220);
             let st = Stroke::new(2.0, col);
             match me.weapon {
-                Weapon::Sword => {
+                w if w.is_melee() => {
                     p.circle_stroke(c, 10.0, st);
                     p.circle_filled(c, 2.0, col);
                 }
-                Weapon::Shotgun => {
-                    let r = 26.0 + me.recoil * 10.0;
+                Weapon::Shotgun | Weapon::Smg => {
+                    let base = if me.weapon == Weapon::Shotgun { 26.0 } else { 14.0 };
+                    let r = base + me.recoil * 10.0;
                     p.circle_stroke(c, r, Stroke::new(1.5, col));
                     p.circle_filled(c, 2.0, col);
                 }
-                Weapon::Revolver => {
+                Weapon::Rocket => {
+                    p.circle_stroke(c, 16.0, Stroke::new(2.5, col));
+                    p.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(6.0, 0.0)], st);
+                    p.line_segment([c + Vec2::new(0.0, -6.0), c + Vec2::new(0.0, 6.0)], st);
+                }
+                _ => {
                     let moving = me.vel.flat().len() > 1.0 || !me.on_ground;
-                    let gap = 5.0 + if moving { 7.0 } else { 0.0 } + me.recoil * 8.0;
+                    let tight = if me.weapon == Weapon::Rifle { 0.5 } else { 1.0 };
+                    let gap = (5.0 + if moving { 7.0 } else { 0.0 } + me.recoil * 8.0) * tight;
                     for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
                         let a = c + Vec2::new(dx * gap, dy * gap);
                         let b = c + Vec2::new(dx * (gap + 9.0), dy * (gap + 9.0));
@@ -1033,12 +1140,26 @@ impl App {
         bar(p, ap_r, me.ap / MAX_AP, Color32::from_rgb(80, 150, 240));
         text_shadow(p, Pos2::new(ap_r.right() + 10.0, ap_r.center().y), Align2::LEFT_CENTER, &format!("AP {}", me.ap.max(0.0).ceil() as i32), 14.0, Color32::from_rgb(170, 200, 255));
 
+        // chat
+        let mut cy = base.y - 92.0;
+        for line in g.chat.iter().rev() {
+            let a = (line.life.min(1.0) * 255.0) as u8;
+            let galley_name = p.layout_no_wrap(format!("{}: ", line.name), FontId::proportional(15.0), Color32::from_rgba_unmultiplied(player_color(line.color).r(), player_color(line.color).g(), player_color(line.color).b(), a));
+            let galley_text = p.layout_no_wrap(line.text.clone(), FontId::proportional(15.0), Color32::from_rgba_unmultiplied(240, 240, 240, a));
+            let w = galley_name.size().x + galley_text.size().x;
+            p.rect_filled(Rect::from_min_size(Pos2::new(base.x - 8.0, cy - 3.0), Vec2::new(w + 16.0, 22.0)), 4.0, Color32::from_black_alpha((a as f32 * 0.5) as u8));
+            let nw = galley_name.size().x;
+            p.galley(Pos2::new(base.x, cy), galley_name, Color32::WHITE);
+            p.galley(Pos2::new(base.x + nw, cy), galley_text, Color32::WHITE);
+            cy -= 24.0;
+        }
+
         // weapons
         let wb = Pos2::new(rect.right() - 28.0, rect.bottom() - 30.0);
         let panel = Rect::from_min_max(Pos2::new(wb.x - 300.0, wb.y - 78.0), Pos2::new(wb.x + 14.0, wb.y + 14.0));
         p.rect_filled(panel, 8.0, Color32::from_black_alpha(110));
         let ammo = match me.weapon {
-            Weapon::Sword => {
+            w if w.is_melee() => {
                 if me.guard {
                     "GUARDING".to_string()
                 } else {
@@ -1049,25 +1170,27 @@ impl App {
                 if me.reload_t > 0.0 {
                     "RELOADING".to_string()
                 } else {
-                    format!("{} / {}", me.mag[w as usize], w.mag())
+                    format!("{} / {}", me.mag[me.cur], w.mag())
                 }
             }
         };
         text_shadow(p, Pos2::new(wb.x, wb.y - 70.0), Align2::RIGHT_TOP, me.weapon.name(), 16.0, ACCENT);
         text_shadow(p, Pos2::new(wb.x, wb.y - 48.0), Align2::RIGHT_TOP, &ammo, 26.0, Color32::WHITE);
-        for k in 0..3u8 {
-            let r = Rect::from_min_size(Pos2::new(wb.x - 286.0 + k as f32 * 40.0, wb.y - 64.0), Vec2::new(34.0, 34.0));
-            let sel = me.weapon as u8 == k;
+        for k in 0..3usize {
+            let r = Rect::from_min_size(Pos2::new(wb.x - 290.0 + k as f32 * 56.0, wb.y - 66.0), Vec2::new(52.0, 40.0));
+            let sel = me.cur == k;
             p.rect_filled(r, 5.0, if sel { Color32::from_rgba_unmultiplied(255, 150, 70, 170) } else { Color32::from_black_alpha(120) });
-            text_shadow(p, r.center(), Align2::CENTER_CENTER, &format!("{}", k + 1), 16.0, Color32::WHITE);
+            text_shadow(p, r.center_top() + Vec2::new(0.0, 4.0), Align2::CENTER_TOP, &format!("{}", k + 1), 13.0, Color32::WHITE);
+            let short: String = me.slot_weapon(k).name().chars().take(7).collect();
+            text_shadow(p, r.center_bottom() - Vec2::new(0.0, 4.0), Align2::CENTER_BOTTOM, &short, 11.0, Color32::from_gray(230));
         }
-        let gtxt = format!("Grenades {}", me.grenades);
+        let gtxt = format!("G: {} x{}", ITEM_NAMES[me.loadout.item.min(2) as usize], me.items);
         text_shadow(p, Pos2::new(wb.x - 286.0, wb.y - 10.0), Align2::LEFT_CENTER, &gtxt, 14.0, Color32::from_rgb(220, 220, 180));
         let mut dash = "Dash ready".to_string();
         if me.dash_cd > 0.0 {
             dash = "Dash ...".into();
         }
-        text_shadow(p, Pos2::new(wb.x - 160.0, wb.y - 10.0), Align2::LEFT_CENTER, &dash, 14.0, Color32::from_rgb(180, 220, 200));
+        text_shadow(p, Pos2::new(wb.x - 120.0, wb.y - 10.0), Align2::LEFT_CENTER, &dash, 14.0, Color32::from_rgb(180, 220, 200));
 
         // scores + timer
         let top = Pos2::new(c.x, rect.top() + 18.0);
@@ -1082,6 +1205,7 @@ impl App {
             }
             Phase::Warmup => "WARM-UP".into(),
             Phase::Countdown => "GET READY".into(),
+            Phase::Loadout => format!("LOADOUT {:.0}", g.mt.timer.max(0.0)),
             Phase::MatchOver => "OVER".into(),
         };
         text_shadow(p, sb.center() + Vec2::new(0.0, -6.0), Align2::CENTER_CENTER, &tt, 18.0, Color32::WHITE);
@@ -1115,7 +1239,7 @@ impl App {
         if g.mt.phase == Phase::Warmup {
             let players = g.present().len();
             let hint = if g.kind == Kind::Host {
-                format!("Warm-up · {players} in the lobby · press Enter to start the match")
+                format!("Warm-up · {players} in the lobby · press F5 to start the match")
             } else {
                 format!("Warm-up · {players} in the lobby · waiting for the host to start")
             };
@@ -1169,6 +1293,55 @@ impl App {
     // ------------------------------------------------------------------ menus
 
     fn _unused_panel(&self) {}
+}
+
+fn loadout_picker(ui: &mut egui::Ui, lo: &mut Loadout) {
+    egui::Grid::new("loadout_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+        ui.colored_label(ACCENT, "Melee");
+        ui.horizontal(|ui| {
+            for w in Weapon::MELEE {
+                ui.selectable_value(&mut lo.melee, w, w.name()).on_hover_text(w.blurb());
+            }
+        });
+        ui.end_row();
+        ui.colored_label(ACCENT, "Gun 1");
+        ui.horizontal_wrapped(|ui| {
+            for w in Weapon::GUNS {
+                ui.selectable_value(&mut lo.gun1, w, w.name()).on_hover_text(w.blurb());
+            }
+        });
+        ui.end_row();
+        ui.colored_label(ACCENT, "Gun 2");
+        ui.horizontal_wrapped(|ui| {
+            for w in Weapon::GUNS {
+                if w != lo.gun1 {
+                    ui.selectable_value(&mut lo.gun2, w, w.name()).on_hover_text(w.blurb());
+                }
+            }
+        });
+        ui.end_row();
+        ui.colored_label(ACCENT, "Item");
+        ui.horizontal(|ui| {
+            for k in 0..3u8 {
+                ui.selectable_value(&mut lo.item, k, ITEM_NAMES[k as usize]).on_hover_text(ITEM_BLURBS[k as usize]);
+            }
+        });
+        ui.end_row();
+    });
+    if lo.gun2 == lo.gun1 {
+        *lo = Loadout::from_bytes(lo.to_bytes());
+    }
+    ui.label(egui::RichText::new(format!(
+        "{}: {}  ·  {}: {}  ·  {}: {}  ·  {}: {}",
+        lo.melee.name(),
+        lo.melee.blurb(),
+        lo.gun1.name(),
+        lo.gun1.blurb(),
+        lo.gun2.name(),
+        lo.gun2.blurb(),
+        ITEM_NAMES[lo.item.min(2) as usize],
+        ITEM_BLURBS[lo.item.min(2) as usize]
+    )).size(13.0).color(Color32::from_gray(200)));
 }
 
 fn mode_picker(ui: &mut egui::Ui, mode: &mut u8) {
@@ -1273,7 +1446,7 @@ impl App {
                 }
                 Page::Host => {
                     ui.heading("Host a Lobby");
-                    ui.label("Up to 8 players. You start in a warm-up; friends drop in with Join a Friend, then you press Enter to start the match. On the same Wi-Fi they use your local address; over the internet, forward the UDP port on your router (or use a virtual LAN app like Tailscale, ZeroTier or Radmin VPN).");
+                    ui.label("Up to 8 players. You start in a warm-up; friends drop in with Join a Friend, then you press F5 (or Start the match in the Esc menu). On the same Wi-Fi they use your local address; over the internet, forward the UDP port on your router (or use a virtual LAN app like Tailscale, ZeroTier or Radmin VPN).");
                     mode_picker(ui, &mut self.settings.mode);
                     ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("kills to win"));
                     ui.horizontal(|ui| {
@@ -1344,11 +1517,12 @@ impl App {
                             ("Butterfly", "slash, right-click guard, slash, guard... in rhythm"),
                             ("Launch", "3rd slash of a combo, or dash + slash: knocks them up"),
                             ("Air combo", "slash in the air to juggle; 3rd air slash smashes down"),
-                            ("1  2  3 / wheel", "katana, scattergun, revolver"),
+                            ("1  2  3 / wheel", "melee, gun 1, gun 2 (pick them on the loadout screen)"),
                             ("R", "reload"),
-                            ("G / F", "throw a grenade (2 per round)"),
+                            ("G / F", "use your item (medkit, armor kit or grenade; 2 per life)"),
+                            ("Enter / T", "chat"),
                             ("Tab", "player list and scores"),
-                            ("Enter", "(host) start the match from the warm-up"),
+                            ("F5", "(host) start the match from the warm-up"),
                             ("Esc", "pause menu"),
                         ] {
                             ui.colored_label(ACCENT, k);
@@ -1393,12 +1567,72 @@ impl App {
         cancel
     }
     fn play_overlay_ui(&mut self, ctx: &egui::Context, rect: Rect) -> bool {
-        let (kind, phase, is_auth) = match &self.screen {
-            Screen::Play { game, .. } => (game.kind, game.mt.phase, game.is_authority()),
+        let (kind, phase, is_auth, ready, timer, humans, votes, voted) = match &self.screen {
+            Screen::Play { game, .. } => {
+                let humans: Vec<&Fighter> = game.f.iter().filter(|f| f.present && !f.is_bot).collect();
+                let votes = humans.iter().filter(|f| f.vote).count();
+                (game.kind, game.mt.phase, game.is_authority(), game.f[game.local].ready, game.mt.timer, humans.len(), votes, game.f[game.local].vote)
+            }
             _ => return false,
         };
         let mut leave = false;
         let center = Pos2::new(rect.center().x - 200.0, rect.center().y - 60.0);
+
+        // chat box
+        if self.chat_open {
+            let pos = Pos2::new(rect.left() + 14.0, rect.bottom() - 150.0);
+            let mut send = false;
+            let mut close = false;
+            egui::Area::new(egui::Id::unique("chatbox")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(10, 8, 20, 220)).corner_radius(6.0).inner_margin(8.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Say:").color(ACCENT));
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.chat_text).char_limit(100).desired_width(360.0).hint_text("Enter to send, Esc to cancel"));
+                        r.request_focus();
+                        if ui.input(|i| i.key_pressed(Key::Enter)) {
+                            send = true;
+                        }
+                        if ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                    });
+                });
+            });
+            if send {
+                let text = self.chat_text.trim().to_string();
+                if !text.is_empty() {
+                    self.chat_send = Some(text);
+                }
+                self.chat_open = false;
+            }
+            if close {
+                self.chat_open = false;
+            }
+        }
+
+        // loadout screen before each match
+        if phase == Phase::Loadout && !ready && self.disconnected.is_none() {
+            let pos = Pos2::new(rect.center().x - 320.0, rect.top() + 110.0);
+            let mut go = false;
+            let mut lo = self.settings.loadout;
+            panel(ctx, "loadout", pos, 600.0, |ui| {
+                ui.heading("Choose your loadout");
+                ui.label(format!("The match starts when everyone is ready ({:.0}s left)", timer.max(0.0)));
+                ui.add_space(6.0);
+                loadout_picker(ui, &mut lo);
+                ui.add_space(6.0);
+                if App::big_button(ui, "Ready!") {
+                    go = true;
+                }
+            });
+            if lo != self.settings.loadout {
+                self.settings.loadout = lo;
+            }
+            if go {
+                self.ready_request = Some(self.settings.loadout);
+                self.settings.save();
+            }
+        }
         if let Some(msg) = self.disconnected.clone() {
             panel(ctx, "disc", center, 360.0, |ui| {
                 ui.heading("Match ended");
@@ -1411,13 +1645,23 @@ impl App {
         }
         if phase == Phase::MatchOver {
             let mut rematch = false;
+            let mut vote = false;
             panel(ctx, "over", Pos2::new(center.x, center.y + 60.0), 360.0, |ui| {
-                if is_auth {
-                    if App::big_button(ui, "New match") {
-                        rematch = true;
+                if kind == Kind::Offline {
+                    if App::big_button(ui, "Rematch") {
+                        vote = true;
                     }
                 } else {
-                    ui.label("Waiting for the host to start a new match…");
+                    ui.label(format!("Rematch votes: {votes} / {humans} (more than half starts it)"));
+                    if !voted && App::big_button(ui, "Vote for a rematch") {
+                        vote = true;
+                    }
+                    if voted {
+                        ui.label("You voted. Waiting for the others…");
+                    }
+                    if is_auth && App::big_button(ui, "Start a new match now") {
+                        rematch = true;
+                    }
                 }
                 if App::big_button(ui, "Leave") {
                     leave = true;
@@ -1425,6 +1669,9 @@ impl App {
             });
             if rematch {
                 self.start_request = true;
+            }
+            if vote {
+                self.vote_request = true;
             }
             return leave;
         }
@@ -1447,6 +1694,14 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.settings.sens, 0.2..=3.0).text("mouse sensitivity"));
                 ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("field of view"));
                 ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("volume"));
+                ui.collapsing("Loadout", |ui| {
+                    loadout_picker(ui, &mut self.settings.loadout);
+                    let when = if matches!(phase, Phase::Fight | Phase::MatchOver) { "Use it from my next respawn" } else { "Use this loadout" };
+                    if ui.button(when).clicked() {
+                        self.ready_request = Some(self.settings.loadout);
+                        self.settings.save();
+                    }
+                });
                 if App::big_button(ui, "Resume") {
                     resume = true;
                 }
