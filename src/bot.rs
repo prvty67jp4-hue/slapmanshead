@@ -1,4 +1,4 @@
-﻿use crate::game::{Game, Input, Weapon};
+﻿use crate::game::{Game, Input, SCOPE_IN, Weapon};
 use crate::math::*;
 
 /// A simple practice opponent.
@@ -115,6 +115,12 @@ impl Bot {
                     Weapon::Rocket => {
                         if dist > 5.0 && dist < 22.0 { 1.6 } else { 0.3 }
                     }
+                    Weapon::Sniper => {
+                        if dist > 14.0 { 2.6 } else { 0.4 }
+                    }
+                    Weapon::HandCannon => {
+                        if dist > 6.0 && dist < 26.0 { 2.1 } else { 0.9 }
+                    }
                     _ => {
                         if dist > 9.0 { 2.0 } else { 1.0 }
                     }
@@ -150,6 +156,8 @@ impl Bot {
                 let pref = match me.weapon {
                     Weapon::Shotgun | Weapon::Smg => 6.0,
                     Weapon::Rocket => 11.0,
+                    Weapon::Sniper => 22.0,
+                    Weapon::HandCannon => 12.0,
                     _ => 14.0,
                 };
                 inp.fwd = if dist > pref + 3.0 { 1.0 } else if dist < pref - 3.0 { -0.7 } else { 0.0 };
@@ -233,6 +241,16 @@ impl Bot {
                         inp.guard = true;
                     } else if dist < me.weapon.melee_range() && aim_off < 0.6 {
                         inp.fire_pressed = self.rng.chance(dt * (4.0 + 6.0 * s));
+                    }
+                }
+                Weapon::Sniper => {
+                    // scope in, then take the shot once the scope is up
+                    if dist > 4.0 {
+                        inp.guard = true;
+                    }
+                    let thresh = 0.03 + 0.05 * (1.0 - s);
+                    if (me.scope_t >= SCOPE_IN || dist <= 4.0) && aim_off < thresh && self.rng.chance(dt * (1.5 + 4.0 * s)) {
+                        inp.fire = true;
                     }
                 }
                 _ => {

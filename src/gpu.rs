@@ -854,6 +854,17 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
             mb.tube(hand + wf.apply(v3(0.0, 0.1, 0.2)), hand + wf.apply(v3(0.0, 0.1, 0.95)), 0.018, 0.016, wf.x, 1.0, gunmetal, -1.0, 1.6);
             mb.tube(hand + wf.apply(v3(0.0, 0.17, 0.05)), hand + wf.apply(v3(0.0, 0.17, 0.3)), 0.025, 0.025, wf.x, 1.0, lin([25, 25, 28]), -1.0, 2.0);
         }
+        Weapon::HandCannon => {
+            mb.obox(hand + wf.apply(v3(0.0, 0.03, 0.0)), &wf, v3(0.024, 0.065, 0.045), lin([40, 40, 44]), -1.0, 0.6);
+            mb.obox(hand + wf.apply(v3(0.0, 0.11, 0.12)), &wf, v3(0.03, 0.04, 0.17), lin([150, 152, 160]), -1.0, 2.0);
+            mb.obox(hand + wf.apply(v3(0.0, 0.07, 0.2)), &wf, v3(0.026, 0.02, 0.09), lin([70, 72, 80]), -1.0, 1.2);
+        }
+        Weapon::Sniper => {
+            mb.obox(hand + wf.apply(v3(0.0, 0.05, -0.2)), &wf, v3(0.035, 0.07, 0.22), lin([52, 58, 50]), -1.0, 0.6);
+            mb.obox(hand + wf.apply(v3(0.0, 0.09, 0.12)), &wf, v3(0.032, 0.045, 0.2), lin([45, 48, 44]), -1.0, 0.8);
+            mb.tube(hand + wf.apply(v3(0.0, 0.11, 0.3)), hand + wf.apply(v3(0.0, 0.11, 1.15)), 0.02, 0.016, wf.x, 1.0, gunmetal, -1.0, 1.6);
+            mb.tube(hand + wf.apply(v3(0.0, 0.18, 0.0)), hand + wf.apply(v3(0.0, 0.18, 0.32)), 0.032, 0.032, wf.x, 1.0, lin([20, 20, 22]), -1.0, 2.2);
+        }
         Weapon::Rocket => {
             mb.tube(hand + wf.apply(v3(0.0, 0.12, -0.35)), hand + wf.apply(v3(0.0, 0.12, 0.55)), 0.075, 0.075, wf.x, 1.0, lin([62, 74, 58]), -1.0, 0.6);
             mb.tube(hand + wf.apply(v3(0.0, 0.12, 0.55)), hand + wf.apply(v3(0.0, 0.12, 0.62)), 0.09, 0.09, wf.x, 1.0, lin([40, 40, 44]), -1.0, 1.0);
@@ -959,6 +970,23 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
             mb.obox(hand + wf.apply(v3(0.0, 0.0, -0.05)), wf, v3(0.035, 0.06, 0.3), wood, 4.0, 0.3);
             mb.tube(hand + wf.apply(v3(0.0, 0.04, 0.15)), hand + wf.apply(v3(0.0, 0.04, 0.95)), 0.018, 0.016, wf.x, 1.0, gunmetal, -1.0, 1.6);
             mb.tube(hand + wf.apply(v3(0.0, 0.11, 0.0)), hand + wf.apply(v3(0.0, 0.11, 0.25)), 0.025, 0.025, wf.x, 1.0, lin([25, 25, 28]), -1.0, 2.0);
+        }
+        Weapon::HandCannon => {
+            // a heavy, square-slide hand cannon
+            mb.obox(hand + wf.apply(v3(0.0, -0.04, 0.0)), wf, v3(0.024, 0.065, 0.045), lin([40, 40, 44]), -1.0, 0.6);
+            mb.obox(hand + wf.apply(v3(0.0, 0.04, 0.12)), wf, v3(0.03, 0.04, 0.17), lin([150, 152, 160]), -1.0, 2.0);
+            mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.2)), wf, v3(0.026, 0.02, 0.09), lin([70, 72, 80]), -1.0, 1.2);
+            mb.obox(hand + wf.apply(v3(0.0, 0.085, 0.27)), wf, v3(0.006, 0.008, 0.01), lin([200, 200, 205]), -1.0, 1.5);
+        }
+        Weapon::Sniper => {
+            // a long heavy bolt-action: stock, receiver, long barrel with a muzzle brake, scope, bolt
+            mb.obox(hand + wf.apply(v3(0.0, -0.01, -0.22)), wf, v3(0.035, 0.07, 0.22), lin([52, 58, 50]), -1.0, 0.6);
+            mb.obox(hand + wf.apply(v3(0.0, 0.03, 0.12)), wf, v3(0.032, 0.045, 0.2), lin([45, 48, 44]), -1.0, 0.8);
+            mb.tube(hand + wf.apply(v3(0.0, 0.05, 0.3)), hand + wf.apply(v3(0.0, 0.05, 1.15)), 0.02, 0.016, wf.x, 1.0, gunmetal, -1.0, 1.6);
+            mb.obox(hand + wf.apply(v3(0.0, 0.05, 1.17)), wf, v3(0.026, 0.022, 0.04), lin([30, 30, 34]), -1.0, 1.0);
+            mb.tube(hand + wf.apply(v3(0.0, 0.12, -0.02)), hand + wf.apply(v3(0.0, 0.12, 0.32)), 0.032, 0.032, wf.x, 1.0, lin([20, 20, 22]), -1.0, 2.2);
+            mb.ellipsoid(hand + wf.apply(v3(0.0, 0.12, 0.33)), wf, v3(0.03, 0.03, 0.006), lin([120, 170, 220]), -1.0, 3.0, 0.0);
+            mb.tube(hand + wf.apply(v3(0.035, 0.04, 0.02)), hand + wf.apply(v3(0.09, 0.0, 0.02)), 0.008, 0.008, wf.y, 1.0, gunmetal, -1.0, 1.6);
         }
         Weapon::Rocket => {
             mb.tube(hand + wf.apply(v3(0.0, 0.1, -0.45)), hand + wf.apply(v3(0.0, 0.1, 0.5)), 0.075, 0.075, wf.x, 1.0, lin([62, 74, 58]), -1.0, 0.6);
@@ -1455,6 +1483,22 @@ impl Gpu {
                 ad.billboard(cam, pos + v3(0.0, 1.0, 0.0), 1.15, lina([140, 200, 255], a));
             }
             shadow_disc(&mut al, &g.world, pos);
+            // a scoped sniper's lens glints at whoever it's pointed at
+            if i != g.local && f.alive && f.weapon == Weapon::Sniper && f.scope_t > 0.0 {
+                let eye = pos + v3(0.0, 1.62, 0.0);
+                let aim = look_dir(f.yaw, f.pitch);
+                let to_cam = (cam.pos - eye).norm();
+                let facing = aim.dot(to_cam);
+                if facing > 0.93 {
+                    let k = ((facing - 0.93) / 0.07).clamp(0.0, 1.0);
+                    let pulse = 0.8 + 0.2 * (g.time * 9.0 + i as f32).sin();
+                    let gp = eye + aim * 0.35 + yaw_right(f.yaw) * 0.05;
+                    let dist = (cam.pos - gp).len();
+                    let size = (0.25 + dist * 0.02) * (0.6 + 0.8 * k) * pulse;
+                    ad.billboard(cam, gp, size, lina([255, 250, 220], 0.9 * k));
+                    ad.billboard(cam, gp, size * 2.2, lina([180, 210, 255], 0.35 * k));
+                }
+            }
         }
         // Capture the Flag: base rings and the flags
         if g.mt.mode == Mode::Ctf {
@@ -1527,8 +1571,8 @@ impl Gpu {
             op.obox(c.pos, &r, v3(0.012, 0.012, 0.03), lin(c.color), -1.0, 1.8);
         }
         for tr in &g.tracers {
-            let t = (tr.life / 0.09).clamp(0.0, 1.0);
-            ad.beam(cam, tr.a, tr.b, 0.03, lina(tr.color, t));
+            let t = (tr.life / tr.max_life.max(0.01)).clamp(0.0, 1.0);
+            ad.beam(cam, tr.a, tr.b, tr.width * (0.6 + 0.4 * t), lina(tr.color, t));
         }
         // brazier flames (animated without state)
         for (bi, b) in g.world.braziers.iter().enumerate() {

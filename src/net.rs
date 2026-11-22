@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
-const MAGIC: [u8; 4] = *b"DRA6";
+const MAGIC: [u8; 4] = *b"DRA7";
 const K_HELLO: u8 = 1;
 const K_STATE: u8 = 2;
 const K_HOST: u8 = 3;
@@ -135,7 +135,7 @@ fn write_fstate(w: &mut W, f: &Fighter) {
     w.f(f.ap);
     w.u8(f.weapon as u8);
     w.u8(f.flags());
-    w.u8(if f.spawn_prot > 0.0 { 1 } else { 0 } | if f.stagger_t > 0.0 { 2 } else { 0 } | if f.sliding > 0.0 { 4 } else { 0 });
+    w.u8(if f.spawn_prot > 0.0 { 1 } else { 0 } | if f.stagger_t > 0.0 { 2 } else { 0 } | if f.sliding > 0.0 { 4 } else { 0 } | if f.scope_t > 0.0 { 8 } else { 0 });
     w.f(f.slash_t);
     w.u8(f.slash_idx);
     w.f(f.hurt_t);
@@ -192,11 +192,12 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.v(*v);
             w.u8(*kind);
         }
-        Ev::Died { victim, killer, w: wp } => {
+        Ev::Died { victim, killer, w: wp, head } => {
             w.u8(4);
             w.u8(*victim);
             w.u8(*killer);
             w.u8(*wp);
+            w.u8(*head as u8);
         }
         Ev::Chat { text } => {
             w.u8(5);
@@ -217,9 +218,9 @@ fn write_ev(w: &mut W, ev: &Ev) {
 fn read_ev(r: &mut R) -> Option<Ev> {
     Some(match r.u8()? {
         1 => Ev::Shot { o: r.v()?, e: r.v()?, w: r.u8()?, spark: r.u8()? },
-        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, 200.0), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()? },
+        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, LETHAL), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()? },
         3 => Ev::Grenade { p: r.v()?, v: clamp_v(r.v()?, 40.0), kind: r.u8()?.min(1) },
-        4 => Ev::Died { victim: r.u8()?, killer: r.u8()?, w: r.u8()? },
+        4 => Ev::Died { victim: r.u8()?, killer: r.u8()?, w: r.u8()?, head: r.u8()? == 1 },
         5 => {
             let n = r.u8()? as usize;
             Ev::Chat { text: String::from_utf8_lossy(r.take(n)?).chars().take(100).collect() }
@@ -1005,6 +1006,7 @@ pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool, sent: f32, now
     f.spawn_prot = if s.flags2 & 1 != 0 { 0.2 } else { 0.0 };
     f.stagger_t = if s.flags2 & 2 != 0 { 0.2 } else { 0.0 };
     f.sliding = if s.flags2 & 4 != 0 { 0.1 } else { 0.0 };
+    f.scope_t = if s.flags2 & 8 != 0 { f.scope_t.max(SCOPE_IN) } else { 0.0 };
     if f.snaps.len() <= 1 {
         f.slash_t = s.slash_t;
         f.slash_idx = s.slash_idx;

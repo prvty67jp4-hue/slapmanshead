@@ -31,10 +31,13 @@ struct Props {
     clips: &'static [Clip],
     gain: f32,
     range: f32,
+    /// Played this much higher (or lower, below 1) than recorded.
+    pitch: f32,
 }
 
 fn props(s: Sfx) -> Props {
-    let p = |clips: &'static [Clip], gain: f32, range: f32| Props { clips, gain, range };
+    let p = |clips: &'static [Clip], gain: f32, range: f32| Props { clips, gain, range, pitch: 1.0 };
+    let pp = |clips: &'static [Clip], gain: f32, range: f32, pitch: f32| Props { clips, gain, range, pitch };
     match s {
         Sfx::Shotgun => p(clips!["shotgun_1.wav", "shotgun_2.wav"], 0.95, 28.0),
         Sfx::Revolver => p(clips!["revolver_1.wav", "revolver_2.wav"], 0.85, 26.0),
@@ -78,6 +81,11 @@ fn props(s: Sfx) -> Props {
         // movement: a soft whoosh for perfect timing, cloth and grit for a slide
         Sfx::Perfect => p(clips!["dash_2.wav", "swing_2.wav"], 0.35, 6.0),
         Sfx::Slide => p(clips!["wall_1.ogg", "wall_2.ogg"], 0.5, 7.0),
+        // the hand cannon: the magnum, deeper and heavier; the sniper: the rifle, deep and loud,
+        // heard across the whole arena
+        Sfx::HandCannon => pp(clips!["revolver_1.wav", "revolver_2.wav"], 1.0, 34.0, 0.8),
+        Sfx::Sniper => pp(clips!["rifle_1.wav", "rifle_2.wav", "shotgun_1.wav"], 1.0, 70.0, 0.72),
+        Sfx::ScopeIn => pp(clips!["switch_gun.ogg"], 0.4, 0.0, 1.4),
     }
 }
 
@@ -204,7 +212,7 @@ pub struct Audio {
 }
 
 /// Every sound, in the order of `Sfx`.
-pub const ALL: [Sfx; 39] = [
+pub const ALL: [Sfx; 42] = [
     Sfx::Shotgun,
     Sfx::Revolver,
     Sfx::Smg,
@@ -244,6 +252,9 @@ pub const ALL: [Sfx; 39] = [
     Sfx::ParryPerfect,
     Sfx::Perfect,
     Sfx::Slide,
+    Sfx::HandCannon,
+    Sfx::Sniper,
+    Sfx::ScopeIn,
 ];
 
 fn mix_into(m: &Arc<Mutex<Mixer>>, frames: usize, channels: usize, rate: f32, mut write: impl FnMut(usize, f32)) {
@@ -465,7 +476,7 @@ impl Audio {
             },
             _ => (1.0, 1.0),
         };
-        let pitch = pitch * if at.is_some() { 1.0 + (self.rand() - 0.5) * 0.08 } else { 1.0 };
+        let pitch = pr.pitch * pitch * if at.is_some() { 1.0 + (self.rand() - 0.5) * 0.08 } else { 1.0 };
         if let Ok(mut m) = self.mixer.lock() {
             if m.voices.len() >= 40 {
                 // drop the oldest so new sounds always play
@@ -511,10 +522,11 @@ mod tests {
                 assert!(pcm.iter().any(|x| x.abs() > 0.05), "{name} isn't silent");
             }
         }
-        // every Sfx is in ALL, in order
+        // every Sfx is in ALL, in order, and the game has room to track each one
         for (i, s) in ALL.iter().enumerate() {
             assert_eq!(*s as usize, i);
         }
+        assert!(ALL.len() <= crate::game::SFX_SLOTS, "raise SFX_SLOTS");
     }
 
     #[test]

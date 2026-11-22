@@ -26,7 +26,24 @@ pub enum Weapon {
     Smg = 5,
     Rifle = 6,
     Rocket = 7,
+    HandCannon = 8,
+    Sniper = 9,
 }
+
+/// Number of weapons (ids 0..N_WEAPONS); kill-feed ids at or above it are other things.
+pub const N_WEAPONS: u8 = 10;
+/// Kill-feed id for grenades.
+pub const GRENADE_TOOL: u8 = 20;
+/// Damage that kills outright, straight through armour (hand-cannon headshots, sniper body hits).
+pub const LETHAL: f32 = 999.0;
+/// Sniper hits on hands, forearms, shins or feet.
+pub const SNIPER_LIMB: f32 = 60.0;
+/// How long the sniper's scope takes to come up; once up, it's dead-on.
+pub const SCOPE_IN: f32 = 0.15;
+/// Rocket launcher: most damage (dead centre), blast radius and flight speed.
+pub const ROCKET_MAX: f32 = 55.0;
+pub const ROCKET_RADIUS: f32 = 3.5;
+pub const ROCKET_SPEED: f32 = 24.0;
 
 /// How a gun shoots. Spread is the tangent of the cone's half-angle: every pellet leaves within
 /// it, and the crosshair is drawn exactly that wide.
@@ -45,7 +62,7 @@ pub struct GunStats {
 
 impl Weapon {
     pub const MELEE: [Weapon; 3] = [Weapon::Dagger, Weapon::Katana, Weapon::Greatsword];
-    pub const GUNS: [Weapon; 5] = [Weapon::Shotgun, Weapon::Revolver, Weapon::Smg, Weapon::Rifle, Weapon::Rocket];
+    pub const GUNS: [Weapon; 7] = [Weapon::Shotgun, Weapon::Revolver, Weapon::HandCannon, Weapon::Smg, Weapon::Rifle, Weapon::Sniper, Weapon::Rocket];
 
     pub fn from_u8(v: u8) -> Weapon {
         match v {
@@ -56,6 +73,8 @@ impl Weapon {
             4 => Weapon::Revolver,
             5 => Weapon::Smg,
             6 => Weapon::Rifle,
+            8 => Weapon::HandCannon,
+            9 => Weapon::Sniper,
             _ => Weapon::Rocket,
         }
     }
@@ -69,6 +88,8 @@ impl Weapon {
             Weapon::Smg => "SMG",
             Weapon::Rifle => "Rifle",
             Weapon::Rocket => "Rocket Launcher",
+            Weapon::HandCannon => "Hand Cannon",
+            Weapon::Sniper => "Sniper",
         }
     }
     pub fn blurb(self) -> &'static str {
@@ -79,8 +100,10 @@ impl Weapon {
             Weapon::Shotgun => "9 pellets, deadly up close",
             Weapon::Revolver => "precise, big headshots",
             Weapon::Smg => "hold to spray, 30 rounds",
-            Weapon::Rifle => "one heavy shot, huge headshots",
+            Weapon::Rifle => "semi-auto marksman, 10 rounds",
             Weapon::Rocket => "explodes, rocket-jump with it",
+            Weapon::HandCannon => "7 heavy rounds, a headshot always kills",
+            Weapon::Sniper => "scope up (right click): one hit to the body kills",
         }
     }
     pub fn is_melee(self) -> bool {
@@ -91,8 +114,10 @@ impl Weapon {
             Weapon::Shotgun => 5,
             Weapon::Revolver => 6,
             Weapon::Smg => 30,
-            Weapon::Rifle => 5,
+            Weapon::Rifle => 10,
             Weapon::Rocket => 1,
+            Weapon::HandCannon => 7,
+            Weapon::Sniper => 5,
             _ => 0,
         }
     }
@@ -101,8 +126,10 @@ impl Weapon {
             Weapon::Shotgun => 0.85,
             Weapon::Revolver => 0.30,
             Weapon::Smg => 0.075,
-            Weapon::Rifle => 1.0,
+            Weapon::Rifle => 0.45,
             Weapon::Rocket => 0.9,
+            Weapon::HandCannon => 0.4,
+            Weapon::Sniper => 1.3,
             _ => 0.0,
         }
     }
@@ -112,15 +139,20 @@ impl Weapon {
             Weapon::Revolver => 1.5,
             Weapon::Smg => 1.8,
             Weapon::Rifle => 2.2,
-            Weapon::Rocket => 2.0,
+            Weapon::Rocket => 2.6,
+            Weapon::HandCannon => 1.9,
+            Weapon::Sniper => 2.8,
             _ => 0.0,
         }
     }
     pub fn gun(self) -> GunStats {
         match self {
             Weapon::Shotgun => GunStats { pellets: 9, spread_still: 0.075, move_cap: 1.0, bloom: 0.0, dmg: 7.5, range: 40.0, head: 1.5, knock: 1.1 },
-            Weapon::Smg => GunStats { pellets: 1, spread_still: 0.02, move_cap: 1.5, bloom: 0.5, dmg: 9.0, range: 80.0, head: 1.4, knock: 0.4 },
-            Weapon::Rifle => GunStats { pellets: 1, spread_still: 0.0015, move_cap: 2.0, bloom: 0.0, dmg: 48.0, range: 220.0, head: 2.0, knock: 3.0 },
+            Weapon::Smg => GunStats { pellets: 1, spread_still: 0.012, move_cap: 1.5, bloom: 0.25, dmg: 9.0, range: 80.0, head: 1.4, knock: 0.4 },
+            Weapon::Rifle => GunStats { pellets: 1, spread_still: 0.003, move_cap: 2.0, bloom: 0.6, dmg: 34.0, range: 200.0, head: 2.0, knock: 2.0 },
+            Weapon::HandCannon => GunStats { pellets: 1, spread_still: 0.012, move_cap: 1.5, bloom: 1.5, dmg: 45.0, range: 160.0, head: 1.0, knock: 2.6 },
+            // unscoped the sniper sprays wide; scoped it's exact (see Fighter::spread)
+            Weapon::Sniper => GunStats { pellets: 1, spread_still: 0.09, move_cap: 1.0, bloom: 0.0, dmg: SNIPER_LIMB, range: 300.0, head: 1.0, knock: 4.0 },
             _ => GunStats { pellets: 1, spread_still: 0.004, move_cap: 1.5, bloom: 0.35, dmg: 24.0, range: 150.0, head: 1.75, knock: 1.6 },
         }
     }
@@ -130,7 +162,8 @@ impl Weapon {
             Weapon::Dagger => 32.0 * 0.72,
             Weapon::Katana => 32.0,
             Weapon::Greatsword => 32.0 * 1.55,
-            Weapon::Rocket => 85.0,
+            Weapon::Rocket => ROCKET_MAX,
+            Weapon::HandCannon | Weapon::Sniper => LETHAL,
             w => {
                 let g = w.gun();
                 g.dmg * g.head
@@ -143,6 +176,23 @@ impl Weapon {
             Weapon::Dagger => 0.26,
             Weapon::Greatsword => 0.52,
             _ => 0.36,
+        }
+    }
+    /// After this long without firing, the next shot goes exactly where the crosshair points.
+    pub fn rest_time(self) -> f32 {
+        match self {
+            Weapon::HandCannon => 0.65,
+            Weapon::Rifle => 0.6,
+            _ => REST_TIME,
+        }
+    }
+    /// Right-click zoom with this gun (1 = none).
+    pub fn zoom(self) -> f32 {
+        match self {
+            Weapon::Sniper => 3.0,
+            Weapon::Rifle | Weapon::Revolver | Weapon::HandCannon => 1.5,
+            Weapon::Shotgun | Weapon::Rocket => 1.2,
+            _ => 1.0, // blades, and the SMG (right click does nothing with it)
         }
     }
     pub fn melee_mult(self) -> f32 {
@@ -202,15 +252,16 @@ impl Loadout {
     }
     pub fn random(rng: &mut Rng) -> Loadout {
         let m = Weapon::MELEE[(rng.next_u32() % 3) as usize];
-        let a = (rng.next_u32() % 5) as usize;
-        let b = (a + 1 + (rng.next_u32() % 4) as usize) % 5;
+        let n = Weapon::GUNS.len();
+        let a = rng.next_u32() as usize % n;
+        let b = (a + 1 + rng.next_u32() as usize % (n - 1)) % n;
         Loadout { melee: m, gun1: Weapon::GUNS[a], gun2: Weapon::GUNS[b], item: (rng.next_u32() % 3) as u8 }
     }
 }
 
-/// What killed someone, for the kill feed (weapons by number, 8 grenade).
+/// What killed someone, for the kill feed (weapons by number, GRENADE_TOOL for grenades).
 pub fn kill_tool(w: u8) -> &'static str {
-    if w == 8 { "Grenade" } else if w < 8 { Weapon::from_u8(w).name() } else { "?" }
+    if w == GRENADE_TOOL { "Grenade" } else if w < N_WEAPONS { Weapon::from_u8(w).name() } else { "?" }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -323,15 +374,27 @@ pub struct HitPose {
 impl HitPose {
     /// The first capsule a ray meets (each grown by `pad` to allow for network jitter).
     pub fn ray(&self, o: V3, d: V3, max_t: f32, pad: f32) -> Option<(f32, Part)> {
-        let mut best: Option<(f32, Part)> = None;
-        for c in &self.caps {
+        self.ray_cap(o, d, max_t, pad).map(|(t, i)| (t, self.caps[i].part))
+    }
+    /// Like `ray`, but says which capsule (see `is_far_limb`).
+    pub fn ray_cap(&self, o: V3, d: V3, max_t: f32, pad: f32) -> Option<(f32, usize)> {
+        let mut best: Option<(f32, usize)> = None;
+        for (i, c) in self.caps.iter().enumerate() {
             if let Some(t) = ray_capsule(o, d, max_t, c.a, c.b, c.r + pad) {
                 if best.map_or(true, |(bt, _)| t < bt) {
-                    best = Some((t, c.part));
+                    best = Some((t, i));
                 }
             }
         }
         best
+    }
+    /// Forearms and hands, shins and feet (capsules 6, 8, 10 and 12).
+    pub fn is_far_limb(i: usize) -> bool {
+        matches!(i, 6 | 8 | 10 | 12)
+    }
+    /// Does the ray (grown by `pad`) touch any capsule that isn't a far limb?
+    pub fn ray_core(&self, o: V3, d: V3, max_t: f32, pad: f32) -> bool {
+        self.caps.iter().enumerate().any(|(i, c)| !HitPose::is_far_limb(i) && ray_capsule(o, d, max_t, c.a, c.b, c.r + pad).is_some())
     }
     /// Does the ray touch this part (grown by `pad`)?
     pub fn ray_part(&self, o: V3, d: V3, max_t: f32, pad: f32, part: Part) -> bool {
@@ -486,6 +549,10 @@ pub struct Fighter {
     pub perfect_t: f32,
     /// Health still to come back after a kill.
     pub regen_left: f32,
+    /// How long the scope (right click with a gun) has been up; 0 when not aiming.
+    pub scope_t: f32,
+    /// Whether the last hit taken was a headshot (for the kill feed).
+    pub last_head: bool,
     pub last_attacker: Option<usize>,
     // network smoothing for remote copies
     pub net_pos: V3,
@@ -589,6 +656,8 @@ impl Fighter {
             sliding: 0.0,
             perfect_t: 0.0,
             regen_left: 0.0,
+            scope_t: 0.0,
+            last_head: false,
             last_attacker: None,
             net_pos: V3::ZERO,
             net_age: 0.0,
@@ -683,7 +752,11 @@ impl Fighter {
         if gs.pellets > 1 {
             return gs.spread_still * self.move_spread; // the shotgun's cone is the cone
         }
-        if self.since_shot >= REST_TIME {
+        if self.weapon == Weapon::Sniper {
+            // wild from the hip, dead-on the moment the scope is up (quickscopes welcome)
+            return if self.scope_t >= SCOPE_IN { 0.0 } else { gs.spread_still };
+        }
+        if self.since_shot >= self.weapon.rest_time() {
             return 0.0; // a rested first shot is perfectly accurate
         }
         gs.spread_still * self.move_spread * (1.0 + gs.bloom * self.recoil)
@@ -878,7 +951,20 @@ pub struct Tracer {
     pub a: V3,
     pub b: V3,
     pub life: f32,
+    pub max_life: f32,
+    pub width: f32,
     pub color: [u8; 3],
+}
+
+impl Tracer {
+    /// A bullet's streak: the sniper's is bright, thick and lingers.
+    pub fn shot(a: V3, b: V3, w: Weapon, color: [u8; 3]) -> Tracer {
+        match w {
+            Weapon::Sniper => Tracer { a, b, life: 0.45, max_life: 0.45, width: 0.07, color: [255, 250, 235] },
+            Weapon::HandCannon => Tracer { a, b, life: 0.12, max_life: 0.12, width: 0.045, color },
+            _ => Tracer { a, b, life: 0.09, max_life: 0.09, width: 0.03, color },
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -904,6 +990,7 @@ pub struct KillCam {
     pub victim: usize,
     pub killer: Option<usize>,
     pub tool: &'static str,
+    pub head: bool,
     pub t: f32,
 }
 
@@ -923,6 +1010,8 @@ pub struct FeedLine {
     pub killer: Option<(String, u8)>,
     pub victim: (String, u8),
     pub tool: &'static str,
+    /// A headshot kill (a small mark next to the weapon).
+    pub head: bool,
     pub text: Option<String>,
     pub life: f32,
 }
@@ -935,7 +1024,7 @@ pub enum Ev {
     Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3 },
     Grenade { p: V3, v: V3, kind: u8 },
     /// Only the host (or the game on this computer) decides deaths.
-    Died { victim: u8, killer: u8, w: u8 },
+    Died { victim: u8, killer: u8, w: u8, head: bool },
     Chat { text: String },
     /// Used a medkit (0) or armor kit (1).
     Item { kind: u8 },
@@ -979,7 +1068,7 @@ pub struct Game {
     /// Slow motion left (real seconds).
     pub slowmo: f32,
     pub killcam: Option<KillCam>,
-    last_kill: Option<(usize, Option<usize>, u8)>,
+    last_kill: Option<(usize, Option<usize>, u8, bool)>,
     pub rng: Rng,
     pub bots: Vec<Option<Bot>>,
     pub out_events: Vec<Ev>,
@@ -1005,7 +1094,7 @@ pub struct Game {
     /// Sounds to play: where they happened (None = not in the world, e.g. a hit marker).
     pub sounds: Vec<(Sfx, Option<V3>, f32)>,
     /// When each kind of sound last played (to keep a shotgun's pellets from stacking up).
-    sfx_last: [f32; 40],
+    sfx_last: [f32; SFX_SLOTS],
     /// When each player's last gunshot sound played (remote shots arrive once per pellet).
     shot_last: [f32; MAX_PLAYERS],
     /// Training room state (only in Training).
@@ -1026,6 +1115,8 @@ pub struct Game {
     pub parry_flash: f32,
     /// "+35 HP" shown after a kill.
     pub heal_pop: f32,
+    /// Upward aim kick from the last shot, for the screen to apply to the mouse aim.
+    pub aim_kick: f32,
 }
 
 /// Moves the player has pulled off in the training room.
@@ -1048,6 +1139,8 @@ pub struct TrainStats {
     pub momentum: u32,
     pub perfects: u32,
     pub best_flow: u32,
+    pub cannon_heads: u32,
+    pub sniper_hits: u32,
 }
 
 pub struct Lesson {
@@ -1055,25 +1148,29 @@ pub struct Lesson {
     pub how: &'static str,
     pub count: fn(&TrainStats) -> u32,
     pub need: u32,
+    /// A gun to hand over in slot 3 for this lesson.
+    pub gun: Option<Weapon>,
 }
 
-pub const LESSONS: [Lesson; 16] = [
-    Lesson { title: "Move and jump", how: "Move with W A S D and look with the mouse. Press SPACE to jump.", count: |s| s.jumps, need: 3 },
-    Lesson { title: "Dash", how: "Press SHIFT (or double-tap a direction key) to dash. Dash in different directions.", count: |s| s.dashes, need: 3 },
-    Lesson { title: "Air dash", how: "Jump with SPACE, then press SHIFT in the air for a second burst of speed.", count: |s| s.air_dashes, need: 2 },
-    Lesson { title: "Wall-run", how: "Run along a wall, jump, then press SPACE again next to the wall while moving along it.", count: |s| s.wallruns, need: 2 },
-    Lesson { title: "Wall climb", how: "Face a wall, jump, then press SPACE again while looking straight at it to run up.", count: |s| s.wallclimbs, need: 1 },
-    Lesson { title: "Wall-jump", how: "While on a wall, press SPACE again to kick off it. Chain wall to wall!", count: |s| s.walljumps, need: 2 },
-    Lesson { title: "Slide", how: "Run, then hold C to slide along the ground. Press SPACE mid-slide to jump out of it with your speed.", count: |s| s.slides.min(1) + s.slide_jumps.min(1), need: 2 },
-    Lesson { title: "Momentum", how: "Land from a dash, air dash or wall-jump: you keep your speed for a moment instead of slowing to a run.", count: |s| s.momentum, need: 3 },
-    Lesson { title: "Perfect timing", how: "Jump or dash the instant you land (within a tenth of a second) for an extra boost and a whoosh.", count: |s| s.perfects, need: 2 },
-    Lesson { title: "Flow chain", how: "Chain moves without staying on the ground: dash, wall-run, wall-jump, air dash. Each adds +6% speed. Reach x4!", count: |s| (s.best_flow >= 4) as u32, need: 1 },
-    Lesson { title: "Sword slash", how: "Press 1 for your katana and click to slash a dummy. Click again to chain swings.", count: |s| s.slash_hits, need: 4 },
-    Lesson { title: "Slash cancel", how: "Right after a slash hits, press SHIFT, SPACE or hold right-click to cut its recovery short.", count: |s| s.cancels, need: 3 },
-    Lesson { title: "Butterfly", how: "Slash, hold right-click to guard, release and slash again. Keep the rhythm going!", count: |s| s.butterflies, need: 4 },
-    Lesson { title: "Launcher", how: "Dash at a dummy and slash during the dash (or land the 3rd hit of a ground combo) to launch it.", count: |s| s.launches, need: 2 },
-    Lesson { title: "Air combo", how: "Launch a dummy, jump after it and slash it in mid-air before it lands.", count: |s| s.air_hits, need: 2 },
-    Lesson { title: "Rocket jump", how: "Press 2 for the rocket launcher. Look down at your feet, jump and fire at the same moment.", count: |s| s.rocket_jumps, need: 1 },
+pub const LESSONS: [Lesson; 18] = [
+    Lesson { title: "Move and jump", how: "Move with W A S D and look with the mouse. Press SPACE to jump.", count: |s| s.jumps, need: 3, gun: None },
+    Lesson { title: "Dash", how: "Press SHIFT (or double-tap a direction key) to dash. Dash in different directions.", count: |s| s.dashes, need: 3, gun: None },
+    Lesson { title: "Air dash", how: "Jump with SPACE, then press SHIFT in the air for a second burst of speed.", count: |s| s.air_dashes, need: 2, gun: None },
+    Lesson { title: "Wall-run", how: "Run along a wall, jump, then press SPACE again next to the wall while moving along it.", count: |s| s.wallruns, need: 2, gun: None },
+    Lesson { title: "Wall climb", how: "Face a wall, jump, then press SPACE again while looking straight at it to run up.", count: |s| s.wallclimbs, need: 1, gun: None },
+    Lesson { title: "Wall-jump", how: "While on a wall, press SPACE again to kick off it. Chain wall to wall!", count: |s| s.walljumps, need: 2, gun: None },
+    Lesson { title: "Slide", how: "Run, then hold C to slide along the ground. Press SPACE mid-slide to jump out of it with your speed.", count: |s| s.slides.min(1) + s.slide_jumps.min(1), need: 2, gun: None },
+    Lesson { title: "Momentum", how: "Land from a dash, air dash or wall-jump: you keep your speed for a moment instead of slowing to a run.", count: |s| s.momentum, need: 3, gun: None },
+    Lesson { title: "Perfect timing", how: "Jump or dash the instant you land (within a tenth of a second) for an extra boost and a whoosh.", count: |s| s.perfects, need: 2, gun: None },
+    Lesson { title: "Flow chain", how: "Chain moves without staying on the ground: dash, wall-run, wall-jump, air dash. Each adds +6% speed. Reach x4!", count: |s| (s.best_flow >= 4) as u32, need: 1, gun: None },
+    Lesson { title: "Sword slash", how: "Press 1 for your katana and click to slash a dummy. Click again to chain swings.", count: |s| s.slash_hits, need: 4, gun: None },
+    Lesson { title: "Slash cancel", how: "Right after a slash hits, press SHIFT, SPACE or hold right-click to cut its recovery short.", count: |s| s.cancels, need: 3, gun: None },
+    Lesson { title: "Butterfly", how: "Slash, hold right-click to guard, release and slash again. Keep the rhythm going!", count: |s| s.butterflies, need: 4, gun: None },
+    Lesson { title: "Launcher", how: "Dash at a dummy and slash during the dash (or land the 3rd hit of a ground combo) to launch it.", count: |s| s.launches, need: 2, gun: None },
+    Lesson { title: "Air combo", how: "Launch a dummy, jump after it and slash it in mid-air before it lands.", count: |s| s.air_hits, need: 2, gun: None },
+    Lesson { title: "Hand cannon", how: "Press 3 for the hand cannon. A headshot always kills, even through armour. Land 2 headshots on a dummy (wait a beat between shots: the first is dead-on).", count: |s| s.cannon_heads, need: 2, gun: Some(Weapon::HandCannon) },
+    Lesson { title: "Sniper", how: "Press 3 for the sniper and hold right click to scope: it's dead-on once the scope is up. Hit a dummy twice (one body hit kills a real player).", count: |s| s.sniper_hits, need: 2, gun: Some(Weapon::Sniper) },
+    Lesson { title: "Rocket jump", how: "Press 2 for the rocket launcher. Look down at your feet, jump and fire at the same moment.", count: |s| s.rocket_jumps, need: 1, gun: None },
 ];
 
 pub struct Training {
@@ -1104,6 +1201,9 @@ impl Training {
         self.done_t = 0.0;
     }
 }
+
+/// Room for every kind of sound (must stay above the number of `Sfx` kinds; a test checks).
+pub const SFX_SLOTS: usize = 64;
 
 /// Every sound the game makes (recorded clips live in audio.rs).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1147,6 +1247,9 @@ pub enum Sfx {
     ParryPerfect,
     Perfect,
     Slide,
+    HandCannon,
+    Sniper,
+    ScopeIn,
 }
 
 impl Sfx {
@@ -1157,6 +1260,8 @@ impl Sfx {
             Weapon::Smg => Sfx::Smg,
             Weapon::Rifle => Sfx::Rifle,
             Weapon::Rocket => Sfx::Rocket,
+            Weapon::HandCannon => Sfx::HandCannon,
+            Weapon::Sniper => Sfx::Sniper,
             _ => Sfx::Revolver,
         }
     }
@@ -1169,6 +1274,13 @@ pub const STAGGER_TIME: f32 = 0.6;
 
 /// After this long without firing, the next shot goes exactly where the crosshair points.
 pub const REST_TIME: f32 = 0.4;
+
+/// What the host could confirm about a player's hit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClaimCheck {
+    pub head_ok: bool,
+    pub core_ok: bool,
+}
 
 pub enum Act {
     /// A gunshot with the spread it had the moment it was fired.
@@ -1241,7 +1353,7 @@ impl Game {
                 _ => Some(("GET READY".into(), 2.0)),
             },
             sounds: Vec::new(),
-            sfx_last: [-1.0; 40],
+            sfx_last: [-1.0; SFX_SLOTS],
             shot_last: [-1.0; MAX_PLAYERS],
             train: None,
             hp_hold: 0.0,
@@ -1253,6 +1365,7 @@ impl Game {
             hit_head: false,
             parry_flash: 0.0,
             heal_pop: 0.0,
+            aim_kick: 0.0,
         }
     }
 
@@ -1329,10 +1442,21 @@ impl Game {
                 }
             }
         }
-        // refill ammo and grenades so practice never runs dry
+        // refill ammo and grenades so practice never runs dry; hand over this lesson's gun
         if let Some(f) = self.f.get_mut(me) {
             f.items = f.items.max(1);
             t.stats.best_flow = t.stats.best_flow.max(f.flow);
+            if let Some(gw) = LESSONS.get(t.lesson).and_then(|l| l.gun) {
+                if f.loadout.gun2 != gw {
+                    f.loadout.gun2 = gw;
+                    f.mag[2] = gw.mag();
+                    if f.cur == 2 {
+                        f.weapon = gw;
+                        f.reload_t = 0.0;
+                    }
+                    self.my_loadout.gun2 = gw;
+                }
+            }
         }
         if t.combo_t > 0.0 {
             t.combo_t -= dt;
@@ -1627,7 +1751,7 @@ impl Game {
     }
 
     pub fn say(&mut self, s: String) {
-        self.feed.push(FeedLine { killer: None, victim: (String::new(), 0), tool: "", text: Some(s), life: 5.0 });
+        self.feed.push(FeedLine { killer: None, victim: (String::new(), 0), tool: "", head: false, text: Some(s), life: 5.0 });
         if self.feed.len() > 6 {
             self.feed.remove(0);
         }
@@ -1716,9 +1840,10 @@ impl Game {
                     }
                     let killer = ff.last_attacker;
                     let w = ff.last_weapon;
-                    self.on_death(i, killer, w);
+                    let head = ff.last_head;
+                    self.on_death(i, killer, w, head);
                     if self.kind == Kind::Host {
-                        self.out_events.push(Ev::Died { victim: i as u8, killer: killer.map_or(255, |k| k as u8), w });
+                        self.out_events.push(Ev::Died { victim: i as u8, killer: killer.map_or(255, |k| k as u8), w, head });
                     }
                 }
             }
@@ -1822,18 +1947,18 @@ impl Game {
     }
 
     /// Someone died (on this computer, or we were told). Feed line, and the score on the authority.
-    fn on_death(&mut self, victim: usize, killer: Option<usize>, w: u8) {
+    fn on_death(&mut self, victim: usize, killer: Option<usize>, w: u8, head: bool) {
         let vname = (self.f[victim].name.clone(), self.f[victim].color_idx);
         let k = killer.filter(|&k| k != victim && k < self.f.len() && self.f[k].present);
         let kname = k.map(|k| (self.f[k].name.clone(), self.f[k].color_idx));
-        self.feed.push(FeedLine { killer: kname, victim: vname, tool: kill_tool(w), text: None, life: 6.0 });
+        self.feed.push(FeedLine { killer: kname, victim: vname, tool: kill_tool(w), head, text: None, life: 6.0 });
         if self.feed.len() > 6 {
             self.feed.remove(0);
         }
         self.sfx(Sfx::Hurt, self.f[victim].pos);
         let p = self.f[victim].chest();
         self.burst(p, [200, 30, 40], 26, 6.0);
-        self.last_kill = Some((victim, k, w));
+        self.last_kill = Some((victim, k, w, head));
         if k == Some(self.local) && victim != self.local && self.is_enemy(self.local, victim) {
             self.streak = if self.time - self.last_kill_time < 4.0 { self.streak + 1 } else { 1 };
             self.last_kill_time = self.time;
@@ -1909,8 +2034,8 @@ impl Game {
         if self.kind == Kind::Demo {
             return;
         }
-        if let Some((victim, killer, w)) = self.last_kill {
-            self.killcam = Some(KillCam { victim, killer, tool: kill_tool(w), t: 0.0 });
+        if let Some((victim, killer, w, head)) = self.last_kill {
+            self.killcam = Some(KillCam { victim, killer, tool: kill_tool(w), head, t: 0.0 });
             self.slowmo = KILLCAM_TIME;
         }
     }
@@ -2484,6 +2609,11 @@ impl Game {
         ff.guard = can_act && melee && inp.guard && !ff.slashing() && ff.switch_t <= 0.0;
         ff.guard_t = if ff.guard { ff.guard_t + dt } else { 0.0 };
         ff.stagger_t = (ff.stagger_t - dt).max(0.0);
+        let scoping = can_act && !melee && inp.guard && ff.weapon.zoom() > 1.0 && ff.reload_t <= 0.0 && ff.switch_t <= 0.0;
+        if scoping && ff.scope_t <= 0.0 && ff.weapon == Weapon::Sniper {
+            sounds.push(Sfx::ScopeIn);
+        }
+        ff.scope_t = if scoping { ff.scope_t + dt } else { 0.0 };
 
         // dash / tumble
         if ff.dash_buf > 0.0 && can_act && ff.dash_cd <= 0.0 && ff.wall.is_none() && !slash_locked {
@@ -2983,11 +3113,11 @@ impl Game {
     }
 
     /// Where a ray first meets a fighter's body, and which part.
-    pub fn ray_fighter(&self, j: usize, o: V3, d: V3, max_t: f32) -> Option<(f32, Part)> {
+    pub fn ray_fighter(&self, j: usize, o: V3, d: V3, max_t: f32) -> Option<(f32, Part, bool)> {
         let pose = self.hit_pose(j);
         // quick reject: the box around all the shapes
         pose.bounds().ray(o, d, max_t)?;
-        pose.ray(o, d, max_t, 0.0)
+        pose.ray_cap(o, d, max_t, 0.0).map(|(t, i)| (t, pose.caps[i].part, HitPose::is_far_limb(i)))
     }
 
     /// (host) a fighter's hit shapes `t` seconds into the game, from recent history.
@@ -3040,7 +3170,7 @@ impl Game {
             if !self.f[j].alive || !self.is_enemy(i, j) {
                 continue;
             }
-            if let Some((ht, _)) = self.ray_fighter(j, start, dir, t) {
+            if let Some((ht, _, _)) = self.ray_fighter(j, start, dir, t) {
                 t = ht;
                 best = Some(j);
             }
@@ -3066,7 +3196,7 @@ impl Game {
             if !self.f[j].alive || !self.is_enemy(i, j) {
                 continue;
             }
-            if let Some((ht, _)) = self.ray_fighter(j, start, dir, t) {
+            if let Some((ht, _, _)) = self.ray_fighter(j, start, dir, t) {
                 t = t.min(ht);
             }
         }
@@ -3087,8 +3217,8 @@ impl Game {
             }
             Act::Gun { w: Weapon::Rocket, .. } => {
                 let (o, dir) = self.shot_ray(i);
-                let v = dir * 34.0;
-                self.grenades.push(Grenade { pos: o, vel: v, fuse: 4.0, owner: i, kind: 1 });
+                let v = dir * ROCKET_SPEED;
+                self.grenades.push(Grenade { pos: o, vel: v, fuse: 5.0, owner: i, kind: 1 });
                 if self.kind == Kind::Host || self.kind == Kind::Client {
                     self.out_events.push(Ev::Grenade { p: o, v, kind: 1 });
                 }
@@ -3137,6 +3267,16 @@ impl Game {
                         self.casings.remove(0);
                     }
                 }
+                if i == self.local && !self.f[i].is_bot {
+                    // recoil: the hand cannon and sniper kick the aim up (it settles back)
+                    self.aim_kick += match w {
+                        Weapon::HandCannon => 0.075,
+                        Weapon::Sniper => 0.05,
+                        Weapon::Rifle => 0.018,
+                        Weapon::Revolver => 0.02,
+                        _ => 0.0,
+                    };
+                }
                 if i == self.local {
                     // only a nudge: a shaking view would throw off the aim
                     self.shake = self.shake.max(match w {
@@ -3172,19 +3312,19 @@ impl Game {
             t = wt;
             hit_world = true;
         }
-        let mut victim: Option<(usize, Part)> = None;
+        let mut victim: Option<(usize, Part, bool)> = None;
         for j in 0..self.f.len() {
             if !self.f[j].alive || !self.is_enemy(shooter, j) {
                 continue;
             }
-            if let Some((ht, part)) = self.ray_fighter(j, o, d, t) {
+            if let Some((ht, part, far)) = self.ray_fighter(j, o, d, t) {
                 t = ht;
-                victim = Some((j, part));
+                victim = Some((j, part, far));
             }
         }
         let end = o + d * t;
         let mut spark = 0u8;
-        if let Some((j, part)) = victim {
+        if let Some((j, part, far)) = victim {
             let head = part == Part::Head;
             let gs = w.gun();
             let falloff = match w {
@@ -3192,11 +3332,23 @@ impl Game {
                 Weapon::Smg => (1.0 - (t - 20.0).max(0.0) / 60.0).max(0.5),
                 _ => 1.0,
             };
-            let mut amount = dmg * falloff * if head { gs.head } else { part.mult() };
+            let mut amount = match w {
+                // a hand-cannon headshot always kills
+                Weapon::HandCannon if head => LETHAL,
+                // the sniper kills on anything but hands, forearms, shins and feet
+                Weapon::Sniper => {
+                    if far {
+                        SNIPER_LIMB
+                    } else {
+                        LETHAL
+                    }
+                }
+                _ => dmg * falloff * if head { gs.head } else { part.mult() },
+            };
             let v = &self.f[j];
             let blocked = v.guard && v.fwd().dot(-d) > 0.45;
             if blocked {
-                amount *= 0.12;
+                amount = amount.min(gs.dmg.max(45.0)) * 0.12; // a sword guard stops even the big ones
                 spark = 2;
             } else {
                 // armour throws sparks along with the blood
@@ -3208,11 +3360,18 @@ impl Game {
             }
             let knock = d.flat().norm() * gs.knock;
             self.damage(shooter, j, amount, knock, 0.0, head && !blocked, end, w as u8, o, d);
+            if !blocked {
+                match w {
+                    Weapon::HandCannon if head => self.note(shooter, |s| s.cannon_heads += 1),
+                    Weapon::Sniper => self.note(shooter, |s| s.sniper_hits += 1),
+                    _ => {}
+                }
+            }
         } else if hit_world {
             spark = 3;
         }
         let color = if shooter == self.local { [255, 230, 150] } else { [255, 170, 120] };
-        self.tracers.push(Tracer { a: o, b: end, life: 0.09, color });
+        self.tracers.push(Tracer::shot(o, end, w, color));
         self.impact_fx(end, spark);
         if spark == 1 || spark == 5 {
             self.sfx(Sfx::BulletFlesh, end);
@@ -3394,7 +3553,8 @@ impl Game {
             self.combo_hit(amount);
             self.hitmarker = if head { 0.35 } else { 0.25 };
             self.hit_head = head || (self.hit_head && self.time - self.hit_chain_t < 0.02);
-            self.dmg_nums.push(DmgNum { pos: at + v3(0.0, 0.3, 0.0), amount: amount.round() as i32, life: 0.9, head });
+            let shown = if amount >= LETHAL { (self.f[victim].hp + self.f[victim].ap).max(1.0) } else { amount };
+            self.dmg_nums.push(DmgNum { pos: at + v3(0.0, 0.3, 0.0), amount: shown.round() as i32, life: 0.9, head: head || amount >= LETHAL });
             // one crisp tick per shot (a shotgun's pellets count once), climbing in pitch while
             // the hits keep coming
             let volley = self.time - self.hit_chain_t < 0.02;
@@ -3440,7 +3600,9 @@ impl Game {
             }
             let ff = &mut self.f[victim];
             let mut a = amount;
-            if ff.ap > 0.0 {
+            if amount >= LETHAL {
+                a = ff.hp; // through any armour
+            } else if ff.ap > 0.0 {
                 let absorbed = (a * 0.6).min(ff.ap);
                 ff.ap -= absorbed;
                 a -= absorbed;
@@ -3449,6 +3611,7 @@ impl Game {
             ff.hurt_t = 0.25;
             ff.flow = 0;
             ff.last_weapon = w;
+            ff.last_head = head;
             if let Some(at) = attacker {
                 ff.last_attacker = Some(at);
             }
@@ -3477,9 +3640,10 @@ impl Game {
     /// Lag compensation: does a player's reported hit hold up against where the target was when
     /// that player saw it (their ping ago)? Also throws out impossible damage and weapons they
     /// don't carry.
-    /// Returns None when the claim is thrown out, or Some(whether a claimed headshot holds up).
+    /// Returns None when the claim is thrown out; otherwise whether a claimed headshot holds up
+    /// and whether the shot touched the body proper (not just a hand, forearm, shin or foot).
     #[allow(clippy::too_many_arguments)]
-    pub fn validate_claim(&self, shooter: usize, victim: usize, w: u8, dmg: f32, o: V3, dir: V3, head: bool) -> Option<bool> {
+    pub fn validate_claim(&self, shooter: usize, victim: usize, w: u8, dmg: f32, o: V3, dir: V3, head: bool) -> Option<ClaimCheck> {
         if victim >= self.f.len() || !self.f[victim].present || !self.f[victim].alive || !self.is_enemy(shooter, victim) {
             return None;
         }
@@ -3488,7 +3652,7 @@ impl Game {
             return None;
         }
         let wpn = Weapon::from_u8(w);
-        if w >= 8 || !s.loadout.has(wpn) || wpn == Weapon::Rocket {
+        if w >= N_WEAPONS || !s.loadout.has(wpn) || wpn == Weapon::Rocket {
             return None; // explosions are worked out by the host itself
         }
         if !(dmg > 0.0) || dmg > wpn.max_hit() * 1.5 * 1.05 {
@@ -3501,6 +3665,7 @@ impl Game {
         let sp_now = s.pos;
         let mut hit = false;
         let mut head_ok = false;
+        let mut core_ok = false;
         for back in [INTERP_DELAY, (INTERP_DELAY + MAX_INTERP) * 0.5, MAX_INTERP] {
             let rewind = (ping + back + 0.015).clamp(0.0, 0.7);
             let t = self.time - rewind;
@@ -3510,7 +3675,7 @@ impl Game {
                 let reach = wpn.melee_range() + 1.6;
                 let ok = |sp: V3| (vp - sp).flat().len() <= reach && (vp.y - sp.y).abs() <= 3.0;
                 if ok(sp_then) || ok(sp_now) {
-                    return Some(false);
+                    return Some(ClaimCheck { head_ok: false, core_ok: true });
                 }
                 continue;
             }
@@ -3526,9 +3691,12 @@ impl Game {
                 if head && pose.ray_part(o, d, range, 0.12, Part::Head) {
                     head_ok = true;
                 }
+                if pose.ray_core(o, d, range, 0.15) {
+                    core_ok = true;
+                }
             }
         }
-        hit.then_some(head_ok)
+        hit.then_some(ClaimCheck { head_ok, core_ok })
     }
 
     /// Medkit (0) or armor kit (1).
@@ -3588,7 +3756,7 @@ impl Game {
         }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn apply_hit(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, _head: bool, w: u8, src: Option<V3>) {
+    pub fn apply_hit(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8, src: Option<V3>) {
         let ff = &mut self.f[victim];
         if !ff.alive || !ff.present || ff.spawn_prot > 0.0 {
             return;
@@ -3597,8 +3765,11 @@ impl Game {
             return;
         }
         ff.last_weapon = w;
+        ff.last_head = head;
         let mut a = amount;
-        if ff.ap > 0.0 {
+        if amount >= LETHAL {
+            a = ff.hp; // through any armour
+        } else if ff.ap > 0.0 {
             let absorbed = (a * 0.6).min(ff.ap);
             ff.ap -= absorbed;
             a -= absorbed;
@@ -3634,7 +3805,7 @@ impl Game {
         }
         if victim == self.local {
             let me = self.f[victim].pos;
-            let explosive = w == 8 || w == Weapon::Rocket as u8;
+            let explosive = w == GRENADE_TOOL || w == Weapon::Rocket as u8;
             let from = match (src, attacker) {
                 _ if explosive && knock.flat().len() > 0.1 => me - knock.flat().norm() * 3.0,
                 (Some(s), _) if s != V3::ZERO => s,
@@ -3730,7 +3901,7 @@ impl Game {
         if !self.is_authority() {
             return;
         }
-        let (radius, base, extra, w) = if kind == 1 { (4.5, 22.0, 58.0, Weapon::Rocket as u8) } else { (4.8, 18.0, 42.0, 8u8) };
+        let (radius, base, extra, w) = if kind == 1 { (ROCKET_RADIUS, 8.0, ROCKET_MAX - 8.0, Weapon::Rocket as u8) } else { (4.8, 18.0, 42.0, GRENADE_TOOL) };
         for j in 0..self.f.len() {
             if !self.f[j].alive || !self.f[j].present || self.f[j].spawn_prot > 0.0 {
                 continue;
@@ -3742,7 +3913,8 @@ impl Game {
             let d = (c - p).len();
             if d < radius && self.world.line_clear(p + v3(0.0, 0.2, 0.0), c) {
                 let k = 1.0 - d / radius;
-                let mut dmg = base + extra * k;
+                // rockets fall off fast from the centre (squared); grenades evenly
+                let mut dmg = if kind == 1 { base + extra * k * k } else { base + extra * k };
                 let mut knock = (c - p).norm() * (6.0 + 8.0 * k) + v3(0.0, 4.0 * k + 2.0, 0.0);
                 if j == owner {
                     // your own blast hurts less and throws you further (rocket jump)
@@ -3831,7 +4003,7 @@ impl Game {
         match ev {
             Ev::Shot { o, e, w, spark } => {
                 if w != 0 {
-                    self.tracers.push(Tracer { a: o, b: e, life: 0.09, color: [255, 170, 120] });
+                    self.tracers.push(Tracer::shot(o, e, Weapon::from_u8(w), [255, 170, 120]));
                     for _ in 0..4 {
                         let v = (e - o).norm() * self.rng.range(2.0, 5.0);
                         self.particles.push(Particle { pos: o, vel: v, life: 0.08, max_life: 0.08, size: 0.18, color: [255, 220, 120], gravity: 0.0 });
@@ -3859,11 +4031,21 @@ impl Game {
                 if self.kind == Kind::Host {
                     // a player says they hit someone: check it against the recent past
                     if from != 0 {
-                        if let Some(head_ok) = self.validate_claim(from, v, w, dmg, o, dir, head) {
-                            // a headshot the host can't confirm still counts, as a body shot
-                            let gs = Weapon::from_u8(w).gun();
-                            let dmg = if head && !head_ok && !Weapon::from_u8(w).is_melee() { dmg / gs.head.max(1.0) } else { dmg };
-                            self.authority_hit(v, Some(from), dmg, knock, stun, head && head_ok, w);
+                        if let Some(chk) = self.validate_claim(from, v, w, dmg, o, dir, head) {
+                            let wpn = Weapon::from_u8(w);
+                            let gs = wpn.gun();
+                            let mut dmg = dmg;
+                            // what the host can't confirm still counts, at the lesser damage
+                            if dmg >= LETHAL {
+                                match wpn {
+                                    Weapon::HandCannon if !(head && chk.head_ok) => dmg = gs.dmg,
+                                    Weapon::Sniper if !chk.core_ok => dmg = SNIPER_LIMB,
+                                    _ => {}
+                                }
+                            } else if head && !chk.head_ok && !wpn.is_melee() {
+                                dmg /= gs.head.max(1.0);
+                            }
+                            self.authority_hit(v, Some(from), dmg, knock, stun, head && chk.head_ok, w);
                         }
                     }
                 } else if from == 0 && v == self.local && self.f[v].owned {
@@ -3872,9 +4054,9 @@ impl Game {
                 }
             }
             Ev::Grenade { p, v, kind } => {
-                self.grenades.push(Grenade { pos: p, vel: v, fuse: if kind == 1 { 4.0 } else { 1.7 }, owner: from, kind });
+                self.grenades.push(Grenade { pos: p, vel: v, fuse: if kind == 1 { 5.0 } else { 1.7 }, owner: from, kind });
             }
-            Ev::Died { victim, killer, w } => {
+            Ev::Died { victim, killer, w, head } => {
                 let v = victim as usize;
                 if self.kind == Kind::Client && from == 0 && v < self.f.len() && self.f[v].present {
                     self.f[v].alive = false;
@@ -3885,7 +4067,7 @@ impl Game {
                         self.f[v].wall = None;
                     }
                     let k = if (killer as usize) < self.f.len() { Some(killer as usize) } else { None };
-                    self.on_death(v, k, w);
+                    self.on_death(v, k, w, head);
                 }
             }
             Ev::Chat { text } => {
@@ -4032,7 +4214,7 @@ mod lag_comp_tests {
         assert!(past.x < 4.5, "history should remember the past, got {:?}", past);
         let dir_past = (past + v3(0.0, 1.0, 0.0) - o).norm();
         let dir_now = (g.f[1].pos + v3(0.0, 1.0, 0.0) - o).norm();
-        assert!(g.validate_claim(0, 1, Weapon::Rifle as u8, 48.0, o, dir_past, false).is_some(), "a hit on what the shooter saw counts");
+        assert!(g.validate_claim(0, 1, Weapon::Rifle as u8, 34.0, o, dir_past, false).is_some(), "a hit on what the shooter saw counts");
         assert!(g.validate_claim(0, 1, Weapon::Rifle as u8, 48.0, o, v3(-1.0, 0.0, 0.0), false).is_none(), "a miss is thrown out");
         assert!(g.validate_claim(0, 1, Weapon::Rifle as u8, 500.0, o, dir_past, false).is_none(), "impossible damage is thrown out");
         assert!(g.validate_claim(0, 1, Weapon::Smg as u8, 9.0, o, dir_past, false).is_none(), "a gun you don't carry is thrown out");
@@ -4041,9 +4223,9 @@ mod lag_comp_tests {
         // what a 200 ms player saw: their ping plus their playback delay ago
         let head_then = g.pose_at(1, g.time - (0.2 + INTERP_DELAY + 0.015)).caps[0];
         let at_head = ((head_then.a + head_then.b) * 0.5 - o).norm();
-        assert_eq!(g.validate_claim(0, 1, Weapon::Rifle as u8, 96.0, o, at_head, true), Some(true), "a real headshot counts as one");
+        assert_eq!(g.validate_claim(0, 1, Weapon::Rifle as u8, 68.0, o, at_head, true).map(|c| c.head_ok), Some(true), "a real headshot counts as one");
         let at_legs = (past + v3(0.0, 0.5, 0.0) - o).norm();
-        assert_eq!(g.validate_claim(0, 1, Weapon::Rifle as u8, 96.0, o, at_legs, true), Some(false), "a leg shot claimed as a headshot counts as a body shot");
+        assert_eq!(g.validate_claim(0, 1, Weapon::Rifle as u8, 68.0, o, at_legs, true).map(|c| c.head_ok), Some(false), "a leg shot claimed as a headshot counts as a body shot");
     }
 }
 #[cfg(test)]
@@ -4587,5 +4769,133 @@ mod movement_tests {
         g.f[1].hp = 0.0;
         run(&mut g, 2.5, Input::default());
         assert!(g.f[0].hp >= 40.0 + KILL_HEAL - 0.5 && g.f[0].hp <= 40.0 + KILL_HEAL + 0.5, "healed: {}", g.f[0].hp);
+    }
+}
+
+#[cfg(test)]
+mod weapon_tests {
+    use super::*;
+
+    /// A target at the origin with full health and full armour, and a shooter holding `gun`.
+    fn range(gun: Weapon) -> Game {
+        let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
+        g.world = crate::game::lag_comp_tests::flat_world();
+        g.bots[1] = None;
+        g.mt.phase = Phase::Fight;
+        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: gun, gun2: Weapon::Revolver, item: 0 };
+        g.f[0].equip();
+        g.f[0].pos = v3(0.0, 0.0, -10.0);
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Smg, item: 0 };
+        g.f[1].equip();
+        for i in 0..2 {
+            g.f[i].spawn_prot = 0.0;
+        }
+        for _ in 0..20 {
+            g.f[1].pos = V3::ZERO;
+            g.f[1].vel = V3::ZERO;
+            g.f[1].yaw = std::f32::consts::PI;
+            g.tick(&Input::default());
+        }
+        g.f[1].hp = MAX_HP;
+        g.f[1].ap = MAX_AP;
+        g
+    }
+
+    /// A shot (origin, direction) whose first hit on the target is capsule `cap`.
+    fn shot_at(g: &Game, cap: usize) -> (V3, V3) {
+        let pose = g.hit_pose(1);
+        let c = pose.caps[cap];
+        let centre = (c.a + c.b) * 0.5;
+        for tilt in [0.0f32, -0.4, 0.4, -0.8] {
+            for k in 0..16 {
+                let a = k as f32 / 16.0 * std::f32::consts::TAU;
+                let d = v3(a.sin() * tilt.cos(), tilt.sin(), a.cos() * tilt.cos()).norm();
+                let o = centre - d * 5.0;
+                if pose.ray_cap(o, d, 10.0, 0.0).map(|h| h.1) == Some(cap) {
+                    return (o, d);
+                }
+            }
+        }
+        panic!("no clear shot at capsule {cap}");
+    }
+
+    fn fire(g: &mut Game, w: Weapon, cap: usize) {
+        let (o, d) = shot_at(g, cap);
+        g.fire_ray(0, o, d, w.gun().dmg, w.gun().range, w);
+        g.tick(&Input::default()); // deaths are settled in the tick
+    }
+
+    #[test]
+    fn hand_cannon_headshot_always_kills() {
+        let mut g = range(Weapon::HandCannon);
+        fire(&mut g, Weapon::HandCannon, 0);
+        assert!(!g.f[1].alive, "one headshot through full armour kills");
+        let mut g = range(Weapon::HandCannon);
+        fire(&mut g, Weapon::HandCannon, 2);
+        assert!(g.f[1].alive, "a body shot doesn''t");
+        assert!(g.f[1].hp < MAX_HP && g.f[1].ap < MAX_AP, "but it hurts (armour soaks some)");
+    }
+
+    #[test]
+    fn sniper_kills_on_the_body_not_hands_or_feet() {
+        // head, neck, chest, shoulders, hips, upper arms, thighs
+        for cap in [0usize, 2, 4, 5, 7, 9, 11] {
+            let mut g = range(Weapon::Sniper);
+            fire(&mut g, Weapon::Sniper, cap);
+            assert!(!g.f[1].alive, "capsule {cap} ({:?}) is a one-shot kill", g.hit_pose(1).caps[cap].part);
+        }
+        // forearms/hands and shins/feet
+        for cap in [6usize, 8, 10, 12] {
+            let mut g = range(Weapon::Sniper);
+            fire(&mut g, Weapon::Sniper, cap);
+            assert!(g.f[1].alive, "capsule {cap} isn''t a kill");
+            let lost = (MAX_HP - g.f[1].hp) + (MAX_AP - g.f[1].ap);
+            assert!((lost - SNIPER_LIMB).abs() < 1.0, "a limb hit does 60 (lost {lost})");
+        }
+    }
+
+    #[test]
+    fn sniper_is_dead_on_only_when_scoped() {
+        let mut f = Fighter::new("T", 0, true);
+        f.weapon = Weapon::Sniper;
+        f.scope_t = 0.0;
+        assert!(f.spread() > 0.05, "wild from the hip");
+        f.scope_t = SCOPE_IN;
+        assert_eq!(f.spread(), 0.0, "exact once the scope is up");
+    }
+
+    #[test]
+    fn rocket_tops_out_at_55() {
+        assert_eq!(Weapon::Rocket.max_hit(), 55.0);
+        let mut g = range(Weapon::Rocket);
+        g.f[1].ap = 0.0;
+        let c = g.f[1].chest();
+        g.explode(c, 0, 1);
+        assert!((MAX_HP - g.f[1].hp - 55.0).abs() < 0.01, "dead centre: {}", MAX_HP - g.f[1].hp);
+        let mut g = range(Weapon::Rocket);
+        g.f[1].ap = 0.0;
+        let c = g.f[1].chest();
+        g.explode(c + v3(2.5, 0.0, 0.0), 0, 1);
+        let lost = MAX_HP - g.f[1].hp;
+        assert!(lost > 0.0 && lost < 20.0, "falls off fast: {lost} at 2.5 m");
+        let mut g = range(Weapon::Rocket);
+        let c = g.f[1].chest();
+        g.explode(c + v3(3.7, 0.0, 0.0), 0, 1);
+        assert_eq!(g.f[1].hp, MAX_HP, "nothing past 3.5 m");
+    }
+
+    #[test]
+    fn balance_numbers() {
+        assert_eq!(Weapon::Rifle.mag(), 10);
+        assert!((Weapon::Rifle.interval() - 0.45).abs() < 1e-6);
+        assert_eq!(Weapon::Rifle.gun().dmg, 34.0);
+        assert_eq!(Weapon::Rifle.gun().head, 2.0);
+        assert_eq!(Weapon::HandCannon.mag(), 7);
+        assert_eq!(Weapon::Sniper.mag(), 5);
+        assert!((Weapon::Sniper.interval() - 1.3).abs() < 1e-6 && (Weapon::Sniper.reload_time() - 2.8).abs() < 1e-6);
+        assert!((Weapon::Rocket.reload_time() - 2.6).abs() < 1e-6);
+        assert_eq!(Weapon::Smg.zoom(), 1.0, "no zoom on the SMG");
+        assert_eq!(Weapon::Sniper.zoom(), 3.0);
+        assert!(Weapon::Smg.gun().spread_still <= 0.02 * 0.61);
     }
 }

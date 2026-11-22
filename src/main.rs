@@ -36,6 +36,10 @@ struct Settings {
     join_addr: String,
     volume: f32,
     music_volume: f32,
+    /// Music on at all, and separately in the menus and in matches.
+    music_on: bool,
+    menu_music: bool,
+    match_music: bool,
     loadout: Loadout,
     binds: [Bind; N_ACTIONS],
     /// Graphics preset (index into gpu::Quality::PRESETS).
@@ -96,7 +100,7 @@ enum Bind {
     Unbound,
 }
 
-const N_ACTIONS: usize = 17;
+const N_ACTIONS: usize = 18;
 const A_FWD: usize = 0;
 const A_BACK: usize = 1;
 const A_LEFT: usize = 2;
@@ -114,6 +118,7 @@ const A_GUN2: usize = 13;
 const A_SCORES: usize = 14;
 const A_CHAT: usize = 15;
 const A_SLIDE: usize = 16;
+const A_MUSIC: usize = 17;
 
 /// (saved id, what it does)
 const ACTIONS: [(&str, &str); N_ACTIONS] = [
@@ -134,6 +139,7 @@ const ACTIONS: [(&str, &str); N_ACTIONS] = [
     ("scores", "Player list (hold)"),
     ("chat", "Chat"),
     ("slide", "Slide (while running)"),
+    ("music", "Music on / off"),
 ];
 
 fn default_binds() -> [Bind; N_ACTIONS] {
@@ -156,6 +162,7 @@ fn default_binds() -> [Bind; N_ACTIONS] {
         Key(egui::Key::Tab),
         Key(egui::Key::T),
         Key(egui::Key::C),
+        Key(egui::Key::M),
     ]
 }
 
@@ -249,7 +256,10 @@ impl Default for Settings {
             port: net::DEFAULT_PORT.to_string(),
             join_addr: String::new(),
             volume: 0.7,
-            music_volume: 0.5,
+            music_volume: 0.3,
+            music_on: true,
+            menu_music: true,
+            match_music: true,
             loadout: Loadout::default(),
             binds: default_binds(),
             quality: 2,
@@ -295,7 +305,10 @@ impl Settings {
                             "port" => s.port = v.to_string(),
                             "join" => s.join_addr = v.to_string(),
                             "volume" => s.volume = v.parse().unwrap_or(s.volume),
-                            "music_volume" => s.music_volume = v.parse().unwrap_or(0.5f32).clamp(0.0, 1.0),
+                            "music_volume" => s.music_volume = v.parse().unwrap_or(0.3f32).clamp(0.0, 1.0),
+                            "music_on" => s.music_on = v != "0",
+                            "menu_music" => s.menu_music = v != "0",
+                            "match_music" => s.match_music = v != "0",
                             "loadout" => {
                                 let b: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                                 if b.len() == 4 {
@@ -346,6 +359,10 @@ impl Settings {
                 s.cross_size = 0.8;
             }
         }
+        // settings saved before the playtest update: quieter music by default
+        if saved && aim_v < 3 && (s.music_volume - 0.5).abs() < 0.01 {
+            s.music_volume = 0.3;
+        }
         s
     }
     fn save(&self) {
@@ -360,8 +377,8 @@ impl Settings {
             );
             let [r, g, b] = self.cross_color;
             text += &format!(
-                "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\naim_v=2\n",
-                self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8
+                "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\naim_v=3\n",
+                self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8
             );
             for (k, (id, _)) in ACTIONS.iter().enumerate() {
                 text += &format!("bind.{id}={}\n", self.binds[k].id());
@@ -464,6 +481,11 @@ struct App {
     ads_zoom: std::cell::Cell<f32>,
     wall_t: f32,
     train_step: i32,
+    /// Recoil still to settle back out of the aim.
+    kick_back: f32,
+    /// "Next track" presses (steps through the tracks), and a short note on screen.
+    track_skip: usize,
+    music_note: Option<(&'static str, f32)>,
 }
 
 impl App {
@@ -531,6 +553,9 @@ impl App {
             ads_zoom: std::cell::Cell::new(1.0),
             wall_t: 0.0,
             train_step: 0,
+            kick_back: 0.0,
+            track_skip: 0,
+            music_note: None,
         };
         // test switches: DUEL_QUALITY=0..3, DUEL_PAGE=settings:<tab> | join | main, DUEL_RECENT=1 (sample list)
         if let Some(q) = std::env::var("DUEL_QUALITY").ok().and_then(|v| v.parse::<usize>().ok()) {
@@ -721,6 +746,22 @@ impl App {
         }
     }
 
+    /// Music switches: all music, menu music, match music, and skip to the next track.
+    fn music_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.settings.music_on, "Music");
+            ui.add_enabled_ui(self.settings.music_on, |ui| {
+                ui.checkbox(&mut self.settings.menu_music, "in menus");
+                ui.checkbox(&mut self.settings.match_music, "in matches");
+                if ui.button("Next track").clicked() {
+                    self.track_skip += 1;
+                }
+            });
+        });
+        let key = self.settings.binds[A_MUSIC].name();
+        ui.label(egui::RichText::new(format!("Press {key} in a match to turn music on or off.")).size(13.0).color(Color32::from_gray(170)));
+    }
+
     /// The network test settings, when switched on.
     fn net_sim(&self) -> Option<net::NetSim> {
         self.settings.net_test.then(|| net::NetSim { lag_ms: self.settings.net_lag, loss: self.settings.net_loss / 100.0 })
@@ -902,6 +943,7 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("field of view"));
                 ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("effects volume"));
                 ui.add(egui::Slider::new(&mut self.settings.music_volume, 0.0..=1.0).text("music volume"));
+                self.music_ui(ui);
                 if self.audio.is_none() && self.screenshot.is_none() {
                     ui.label("(no sound device found)");
                 }
@@ -1397,10 +1439,16 @@ impl eframe::App for App {
         } else if !self.captured && ctx.input(|i| i.pointer.primary_clicked()) && ctx.is_pointer_over_egui() {
             sounds.push((Sfx::UiClick, None, 1.0));
         }
+        let n_tracks = audio::TRACK_FIGHTS.len() + 1;
         let track = match &self.screen {
-            Screen::Play { game, .. } if game.train.is_some() => Some(audio::TRACK_FIGHTS[0]),
-            Screen::Play { game, .. } => Some(audio::TRACK_FIGHTS[(game.mt.number as usize) % audio::TRACK_FIGHTS.len()]),
-            _ => Some(audio::TRACK_MENU),
+            _ if !self.settings.music_on => None,
+            Screen::Play { .. } if !self.settings.match_music => None,
+            Screen::Play { game, .. } => {
+                let base = if game.train.is_some() { 0 } else { game.mt.number as usize };
+                Some(audio::TRACK_FIGHTS[(base + self.track_skip) % audio::TRACK_FIGHTS.len()])
+            }
+            _ if !self.settings.menu_music => None,
+            _ => Some((audio::TRACK_MENU + self.track_skip) % n_tracks),
         };
         if let Some(a) = &mut self.audio {
             let mute = std::env::var_os("DUEL_AUDIO_TEST").is_some();
@@ -1489,6 +1537,10 @@ impl App {
             self.show_scores = b[A_SCORES].down(i);
             if i.key_pressed(Key::F5) {
                 self.start_request = true;
+            }
+            if b[A_MUSIC].tapped(i, prev) {
+                self.settings.music_on = !self.settings.music_on;
+                self.music_note = Some((if self.settings.music_on { "Music on" } else { "Music off" }, 1.5));
             }
             if i.key_pressed(Key::N) {
                 self.train_step += 1;
@@ -1594,6 +1646,12 @@ impl App {
     }
 
     fn step_play(&mut self, dt: f32) {
+        if let Some((_, t)) = self.music_note.as_mut() {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.music_note = None;
+            }
+        }
         let keys = self.keys_snapshot();
         let mut inp = self.current_input(&keys);
         if self.chat_open {
@@ -1728,6 +1786,10 @@ impl App {
             if game.chat.is_empty() {
                 game.add_chat(1, "that was a clean launch, rematch after this?");
             }
+            if !game.feed.iter().any(|l| l.head) {
+                game.feed.push(FeedLine { killer: Some(("Vex".into(), 1)), victim: ("Ash".into(), 2), tool: "Hand Cannon", head: true, text: None, life: 6.0 });
+                game.feed.push(FeedLine { killer: Some(("Tester".into(), 0)), victim: ("Kiro".into(), 3), tool: "Sniper", head: false, text: None, life: 6.0 });
+            }
         }
         // game feel: a brief freeze when a sword hit lands, slow motion for the final kill
         if let Some(kc) = game.killcam.as_mut() {
@@ -1762,6 +1824,26 @@ impl App {
         }
         if let Ok(page) = std::env::var("DUEL_GALLERY") {
             gallery_pose(game, page == "2");
+        }
+        // test switch: hold a scoped sniper (to photograph the scope)
+        if self.autoplay && std::env::var_os("DUEL_SCOPE_TEST").is_some() && game.time > 3.0 {
+            let l = game.local;
+            let f = &mut game.f[l];
+            f.loadout.gun2 = Weapon::Sniper;
+            f.cur = 2;
+            f.weapon = Weapon::Sniper;
+            f.scope_t = 1.0;
+        }
+        // recoil: the kick goes into the aim, and most of it settles back by itself
+        let kick = std::mem::take(&mut game.aim_kick);
+        if kick > 0.0 {
+            self.aim_pitch = (self.aim_pitch + kick).min(1.4);
+            self.kick_back += kick * 0.75;
+        }
+        if self.kick_back > 0.0 {
+            let r = self.kick_back * (dt * 9.0).min(1.0);
+            self.aim_pitch -= r;
+            self.kick_back -= r;
         }
         // after a respawn, look where the new body faces
         let l = game.local;
@@ -1925,15 +2007,11 @@ impl App {
         }
         let (pivot, dir, max_dist) = game.camera_rig(body, yaw, pitch);
         // right mouse with a gun: aim down sights (zoom in, camera a little closer)
-        let ads = !f.weapon.is_melee() && f.alive && self.keys_snapshot().guard && (self.captured || f.is_bot);
-        let want_zoom = if !ads {
-            1.0
-        } else if matches!(f.weapon, Weapon::Rifle | Weapon::Revolver) {
-            1.5
-        } else {
-            1.2
-        };
-        let zoom = self.ads_zoom.get() + (want_zoom - self.ads_zoom.get()) * (self.frame_dt * 14.0).min(1.0);
+        // (each gun has its own zoom; the SMG has none; the sniper's 3x scope snaps up in 0.15 s)
+        let ads = f.alive && f.scope_t > 0.0;
+        let want_zoom = if ads { f.weapon.zoom() } else { 1.0 };
+        let rate = if f.weapon == Weapon::Sniper { 35.0 } else { 14.0 };
+        let zoom = self.ads_zoom.get() + (want_zoom - self.ads_zoom.get()) * (self.frame_dt * rate).min(1.0);
         self.ads_zoom.set(zoom);
         let max_dist = max_dist * (1.0 - 0.3 * (zoom - 1.0));
         // snap in at once when a wall gets in the way, ease back out smoothly
@@ -2181,6 +2259,56 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
 
 // ---------------------------------------------------------------------- HUD
 
+/// Marks a headshot in a line of text (see `layout_pieces`).
+const HS_ICON: &str = "\u{1}";
+const HS_GOLD: Color32 = Color32::from_rgb(255, 205, 70);
+
+/// A piece of a line: some text, or the headshot icon.
+enum Piece {
+    Text(std::sync::Arc<egui::Galley>),
+    Icon(f32, Color32),
+}
+
+impl Piece {
+    fn width(&self) -> f32 {
+        match self {
+            Piece::Text(g) => g.size().x,
+            Piece::Icon(w, _) => *w,
+        }
+    }
+}
+
+fn layout_pieces(p: &egui::Painter, parts: Vec<(String, Color32)>, font: &FontId, size: f32, fade: impl Fn(Color32) -> Color32) -> Vec<Piece> {
+    parts
+        .into_iter()
+        .map(|(t, col)| if t == HS_ICON { Piece::Icon(size * 1.3, fade(col)) } else { Piece::Text(p.layout_no_wrap(t, font.clone(), fade(col))) })
+        .collect()
+}
+
+fn draw_pieces(p: &egui::Painter, at: Pos2, pieces: Vec<Piece>, size: f32) {
+    let mut x = at.x;
+    for pc in pieces {
+        let w = pc.width();
+        match pc {
+            Piece::Text(g) => p.galley(Pos2::new(x, at.y), g, Color32::WHITE),
+            Piece::Icon(_, col) => headshot_icon(p, Pos2::new(x + w * 0.55, at.y + size * 0.62), size * 0.42, col),
+        }
+        x += w;
+    }
+}
+
+/// A small target-on-a-head mark for headshot kills: a ring, four ticks and a dot.
+fn headshot_icon(p: &egui::Painter, c: Pos2, r: f32, col: Color32) {
+    let dark = Color32::from_black_alpha(col.a() / 2);
+    p.circle_stroke(c + Vec2::splat(1.0), r, Stroke::new(2.0, dark));
+    p.circle_stroke(c, r, Stroke::new(1.6, col));
+    for (dx, dy) in [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+        let d = Vec2::new(dx, dy);
+        p.line_segment([c + d * (r * 0.55), c + d * (r * 1.35)], Stroke::new(1.6, col));
+    }
+    p.circle_filled(c, r * 0.28, col);
+}
+
 fn text_shadow(p: &egui::Painter, pos: Pos2, align: Align2, s: &str, size: f32, color: Color32) {
     let font = FontId::proportional(size);
     p.text(pos + Vec2::new(2.0, 2.0), align, s, font.clone(), Color32::from_black_alpha(170));
@@ -2303,6 +2431,49 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
 impl App {
     /// F3: frame rate, ping, packet loss, players and traffic. A small tag always shows while
     /// the network test is on, so nobody forgets it.
+    /// The sniper's scope: black all round a round lens, with fine crosshairs and range marks.
+    fn draw_scope(&self, p: &egui::Painter, rect: Rect) {
+        let c = rect.center();
+        let r = rect.width().min(rect.height()) * 0.46;
+        let outer = rect.size().length();
+        let black = Color32::from_rgb(4, 4, 6);
+        // the dark surround, as a ring from the lens edge out past the corners
+        let mut mesh = egui::epaint::Mesh::default();
+        let n = 96u32;
+        for k in 0..=n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            let d = Vec2::new(a.cos(), a.sin());
+            mesh.colored_vertex(c + d * r, black);
+            mesh.colored_vertex(c + d * outer, black);
+        }
+        for k in 0..n {
+            let i = k * 2;
+            mesh.add_triangle(i, i + 1, i + 3);
+            mesh.add_triangle(i, i + 3, i + 2);
+        }
+        p.add(egui::Shape::mesh(mesh));
+        // a soft dark rim inside the lens
+        for (w, a) in [(10.0, 160u8), (22.0, 70), (40.0, 25)] {
+            p.circle_stroke(c, r - w * 0.5, Stroke::new(w, Color32::from_black_alpha(a)));
+        }
+        // crosshairs: thick at the edges, fine in the middle, with range marks
+        let line = Color32::from_rgba_unmultiplied(10, 10, 10, 230);
+        let thick = Stroke::new(3.0, line);
+        let fine = Stroke::new(1.2, line);
+        let inner = r * 0.45;
+        for (dx, dy) in [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            let d = Vec2::new(dx, dy);
+            p.line_segment([c + d * inner, c + d * r], thick);
+            p.line_segment([c + d * 4.0, c + d * inner], fine);
+            for m in 1..=4 {
+                let at = c + d * (inner * m as f32 / 5.0);
+                let side = Vec2::new(-dy, dx) * 4.0;
+                p.line_segment([at - side, at + side], fine);
+            }
+        }
+        p.circle_filled(c, 1.6, Color32::from_rgb(230, 40, 40));
+    }
+
     fn draw_net_overlay(&self, p: &egui::Painter, rect: Rect, g: &Game, n: Option<&Net>) {
         let s = (rect.width() / 1280.0).min(rect.height() / 720.0).clamp(0.62, 1.5);
         let x = rect.left() + 14.0 * s;
@@ -2429,11 +2600,25 @@ impl App {
                 let a = ((kc.t / 0.3).min(1.0) * 255.0) as u8;
                 text_shadow(p, Pos2::new(c.x, rect.top() + bar_h * 0.5), Align2::CENTER_CENTER, "FINAL KILL", 30.0 * s, Color32::from_rgba_unmultiplied(255, 150, 70, a));
                 let victim = &g.f[kc.victim].name;
-                let line = match kc.killer.filter(|&k| k < g.f.len()) {
-                    Some(k) => format!("{}  [{}]  {}", g.f[k].name, kc.tool, victim),
-                    None => format!("{victim} went down"),
-                };
-                fit_center(p, Pos2::new(c.x, rect.bottom() - bar_h * 0.5), &line, 20.0 * s, rect.width() - 40.0, Color32::from_rgba_unmultiplied(240, 230, 220, a));
+                let col = Color32::from_rgba_unmultiplied(240, 230, 220, a);
+                let mut parts: Vec<(String, Color32)> = Vec::new();
+                match kc.killer.filter(|&k| k < g.f.len()) {
+                    Some(k) => {
+                        parts.push((format!("{}  [{}]", g.f[k].name, kc.tool), col));
+                        if kc.head {
+                            parts.push((HS_ICON.into(), HS_GOLD));
+                            parts.push((" HEADSHOT".into(), Color32::from_rgba_unmultiplied(255, 215, 80, a)));
+                        }
+                        parts.push((format!("  {victim}"), col));
+                    }
+                    None => parts.push((format!("{victim} went down"), col)),
+                }
+                let size = 20.0 * s;
+                let font = FontId::proportional(size);
+                let pieces = layout_pieces(p, parts, &font, size, |c| c);
+                let total: f32 = pieces.iter().map(|pc| pc.width()).sum();
+                let y = rect.bottom() - bar_h * 0.5 - size * 0.6;
+                draw_pieces(p, Pos2::new(c.x - total * 0.5, y), pieces, size);
                 return;
             }
         }
@@ -2540,7 +2725,13 @@ impl App {
             }
             self.cross_gap.set(gap);
             let size = self.settings.cross_size * s;
-            draw_crosshair(p, c, self.settings.cross_style, col, dot_col, size, gap, me.weapon == Weapon::Shotgun);
+            // the sniper's scope replaces the crosshair once it's up
+            let scoped = me.weapon == Weapon::Sniper && self.ads_zoom.get() > 2.2;
+            if scoped {
+                self.draw_scope(p, rect);
+            } else {
+                draw_crosshair(p, c, self.settings.cross_style, col, dot_col, size, gap, me.weapon == Weapon::Shotgun);
+            }
             // the reload ring and labels sit outside the spread
             let ring_r = (30.0 * s).max(gap + 12.0 * s);
             // reload: a ring that fills up around the crosshair
@@ -2818,6 +3009,10 @@ impl App {
             }
         }
 
+        if let Some((note, t)) = self.music_note {
+            let a = ((t / 0.4).min(1.0) * 255.0) as u8;
+            text_shadow(p, Pos2::new(c.x, sb.bottom() + 40.0 * s), Align2::CENTER_CENTER, note, 16.0 * s, Color32::from_rgba_unmultiplied(200, 220, 255, a));
+        }
         // banner and phase messages
         if let Some((text, _)) = &g.banner {
             fit_center(p, Pos2::new(c.x, rect.top() + rect.height() * 0.3), text, 46.0 * s, rect.width() - 40.0, ACCENT);
@@ -2894,16 +3089,20 @@ impl App {
             } else {
                 if let Some((k, kc)) = &line.killer {
                     parts.push((k.clone(), player_color(*kc)));
-                    parts.push((format!("  [{}]  ", line.tool), Color32::from_gray(220)));
+                    parts.push((format!("  [{}]", line.tool), Color32::from_gray(220)));
+                    if line.head {
+                        parts.push((HS_ICON.into(), HS_GOLD));
+                    }
+                    parts.push(("  ".into(), Color32::from_gray(220)));
                 }
                 parts.push((line.victim.0.clone(), player_color(line.victim.1)));
                 if line.killer.is_none() {
                     parts.push(("  went down".into(), Color32::from_gray(220)));
                 }
             }
-            let galleys: Vec<_> = parts.into_iter().map(|(t, col)| p.layout_no_wrap(t, font.clone(), fade(col))).collect();
-            let total: f32 = galleys.iter().map(|g| g.size().x).sum();
-            lines.push((galleys, total, a));
+            let pieces = layout_pieces(p, parts, &font, 15.0 * s, |col| fade(col));
+            let total: f32 = pieces.iter().map(|pc| pc.width()).sum();
+            lines.push((pieces, total, a));
         }
         let widest = lines.iter().map(|l| l.1).fold(0.0f32, f32::max);
         let feed_left = rect.right() - margin - widest - 12.0 * s;
@@ -2912,12 +3111,8 @@ impl App {
         for (galleys, total, a) in lines {
             let back = Rect::from_min_size(Pos2::new(rect.right() - margin - total - 12.0 * s, y - 3.0 * s), Vec2::new(total + 12.0 * s, row_h - 2.0 * s));
             p.rect_filled(back, 4.0, Color32::from_black_alpha((a as f32 * 0.45) as u8));
-            let mut x = rect.right() - margin - 6.0 * s - total;
-            for gl in galleys {
-                let w = gl.size().x;
-                p.galley(Pos2::new(x, y), gl, Color32::WHITE);
-                x += w;
-            }
+            let x = rect.right() - margin - 6.0 * s - total;
+            draw_pieces(p, Pos2::new(x, y), galleys, 15.0 * s);
             y += row_h;
         }
 
@@ -3457,6 +3652,7 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.settings.sens, 0.2..=3.0).text("mouse sensitivity"));
                 ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("effects volume"));
                 ui.add(egui::Slider::new(&mut self.settings.music_volume, 0.0..=1.0).text("music volume"));
+                self.music_ui(ui);
                 if ui.button("All settings (controls, graphics, crosshair)…").clicked() {
                     self.pause_settings = true;
                 }
@@ -3544,8 +3740,8 @@ mod aim_tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
         let mut rng = Rng(99);
         for fov in (60..=110).step_by(5) {
-            for w in [Weapon::Shotgun, Weapon::Smg, Weapon::Revolver, Weapon::Rifle] {
-                // 0: rested, 1: running right after a shot, 2: standing mid-spray
+            for w in [Weapon::Shotgun, Weapon::Smg, Weapon::Revolver, Weapon::Rifle, Weapon::HandCannon, Weapon::Sniper] {
+                // 0: rested (sniper scoped), 1: running right after a shot, 2: standing mid-spray
                 for state in 0..3 {
                     let mut g = Game::new(Kind::Offline, 0, Mode::Ffa, 5);
                     g.world = range_world();
@@ -3558,6 +3754,7 @@ mod aim_tests {
                         f.pitch = pitch;
                         f.weapon = w;
                         let cap = w.gun().move_cap;
+                        f.scope_t = if state == 0 { 1.0 } else { 0.0 };
                         (f.since_shot, f.move_spread, f.recoil) = match state {
                             0 => (5.0, 1.0, 0.0),
                             1 => (0.05, cap, 0.8),

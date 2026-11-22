@@ -160,7 +160,7 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32) ->
         Play { clip: if sprint { "Sprint_Loop" } else { "Jog_Fwd_Loop" }, t: 0.0, rate: if back { -rate } else { rate }, looped: true }
     } else if melee {
         Play { clip: "Sword_Idle", t: 0.0, rate: 1.0, looped: true }
-    } else if f.weapon == Weapon::Revolver {
+    } else if matches!(f.weapon, Weapon::Revolver | Weapon::HandCannon) {
         Play { clip: "Pistol_Idle_Loop", t: 0.0, rate: 1.0, looped: true }
     } else {
         Play { clip: "Idle_Loop", t: 0.0, rate: 1.0, looped: true }
@@ -311,6 +311,11 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32) ->
             let down = Vec3::NEG_Y;
             let (hr, hl) = match f.weapon {
                 Weapon::Revolver => (sh_r + aim * reach * 0.9 - side * 0.06, None),
+                // the hand cannon: both hands on it
+                Weapon::HandCannon => {
+                    let hr = sh_r + aim * reach * 0.88 - side * 0.1;
+                    (hr, Some(hr - side * 0.07 + down * 0.04 - aim * 0.04))
+                }
                 Weapon::Rocket => {
                     let hr = sh_r + aim * 0.22 + down * 0.12;
                     (hr, Some(hr + aim * 0.32 - side * 0.12 + down * 0.04))
