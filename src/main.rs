@@ -310,13 +310,6 @@ fn main() -> eframe::Result<()> {
     }
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions { viewport, ..Default::default() };
-    #[cfg(target_os = "macos")]
-    if screenshot.is_some() {
-        use eframe::winit::platform::macos::EventLoopBuilderExtMacOS;
-        options.event_loop_builder = Some(Box::new(|b| {
-            b.with_activate_ignoring_other_apps(false);
-        }));
-    }
     eframe::run_native(
         "Duel Rush",
         options,
