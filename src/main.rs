@@ -1146,10 +1146,11 @@ impl App {
                 if let Some((k, kc)) = &line.killer {
                     parts.push((k.clone(), player_color(*kc)));
                     parts.push((format!("  [{}]  ", line.tool), Color32::from_gray(220)));
-                } else {
-                    parts.push(("✝ ".into(), Color32::from_gray(220)));
                 }
                 parts.push((line.victim.0.clone(), player_color(line.victim.1)));
+                if line.killer.is_none() {
+                    parts.push(("  went down".into(), Color32::from_gray(220)));
+                }
             }
             let galleys: Vec<_> = parts.into_iter().map(|(s, col)| p.layout_no_wrap(s, font.clone(), fade(col))).collect();
             let total: f32 = galleys.iter().map(|g| g.size().x).sum();
@@ -1175,6 +1176,14 @@ impl App {
     // ------------------------------------------------------------------ menus
 
     fn _unused_panel(&self) {}
+}
+
+fn mode_picker(ui: &mut egui::Ui, mode: &mut u8) {
+    ui.horizontal(|ui| {
+        ui.label("Mode");
+        ui.selectable_value(mode, 0, "Free-for-All");
+        ui.selectable_value(mode, 1, "Team Deathmatch");
+    });
 }
 
 fn panel<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -1206,7 +1215,7 @@ impl App {
         let tpos = Pos2::new(rect.left() + 48.0, rect.top() + 40.0);
         p.text(tpos + Vec2::new(3.0, 3.0), Align2::LEFT_TOP, TITLE, FontId::proportional(64.0), Color32::from_black_alpha(200));
         p.text(tpos, Align2::LEFT_TOP, TITLE, FontId::proportional(64.0), ACCENT);
-        p.text(tpos + Vec2::new(4.0, 74.0), Align2::LEFT_TOP, "blades · bullets · wall-runs   —   1v1 arena", FontId::proportional(17.0), Color32::from_rgb(235, 220, 210));
+        p.text(tpos + Vec2::new(4.0, 74.0), Align2::LEFT_TOP, "blades · bullets · wall-runs   —   arena duels for up to 8", FontId::proportional(17.0), Color32::from_rgb(235, 220, 210));
         let mut next: Option<Page> = None;
         let mut action: Option<Box<dyn FnOnce(&mut App)>> = None;
         let pos = Pos2::new(rect.left() + 48.0, rect.top() + 150.0);
@@ -1225,10 +1234,10 @@ impl App {
                         ui.add(egui::TextEdit::singleline(&mut self.settings.name).char_limit(16).desired_width(220.0));
                     });
                     ui.add_space(6.0);
-                    if Self::big_button(ui, "Practice vs Bot") {
+                    if Self::big_button(ui, "Practice vs Bots") {
                         next = Some(Page::Practice);
                     }
-                    if Self::big_button(ui, "Host a Match") {
+                    if Self::big_button(ui, "Host a Lobby") {
                         next = Some(Page::Host);
                     }
                     if Self::big_button(ui, "Join a Friend") {
@@ -1245,19 +1254,22 @@ impl App {
                     }
                 }
                 Page::Practice => {
-                    ui.heading("Practice vs Bot");
+                    ui.heading("Practice vs Bots");
+                    mode_picker(ui, &mut self.settings.mode);
+                    ui.add(egui::Slider::new(&mut self.settings.bots, 1..=7).text("bots"));
                     ui.label("Bot difficulty");
                     ui.horizontal(|ui| {
                         for (k, (n, _)) in BOT_LEVELS.iter().enumerate() {
                             ui.selectable_value(&mut self.settings.bot_level, k, *n);
                         }
                     });
-                    ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=15).text("rounds to win"));
+                    ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("kills to win"));
                     if Self::big_button(ui, "Fight!") {
                         action = Some(Box::new(|app: &mut App| {
                             let lvl = BOT_LEVELS[app.settings.bot_level].1;
-                            let name = if app.settings.name.trim().is_empty() { "Player".to_string() } else { app.settings.name.clone() };
-                            let g = Game::new(Kind::Offline, 0, [&name, "Bot"], lvl, app.settings.rounds);
+                            let name = clean_name(&app.settings.name, 0);
+                            let mode = Mode::from_u8(app.settings.mode);
+                            let g = Game::offline(&name, app.settings.bots, lvl, mode, app.settings.rounds as u16);
                             app.settings.save();
                             app.start_game(g, None);
                         }));
@@ -1267,21 +1279,21 @@ impl App {
                     }
                 }
                 Page::Host => {
-                    ui.heading("Host a Match");
-                    ui.label("Your friend joins using your address. On the same Wi-Fi / network use the local address. Over the internet, forward the UDP port on your router (or use a virtual LAN app like Tailscale, ZeroTier or Radmin VPN and share that address).");
+                    ui.heading("Host a Lobby");
+                    ui.label("Up to 8 players. You start in a warm-up; friends drop in with Join a Friend, then you press Enter to start the match. On the same Wi-Fi they use your local address; over the internet, forward the UDP port on your router (or use a virtual LAN app like Tailscale, ZeroTier or Radmin VPN).");
+                    mode_picker(ui, &mut self.settings.mode);
+                    ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("kills to win"));
                     ui.horizontal(|ui| {
                         ui.label("Port (UDP)");
                         ui.add(egui::TextEdit::singleline(&mut self.settings.port).desired_width(90.0));
                     });
-                    ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=15).text("rounds to win"));
-                    if Self::big_button(ui, "Start Hosting") {
+                    if Self::big_button(ui, "Open Lobby") {
                         action = Some(Box::new(|app: &mut App| {
                             let port: u16 = app.settings.port.trim().parse().unwrap_or(net::DEFAULT_PORT);
-                            match Net::host(port) {
-                                Ok(n) => {
+                            match app.start_hosting(port) {
+                                Ok(()) => {
                                     app.settings.save();
                                     app.menu_msg = None;
-                                    app.screen = Screen::Lobby { net: n, waiting_since: 0.0 };
                                 }
                                 Err(e) => app.menu_msg = Some(e),
                             }
@@ -1342,6 +1354,8 @@ impl App {
                             ("1  2  3 / wheel", "katana, scattergun, revolver"),
                             ("R", "reload"),
                             ("G / F", "throw a grenade (2 per round)"),
+                            ("Tab", "player list and scores"),
+                            ("Enter", "(host) start the match from the warm-up"),
                             ("Esc", "pause menu"),
                         ] {
                             ui.colored_label(ACCENT, k);
@@ -1349,7 +1363,7 @@ impl App {
                             ui.end_row();
                         }
                     });
-                    ui.label("The third katana hit is heavy: it breaks guards and launches. Headshots with the revolver do extra damage. Win rounds by taking your rival down.");
+                    ui.label("The third katana hit is heavy: it breaks guards and launches. Headshots with the revolver do extra damage. Free-for-All: everyone for themselves. Team Deathmatch: Red vs Blue. First to the kill limit wins; you respawn after 3 seconds.");
                     if Self::big_button(ui, "Back") {
                         next = Some(Page::Main);
                     }
@@ -1371,30 +1385,12 @@ impl App {
     }
 
     fn lobby_ui(&mut self, ctx: &egui::Context, rect: Rect) -> bool {
-        let Screen::Lobby { net, waiting_since } = &self.screen else { return false };
-        let is_host = net.is_host;
-        let port = net.port;
+        let Screen::Lobby { waiting_since, .. } = &self.screen else { return false };
         let t = *waiting_since;
         let mut cancel = false;
-        let ip = if is_host { self.lan_ip.clone() } else { None };
         panel(ctx, "lobby", Pos2::new(rect.left() + 48.0, rect.top() + 150.0), 380.0, |ui| {
-            if is_host {
-                ui.heading("Waiting for your friend…");
-                ui.label("Tell them to press Join a Friend and type:");
-                let addr = match &ip {
-                    Some(ip) => format!("{ip}:{port}"),
-                    None => format!("<your address>:{port}"),
-                };
-                ui.label(egui::RichText::new(&addr).size(26.0).color(ACCENT));
-                if ui.button("Copy address").clicked() {
-                    ui.ctx().copy_text(addr.clone());
-                }
-                ui.label("That's your address on this network. For friends over the internet, forward this UDP port on your router and give them your public address, or use a virtual LAN app.");
-                ui.label("If Windows asks about the firewall, allow access.");
-            } else {
-                ui.heading("Connecting…");
-                ui.label(format!("{:.0}s", t));
-            }
+            ui.heading("Joining…");
+            ui.label(format!("Knocking on the host's door ({:.0}s)", t));
             let dots = ".".repeat(((t * 2.0) as usize % 4) + 1);
             ui.label(dots);
             if App::big_button(ui, "Cancel") {
@@ -1403,10 +1399,9 @@ impl App {
         });
         cancel
     }
-
     fn play_overlay_ui(&mut self, ctx: &egui::Context, rect: Rect) -> bool {
         let (kind, phase, is_auth) = match &self.screen {
-            Screen::Play { game, .. } => (game.kind, game.round.phase, game.is_authority()),
+            Screen::Play { game, .. } => (game.kind, game.mt.phase, game.is_authority()),
             _ => return false,
         };
         let mut leave = false;
@@ -1425,20 +1420,18 @@ impl App {
             let mut rematch = false;
             panel(ctx, "over", Pos2::new(center.x, center.y + 60.0), 360.0, |ui| {
                 if is_auth {
-                    if App::big_button(ui, "Rematch") {
+                    if App::big_button(ui, "New match") {
                         rematch = true;
                     }
                 } else {
-                    ui.label("Waiting for the host to start a rematch…");
+                    ui.label("Waiting for the host to start a new match…");
                 }
                 if App::big_button(ui, "Leave") {
                     leave = true;
                 }
             });
             if rematch {
-                if let Screen::Play { game, .. } = &mut self.screen {
-                    game.rematch();
-                }
+                self.start_request = true;
             }
             return leave;
         }
@@ -1448,6 +1441,15 @@ impl App {
                 ui.heading("Paused");
                 if kind != Kind::Offline {
                     ui.label("The match keeps going while this menu is open!");
+                }
+                if kind == Kind::Host {
+                    if let Some(ip) = &self.lan_ip {
+                        ui.label(format!("Friends join with: {ip}:{}", self.settings.port.trim()));
+                    }
+                    if phase == Phase::Warmup && App::big_button(ui, "Start the match") {
+                        self.start_request = true;
+                        self.paused = false;
+                    }
                 }
                 ui.add(egui::Slider::new(&mut self.settings.sens, 0.2..=3.0).text("mouse sensitivity"));
                 ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("field of view"));
