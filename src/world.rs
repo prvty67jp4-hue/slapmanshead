@@ -19,27 +19,35 @@ pub struct Block {
 /// The maps a match can be played on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapId {
-    /// 30 x 30 m, tight and vertical: wall-run corridors, three levels, dash gaps.
+    /// 38 x 38 m: a clear centre, three lanes from each spawn, wall-run corridors, three levels.
     Arena = 0,
     /// The original wide 48 x 48 m courtyard.
     Courtyard = 1,
+    /// 30 x 30 m, tight and vertical: narrow corridors, lots of cover, dash gaps.
+    CloseQuarters = 2,
 }
 
 impl MapId {
-    pub const ALL: [MapId; 2] = [MapId::Arena, MapId::Courtyard];
+    pub const ALL: [MapId; 3] = [MapId::Arena, MapId::Courtyard, MapId::CloseQuarters];
     pub fn from_u8(v: u8) -> MapId {
-        if v == 1 { MapId::Courtyard } else { MapId::Arena }
+        match v {
+            1 => MapId::Courtyard,
+            2 => MapId::CloseQuarters,
+            _ => MapId::Arena,
+        }
     }
     pub fn name(self) -> &'static str {
         match self {
             MapId::Arena => "Arena",
             MapId::Courtyard => "Open Courtyard",
+            MapId::CloseQuarters => "Close Quarters",
         }
     }
     pub fn blurb(self) -> &'static str {
         match self {
-            MapId::Arena => "small and vertical: wall-run corridors, three levels, gaps to dash across",
+            MapId::Arena => "a clear centre with a tower, three lanes from each spawn, wall-run corridors and balconies",
             MapId::Courtyard => "big and open: long sight lines around a central dais",
+            MapId::CloseQuarters => "small and vertical: tight wall-run corridors, three levels, gaps to dash across",
         }
     }
 }
@@ -134,13 +142,74 @@ impl World {
         match map {
             MapId::Arena => World::arena(),
             MapId::Courtyard => World::courtyard(),
+            MapId::CloseQuarters => World::close_quarters(),
         }
     }
 
-    /// The main arena: 30 x 30 m, built for wall-running and fighting up and down. Three levels
+    /// The main arena: 38 x 38 m. A clear 14 m centre holding only a tower and the pillar pair
+    /// beside it; from each spawn three lanes (left, middle, right) lead there between two big
+    /// platforms; 5 m wall-run corridors down both sides; balconies over the spawns; the
+    /// platforms sit 6.5 m apart (a dash or a wall-jump crosses). Point symmetric.
+    pub fn arena() -> World {
+        let h = 19.0; // half size
+        let wall_h = 9.0;
+        let lvl2 = 3.0;
+        let mut v = Vec::new();
+        let (deco, banners) = enclosure(&mut v, h, wall_h, 7.6, 12.0);
+
+        // top level: high ledges along the back walls
+        v.push(bx(-h, 5.0, -h, h, 5.5, -h + 1.2, Mat::Trim));
+        v.push(bx(-h, 5.0, h - 1.2, h, 5.5, h, Mat::Trim));
+
+        // ---- balconies (level 2) over the spawns, on a few big supports
+        sym(&mut v, bx(-13.0, 2.6, -h, 13.0, lvl2, -15.5, Mat::Stone));
+        sym(&mut v, bx(-5.3, 0.0, -16.1, -3.7, 2.6, -15.5, Mat::Stone));
+        sym(&mut v, bx(3.7, 0.0, -16.1, 5.3, 2.6, -15.5, Mat::Stone));
+        // stairs up from the left lane, alongside the corridor wall
+        stairs_z(&mut v, -13.0, -11.4, -15.5, 1.0, 5, 0.6, Mat::Stone);
+
+        // ---- side corridors: 5 m between the outer wall and a tall inner wall, an 8 m doorway
+        // into the middle
+        sym(&mut v, bx(-13.6, 0.0, -15.5, -13.0, 5.0, -4.0, Mat::Wall));
+        sym(&mut v, bx(-13.6, 0.0, 4.0, -13.0, 5.0, 15.5, Mat::Wall));
+
+        // ---- two big platforms (level 2) split each half into three lanes; 6.5 m apart
+        sym(&mut v, bx(-8.0, 0.0, -13.0, -3.25, lvl2, -7.5, Mat::Stone));
+        sym(&mut v, bx(3.25, 0.0, -13.0, 8.0, lvl2, -7.5, Mat::Stone));
+        // a bridge from the balcony out to the left platform (walk under it)
+        sym(&mut v, bx(-6.3, 2.6, -15.5, -5.2, lvl2, -13.0, Mat::Trim));
+        // steps up onto the right platform from the centre side
+        stairs_z(&mut v, 6.5, 8.0, -7.5, 1.0, 5, 0.5, Mat::Stone);
+
+        // ---- the centre: a 5 m tower with low ledges front and back, and a tall pillar on each
+        // side 2.5 m from it (wall-jump between pillar and tower)
+        v.push(bx(-1.5, 0.0, -1.5, 1.5, 5.0, 1.5, Mat::Stone));
+        sym(&mut v, bx(-1.5, 0.0, -2.3, 1.5, 2.5, -1.5, Mat::Trim));
+        sym(&mut v, bx(4.0, 0.0, -0.5, 5.0, 7.0, 0.5, Mat::Metal));
+
+        // braziers on the tower and the balcony back corners
+        let mut braziers = Vec::new();
+        for (x, y, z) in [(-1.1f32, 5.0f32, -1.1f32), (1.1, 5.0, 1.1), (-12.6, lvl2, -18.4), (12.6, lvl2, -18.4), (-12.6, lvl2, 18.4), (12.6, lvl2, 18.4)] {
+            v.push(bx(x - 0.25, y, z - 0.25, x + 0.25, y + 0.7, z + 0.25, Mat::Metal));
+            braziers.push(v3(x, y + 0.75, z));
+        }
+
+        World {
+            blocks: v,
+            spawn_points: mirrored_spawns(&[(-9.5, 0.0, -17.5), (0.0, 0.0, -17.5), (9.5, 0.0, -17.5), (0.0, lvl2, -17.4), (-16.5, 0.0, -11.0), (16.5, 0.0, -8.0)]),
+            half: h,
+            deco,
+            braziers,
+            banners,
+            map: MapId::Arena,
+            flags: [v3(0.0, 0.0, -17.2), v3(0.0, 0.0, 17.2)],
+        }
+    }
+
+    /// Close Quarters: 30 x 30 m, built for wall-running and fighting up and down. Three levels
     /// (ground, 3 m balconies and platforms, a 5 m tower and wall tops), corridors with walls on
     /// both sides, a gap only a dash or wall-jump crosses, and nowhere open more than ~8 m across.
-    pub fn arena() -> World {
+    pub fn close_quarters() -> World {
         let h = 15.0; // half size
         let wall_h = 9.0;
         let lvl2 = 3.0;
@@ -211,7 +280,7 @@ impl World {
             deco,
             braziers,
             banners,
-            map: MapId::Arena,
+            map: MapId::CloseQuarters,
             flags: [v3(0.0, 0.0, -13.8), v3(0.0, 0.0, 13.8)],
         }
     }

@@ -220,7 +220,7 @@ impl Bot {
             }
         }
         self.dash_t -= dt;
-        if self.dash_t <= 0.0 && visible {
+        if self.dash_t <= 0.0 && visible && me.dash_charges >= 1.0 {
             self.dash_t = 1.5 + self.rng.f() * (3.5 - 2.0 * s);
             inp.dash = true;
             if melee && dist > 3.0 {

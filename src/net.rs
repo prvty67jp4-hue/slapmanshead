@@ -798,7 +798,7 @@ impl Net {
         let you_ap = r.f()?;
         let you_alive = r.u8()? == 1;
         let mode = Mode::from_u8(r.u8()?);
-        let map = r.u8()?.min(1);
+        let map = r.u8()?.min(2);
         let phase = Phase::from_u8(r.u8()?);
         let timer = r.f()?;
         let target = r.u16()?;

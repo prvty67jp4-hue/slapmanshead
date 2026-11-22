@@ -355,7 +355,7 @@ impl Settings {
                             "bot" => s.bot_level = v.parse().unwrap_or(s.bot_level).min(3),
                             "rounds" => s.rounds = v.parse().unwrap_or(s.rounds).clamp(1, 50),
                             "mode" => s.mode = v.parse().unwrap_or(0u8).min(5),
-                            "map" => s.map = v.parse().unwrap_or(0u8).min(1),
+                            "map" => s.map = v.parse().unwrap_or(0u8).min(2),
                             "bots" => s.bots = v.parse().unwrap_or(3usize).clamp(1, 7),
                             "port" => s.port = v.to_string(),
                             "join" => s.join_addr = v.to_string(),
@@ -3603,10 +3603,24 @@ impl App {
         }
         // row 3: item (left) and dash (right)
         let row3_y = right.bottom() - 14.0 * s;
-        let dash = if me.dash_cd > 0.0 { "Dash ..." } else { "Dash ready" };
-        let dash_g = p.layout_no_wrap(dash.to_string(), FontId::proportional(13.0 * s), Color32::from_rgb(180, 220, 200));
-        let dash_w = dash_g.size().x;
+        // dashes: one pip each, the refilling one fills up
+        let most = g.tune.dash_charges.round().max(1.0) as usize;
+        let pip = 9.0 * s;
+        let pgap = 4.0 * s;
+        let pips_w = most as f32 * pip + (most as f32 - 1.0) * pgap;
+        let dash_g = p.layout_no_wrap("Dash".to_string(), FontId::proportional(13.0 * s), Color32::from_rgb(180, 220, 200));
+        let dash_w = dash_g.size().x + 6.0 * s + pips_w;
+        let px0 = right.right() - pad - pips_w;
         p.galley(Pos2::new(right.right() - pad - dash_w, row3_y - dash_g.size().y * 0.5), dash_g, Color32::WHITE);
+        for k in 0..most {
+            let fill = (me.dash_charges - k as f32).clamp(0.0, 1.0);
+            let r = Rect::from_min_size(Pos2::new(px0 + k as f32 * (pip + pgap), row3_y - pip * 0.5), Vec2::splat(pip));
+            p.rect_filled(r, 2.0 * s, Color32::from_black_alpha(140));
+            if fill > 0.0 {
+                let col = if fill >= 1.0 { Color32::from_rgb(120, 230, 190) } else { Color32::from_rgb(70, 120, 110) };
+                p.rect_filled(Rect::from_min_max(Pos2::new(r.left(), r.bottom() - pip * fill), r.max), 2.0 * s, col);
+            }
+        }
         let item = format!("G  {} x{}", ITEM_NAMES[me.loadout.item.min(2) as usize], me.items);
         fit_text(p, Pos2::new(right.left() + pad, row3_y - 8.0 * s), &item, 13.0 * s, pw - pad * 3.0 - dash_w, Color32::from_rgb(220, 220, 180));
 
@@ -4170,7 +4184,7 @@ impl App {
                             ("Space on a wall", "kick off the wall"),
                             ("Shift / Q", "dash (once more in the air)"),
                             ("C while running", "slide, keeping your speed; Space jumps out of it"),
-                            ("Flow", "chain moves without stopping on the ground: each adds +6% speed (up to +30%)"),
+                            ("Flow", "chain moves without stopping on the ground: each adds +4% speed (up to +20%)"),
                             ("Perfect timing", "jump or dash the instant you land for an extra boost"),
                             ("Double-tap W A S D", "dodge in that direction"),
                             ("Cancel", "after a slash lands: dash, jump or guard to cut it short"),

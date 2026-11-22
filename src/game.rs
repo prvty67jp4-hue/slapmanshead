@@ -9,7 +9,7 @@ pub const HEIGHT: f32 = 1.8;
 pub const GRAVITY: f32 = 25.0;
 pub const JUMP_VEL: f32 = 9.4;
 /// Base running speed: flow chains and dashes are where the real speed comes from.
-pub const RUN_SPEED: f32 = 7.2;
+pub const RUN_SPEED: f32 = 6.6;
 pub const MAX_HP: f32 = 100.0;
 pub const MAX_AP: f32 = 50.0;
 pub const TICK: f32 = 1.0 / 120.0;
@@ -407,7 +407,8 @@ pub struct WallRun {
 }
 
 /// Each chained move adds this much speed...
-pub const FLOW_STEP: f32 = 0.06;
+/// Speed added per chained move (5 in a chain: +20%).
+pub const FLOW_STEP: f32 = 0.04;
 
 /// Feel settings the developer tuning panel (F4) changes live. The defaults are the game's own.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -425,6 +426,10 @@ pub struct Tuning {
     pub dash_speed: f32,
     /// Seconds a dash lasts.
     pub dash_time: f32,
+    /// Dashes you can do back to back, and seconds for each spent one to come back (they
+    /// refill one at a time).
+    pub dash_charges: f32,
+    pub dash_recharge: f32,
     /// Slowest wall run (you keep any faster entry speed).
     pub wall_speed: f32,
     /// Longest wall run (seconds; running up a wall lasts about half).
@@ -471,11 +476,14 @@ impl Default for Tuning {
             accel_time: 0.12,
             stop_time: 0.1,
             air_control: 22.0,
-            gravity: GRAVITY,
+            // a touch lighter than thrown things fall, so jumps hang a little and read easily
+            gravity: 23.0,
             jump_height: JUMP_VEL * JUMP_VEL / (2.0 * GRAVITY),
-            dash_speed: 18.5,
+            dash_speed: 16.0,
             dash_time: 0.2,
-            wall_speed: 10.0,
+            dash_charges: 2.0,
+            dash_recharge: 1.9,
+            wall_speed: 9.0,
             wall_time: 1.15,
             flow_step: FLOW_STEP,
             cam_dist: 3.2,
@@ -492,7 +500,7 @@ impl Default for Tuning {
             cam_bob: 0.025,
             cam_roll: 6.0,
             land_dip: 0.18,
-            fov_speed: 8.0,
+            fov_speed: 4.0,
             // a thin outline: the fighters wear their own colours now
             rim: 0.5,
             rim_width: 4.0,
@@ -543,7 +551,7 @@ pub struct TuneField {
     pub set: fn(&mut Tuning, f32),
 }
 
-pub const TUNE_FIELDS: [TuneField; 28] = [
+pub const TUNE_FIELDS: [TuneField; 30] = [
     TuneField { key: "run_speed", label: "Run speed", min: 4.0, max: 16.0, unit: "m/s", group: "Movement", get: |t| t.run_speed, set: |t, v| t.run_speed = v },
     TuneField { key: "accel_time", label: "Ground acceleration time", min: 0.01, max: 0.6, unit: "s", group: "Movement", get: |t| t.accel_time, set: |t, v| t.accel_time = v },
     TuneField { key: "stop_time", label: "Stopping time", min: 0.01, max: 0.8, unit: "s", group: "Movement", get: |t| t.stop_time, set: |t, v| t.stop_time = v },
@@ -552,6 +560,8 @@ pub const TUNE_FIELDS: [TuneField; 28] = [
     TuneField { key: "jump_height", label: "Jump height", min: 0.3, max: 5.0, unit: "m", group: "Movement", get: |t| t.jump_height, set: |t, v| t.jump_height = v },
     TuneField { key: "dash_speed", label: "Dash speed", min: 6.0, max: 40.0, unit: "m/s", group: "Moves", get: |t| t.dash_speed, set: |t, v| t.dash_speed = v },
     TuneField { key: "dash_time", label: "Dash length", min: 0.05, max: 0.6, unit: "s", group: "Moves", get: |t| t.dash_time, set: |t, v| t.dash_time = v },
+    TuneField { key: "dash_charges", label: "Dashes in a row", min: 1.0, max: 6.0, unit: "", group: "Moves", get: |t| t.dash_charges, set: |t, v| t.dash_charges = v.round() },
+    TuneField { key: "dash_recharge", label: "Dash refill time (each)", min: 0.3, max: 4.0, unit: "s", group: "Moves", get: |t| t.dash_recharge, set: |t, v| t.dash_recharge = v },
     TuneField { key: "wall_speed", label: "Wall-run speed (min)", min: 4.0, max: 24.0, unit: "m/s", group: "Moves", get: |t| t.wall_speed, set: |t, v| t.wall_speed = v },
     TuneField { key: "wall_time", label: "Wall-run duration", min: 0.2, max: 3.0, unit: "s", group: "Moves", get: |t| t.wall_time, set: |t, v| t.wall_time = v },
     TuneField { key: "flow_step", label: "Flow chain bonus (per move)", min: 0.0, max: 0.2, unit: "×", group: "Moves", get: |t| t.flow_step, set: |t, v| t.flow_step = v },
@@ -573,7 +583,7 @@ pub const TUNE_FIELDS: [TuneField; 28] = [
     TuneField { key: "rim", label: "Player rim light", min: 0.0, max: 2.0, unit: "×", group: "Players", get: |t| t.rim, set: |t, v| t.rim = v },
     TuneField { key: "rim_width", label: "Rim thinness", min: 1.0, max: 6.0, unit: "", group: "Players", get: |t| t.rim_width, set: |t, v| t.rim_width = v },
 ];
-/// ...up to this many steps (+30%).
+/// ...up to this many steps (+20%).
 pub const FLOW_MAX: u32 = 5;
 /// Moves count as chained if you weren't on the ground longer than this before them.
 pub const CHAIN_GROUND: f32 = 0.3;
@@ -582,7 +592,8 @@ pub const MOMENTUM_HOLD: f32 = 0.4;
 /// Jump or dash this soon after landing for a perfect-timing boost.
 pub const PERFECT_WINDOW: f32 = 0.1;
 /// Slides start at this speed and last at most this long.
-pub const SLIDE_MIN_SPEED: f32 = 7.0;
+/// A slide starts from about a full run (a little under run speed).
+pub const SLIDE_MIN_SPEED: f32 = 6.4;
 pub const SLIDE_TIME: f32 = 0.85;
 /// Health given back over a moment for each kill.
 pub const KILL_HEAL: f32 = 35.0;
@@ -781,6 +792,8 @@ pub struct Fighter {
     pub guard: bool,
     pub dash_t: f32,
     pub dash_cd: f32,
+    /// Dashes ready to use (a fraction is one refilling).
+    pub dash_charges: f32,
     pub air_dash: bool,
     pub wall: Option<WallRun>,
     pub wallruns_left: u8,
@@ -819,7 +832,7 @@ pub struct Fighter {
     pub air_t: f32,
     pub land_t: f32,
     pub last_air: f32,
-    /// Moves chained (each +6% speed), its little pop on screen, and the slow fade on foot.
+    /// Moves chained (each +4% speed), its little pop on screen, and the slow fade on foot.
     pub flow: u32,
     pub flow_pop: f32,
     flow_fade: f32,
@@ -940,6 +953,7 @@ impl Fighter {
             guard: false,
             dash_t: 0.0,
             dash_cd: 0.0,
+            dash_charges: 2.0,
             air_dash: false,
             wall: None,
             wallruns_left: 2,
@@ -1542,7 +1556,7 @@ pub const LESSONS: [Lesson; 27] = [
     Lesson { title: "Slide", how: "Run, then hold C to slide along the ground. Press SPACE mid-slide to jump out of it with your speed.", count: |s| s.slides.min(1) + s.slide_jumps.min(1), need: 2, gun: None, melee: None, dummy: 0 },
     Lesson { title: "Momentum", how: "Land from a dash, air dash or wall-jump: you keep your speed for a moment instead of slowing to a run.", count: |s| s.momentum, need: 3, gun: None, melee: None, dummy: 0 },
     Lesson { title: "Perfect timing", how: "Jump or dash the instant you land (within a tenth of a second) for an extra boost and a whoosh.", count: |s| s.perfects, need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Flow chain", how: "Chain moves without staying on the ground: dash, wall-run, wall-jump, air dash. Each adds +6% speed. Reach x4!", count: |s| (s.best_flow >= 4) as u32, need: 1, gun: None, melee: None, dummy: 0 },
+    Lesson { title: "Flow chain", how: "Chain moves without staying on the ground: dash, wall-run, wall-jump, air dash. Each adds +4% speed. Reach x4!", count: |s| (s.best_flow >= 4) as u32, need: 1, gun: None, melee: None, dummy: 0 },
     Lesson { title: "Sword slash", how: "Press 1 for your katana and click to slash a dummy. Click again to chain swings.", count: |s| s.slash_hits, need: 4, gun: None, melee: None, dummy: 0 },
     Lesson { title: "Slash cancel", how: "Right after a slash hits, press SHIFT, SPACE or hold right-click to cut its recovery short.", count: |s| s.cancels, need: 3, gun: None, melee: None, dummy: 0 },
     Lesson { title: "Butterfly", how: "Slash, hold right-click to guard, release and slash again. Keep the rhythm going!", count: |s| s.butterflies, need: 4, gun: None, melee: None, dummy: 0 },
@@ -3023,6 +3037,9 @@ impl Game {
         ff.fire_cd = (ff.fire_cd - dt).max(0.0);
         ff.switch_t = (ff.switch_t - dt).max(0.0);
         ff.dash_cd = (ff.dash_cd - dt).max(0.0);
+        // spent dashes come back one at a time
+        let most = tn.dash_charges.round().max(1.0);
+        ff.dash_charges = (ff.dash_charges + dt / tn.dash_recharge.max(0.05)).min(most);
         ff.item_cd = (ff.item_cd - dt).max(0.0);
         ff.hurt_t = (ff.hurt_t - dt).max(0.0);
         ff.stun_t = (ff.stun_t - dt).max(0.0);
@@ -3208,7 +3225,7 @@ impl Game {
                 fire_dash = ff.dash_dir.take();
             }
         }
-        let wants_dash = ff.dash_buf > 0.0 && can_act && ff.dash_cd <= 0.0 && ff.wall.is_none() && !slash_locked && ff.dash_wind <= 0.0;
+        let wants_dash = ff.dash_buf > 0.0 && can_act && ff.dash_cd <= 0.0 && ff.dash_charges >= 1.0 && ff.wall.is_none() && !slash_locked && ff.dash_wind <= 0.0;
         if wants_dash && ff.on_ground && tn.dash_windup > 0.0 && fire_dash.is_none() {
             let dir = if wish.len() > 0.1 { wish.norm() } else { fwd };
             ff.dash_wind = tn.dash_windup;
@@ -3245,6 +3262,7 @@ impl Game {
                 dashed = true;
             }
             if dashed {
+                ff.dash_charges = (ff.dash_charges - 1.0).max(0.0);
                 // a dash cancels a charged heavy, and starts a fresh string
                 ff.basic_n = 0;
                 ff.charge_t = 0.0;
@@ -6121,7 +6139,7 @@ mod movement_tests {
         run(&mut g, 2.0, Input::default());
         assert_eq!(g.f[0].flow, 0, "standing still resets it");
         g.f[0].flow = 9;
-        assert!((g.f[0].flow_mult() - 1.3).abs() < 1e-4, "capped at +30%");
+        assert!((g.f[0].flow_mult() - 1.2).abs() < 1e-4, "capped at +20%");
     }
 
     #[test]
@@ -6169,7 +6187,7 @@ mod movement_tests {
         g2.f[0].on_ground = false;
         g2.f[0].vel = v3(0.0, 2.0, 3.0);
         g2.tick(&Input { jump: true, yaw: 0.0, ..Default::default() });
-        assert!((g2.f[0].wall.expect("on the wall").speed - 10.0).abs() < 1e-3);
+        assert!((g2.f[0].wall.expect("on the wall").speed - g2.tune.wall_speed).abs() < 1e-3);
     }
 
     #[test]
@@ -6412,8 +6430,9 @@ mod tuning_tests {
         assert_eq!(wild.jump_height, Tuning::default().jump_height, "bad values are ignored");
         // the defaults are the game''s own numbers
         let d = Tuning::default();
-        assert!((d.jump_vel() - JUMP_VEL).abs() < 1e-3);
-        assert!((d.accel() - 60.0).abs() < 1e-3 && (d.decel() - 72.0).abs() < 1e-3);
+        assert!((d.jump_vel() - (2.0 * d.gravity * d.jump_height).sqrt()).abs() < 1e-3, "jump speed follows gravity and height");
+        // full speed in 0.12 s, a stop in 0.1 s, whatever the run speed
+        assert!((d.accel() - d.run_speed / 0.12).abs() < 1e-3 && (d.decel() - d.run_speed / 0.1).abs() < 1e-3);
     }
 
     #[test]
@@ -6949,66 +6968,122 @@ mod map_tests {
         (dx * dx + dz * dz).sqrt()
     }
 
-    #[test]
-    fn arena_is_small_dense_and_vertical() {
-        let w = World::arena();
-        assert_eq!(w.map, MapId::Arena);
-        assert!((w.half * 2.0 - 30.0).abs() < 0.01, "30 x 30 m");
-        // anything standing on the ground that you can't just see over
-        let blockers: Vec<Aabb> = w.blocks.iter().map(|b| b.b).filter(|b| b.min.y < 2.0 && b.max.y > 1.0).collect();
-        let mut widest: f32 = 0.0;
-        let mut at = V3::ZERO;
-        let mut x = -w.half + 0.25;
-        while x < w.half {
-            let mut z = -w.half + 0.25;
-            while z < w.half {
-                let p = v3(x, 0.0, z);
-                if !blockers.iter().any(|b| foot_dist(p, b) <= 0.0) {
-                    let d = blockers.iter().map(|b| foot_dist(p, b)).fold(f32::MAX, f32::min);
-                    if d * 2.0 > widest {
-                        widest = d * 2.0;
-                        at = p;
-                    }
-                }
-                z += 0.5;
-            }
-            x += 0.5;
-        }
-        assert!(widest <= 8.5, "no open area more than ~8 m across: {widest:.1} m at {at:?}");
-        // three levels: the ground, about 3 m, and 5 m or more
-        let tops: Vec<f32> = w.blocks.iter().filter(|b| (b.b.max.x - b.b.min.x) * (b.b.max.z - b.b.min.z) >= 1.0).map(|b| b.b.max.y).collect();
-        assert!(tops.iter().any(|&t| (t - 3.0).abs() < 0.3), "a middle level");
-        assert!(tops.iter().any(|&t| (5.0..6.0).contains(&t)), "a top level");
-        // everyone spawns on solid ground, not inside anything
+    /// Spawns stand on something and inside nothing.
+    fn spawns_are_clear(w: &World) {
         for &(p, _) in &w.spawn_points {
             let body = Aabb::new(p + v3(-RADIUS, 0.05, -RADIUS), p + v3(RADIUS, HEIGHT, RADIUS));
             assert!(!w.blocks.iter().any(|b| b.b.overlaps(&body)), "spawn {p:?} is clear");
             assert!((w.ground_below(p + v3(0.0, 0.1, 0.0)) - p.y).abs() < 0.05, "spawn {p:?} stands on something");
             assert!(p.x.abs() < w.half && p.z.abs() < w.half);
         }
-        // the open courtyard is still there as a second map
+    }
+
+    /// Three levels: the ground, about 3 m, and 5 m or more.
+    fn three_levels(w: &World) {
+        let tops: Vec<f32> = w.blocks.iter().filter(|b| (b.b.max.x - b.b.min.x) * (b.b.max.z - b.b.min.z) >= 1.0).map(|b| b.b.max.y).collect();
+        assert!(tops.iter().any(|&t| (t - 3.0).abs() < 0.3), "a middle level");
+        assert!(tops.iter().any(|&t| (5.0..6.0).contains(&t)), "a top level");
+    }
+
+    /// Things on the ground you can't just see over.
+    fn blockers(w: &World) -> Vec<Aabb> {
+        w.blocks.iter().map(|b| b.b).filter(|b| b.min.y < 2.0 && b.max.y > 1.0).collect()
+    }
+
+    #[test]
+    fn close_quarters_is_small_dense_and_vertical() {
+        let w = World::build(MapId::CloseQuarters);
+        assert_eq!(w.map, MapId::CloseQuarters);
+        assert_eq!(MapId::CloseQuarters.name(), "Close Quarters");
+        assert!((w.half * 2.0 - 30.0).abs() < 0.01, "30 x 30 m");
+        let bl = blockers(&w);
+        let mut widest: f32 = 0.0;
+        let mut x = -w.half + 0.25;
+        while x < w.half {
+            let mut z = -w.half + 0.25;
+            while z < w.half {
+                let p = v3(x, 0.0, z);
+                if !bl.iter().any(|b| foot_dist(p, b) <= 0.0) {
+                    widest = widest.max(bl.iter().map(|b| foot_dist(p, b)).fold(f32::MAX, f32::min) * 2.0);
+                }
+                z += 0.5;
+            }
+            x += 0.5;
+        }
+        assert!(widest <= 8.5, "no open area more than ~8 m across: {widest:.1} m");
+        three_levels(&w);
+        spawns_are_clear(&w);
         let cy = World::build(MapId::Courtyard);
         assert_eq!(cy.map, MapId::Courtyard);
         assert!(cy.half > 20.0);
-        assert_eq!(MapId::Courtyard.name(), "Open Courtyard");
     }
 
-    /// Run off platform P2 towards P1 (6.5 m away, both 3 m up), jumping at the edge.
-    fn leap(dash: bool) -> V3 {
+    #[test]
+    fn arena_is_open_with_a_clear_centre_and_three_lanes() {
+        let w = World::arena();
+        assert_eq!(w.map, MapId::Arena);
+        assert!((w.half * 2.0 - 38.0).abs() < 0.01, "38 x 38 m");
+        let bl = blockers(&w);
+        // the middle 14 m: only the tower (with its ledges) and the pillar pair
+        let centre: Vec<&Aabb> = bl.iter().filter(|b| foot_dist(V3::ZERO, b) < 7.0).collect();
+        for b in &centre {
+            let mid = (b.min + b.max) * 0.5;
+            let tower = foot_dist(V3::ZERO, b) < 0.01 || (mid.x.abs() < 0.1 && mid.z.abs() < 2.5);
+            let pillar = (mid.x.abs() - 4.5).abs() < 0.1 && mid.z.abs() < 0.1 && b.max.y > 6.0;
+            assert!(tower || pillar, "only the tower and the pillar pair in the centre, found {b:?}");
+        }
+        assert!(centre.len() <= 5);
+        // the side corridors are at least 5 m wide all along
+        for side in [-1.0f32, 1.0] {
+            let mut z = -15.0;
+            while z <= 15.0 {
+                let p = v3(side * 16.1, 0.0, z);
+                let d = bl.iter().map(|b| foot_dist(p, b)).fold(f32::MAX, f32::min);
+                assert!(d >= 2.49, "corridor at {p:?} only {:.2} m to a wall", d);
+                z += 0.5;
+            }
+        }
+        // three clear lanes from each spawn to the centre, each at least 5 m wide
+        for x in [-10.5f32, 0.0, 10.5] {
+            for off in [-0.45f32, 0.0, 0.45] {
+                for sgn in [-1.0f32, 1.0] {
+                    let (a, b) = (v3((x + off) * sgn, 1.0, -15.2 * sgn), v3((x + off) * sgn, 1.0, -7.0 * sgn));
+                    assert!(w.line_clear(a, b), "lane at x {x} is open from spawn to the centre");
+                }
+            }
+            let p = v3(x, 0.0, -10.0);
+            let d = bl.iter().map(|b| foot_dist(p, b)).fold(f32::MAX, f32::min);
+            assert!(d >= 2.37, "lane at x {x} is about 5 m wide ({:.2} m to the side)", d);
+        }
+        three_levels(&w);
+        spawns_are_clear(&w);
+        // the two sides start well apart
+        let (red, blue): (Vec<V3>, Vec<V3>) = (w.spawn_points.iter().map(|s| s.0).filter(|p| p.z < 0.0).collect(), w.spawn_points.iter().map(|s| s.0).filter(|p| p.z > 0.0).collect());
+        for r in &red {
+            for b in &blue {
+                assert!((*r - *b).len() > 15.0);
+            }
+        }
+    }
+
+    /// Run off one platform towards the other (`gap` metres apart, both 3 m up), jumping at the
+    /// edge: `x0` start, `edge` where to jump, `far` the far platform's near edge, `z` the line.
+    fn leap(map: MapId, x0: f32, edge: f32, far: f32, z: f32, dash: bool) -> V3 {
         let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
+        g.set_map(map);
         g.bots[1] = None;
-        g.f[1].pos = v3(13.0, 0.0, 10.0);
+        g.f[1].pos = v3(16.0, 0.0, 16.0);
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         let yaw = -std::f32::consts::FRAC_PI_2; // facing -x
-        g.f[0].pos = v3(5.6, 3.0, -6.75);
+        g.f[0].pos = v3(x0, 3.0, z);
         g.f[0].prev_pos = g.f[0].pos;
         g.f[0].yaw = yaw;
         g.f[0].on_ground = true;
         g.f[0].spawn_prot = 0.0;
         let run = Input { fwd: 1.0, yaw, ..Default::default() };
         for _ in 0..240 {
-            if g.f[0].pos.x < 2.25 {
+            if g.f[0].pos.x < edge {
                 break;
             }
             g.tick(&run);
@@ -7023,9 +7098,9 @@ mod map_tests {
                 continue;
             }
             // over the far platform: pull back so you don't sail past it
-            let brake = dashed && g.f[0].pos.x < -5.2;
+            let brake = dashed && g.f[0].pos.x < far - 0.8;
             g.tick(&Input { fwd: if brake { -1.0 } else { 1.0 }, ..run });
-            if g.f[0].on_ground && g.f[0].air_t == 0.0 && g.f[0].pos.x < 1.5 {
+            if g.f[0].on_ground && g.f[0].air_t == 0.0 && g.f[0].pos.x < edge - 0.75 {
                 break;
             }
         }
@@ -7033,27 +7108,72 @@ mod map_tests {
     }
 
     #[test]
-    fn the_platform_gap_needs_a_dash() {
-        let plain = leap(false);
-        assert!(plain.y < 0.5, "a plain running jump falls short: landed at {plain:?}");
-        let dashed = leap(true);
-        assert!((dashed.y - 3.0).abs() < 0.2 && dashed.x <= -4.4, "a jump and an air dash make it: landed at {dashed:?}");
+    fn the_platform_gaps_need_a_dash() {
+        for (map, x0, edge, far, z) in [(MapId::CloseQuarters, 5.6, 2.25, -4.5, -6.75), (MapId::Arena, 7.6, 3.5, -3.25, -10.25)] {
+            let plain = leap(map, x0, edge, far, z, false);
+            assert!(plain.y < 0.5, "{map:?}: a plain running jump falls short: landed at {plain:?}");
+            let dashed = leap(map, x0, edge, far, z, true);
+            assert!((dashed.y - 3.0).abs() < 0.2 && dashed.x <= far + 0.05, "{map:?}: a jump and an air dash make it: landed at {dashed:?}");
+        }
     }
 
     #[test]
-    fn stairs_lead_up_to_the_balcony() {
-        let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
-        g.bots[1] = None;
-        g.f[1].pos = v3(13.0, 0.0, 10.0);
-        g.mt.phase = Phase::Fight;
-        // walk up the stairs by the west corridor wall (facing -z)
-        g.f[0].pos = v3(-9.6, 0.0, -7.5);
-        g.f[0].prev_pos = g.f[0].pos;
-        g.f[0].spawn_prot = 0.0;
-        let up = Input { fwd: 1.0, yaw: std::f32::consts::PI, ..Default::default() };
-        for k in 0..(2.5 / TICK) as usize {
-            g.tick(&up);
+    fn stairs_lead_up_to_the_balconies() {
+        for (map, start, past) in [(MapId::CloseQuarters, v3(-9.6, 0.0, -7.5), -12.4), (MapId::Arena, v3(-12.2, 0.0, -10.5), -15.5)] {
+            let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
+            g.set_map(map);
+            g.bots[1] = None;
+            g.f[1].pos = v3(16.0, 0.0, 16.0);
+            g.mt.phase = Phase::Fight;
+            // walk up the stairs by the west corridor wall (facing -z)
+            g.f[0].pos = start;
+            g.f[0].prev_pos = start;
+            g.f[0].spawn_prot = 0.0;
+            let up = Input { fwd: 1.0, yaw: std::f32::consts::PI, ..Default::default() };
+            for _ in 0..(2.5 / TICK) as usize {
+                g.tick(&up);
+            }
+            assert!((g.f[0].pos.y - 3.0).abs() < 0.1 && g.f[0].pos.z < past, "{map:?}: on the balcony: {:?}", g.f[0].pos);
         }
-        assert!((g.f[0].pos.y - 3.0).abs() < 0.1 && g.f[0].pos.z < -12.4, "on the balcony: {:?}", g.f[0].pos);
+    }
+}
+#[cfg(test)]
+mod dash_charge_tests {
+    use super::*;
+
+    #[test]
+    fn three_dashes_then_they_refill_one_at_a_time() {
+        let mut g = Game::offline("A", 1, 0.5, Mode::Ffa, 50);
+        g.world = crate::game::lag_comp_tests::flat_world();
+        g.bots[1] = None;
+        g.f[1].pos = v3(40.0, 0.0, 40.0);
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = 99.0;
+        g.f[0].pos = V3::ZERO;
+        g.f[0].spawn_prot = 0.0;
+        let fwd = Input { fwd: 1.0, ..Default::default() };
+        // dash as soon as each one is allowed
+        let mut dashes = 0;
+        let mut was = false;
+        for _ in 0..(1.4 / TICK) as usize {
+            g.tick(&Input { dash: true, ..fwd });
+            let now = g.f[0].dash_t > 0.0;
+            if now && !was {
+                dashes += 1;
+            }
+            was = now;
+        }
+        assert_eq!(dashes, g.tune.dash_charges as usize, "the full set in a row, then no more");
+        assert!(g.f[0].dash_charges < 1.0);
+        // each spent dash comes back after its refill time (one at a time)
+        let refill = g.tune.dash_recharge;
+        for _ in 0..((refill + 0.1) / TICK) as usize {
+            g.tick(&fwd);
+        }
+        assert!(g.f[0].dash_charges >= 1.0 && g.f[0].dash_charges < 2.0, "one back: {}", g.f[0].dash_charges);
+        for _ in 0..((refill * 2.0) / TICK) as usize {
+            g.tick(&fwd);
+        }
+        assert!((g.f[0].dash_charges - g.tune.dash_charges).abs() < 1e-3, "all back: {}", g.f[0].dash_charges);
     }
 }
