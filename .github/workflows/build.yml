@@ -22,9 +22,11 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\duel_arena.exe "dist\Duel Rush.exe"
-          Compress-Archive -Path "dist\Duel Rush.exe" -DestinationPath DuelRush-Windows.zip
+          New-Item -ItemType Directory -Force "dist\Duel Rush" | Out-Null
+          Copy-Item target\release\duel_arena.exe "dist\Duel Rush\Duel Rush.exe"
+          # Steam library must sit next to the game, or Steam features switch off
+          Copy-Item redist\steam_api64.dll "dist\Duel Rush\steam_api64.dll"
+          Compress-Archive -Path "dist\Duel Rush" -DestinationPath DuelRush-Windows.zip
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -51,6 +53,12 @@ jobs:
             target/x86_64-apple-darwin/release/duel_arena \
             -output "$APP/Contents/MacOS/duel_arena"
           chmod +x "$APP/Contents/MacOS/duel_arena"
+          # Steam library: the game won't start on a Mac without it next to the program
+          DYLIB=$(find ~/.cargo/registry/src -path '*steamworks-sys*' -name libsteam_api.dylib | head -1)
+          echo "Steam dylib: $DYLIB"
+          cp "$DYLIB" "$APP/Contents/MacOS/libsteam_api.dylib"
+          install_name_tool -add_rpath @executable_path "$APP/Contents/MacOS/duel_arena" || true
+          otool -L "$APP/Contents/MacOS/duel_arena" | grep -i steam
           cat > "$APP/Contents/Info.plist" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -91,4 +99,4 @@ jobs:
           gh release create latest DuelRush-Windows.zip DuelRush-Mac.zip \
             --target "${{ github.sha }}" \
             --title "Latest build (#${{ github.run_number }})" \
-            --notes "Windows: unzip and run Duel Rush.exe (More info -> Run anyway). Mac: unzip, right-click Duel Rush -> Open (or System Settings -> Privacy & Security -> Open Anyway). Both players need the same build to connect."
+            --notes "Windows: unzip and run Duel Rush.exe (keep steam_api64.dll next to it) (More info -> Run anyway). Mac: unzip, right-click Duel Rush -> Open (or System Settings -> Privacy & Security -> Open Anyway). Both players need the same build to connect."
