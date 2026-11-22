@@ -1,0 +1,94 @@
+# Builds Duel Rush for Windows and Mac every time you push, and puts both
+# downloads on the repo's "Releases" page under "Latest build".
+name: Build game
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\duel_arena.exe "dist\Duel Rush.exe"
+          Compress-Archive -Path "dist\Duel Rush.exe" -DestinationPath DuelRush-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: DuelRush-Windows.zip
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (Apple Silicon + Intel)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+      - name: Make Duel Rush.app
+        run: |
+          APP="Duel Rush.app"
+          mkdir -p "$APP/Contents/MacOS"
+          lipo -create \
+            target/aarch64-apple-darwin/release/duel_arena \
+            target/x86_64-apple-darwin/release/duel_arena \
+            -output "$APP/Contents/MacOS/duel_arena"
+          chmod +x "$APP/Contents/MacOS/duel_arena"
+          cat > "$APP/Contents/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Duel Rush</string>
+            <key>CFBundleDisplayName</key><string>Duel Rush</string>
+            <key>CFBundleIdentifier</key><string>local.duelrush.game</string>
+            <key>CFBundleExecutable</key><string>duel_arena</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleVersion</key><string>${{ github.run_number }}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" DuelRush-Mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: DuelRush-Mac.zip
+
+  release:
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish "Latest build"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest DuelRush-Windows.zip DuelRush-Mac.zip \
+            --target "${{ github.sha }}" \
+            --title "Latest build (#${{ github.run_number }})" \
+            --notes "Windows: unzip and run Duel Rush.exe (More info -> Run anyway). Mac: unzip, right-click Duel Rush -> Open (or System Settings -> Privacy & Security -> Open Anyway). Both players need the same build to connect."

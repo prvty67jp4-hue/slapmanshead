@@ -1,0 +1,209 @@
+﻿use crate::game::{Game, Input, Weapon};
+use crate::math::*;
+
+/// A simple practice opponent.
+pub struct Bot {
+    pub skill: f32,
+    rng: Rng,
+    strafe: f32,
+    strafe_t: f32,
+    jump_t: f32,
+    dash_t: f32,
+    err: V3,
+    err_t: f32,
+    choose_t: f32,
+    want: Weapon,
+    last_pos: V3,
+    stuck_t: f32,
+    guard_t: f32,
+    jump_again: f32,
+    style: f32,
+    target: Option<usize>,
+    retarget: f32,
+}
+
+impl Bot {
+    pub fn new(skill: f32, seed: u64) -> Bot {
+        let mut rng = Rng(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) | 1);
+        let style = rng.f();
+        Bot {
+            skill: skill.clamp(0.05, 1.0),
+            rng,
+            strafe: 1.0,
+            strafe_t: 0.0,
+            jump_t: 2.0,
+            dash_t: 3.0,
+            err: V3::ZERO,
+            err_t: 0.0,
+            choose_t: 0.0,
+            want: Weapon::Revolver,
+            last_pos: V3::ZERO,
+            stuck_t: 0.0,
+            guard_t: 0.0,
+            jump_again: 0.0,
+            style,
+            target: None,
+            retarget: 0.0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.target = None;
+        self.retarget = 0.0;
+    }
+
+    pub fn think(&mut self, g: &Game, i: usize, dt: f32) -> Input {
+        let me = &g.f[i];
+        let mut inp = Input { yaw: me.yaw, pitch: me.pitch, ..Default::default() };
+        if !me.alive {
+            return inp;
+        }
+        // keep a target for a while, re-pick now and then
+        self.retarget -= dt;
+        let valid = self.target.map_or(false, |t| t < g.f.len() && g.f[t].alive && g.is_enemy(i, t));
+        if !valid || self.retarget <= 0.0 {
+            self.target = g.nearest_enemy(i);
+            self.retarget = 1.0 + self.rng.f();
+        }
+        let Some(ti) = self.target else {
+            // nobody to fight: wander
+            inp.fwd = 1.0;
+            inp.yaw = me.yaw + (g.time * 0.7 + i as f32).sin() * 0.02;
+            return inp;
+        };
+        let en = &g.f[ti];
+        let s = self.skill;
+        let lead = 0.05 + 0.12 * s;
+        let target = if en.alive { en.chest() + v3(0.0, 0.1, 0.0) + en.vel * lead } else { en.pos };
+        self.err_t -= dt;
+        if self.err_t <= 0.0 {
+            self.err_t = 0.35 + self.rng.f() * 0.4;
+            let m = (1.0 - s) * 1.6 + 0.12;
+            self.err = v3(self.rng.range(-m, m), self.rng.range(-m * 0.6, m * 0.6), self.rng.range(-m, m));
+        }
+        let eye = me.eye();
+        let to = target + self.err - eye;
+        let flat = v3(to.x, 0.0, to.z).len().max(0.01);
+        let want_yaw = to.x.atan2(to.z);
+        let want_pitch = to.y.atan2(flat);
+        let turn = (3.0 + 9.0 * s) * dt;
+        let dy = wrap_angle(want_yaw - me.yaw);
+        inp.yaw = me.yaw + dy.clamp(-turn, turn);
+        inp.pitch = approach(me.pitch, want_pitch, turn);
+        let aim_off = dy.abs() + (want_pitch - me.pitch).abs();
+
+        if g.frozen() {
+            return inp;
+        }
+
+        let dist = (en.pos - me.pos).len();
+        let visible = en.alive && g.world.line_clear(eye, en.chest());
+
+        // weapon choice (with a little hesitation)
+        self.choose_t -= dt;
+        if self.choose_t <= 0.0 {
+            self.choose_t = 0.6 + self.rng.f() * 0.6;
+            let sword_range = 3.6 + self.style * 4.0;
+            self.want = if dist < sword_range {
+                Weapon::Sword
+            } else if dist < 10.0 && me.mag[1] > 0 {
+                Weapon::Shotgun
+            } else {
+                Weapon::Revolver
+            };
+            if self.want != Weapon::Sword && me.mag[self.want as usize] == 0 && me.reload_t <= 0.0 {
+                // empty gun: pick the other one
+                self.want = if self.want == Weapon::Shotgun { Weapon::Revolver } else { Weapon::Shotgun };
+            }
+        }
+        if me.weapon != self.want {
+            inp.select = Some(self.want as u8);
+        }
+
+        // movement
+        self.strafe_t -= dt;
+        if self.strafe_t <= 0.0 {
+            self.strafe_t = 0.5 + self.rng.f() * 1.3;
+            self.strafe = if self.rng.chance(0.5) { 1.0 } else { -1.0 };
+        }
+        let fwd = yaw_fwd(inp.yaw);
+        let _ = fwd;
+        if visible {
+            if me.weapon == Weapon::Sword {
+                inp.fwd = 1.0;
+                inp.right = self.strafe * 0.35;
+            } else {
+                let pref = if me.weapon == Weapon::Shotgun { 6.0 } else { 13.0 };
+                inp.fwd = if dist > pref + 3.0 { 1.0 } else if dist < pref - 3.0 { -0.7 } else { 0.0 };
+                inp.right = self.strafe;
+            }
+        } else {
+            inp.fwd = 1.0;
+            inp.right = self.strafe * 0.3;
+        }
+
+        // unstick: jump and wall-run over things
+        let moved = (me.pos - self.last_pos).flat().len();
+        self.last_pos = me.pos;
+        if moved < 0.02 && (inp.fwd != 0.0 || inp.right != 0.0) {
+            self.stuck_t += dt;
+        } else {
+            self.stuck_t = (self.stuck_t - dt).max(0.0);
+        }
+        self.jump_t -= dt;
+        if (self.stuck_t > 0.25 || self.jump_t <= 0.0) && me.on_ground {
+            inp.jump = true;
+            self.jump_t = 1.2 + self.rng.f() * 3.0;
+            self.jump_again = 0.28 + self.rng.f() * 0.2;
+            self.stuck_t = 0.0;
+        }
+        if self.jump_again > 0.0 {
+            self.jump_again -= dt;
+            if self.jump_again <= 0.0 && !me.on_ground {
+                inp.jump = true; // starts a wall run when next to a wall
+            }
+        }
+        self.dash_t -= dt;
+        if self.dash_t <= 0.0 && visible {
+            self.dash_t = 1.5 + self.rng.f() * (3.5 - 2.0 * s);
+            inp.dash = true;
+            if me.weapon == Weapon::Sword && dist > 3.0 {
+                inp.fwd = 1.0;
+                inp.right = 0.0;
+            }
+        }
+
+        // attacking
+        if visible && en.alive {
+            match me.weapon {
+                Weapon::Sword => {
+                    let facing_me = en.fwd().dot((me.pos - en.pos).flat().norm()) > 0.8;
+                    self.guard_t -= dt;
+                    if en.weapon != Weapon::Sword && facing_me && dist > 3.0 && self.rng.chance(dt * 2.5 * s) {
+                        self.guard_t = 0.4 + self.rng.f() * 0.6;
+                    }
+                    if en.slashing() && dist < 3.2 && self.rng.chance(dt * 6.0 * s) {
+                        self.guard_t = 0.35;
+                    }
+                    if self.guard_t > 0.0 {
+                        inp.guard = true;
+                    } else if dist < 2.8 && aim_off < 0.6 {
+                        inp.fire_pressed = self.rng.chance(dt * (4.0 + 6.0 * s));
+                    }
+                }
+                _ => {
+                    let thresh = 0.05 + 0.08 * (1.0 - s);
+                    if aim_off < thresh && self.rng.chance(dt * (3.0 + 6.0 * s)) {
+                        inp.fire = true;
+                    }
+                }
+            }
+            if dist > 8.0 && dist < 18.0 && me.grenades > 0 && self.rng.chance(dt * 0.12) {
+                inp.grenade = true;
+            }
+        } else if me.weapon != Weapon::Sword && me.mag[me.weapon as usize] < me.weapon.mag() && self.rng.chance(dt) {
+            inp.reload = true;
+        }
+        inp
+    }
+}
