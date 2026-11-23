@@ -538,4 +538,22 @@ mod nav_tests {
         }
         assert!(failed.is_empty(), "bots couldn't get to: {failed:?}");
     }
+
+    /// Capture the Flag on the team map, eight bots (4v4): they find the enemy flag room, carry
+    /// the flag home through the lanes and score.
+    #[test]
+    fn bots_capture_flags_on_bridgeworks() {
+        let mut g = Game::offline("A", 7, 1.0, Mode::Ctf, 3);
+        g.set_map(MapId::Bridgeworks);
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = 999.0;
+        g.bots[0] = Some(Bot::new(1.0, 11));
+        let mut t = 0.0;
+        while t < 480.0 && g.mt.team_score.iter().all(|&s| s == 0) {
+            g.tick(&Input::default());
+            t += TICK;
+        }
+        println!("first capture after {t:.0} s: {:?}", g.mt.team_score);
+        assert!(g.mt.team_score.iter().any(|&s| s > 0), "no flag captured in 8 minutes");
+    }
 }

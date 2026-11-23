@@ -88,6 +88,9 @@ pub fn platform() -> &'static str {
 pub struct Download {
     pub file: String,
     pub sha256: String,
+    /// The build this file is, when it isn't the release's own (a Mac zip kept from an earlier
+    /// build because that run's Mac build didn't finish).
+    pub build: Option<u32>,
 }
 
 /// What version.json says.
@@ -102,6 +105,10 @@ pub struct Manifest {
 impl Manifest {
     pub fn download(&self, platform: &str) -> Option<&Download> {
         self.files.iter().find(|(p, _)| p == platform).map(|(_, d)| d)
+    }
+    /// The build platform would get (its own file's build when the release kept an older one).
+    pub fn build_for(&self, platform: &str) -> u32 {
+        self.download(platform).and_then(|d| d.build).unwrap_or(self.build)
     }
 }
 
@@ -120,7 +127,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
             if file.is_empty() || file.contains(['/', '\\']) || file.contains("..") || sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
                 continue;
             }
-            files.push((platform.clone(), Download { file: file.to_string(), sha256: sha }));
+            let fb = d.get("build").and_then(|b| b.as_u64()).filter(|&b| b > 0 && b <= u32::MAX as u64).map(|b| b as u32);
+            files.push((platform.clone(), Download { file: file.to_string(), sha256: sha, build: fb }));
         }
     }
     Ok(Manifest { build, version, notes, files })
@@ -368,7 +376,7 @@ impl Updater {
         let me = self.clone();
         let _ = std::thread::Builder::new().name("update check".into()).spawn(move || {
             let p = match fetch(&manifest_url(), None).and_then(|b| parse_manifest(&String::from_utf8_lossy(&b))) {
-                Ok(m) if is_newer(m.build, local_build()) => Phase::Available(m),
+                Ok(m) if is_newer(m.build_for(platform()), local_build()) => Phase::Available(m),
                 Ok(_) => Phase::UpToDate,
                 Err(e) => Phase::CheckFailed(e),
             };
@@ -382,11 +390,11 @@ impl Updater {
             return;
         }
         let me = self.clone();
-        self.set(Phase::Downloading { build: m.build, got: 0, total: 0 });
+        self.set(Phase::Downloading { build: m.build_for(platform()), got: 0, total: 0 });
         let _ = std::thread::Builder::new().name("update download".into()).spawn(move || {
             let r = me.download_and_install(&m);
             me.set(match r {
-                Ok(()) => Phase::Restart { build: m.build },
+                Ok(()) => Phase::Restart { build: m.build_for(platform()) },
                 Err(e) => Phase::Failed(e),
             });
         });
@@ -397,7 +405,7 @@ impl Updater {
         if platform() == "linux" {
             return Err("updating in place isn't supported on Linux yet".into());
         }
-        let build = m.build;
+        let build = m.build_for(platform());
         let me = self.clone();
         let bytes = fetch(&file_url(&d.file), Some(&move |got, total| me.set(Phase::Downloading { build, got, total })))?;
         check_hash(&sha256_hex(&bytes), &d.sha256)?;
@@ -484,6 +492,23 @@ mod tests {
         assert!(parse_manifest(r#"{"version": "1"}"#).is_err(), "no build number");
         assert!(parse_manifest("not json").is_err());
         assert!(file_url("DuelRush-Windows.zip").ends_with("/releases/download/latest/DuelRush-Windows.zip"));
+    }
+
+    /// When a release keeps an older Mac zip (that run's Mac build didn't finish), the Mac is
+    /// told that zip's own build, so it isn't offered the same build again as an update.
+    #[test]
+    fn a_kept_older_file_carries_its_own_build() {
+        let sha = "b".repeat(64);
+        let text = format!(
+            r#"{{"build": 20, "files": {{
+                "windows": {{"file": "DuelRush-Windows.zip", "sha256": "{sha}"}},
+                "mac": {{"file": "DuelRush-Mac.zip", "sha256": "{sha}", "build": 18}} }} }}"#
+        );
+        let m = parse_manifest(&text).unwrap();
+        assert_eq!(m.build_for("windows"), 20);
+        assert_eq!(m.build_for("mac"), 18);
+        assert_eq!(m.build_for("linux"), 20, "no file of its own: the release's build");
+        assert!(!is_newer(m.build_for("mac"), 18), "a Mac on build 18 is up to date");
     }
 
     #[test]
