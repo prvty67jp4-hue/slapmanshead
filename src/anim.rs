@@ -53,10 +53,13 @@ pub struct SkinVtx {
     pub nrm: [f32; 3],
     pub joints: [u32; 4],
     pub weights: [f32; 4],
-    /// Low byte: material (or 1 = team-colour accent on a textured fighter); bits 8+: texture
-    /// layer of the fighters' texture set (255 = untextured).
+    /// Low byte: material on the plain mannequin; on a textured fighter bit 0 = team-colour
+    /// accent, bits 1-3 the kind of surface, bits 4-7 sway (see chars::mat_word); bits 8+:
+    /// texture layer of the fighters' texture set (255 = untextured).
     pub mat: u32,
     pub uv: [f32; 2],
+    /// A normal smoothed across hard edges and seams, for pushing out the outline shell.
+    pub onrm: [f32; 3],
 }
 
 /// Texture layer meaning "no texture" (the plain mannequin).
@@ -212,7 +215,7 @@ impl Rig {
                 let mat = prim.material().index().unwrap_or(0) as u32;
                 for k in 0..pos.len() {
                     let j = jnt[k];
-                    verts.push(SkinVtx { pos: pos[k], nrm: nrm[k], joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32], weights: wts[k], mat: (NO_LAYER << 8) | mat, uv: [0.0, 0.0] });
+                    verts.push(SkinVtx { pos: pos[k], nrm: nrm[k], joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32], weights: wts[k], mat: (NO_LAYER << 8) | mat, uv: [0.0, 0.0], onrm: nrm[k] });
                 }
                 match r.read_indices() {
                     Some(ix) => indices.extend(ix.into_u32().map(|i| i + base)),

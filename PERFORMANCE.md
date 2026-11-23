@@ -30,6 +30,21 @@ Steam Deck preset's graphics share (about 0.2 ms average, 0.6 ms at the 1% low) 
 16.7 ms a 60 fps frame allows. The Deck also starts with a 60 fps limit and dynamic resolution on. Worth
 confirming on a real Deck.
 
+## Character art pass (toon shading, outlines, accessories)
+
+The fighters' toon shading, their outline pass (each fighter drawn a second time as an inside-out shell) and
+the accessories (about 600 to 4,700 more triangles a fighter) were timed with the same Steam Deck preset run
+(8 fighters, 1280x800, 30 s) on the build before and the build after (`tools/capture_fighters.ps1 -Bench`):
+
+| Build | Average | 1% low | 3D drawing (processor) |
+| --- | --- | --- | --- |
+| Before | 662 fps (1.51 ms) | 413 fps (2.42 ms) | 1.09 ms |
+| After | 660 fps (1.52 ms) | 371 fps (2.70 ms) | 1.02 ms |
+
+The cost is about 0.3 ms at the 1% low on the RTX 3060. Scaled to the Deck as above (graphics 8 times
+slower), that's roughly 2.5 ms more in the worst frames, still far inside the 16.7 ms a 60 fps frame allows:
+the Steam Deck preset still holds 60 fps (estimated; not measured on a Deck).
+
 ## Memory
 
 - The game's own lists (effects, replays, histories, logs) stay flat through a 30-minute match: checked every

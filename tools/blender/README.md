@@ -45,3 +45,36 @@ Conventions the game relies on:
 
 After changing a model, run `cargo test` (it checks every model and icon loads, the reach, the moving parts, and
 that each gun's front hand reaches where it holds the gun).
+
+# Fighter accessories (Blender)
+
+Each fighter's signature accessory is built by `build_accessories.py`, fitted onto that fighter's own body:
+
+    cargo test --release dump_fighter_refs -- --ignored      (once: writes app/tools/blender/ref/)
+    blender --background --factory-startup --python app/tools/blender/build_accessories.py
+    blender --background --factory-startup --python app/tools/blender/build_accessories.py -- striker
+
+- Corvin Vale: a brass warden badge (a shield with a star) on a leather backing, on the coat's left breast.
+- Sable Rook: a knitted scarf with pale stripes wrapped twice round the neck over the hood's collar, knotted
+  at the front left, two tails down the chest. It takes the player's colour; the tails sway.
+- Bram "Anvil" Kask: a pauldron of three dark hammered iron plates laid over the left shoulder's own curve
+  like scales (fitted by ray casts round the arm; in the game each vertex copies the bones of the skin under
+  it, so it bends with the shoulder and stays inside the arm's outline), a leather strap across the chest, and a smith's apron on a belt
+  (it hugs the belly, hangs straight from the widest point, follows the thighs and sways).
+- Ilya Fen: a hood over the head and shoulders with a thin trim along its front edge (over the brow, down
+  to the jaw): a soft accent in the player's colour, brighter only while Afterimage is on (her hair is under
+  the hood).
+
+What it writes:
+
+- `app/assets/characters/acc_<name>.glb`: the accessory, each piece its own mesh (`badge`, `scarf`,
+  `scarf_tail_*`, `pauldron`, `strap`, `apron`, `belt`, `hood`, `hood_trim`). `ACCESSORIES` in
+  `src/chars.rs` says which bones each piece follows and how much it sways; material names say what it is
+  (`glow` is drawn unlit in the player's colour, `brass`/`iron` as metal, `leather`/`apron` as leather).
+- `app/assets/characters/accessories.png`: the four 512 x 512 bakes in one image, a quarter each (ranger top
+  left, huntress top right, brawler bottom left, striker bottom right); each model's UVs point into its quarter.
+- `app/shots/character-art/accessories/<name>.png`: four views of the accessory on the body.
+
+Conventions: the game's model space for the fighter (metres, y up, the fighter faces +z, their left is +x),
+read from `ref/anchors.json` (bone positions) and `ref/<name>.obj` (the body, in its rest T-pose). Pieces are
+fitted with ray casts and an "outside surface" shrink-wrap, so nothing sinks into the body.

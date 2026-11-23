@@ -32,8 +32,9 @@ const MAX_INST: usize = 16;
 /// Point lights at once (braziers, torches, muzzle flashes).
 const MAX_LIGHTS: usize = 12;
 /// Per character: two tints, the hit flash (three words of joint bits + strength), the joints.
-// tint0, tint1, flash, rim (4 floats each), then the joints
-const INST_FLOATS: usize = 16 + MAX_JOINTS * 16;
+// tint0, tint1, flash, rim, motion (4 floats each: motion is the velocity and a sway phase),
+// then the joints
+const INST_FLOATS: usize = 20 + MAX_JOINTS * 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -117,12 +118,28 @@ impl Fx {
 const U_DECL: &str = r#"
 struct U { vp: mat4x4<f32>, cam: vec4<f32>, right: vec4<f32>, up: vec4<f32>, fwd: vec4<f32>, sun: vec4<f32>, sun_col: vec4<f32>, fog: vec4<f32>, params: vec4<f32>, light_vp: mat4x4<f32>, shadow: vec4<f32>, sh: array<vec4<f32>, 9>, lpos: array<vec4<f32>, 12>, lcol: array<vec4<f32>, 12> };
 @group(0) @binding(0) var<uniform> u: U;
-struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, joints: array<mat4x4<f32>, 72> };
+struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, motion: vec4<f32>, joints: array<mat4x4<f32>, 72> };
 @group(0) @binding(3) var<storage, read> insts: array<Inst>;
 struct VIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32> };
-struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32, @location(5) uv: vec2<f32> };
+struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32, @location(5) uv: vec2<f32>, @location(6) on: vec3<f32> };
 fn skin_matrix(v: SIn, ii: u32) -> mat4x4<f32> {
   return insts[ii].joints[v.j.x] * v.w.x + insts[ii].joints[v.j.y] * v.w.y + insts[ii].joints[v.j.z] * v.w.z + insts[ii].joints[v.j.w] * v.w.w;
+}
+// secondary motion: hair, scarf tails, an apron, belt pouches drift a little at rest and trail
+// behind the way the fighter moves (bits 4-7 of the material word say how much)
+fn sway_offset(v: SIn, ii: u32) -> vec3<f32> {
+  let s = f32((v.mat >> 4u) & 15u) / 15.0;
+  if (s <= 0.0 || (v.mat >> 8u) >= 255u) { return vec3<f32>(0.0, 0.0, 0.0); }
+  let mo = insts[ii].motion;
+  let t = u.params.x;
+  let ph = mo.w + v.pos.y * 5.0;
+  let speed = min(length(mo.xz), 9.0) / 9.0;
+  let idle = vec3<f32>(sin(t * 1.7 + ph), 0.0, cos(t * 1.3 + ph * 1.3)) * 0.02;
+  let flap = vec3<f32>(sin(t * 9.0 + ph * 2.0), 0.4 * sin(t * 7.0 + ph), cos(t * 8.3 + ph)) * 0.018 * speed;
+  var drag = -mo.xyz * vec3<f32>(0.014, 0.006, 0.014);
+  let dl = length(drag);
+  if (dl > 0.12) { drag = drag * (0.12 / dl); }
+  return (idle + flap + drag) * s;
 }
 "#;
 
@@ -138,13 +155,15 @@ const SHADER: &str = r#"
 
 const PI: f32 = 3.14159265;
 
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) wpos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32>, @location(5) rim: vec4<f32> };
+// (bp, bn: a fighter's surface in its own model space, so painted detail sticks to it as it moves)
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) wpos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32>, @location(5) rim: vec4<f32>, @location(6) bp: vec3<f32>, @location(7) bn: vec3<f32> };
 
 @vertex fn vs(v: VIn) -> VOut {
   var o: VOut;
   o.clip = u.vp * vec4<f32>(v.pos, 1.0);
   o.wpos = v.pos; o.nrm = v.nrm; o.uv = v.uv; o.col = v.col; o.ex = v.ex;
   o.rim = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  o.bp = v.pos; o.bn = v.nrm;
   return o;
 }
 
@@ -222,6 +241,89 @@ fn vnoise(p: vec2<f32>) -> f32 {
   return mix(mix(hash21(i), hash21(i + vec2<f32>(1.0, 0.0)), w.x), mix(hash21(i + vec2<f32>(0.0, 1.0)), hash21(i + vec2<f32>(1.0, 1.0)), w.x), w.y);
 }
 
+fn lum3(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)); }
+
+// The fighters' toon shading: two soft-edged light bands (shade, light, full light), colour-rich
+// shade, crisp highlights by material (metal, leather, hair, skin, eyes), a rim of sky light round
+// the silhouette, and painted detail on the surface: woven cloth, creased leather, scratched
+// metal. The kind of surface comes from the material word (ex.w), or for the outfits from the
+// texture's colour: pale grey is metal, warm brown leather, anything else cloth.
+fn toon(i: VOut, albedo_in: vec3<f32>, texel: vec3<f32>, n: vec3<f32>, ng: vec3<f32>, v: vec3<f32>, l: vec3<f32>, sh: f32, q: vec2<f32>, fw_weave: f32, fw_q: f32) -> vec3<f32> {
+  var kind = u32(i.ex.w + 0.5);
+  let mx = max(texel.r, max(texel.g, texel.b));
+  let mn = min(texel.r, min(texel.g, texel.b));
+  let sat = (mx - mn) / max(mx, 0.001);
+  if (kind == 0u) {
+    if (sat < 0.22 && mx > 0.42) { kind = 6u; }
+    else if (texel.r > texel.g && texel.g > texel.b * 1.25 && texel.g > texel.r * 0.25 && sat > 0.4 && mx < 0.3) { kind = 7u; }
+  }
+  var alb = albedo_in;
+  // painted detail, faded out before it gets finer than a pixel
+  let fine = 1.0 - smoothstep(0.9, 2.2, fw_weave);
+  let mid = 1.0 - smoothstep(0.12, 0.35, fw_q * 22.0);
+  if (kind == 0u) {
+    // cloth: a weave up close, soft mottling from afar
+    let wq = q * 1050.0;
+    let over = step(0.0, sin(wq.x * 0.5) * sin(wq.y * 0.5));
+    let thread = mix(abs(sin(wq.y)), abs(sin(wq.x)), over);
+    alb = alb * (1.0 - 0.18 * (1.0 - thread) * fine);
+    alb = alb * (0.9 + 0.2 * vnoise(q * 9.0));
+  } else if (kind == 7u) {
+    // leather: creases and grain, a little darker and warmer
+    let r = vnoise(q * 40.0 + vec2<f32>(vnoise(q * 8.0) * 2.0, 0.0));
+    let crease = smoothstep(0.9, 0.98, 1.0 - abs(r * 2.0 - 1.0)) * mid;
+    alb = alb * vec3<f32>(0.95, 0.9, 0.84) * (1.0 - 0.16 * crease) * (0.92 + 0.16 * vnoise(q * 140.0) * fine + 0.08 * (1.0 - fine));
+  } else if (kind == 6u) {
+    // metal: brighter and cooler, with scratches and worn patches
+    alb = mix(alb, vec3<f32>(lum3(alb)), 0.25) * 1.15;
+    let scratch = smoothstep(0.93, 1.0, abs(sin(q.x * 260.0 + vnoise(q * 30.0) * 8.0))) * smoothstep(0.45, 0.7, vnoise(q * 12.0)) * mid;
+    alb = alb * (1.0 + 0.25 * scratch);
+  } else if (kind == 5u) {
+    alb = alb * (0.96 + 0.08 * vnoise(q * 30.0));
+  } else if (kind == 1u) {
+    // eyebrows: darker, defined
+    alb = alb * 0.5;
+  }
+  let sunc = u.sun_col.rgb * u.sun.w;
+  let x = min(dot(n, l), mix(-0.3, 1.0, sh));
+  let b1 = smoothstep(-0.03, 0.05, x);
+  let b2 = smoothstep(0.45, 0.52, x);
+  var lit = 0.55 * b1 + 0.45 * b2;
+  // eyes and eyebrows stay readable in the shade
+  if (kind == 1u || kind == 2u) { lit = 0.5 + 0.5 * lit; }
+  // the shade: richer and a little cooler (skin warmer), never black
+  let hue = alb / max(max(alb.r, max(alb.g, alb.b)), 0.02);
+  var shade_c = alb * mix(vec3<f32>(1.0), hue, 0.3);
+  if (kind == 5u) { shade_c = alb * vec3<f32>(1.06, 0.86, 0.82); }
+  let amb = sky_light(n) * 0.6 + sky_light(vec3<f32>(0.0, 1.0, 0.0)) * 0.55 + u.fog.rgb * 0.18;
+  var c = alb * sunc * lit * 0.85 + mix(shade_c, alb, lit) * amb * 1.32;
+  let h = normalize(l + v);
+  let ndh = max(dot(n, h), 0.0);
+  var sp = 0.0;
+  // (metal: only a thin, crisp highlight; no broad sheen that would wash a face of it pale)
+  // (as bright as the metal itself: pale buckles glint, dark iron only shows a dull spot)
+  if (kind == 6u) { sp = smoothstep(0.978, 0.992, ndh) * clamp(lum3(alb) * 3.0, 0.03, 1.1); }
+  else if (kind == 7u) { sp = smoothstep(0.95, 0.975, ndh) * 0.3; }
+  else if (kind == 3u) { sp = smoothstep(0.9, 0.95, ndh) * 0.14; }
+  else if (kind == 5u) { sp = smoothstep(0.97, 0.99, ndh) * 0.08; }
+  else if (kind == 2u) { sp = smoothstep(0.96, 0.985, ndh) * 1.5; }
+  c = c + sunc * sp * b1 * mix(vec3<f32>(1.0), hue, select(0.0, 0.5, kind == 6u));
+  if (kind == 6u) {
+    // metal catches the sky too
+    let r = reflect(-v, n);
+    // metal catches only a glancing touch of the sky (dark iron stays dark)
+    let e = textureSampleLevel(sky, skysamp, sky_uv(r), 3.0).rgb * u.params.z;
+    let graze = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 3.0);
+    c = c + mix(vec3<f32>(lum3(e)), e, 0.4) * alb * (0.06 + 0.3 * graze);
+  }
+  // a rim of sky light round the silhouette (brighter facing up)
+  let fr = 1.0 - clamp(dot(ng, v), 0.0, 1.0);
+  let rim = smoothstep(0.58, 0.8, fr) * (0.45 + 0.55 * clamp(n.y + 0.3, 0.0, 1.0));
+  let rim_k = select(0.9, 0.35, kind == 6u);
+  c = c + sky_light(normalize(n + vec3<f32>(0.0, 0.8, 0.0))) * rim * rim_k * (0.6 + 0.4 * lit);
+  return c;
+}
+
 fn shade(i: VOut) -> vec4<f32> {
   let layer = i.ex.x;
   let mat = i.ex.y;
@@ -234,6 +336,12 @@ fn shade(i: VOut) -> vec4<f32> {
   let dp2 = dpdy(i.wpos);
   let duv1 = dpdx(i.uv);
   let duv2 = dpdy(i.uv);
+  // two coordinates across a fighter's surface in its own space (for its painted detail), and
+  // how fast they change on screen
+  let an = abs(i.bn);
+  let q = select(select(i.bp.xy, i.bp.xz, an.y >= an.z), i.bp.zy, an.x >= an.y && an.x >= an.z);
+  let fw_weave = length(fwidth(q * 1050.0));
+  let fw_q = length(fwidth(q));
   let is_char = mat > 0.25 && mat < 0.75;
   // a weapon: its baked, hand-painted texture in the fighters' array
   let is_wpn = mat > 0.75 && mat < 1.25;
@@ -311,7 +419,11 @@ fn shade(i: VOut) -> vec4<f32> {
   // light bounced up from the sunlit ground (undersides of ledges and balconies aren't black)
   let bounce = u.sun_col.rgb * (u.sun.w * 0.11 * max(-n.y, 0.0) * max(l.y, 0.0));
   // (the sky fill is generous: shaded sides stay mid-tone, never black)
-  c = c + (sky_light(n) * 1.45 + u.fog.rgb * 0.22 + bounce) * albedo * (1.0 - metal) * ao + env * fr * ao * u.shadow.w * mix(0.55, 1.0, sh);
+  if (is_char) {
+    c = toon(i, albedo, t1.rgb, n, ng, v, l, sh, q, fw_weave, fw_q);
+  } else {
+    c = c + (sky_light(n) * 1.45 + u.fog.rgb * 0.22 + bounce) * albedo * (1.0 - metal) * ao + env * fr * ao * u.shadow.w * mix(0.55, 1.0, sh);
+  }
   // braziers, torches and muzzle flashes
   let nl = i32(u.shadow.z);
   for (var q = 0; q < nl; q = q + 1) {
@@ -351,12 +463,48 @@ fn shade(i: VOut) -> vec4<f32> {
   return shade(i);
 }
 
+// The fighters' outlines: the skinned mesh pushed out along its smoothed normals and drawn
+// inside out (front faces culled), so only a rim shows round the silhouette and the creases.
+// About two pixels wide up close, thinning to one far away (cam.w is the picture's height).
+@vertex fn vs_skin_outline(v: SIn, @builtin(instance_index) ii: u32) -> VOut {
+  let m = skin_matrix(v, ii);
+  let wp = (m * vec4<f32>(v.pos, 1.0)).xyz + sway_offset(v, ii);
+  let n = normalize((m * vec4<f32>(v.on, 0.0)).xyz);
+  let low = v.mat & 255u;
+  let lay = v.mat >> 8u;
+  let kind = (low >> 1u) & 7u;
+  let d = length(wp - u.cam.xyz);
+  let px = mix(2.0, 1.0, smoothstep(3.0, 30.0, d)) * max(u.cam.w / 1080.0, 0.65);
+  let thick = px * 2.0 * u.up.w / max(u.cam.w, 1.0) * d;
+  let wp2 = wp + n * thick;
+  var o: VOut;
+  o.clip = u.vp * vec4<f32>(wp2, 1.0);
+  // no line round the eyes, the eyebrows or a glowing trim (or the plain mannequin)
+  if (kind == 1u || kind == 2u || kind == 4u || lay >= 255u) { o.clip = vec4<f32>(0.0, 0.0, -2.0, 1.0); }
+  o.wpos = wp2; o.nrm = n; o.uv = v.uv;
+  o.col = insts[ii].tint0;
+  o.ex = vec4<f32>(f32(lay), select(0.0, 1.0, (low & 1u) == 1u), 0.0, 0.0);
+  o.rim = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+  o.bp = v.pos; o.bn = v.on;
+  return o;
+}
+
+// the line: a dark shade of the surface's own colour (softer than black)
+@fragment fn fs_outline(i: VOut) -> @location(0) vec4<f32> {
+  var c = textureSample(ctex, samp, i.uv, i32(max(i.ex.x, 0.0) + 0.5)).rgb;
+  if (i.ex.y > 0.5) { c = c * mix(vec3<f32>(1.0, 1.0, 1.0), i.col.rgb * 1.35, 0.62); }
+  c = max(mix(vec3<f32>(lum3(c)), c, 1.4), vec3<f32>(0.0)) * 0.16 + vec3<f32>(0.004, 0.004, 0.006);
+  return vec4<f32>(fogit(c, i.wpos), dot(i.wpos - u.cam.xyz, u.fwd.xyz));
+}
+
 @vertex fn vs_skin(v: SIn, @builtin(instance_index) ii: u32) -> VOut {
   let m = skin_matrix(v, ii);
-  let wp = m * vec4<f32>(v.pos, 1.0);
+  let wp = (m * vec4<f32>(v.pos, 1.0)).xyz + sway_offset(v, ii);
   var o: VOut;
-  o.clip = u.vp * vec4<f32>(wp.xyz, 1.0);
-  o.wpos = wp.xyz;
+  o.clip = u.vp * vec4<f32>(wp, 1.0);
+  o.wpos = wp;
+  o.bp = v.pos;
+  o.bn = v.nrm;
   o.nrm = normalize((m * vec4<f32>(v.nrm, 0.0)).xyz);
   let lay = v.mat >> 8u;
   let low = v.mat & 255u;
@@ -366,9 +514,18 @@ fn shade(i: VOut) -> vec4<f32> {
     // a textured fighter: its own colours, the team colour only on its accent pieces (hood,
     // shoulder guard or tunic), and a red wash when hurt
     let acc = mix(vec3<f32>(1.0, 1.0, 1.0), insts[ii].tint0.rgb * 1.35, 0.62);
-    let base = select(vec3<f32>(1.0, 1.0, 1.0), acc, low == 1u);
+    let base = select(vec3<f32>(1.0, 1.0, 1.0), acc, (low & 1u) == 1u);
     o.col = vec4<f32>(mix(base, vec3<f32>(1.5, 0.35, 0.3), insts[ii].tint1.w), 1.0);
-    ex = vec4<f32>(f32(lay), 0.5, 1.0, 0.25);
+    // (the kind of surface goes to the toon shader in ex.w)
+    let kind = (low >> 1u) & 7u;
+    ex = vec4<f32>(f32(lay), 0.5, 1.0, f32(kind));
+    if (kind == 4u) {
+      // a glowing trim: unlit, in the player's colour; a soft accent, bright (and blooming) only
+      // while the fighter's ability is on (tint0.w)
+      let tc = insts[ii].tint0.rgb;
+      o.col = vec4<f32>(tc / max(max(tc.r, max(tc.g, tc.b)), 0.05) * (0.5 + 2.2 * insts[ii].tint0.w), 1.0);
+      ex = vec4<f32>(-1.0, 2.0, 1.0, 0.0);
+    }
   } else {
     o.col = vec4<f32>(select(insts[ii].tint1, insts[ii].tint0, low == 0u).rgb, 1.0);
   }
@@ -412,8 +569,8 @@ const SHADOW_SHADER: &str = r#"
   return u.light_vp * vec4<f32>(v.pos, 1.0);
 }
 @vertex fn vs_skin_shadow(v: SIn, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
-  let wp = skin_matrix(v, ii) * vec4<f32>(v.pos, 1.0);
-  return u.light_vp * vec4<f32>(wp.xyz, 1.0);
+  let wp = (skin_matrix(v, ii) * vec4<f32>(v.pos, 1.0)).xyz + sway_offset(v, ii);
+  return u.light_vp * vec4<f32>(wp, 1.0);
 }
 "#;
 
@@ -2114,6 +2271,8 @@ pub struct Gpu {
     target: Option<Target>,
     pub tex_id: Option<egui::TextureId>,
     pipe_skin: wgpu::RenderPipeline,
+    /// The fighters' outlines (an inside-out shell).
+    pipe_outline: wgpu::RenderPipeline,
     inst_buf: wgpu::Buffer,
     skin: Option<Skin>,
     chars: Vec<CharState>,
@@ -2164,9 +2323,13 @@ fn build_char_textures() -> Vec<Vec<Vec<u8>>> {
     use image::imageops::{FilterType, resize};
     crate::chars::TEXTURES
         .iter()
-        .map(|(_, bytes)| {
+        .map(|(name, bytes)| {
             let img = image::load_from_memory(bytes).map(|i| i.to_rgba8()).unwrap_or_else(|_| image::RgbaImage::from_pixel(CHAR_TEX, CHAR_TEX, image::Rgba([190, 190, 190, 255])));
             let mut img = if img.width() != CHAR_TEX || img.height() != CHAR_TEX { resize(&img, CHAR_TEX, CHAR_TEX, FilterType::Triangle) } else { img };
+            // faces that read at a distance
+            if *name == "hero_male" || *name == "hero_female" {
+                crate::chars::paint_face(&mut img, *name == "hero_female");
+            }
             let mut levels = Vec::new();
             loop {
                 levels.push(img.as_raw().clone());
@@ -2213,14 +2376,15 @@ fn part_masks(rig: &Rig) -> [[u32; 3]; 7] {
     out
 }
 
-fn make_skin_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, samples: u32) -> wgpu::RenderPipeline {
-    let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 4 => Uint32, 5 => Float32x2];
+/// The skinned fighters (`outline`: their inside-out outline shell instead).
+fn make_skin_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, samples: u32, outline: bool) -> wgpu::RenderPipeline {
+    let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 4 => Uint32, 5 => Float32x2, 6 => Float32x3];
     let vbl = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SkinVtx>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("duel skinned"),
+        label: Some(if outline { "duel outline" } else { "duel skinned" }),
         layout: Some(layout),
-        vertex: wgpu::VertexState { module, entry_point: Some("vs_skin"), compilation_options: Default::default(), buffers: &[Some(vbl)] },
-        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+        vertex: wgpu::VertexState { module, entry_point: Some(if outline { "vs_skin_outline" } else { "vs_skin" }), compilation_options: Default::default(), buffers: &[Some(vbl)] },
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: if outline { Some(wgpu::Face::Front) } else { None }, ..Default::default() },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FMT,
             depth_write_enabled: Some(true),
@@ -2231,7 +2395,7 @@ fn make_skin_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, modu
         multisample: wgpu::MultisampleState { count: samples, mask: !0, alpha_to_coverage_enabled: false },
         fragment: Some(wgpu::FragmentState {
             module,
-            entry_point: Some("fs"),
+            entry_point: Some(if outline { "fs_outline" } else { "fs" }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState { format: COLOR_FMT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
         }),
@@ -2327,8 +2491,8 @@ impl DynRes {
     }
 }
 
-/// Every pipeline for one sample count: opaque, alpha, additive, sky, skinned.
-fn make_pipelines(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, samples: u32) -> [wgpu::RenderPipeline; 5] {
+/// Every pipeline for one sample count: opaque, alpha, additive, sky, skinned, outlines.
+fn make_pipelines(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, samples: u32) -> [wgpu::RenderPipeline; 6] {
     // see-through things blend their colour but leave the stored distance alone
     let keep = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
     let alpha = wgpu::BlendState { color: wgpu::BlendState::ALPHA_BLENDING.color, alpha: keep };
@@ -2341,7 +2505,8 @@ fn make_pipelines(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: 
         make_pipeline(device, layout, module, Some(alpha), false, false, samples),
         make_pipeline(device, layout, module, Some(add), false, false, samples),
         make_pipeline(device, layout, module, None, false, true, samples),
-        make_skin_pipeline(device, layout, module, samples),
+        make_skin_pipeline(device, layout, module, samples, false),
+        make_skin_pipeline(device, layout, module, samples, true),
     ]
 }
 
@@ -2389,7 +2554,7 @@ fn make_shadow_pipelines(device: &wgpu::Device, layout: &wgpu::PipelineLayout, m
     };
     let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x4];
     let vbl = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vtx>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs };
-    let sattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 4 => Uint32, 5 => Float32x2];
+    let sattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32x4, 3 => Float32x4, 4 => Uint32, 5 => Float32x2, 6 => Float32x3];
     let sbl = wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SkinVtx>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &sattrs };
     let mk = |entry: &str, vb: wgpu::VertexBufferLayout| {
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2581,7 +2746,7 @@ impl Gpu {
             mapped_at_creation: false,
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("duel layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
-        let [pipe_opaque, pipe_alpha, pipe_add, pipe_sky, pipe_skin] = make_pipelines(device, &layout, &module, MSAA);
+        let [pipe_opaque, pipe_alpha, pipe_add, pipe_sky, pipe_skin, pipe_outline] = make_pipelines(device, &layout, &module, MSAA);
         // the sun's view: its own small layout (uniforms and the fighters' joints)
         let sbgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("duel shadow bgl"), entries: &[ubuf_entry, inst_entry] });
         let sh_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("duel shadow shader"), source: wgpu::ShaderSource::Wgsl(format!("{U_DECL}{SHADOW_SHADER}").into()) });
@@ -2651,6 +2816,7 @@ impl Gpu {
             target: None,
             tex_id: None,
             pipe_skin,
+            pipe_outline,
             inst_buf,
             skin,
             chars: (0..MAX_INST).map(|_| CharState::new()).collect(),
@@ -2687,7 +2853,8 @@ impl Gpu {
         self.quality = q;
         let samples = if q.msaa > 1 { MSAA } else { 1 };
         if samples != self.samples {
-            let [a, b, c, d, e] = make_pipelines(&rs.device, &self.layout, &self.module, samples);
+            let [a, b, c, d, e, o] = make_pipelines(&rs.device, &self.layout, &self.module, samples);
+            self.pipe_outline = o;
             self.pipe_opaque = a;
             self.pipe_alpha = b;
             self.pipe_add = c;
@@ -2842,7 +3009,8 @@ impl Gpu {
         }
         let u = Uniforms {
             vp,
-            cam: [c.x, c.y, c.z, 1.0],
+            // (w: the picture's height in pixels, for the outlines' width)
+            cam: [c.x, c.y, c.z, h as f32],
             right: [cam.right.x, cam.right.y, cam.right.z, 1.0 / sx],
             up: [cam.up.x, cam.up.y, cam.up.z, 1.0 / sy],
             fwd: [cam.fwd.x, cam.fwd.y, cam.fwd.z, 0.0],
@@ -2941,7 +3109,10 @@ impl Gpu {
                         [l[0] + (1.0 - l[0]) * flash, l[1] + (0.3 - l[1]).max(0.0) * flash, l[2] + (0.3 - l[2]).max(0.0) * flash, 1.0]
                     };
                     let mut data = Vec::with_capacity(INST_FLOATS);
-                    data.extend_from_slice(&tint(lk.coat));
+                    let mut t0 = tint(lk.coat);
+                    // (w: a glowing trim brightens while the ability is on: Afterimage's vanish)
+                    t0[3] = if f.invis_t > 0.0 { 1.0 } else { 0.0 };
+                    data.extend_from_slice(&t0);
                     let pants = tint(lk.pants);
                     // (a textured fighter reads the hurt flash from here)
                     data.extend_from_slice(&[pants[0], pants[1], pants[2], flash * 1.6]);
@@ -2955,6 +3126,8 @@ impl Gpu {
                     let own = if i == g.local { 0.35 } else { 1.0 };
                     let rk = g.tune.rim * own * if f.alive { 1.0 } else { 0.3 };
                     data.extend_from_slice(&[rc[0] / top * rk, rc[1] / top * rk, rc[2] / top * rk, g.tune.rim_width.max(0.5)]);
+                    // how it moves (for the sway of hair, scarves and aprons), and its own phase
+                    data.extend_from_slice(&[f.vel.x, f.vel.y, f.vel.z, i as f32 * 1.7]);
                     for j in 0..MAX_JOINTS {
                         let m = p.palette.get(j).copied().unwrap_or(glam::Mat4::IDENTITY);
                         data.extend_from_slice(&m.to_cols_array());
@@ -3243,6 +3416,17 @@ impl Gpu {
                 pass.set_pipeline(&self.pipe_skin);
                 for k in 0..n_inst {
                     // each fighter's own mesh (the plain mannequin if they didn't load)
+                    let (vb, ib, n) = match inst_body.get(k as usize).and_then(|&b| sk.bodies.get(b)) {
+                        Some((v, i, n)) => (v, i, *n),
+                        None => (&sk.vbuf, &sk.ibuf, sk.icount),
+                    };
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..n, 0, k..k + 1);
+                }
+                // their outlines
+                pass.set_pipeline(&self.pipe_outline);
+                for k in 0..n_inst {
                     let (vb, ib, n) = match inst_body.get(k as usize).and_then(|&b| sk.bodies.get(b)) {
                         Some((v, i, n)) => (v, i, *n),
                         None => (&sk.vbuf, &sk.ibuf, sk.icount),

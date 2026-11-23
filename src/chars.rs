@@ -4,6 +4,14 @@
 //! face, eyes and eyebrows taken from a base character, and hair. Every part is moved onto the
 //! outfit's skeleton when loaded, so one set of bone matrices drives the whole fighter; the
 //! animations (made for the library's mannequin) are carried over bone by bone.
+//!
+//! Each fighter also wears a signature accessory built in Blender (tools/blender/build_accessories.py,
+//! `assets/characters/acc_<name>.glb`): its pieces are skinned onto the skeleton here, piece by
+//! piece (ACCESSORIES says which bones each follows and what sways).
+//!
+//! Every vertex's material word says how the shader treats it: bits 8+ the texture layer, bit 0
+//! the team colour, bits 1-3 the kind of surface (KIND_*: the toon shader picks its highlights,
+//! detail and outline from it) and bits 4-7 how much it sways (hair, scarf tails, an apron).
 
 use crate::anim::{Rig, SkinVtx, Trs};
 use glam::{Mat4, Quat, Vec3};
@@ -22,7 +30,7 @@ macro_rules! file {
 }
 
 /// The fighters' texture set, one layer each (image bytes, all PNG).
-pub const TEXTURES: [(&str, &[u8]); 11] = [
+pub const TEXTURES: [(&str, &[u8]); 12] = [
     ("ranger", include_bytes!("../assets/characters/ranger.png")),
     ("ranger_alt", include_bytes!("../assets/characters/ranger_alt.png")),
     ("peasant", include_bytes!("../assets/characters/peasant.png")),
@@ -34,6 +42,84 @@ pub const TEXTURES: [(&str, &[u8]); 11] = [
     ("hair1", include_bytes!("../assets/characters/hair1.png")),
     ("hair2", include_bytes!("../assets/characters/hair2.png")),
     ("eye", include_bytes!("../assets/characters/eye.png")),
+    // the four accessories' baked textures, a quarter each
+    ("accessories", include_bytes!("../assets/characters/accessories.png")),
+];
+
+/// Kinds of surface (bits 1-3 of the material word): picked from the material, or (AUTO) from
+/// the texture's colour in the shader (metal, leather or cloth).
+pub const KIND_AUTO: u32 = 0;
+pub const KIND_BROWS: u32 = 1;
+pub const KIND_EYES: u32 = 2;
+pub const KIND_HAIR: u32 = 3;
+/// Drawn unlit in the player's colour (the hood's trim).
+pub const KIND_GLOW: u32 = 4;
+pub const KIND_SKIN: u32 = 5;
+pub const KIND_METAL: u32 = 6;
+pub const KIND_LEATHER: u32 = 7;
+
+/// A vertex's material word.
+pub fn mat_word(layer: u32, accent: bool, kind: u32, sway: f32) -> u32 {
+    let s = (sway.clamp(0.0, 1.0) * 15.0).round() as u32;
+    (layer << 8) | accent as u32 | (kind & 7) << 1 | s << 4
+}
+
+/// How an accessory piece follows the skeleton.
+#[derive(Clone, Copy)]
+enum Follow {
+    One(&'static str),
+    /// From bone a (at height ya and above) to bone b (at yb and below), blended in between.
+    Blend(&'static str, &'static str, f32, f32),
+    /// Snug on the body: each vertex follows the bones of the nearest vertex of the fighter's
+    /// own skin (the pauldron bends with the shoulder under it).
+    Skin,
+    /// The apron: the hips at the top, the thighs (each its own side) towards the hem.
+    Skirt,
+}
+
+struct Piece {
+    /// Mesh name (a prefix is enough).
+    name: &'static str,
+    follow: Follow,
+    accent: bool,
+    /// Sways below this height (y), fully at this much lower: (top, length).
+    sway: Option<(f32, f32)>,
+}
+
+struct Accessory {
+    glb: &'static [u8],
+    pieces: &'static [Piece],
+}
+
+const ACCESSORIES: [Accessory; 4] = [
+    // Corvin Vale: a brass warden badge on the coat
+    Accessory { glb: include_bytes!("../assets/characters/acc_ranger.glb"), pieces: &[Piece { name: "badge", follow: Follow::One("spine_03"), accent: false, sway: None }] },
+    // Sable Rook: a long scarf in her colour, its tails swaying down the chest
+    Accessory {
+        glb: include_bytes!("../assets/characters/acc_huntress.glb"),
+        pieces: &[
+            Piece { name: "scarf_tail", follow: Follow::One("spine_03"), accent: true, sway: Some((1.41, 0.42)) },
+            Piece { name: "scarf", follow: Follow::Blend("neck_01", "spine_03", 1.46, 1.36), accent: true, sway: None },
+        ],
+    },
+    // Bram Kask: a heavy pauldron and strap, a smith's apron on a belt
+    Accessory {
+        glb: include_bytes!("../assets/characters/acc_brawler.glb"),
+        pieces: &[
+            Piece { name: "pauldron", follow: Follow::Skin, accent: false, sway: None },
+            Piece { name: "strap", follow: Follow::Blend("spine_03", "spine_01", 1.38, 1.08), accent: false, sway: None },
+            Piece { name: "apron", follow: Follow::Skirt, accent: false, sway: Some((1.0, 0.45)) },
+            Piece { name: "belt", follow: Follow::One("pelvis"), accent: false, sway: None },
+        ],
+    },
+    // Ilya Fen: a hood, its trim glowing in her colour
+    Accessory {
+        glb: include_bytes!("../assets/characters/acc_striker.glb"),
+        pieces: &[
+            Piece { name: "hood_trim", follow: Follow::Blend("Head", "spine_03", 1.5, 1.4), accent: true, sway: None },
+            Piece { name: "hood", follow: Follow::Blend("Head", "spine_03", 1.5, 1.4), accent: false, sway: None },
+        ],
+    },
 ];
 
 fn layer(name: &str) -> u32 {
@@ -57,6 +143,111 @@ fn material_layer(mat: &str, swaps: &[(&str, &str)]) -> u32 {
         "MI_Eyes" => "eye",
         _ => "skin_male",
     })
+}
+
+/// The kind of surface a part's material is (its mesh name decides the eyebrows).
+fn kind_of(mesh: &str, mat: &str) -> u32 {
+    if mat == "MI_Eyes" {
+        KIND_EYES
+    } else if mesh == "Eyebrows" || (mesh == "Face" && mat == "MI_Hair_1") {
+        KIND_BROWS
+    } else if mat.starts_with("MI_Hair") {
+        KIND_HAIR
+    } else if mat.starts_with("MI_Regular") || mat.starts_with("MI_Superhero") {
+        KIND_SKIN
+    } else {
+        KIND_AUTO
+    }
+}
+
+/// An accessory material's kind (the palette names from tools/blender).
+fn acc_kind(mat: &str) -> u32 {
+    let m = mat.split("__").next().unwrap_or(mat);
+    match m {
+        "glow" => KIND_GLOW,
+        "brass" | "iron" | "metal_dark" | "metal_mid" | "steel" | "copper" => KIND_METAL,
+        "leather" | "apron" | "tan" => KIND_LEATHER,
+        _ => KIND_AUTO,
+    }
+}
+
+/// How much a vertex of a fighter's own mesh sways: long hair from the shoulders down, the
+/// pouches hanging off a belt, the skirt of a coat or tunic below the waist.
+fn part_sway(mesh: &str, y: f32) -> f32 {
+    if mesh.starts_with("Hair_Long") {
+        ((1.6 - y) / 0.45).clamp(0.0, 1.0)
+    } else if mesh.contains("Belt") {
+        ((1.08 - y) / 0.2).clamp(0.0, 0.5)
+    } else if mesh.ends_with("_Body") {
+        ((1.02 - y) / 0.15).clamp(0.0, 0.45)
+    } else {
+        0.0
+    }
+}
+
+/// Faces that read at a distance: painted over the base characters' face textures when they
+/// load (positions in the 1024 x 1024 texture): a dark lash line over each eye and a fainter one
+/// under it, shaded eye sockets, the sides of the nose and the cheekbones shaded, a little colour
+/// on the cheeks and a defined lip line.
+pub fn paint_face(img: &mut image::RgbaImage, female: bool) {
+    let s = img.width() as f32 / 1024.0;
+    let (eyes, nose, mouth) = if female { ([133.0f32, 240.0], (188.0f32, 230.0f32), (188.0f32, 268.0f32)) } else { ([140.0, 240.0], (190.0, 236.0), (190.0, 270.0)) };
+    let ey = 183.0;
+    // multiply (towards a colour) inside a soft ellipse
+    let mut dab = |cx: f32, cy: f32, rx: f32, ry: f32, col: [f32; 3], k: f32| {
+        let (cx, cy, rx, ry) = (cx * s, cy * s, rx * s, ry * s);
+        let x0 = (cx - rx).floor().max(0.0) as u32;
+        let x1 = ((cx + rx).ceil() as u32).min(img.width() - 1);
+        let y0 = (cy - ry).floor().max(0.0) as u32;
+        let y1 = ((cy + ry).ceil() as u32).min(img.height() - 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = (x as f32 + 0.5 - cx) / rx;
+                let dy = (y as f32 + 0.5 - cy) / ry;
+                let d = dx * dx + dy * dy;
+                if d >= 1.0 {
+                    continue;
+                }
+                let a = (1.0 - d) * (1.0 - d) * k;
+                let p = img.get_pixel_mut(x, y);
+                for c in 0..3 {
+                    let v = p[c] as f32;
+                    p[c] = (v + (v * col[c] - v) * a).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    };
+    let lash = [0.32, 0.22, 0.2];
+    for (side, &ex) in eyes.iter().enumerate() {
+        let out = if side == 0 { -1.0 } else { 1.0 };
+        // the socket, a touch darker
+        dab(ex, ey - 12.0, 30.0, 16.0, [0.82, 0.74, 0.72], 0.8);
+        // the upper lash line: an arc of dabs, heavier towards the outer corner
+        for k in 0..=16 {
+            let a = std::f32::consts::PI * (0.08 + 0.84 * k as f32 / 16.0);
+            let x = ex + 25.0 * a.cos() * -out;
+            let y = ey - 13.0 * a.sin() + 1.0;
+            let outer = ((x - ex) * out / 25.0).clamp(0.0, 1.0);
+            dab(x, y, 4.5 + 2.0 * outer, 3.5 + 1.2 * outer, lash, 0.95);
+        }
+        // a wing at the outer corner, and the fainter lower lash line
+        dab(ex + 27.0 * out, ey - 2.0, 7.0, 3.0, lash, 0.8);
+        for k in 0..=10 {
+            let a = std::f32::consts::PI * (0.15 + 0.7 * k as f32 / 10.0);
+            dab(ex + 22.0 * a.cos(), ey + 10.0 * a.sin() + 1.0, 3.0, 2.2, [0.55, 0.42, 0.4], 0.55);
+        }
+        // the cheekbone's shadow below and outside, and a little colour on the cheek
+        dab(ex + 22.0 * out, ey + 66.0, 22.0, 34.0, [0.86, 0.8, 0.8], 0.7);
+        dab(ex + 4.0 * out, ey + 45.0, 28.0, 18.0, [1.0, 0.84, 0.8], 0.35);
+    }
+    // the sides of the nose and the nostrils
+    for out in [-1.0f32, 1.0] {
+        dab(nose.0 + 13.0 * out, nose.1 - 24.0, 7.0, 30.0, [0.8, 0.72, 0.7], 0.75);
+        dab(nose.0 + 9.0 * out, nose.1 + 2.0, 5.0, 3.5, [0.55, 0.4, 0.38], 0.7);
+    }
+    // the lip line, and a soft shadow under the lower lip
+    dab(mouth.0, mouth.1, 26.0, 3.5, [0.6, 0.42, 0.4], 0.8);
+    dab(mouth.0, mouth.1 + 16.0, 18.0, 6.0, [0.86, 0.78, 0.76], 0.6);
 }
 
 /// A piece of a fighter.
@@ -101,14 +292,11 @@ fn hair_beard() -> File {
 fn hair_buzzed() -> File {
     file!("Hair_Buzzed")
 }
-fn hair_long() -> File {
-    file!("Hair_Long")
-}
 
 const SPECS: [Spec; 4] = [
     Spec {
         name: "Corvin Vale",
-        blurb: "Ranger: hooded scout in leather, bracers and a shoulder guard",
+        blurb: "Ranger: hooded scout in leather and bracers, a warden's badge on his coat",
         skeleton: male_ranger,
         parts: &[Part { file: male_ranger, head_only: false }, Part { file: hero_male, head_only: true }, Part { file: hair_beard, head_only: false }],
         accent: &["Male_Ranger_Head_Hood", "Male_Ranger_Acc_Pauldron"],
@@ -116,7 +304,7 @@ const SPECS: [Spec; 4] = [
     },
     Spec {
         name: "Sable Rook",
-        blurb: "Huntress: light hooded hunter with pauldrons, in forest colours",
+        blurb: "Huntress: light hooded hunter with pauldrons and a long scarf",
         skeleton: female_ranger,
         parts: &[Part { file: female_ranger, head_only: false }, Part { file: hero_female, head_only: true }],
         // only the pauldrons take the team colour: her hood keeps its own brown, so from behind she
@@ -126,7 +314,7 @@ const SPECS: [Spec; 4] = [
     },
     Spec {
         name: "Bram \"Anvil\" Kask",
-        blurb: "Brawler: bearded street fighter in a rough tunic and boots",
+        blurb: "Brawler: bearded smith in a leather apron, an iron pauldron on his shoulder",
         skeleton: male_peasant,
         parts: &[Part { file: male_peasant, head_only: false }, Part { file: hero_male, head_only: true }, Part { file: hair_buzzed, head_only: false }, Part { file: hair_beard, head_only: false }],
         accent: &["Male_Peasant_Body"],
@@ -134,9 +322,10 @@ const SPECS: [Spec; 4] = [
     },
     Spec {
         name: "Ilya Fen",
-        blurb: "Striker: quick duelist with long hair and a fitted tunic",
+        blurb: "Striker: quick duelist in a fitted tunic and a hood with a glowing trim",
         skeleton: female_peasant,
-        parts: &[Part { file: female_peasant, head_only: false }, Part { file: hero_female, head_only: true }, Part { file: hair_long, head_only: false }],
+        // (her hair is under the hood)
+        parts: &[Part { file: female_peasant, head_only: false }, Part { file: hero_female, head_only: true }],
         accent: &["Female_Peasant_Body"],
         swaps: &[("MI_Peasant", "peasant_alt")],
     },
@@ -170,8 +359,8 @@ pub fn shared() -> Option<&'static Vec<Model>> {
         .get_or_init(|| {
             let rig = crate::anim::shared()?;
             let mut out = Vec::new();
-            for s in &SPECS {
-                match build(rig, s) {
+            for (k, s) in SPECS.iter().enumerate() {
+                match build(rig, k, true) {
                     Ok(m) => out.push(m),
                     Err(e) => {
                         eprintln!("fighter {} not loaded: {e}", s.name);
@@ -221,7 +410,8 @@ fn skeleton(f: &File) -> Result<Skeleton, String> {
     Ok(Skeleton { inv_bind, rest })
 }
 
-fn build(rig: &Rig, spec: &Spec) -> Result<Model, String> {
+fn build(rig: &Rig, which: usize, accessory: bool) -> Result<Model, String> {
+    let spec = &SPECS[which];
     let sk = skeleton(&(spec.skeleton)())?;
     let rig_joints = rig.joint_names();
     let joint_index: HashMap<&str, usize> = rig_joints.iter().enumerate().map(|(k, n)| (n.as_str(), k)).collect();
@@ -308,7 +498,8 @@ fn build(rig: &Rig, spec: &Spec) -> Result<Model, String> {
                             }
                             let (pp, nn) = if ws > 0.0 { (pp / ws, nn.normalize_or(n)) } else { (p, n) };
                             let jr = [0, 1, 2, 3].map(|q| remap.get(j[q] as usize).copied().unwrap_or(0));
-                            verts.push(SkinVtx { pos: pp.to_array(), nrm: nn.to_array(), joints: jr, weights: w, mat: (lay << 8) | accent as u32, uv: uv[k] });
+                            let mat = mat_word(lay, accent, kind_of(mname, mat_name), part_sway(mname, pp.y));
+                            verts.push(SkinVtx { pos: pp.to_array(), nrm: nn.to_array(), joints: jr, weights: w, mat, uv: uv[k], onrm: nn.to_array() });
                         }
                         indices.push(used[k]);
                     }
@@ -317,9 +508,13 @@ fn build(rig: &Rig, spec: &Spec) -> Result<Model, String> {
             }
         }
     }
+    if accessory {
+        add_accessory(&ACCESSORIES[which], &sk, &joint_index, &mut verts, &mut indices)?;
+    }
     if indices.is_empty() {
         return Err("no triangles".into());
     }
+    outline_normals(&mut verts);
     // its skeleton in the rig's terms
     let inv_bind: Vec<Mat4> = rig_joints.iter().enumerate().map(|(k, n)| sk.inv_bind.get(n).copied().unwrap_or_else(|| rig.palette_inv_bind(k))).collect();
     let n_nodes = rig.node_names.len();
@@ -336,6 +531,78 @@ fn build(rig: &Rig, spec: &Spec) -> Result<Model, String> {
         }
     }
     Ok(m)
+}
+
+/// Smooth normals for the outline shell: every vertex at the same spot (the two sides of a
+/// hard edge, where parts meet) gets the average, so the pushed-out shell has no cracks.
+fn outline_normals(verts: &mut [SkinVtx]) {
+    let key = |p: [f32; 3]| [(p[0] * 2000.0).round() as i32, (p[1] * 2000.0).round() as i32, (p[2] * 2000.0).round() as i32];
+    let mut sum: HashMap<[i32; 3], Vec3> = HashMap::new();
+    for v in verts.iter() {
+        *sum.entry(key(v.pos)).or_insert(Vec3::ZERO) += Vec3::from(v.nrm);
+    }
+    for v in verts.iter_mut() {
+        let n = sum.get(&key(v.pos)).copied().unwrap_or(Vec3::from(v.nrm));
+        v.onrm = n.normalize_or(Vec3::from(v.nrm)).to_array();
+    }
+}
+
+/// An accessory's pieces onto the fighter: read from its glTF (already in the fighter's model
+/// space), each vertex given bones and weights by its piece's rule.
+fn add_accessory(acc: &Accessory, sk: &Skeleton, joints: &HashMap<&str, usize>, verts: &mut Vec<SkinVtx>, indices: &mut Vec<u32>) -> Result<(), String> {
+    let g = gltf::Gltf::from_slice(acc.glb).map_err(|e| format!("accessory: {e}"))?;
+    let blob = g.blob.clone().ok_or("accessory: no binary chunk")?;
+    let get = |_b: gltf::Buffer| Some(blob.as_slice());
+    let lay = layer("accessories");
+    // the fighter's own skin (everything before the accessory)
+    let body_n = verts.len();
+    let j = |n: &str| joints.get(n).copied().unwrap_or(0) as u32;
+    // the bones' heights, for the blends
+    let at = |n: &str| sk.inv_bind.get(n).map(|m| m.inverse().w_axis.truncate()).unwrap_or(Vec3::ZERO);
+    for mesh in g.document.meshes() {
+        let mname = mesh.name().unwrap_or("");
+        let Some(piece) = acc.pieces.iter().find(|p| mname.starts_with(p.name)) else { continue };
+        for prim in mesh.primitives() {
+            let r = prim.reader(get);
+            let Some(pos) = r.read_positions() else { continue };
+            let pos: Vec<[f32; 3]> = pos.collect();
+            let nrm: Vec<[f32; 3]> = r.read_normals().map(|i| i.collect()).unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; pos.len()]);
+            let uv: Vec<[f32; 2]> = r.read_tex_coords(0).map(|t| t.into_f32().collect()).unwrap_or_else(|| vec![[0.0, 0.0]; pos.len()]);
+            let kind = acc_kind(prim.material().name().unwrap_or(""));
+            let base = verts.len() as u32;
+            for k in 0..pos.len() {
+                let p = Vec3::from(pos[k]);
+                let (jn, w): ([u32; 4], [f32; 4]) = match piece.follow {
+                    Follow::One(b) => ([j(b), 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
+                    Follow::Blend(a, b, ya, yb) => {
+                        let t = ((p.y - yb) / (ya - yb)).clamp(0.0, 1.0);
+                        ([j(a), j(b), 0, 0], [t, 1.0 - t, 0.0, 0.0])
+                    }
+                    Follow::Skin => {
+                        let near = (0..body_n).min_by(|&a, &b| (Vec3::from(verts[a].pos) - p).length_squared().total_cmp(&(Vec3::from(verts[b].pos) - p).length_squared()));
+                        match near {
+                            Some(n) => (verts[n].joints, verts[n].weights),
+                            None => ([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
+                        }
+                    }
+                    Follow::Skirt => {
+                        let hip = at("pelvis").y.max(0.5);
+                        let t = ((hip + 0.05 - p.y) / 0.45).clamp(0.0, 1.0);
+                        let left = (0.5 + p.x / 0.3).clamp(0.0, 1.0);
+                        let (tl, tr) = (t * 0.45 * left, t * 0.45 * (1.0 - left));
+                        ([j("pelvis"), j("thigh_l"), j("thigh_r"), 0], [1.0 - tl - tr, tl, tr, 0.0])
+                    }
+                };
+                let sway = piece.sway.map_or(0.0, |(top, len)| ((top - p.y) / len).clamp(0.0, 1.0));
+                verts.push(SkinVtx { pos: pos[k], nrm: nrm[k], joints: jn, weights: w, mat: mat_word(lay, piece.accent, kind, sway), uv: uv[k], onrm: nrm[k] });
+            }
+            match r.read_indices() {
+                Some(ix) => indices.extend(ix.into_u32().map(|i| base + i)),
+                None => indices.extend(base..verts.len() as u32),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The base character's body mesh (the one we cut the head from).
@@ -406,6 +673,97 @@ mod tests {
             }
             assert!(worst < 0.01, "{}: rest pose off by {worst} m", name(k as u8));
         }
+    }
+
+    /// Each fighter wears their accessory: skinned onto real bones with whole weights, textured
+    /// from the accessories layer; and the pieces that should sway do (and nothing on the head).
+    #[test]
+    fn accessories_are_worn_and_sway_where_they_should() {
+        let rig = crate::anim::shared().expect("rig");
+        let models = shared().expect("fighters load");
+        let nj = rig.joint_names().len() as u32;
+        let acc = layer("accessories");
+        for (k, m) in models.iter().enumerate() {
+            let worn: Vec<&SkinVtx> = m.verts.iter().filter(|v| v.mat >> 8 == acc).collect();
+            assert!(worn.len() > 200, "{}: wears its accessory ({} vertices)", name(k as u8), worn.len());
+            for v in &worn {
+                let s: f32 = v.weights.iter().sum();
+                assert!((s - 1.0).abs() < 1e-3 && v.joints.iter().all(|&j| j < nj), "{}: skinned", name(k as u8));
+            }
+            let sway = |v: &SkinVtx| (v.mat >> 4) & 15;
+            // nothing above the neck sways (the head stays crisp)
+            assert!(m.verts.iter().filter(|v| v.pos[1] > 1.5).all(|v| sway(v) == 0), "{}: no sway on the head", name(k as u8));
+            let swaying = m.verts.iter().filter(|v| sway(v) > 0).count();
+            match k {
+                // scarf tails and the apron sway, their tips most
+                1 | 2 => assert!(worn.iter().filter(|v| sway(v) >= 10).count() > 20, "{}: the tails / apron hem sway", name(k as u8)),
+                _ => {}
+            }
+            assert!(swaying > 0, "{}: something sways (belt pouches, tails, an apron)", name(k as u8));
+            // the faces: eyes and eyebrows marked for the shader
+            let kind = |v: &&SkinVtx| (v.mat >> 1) & 7;
+            assert!(m.verts.iter().filter(|v| kind(v) == KIND_EYES).count() > 20, "{}: eyes", name(k as u8));
+            assert!(m.verts.iter().filter(|v| kind(v) == KIND_BROWS).count() > 10, "{}: eyebrows", name(k as u8));
+            // outline normals are unit length
+            assert!(m.verts.iter().all(|v| (Vec3::from(v.onrm).length() - 1.0).abs() < 1e-3));
+        }
+        // the striker's hood trim glows in her colour, the huntress's scarf is in hers
+        assert!(models[3].verts.iter().any(|v| (v.mat >> 1) & 7 == KIND_GLOW && v.mat & 1 == 1));
+        assert!(models[1].verts.iter().any(|v| v.mat >> 8 == acc && v.mat & 1 == 1));
+    }
+
+    /// The face paint darkens the lash lines and leaves the rest of the texture alone.
+    #[test]
+    fn faces_are_painted_where_the_eyes_are() {
+        for (female, eye) in [(false, (140u32, 183u32)), (true, (133, 183))] {
+            let mut img = image::RgbaImage::from_pixel(1024, 1024, image::Rgba([200, 160, 140, 255]));
+            paint_face(&mut img, female);
+            let lash = img.get_pixel(eye.0, eye.1 - 12);
+            assert!(lash[0] < 150, "a dark line over the eye: {lash:?}");
+            assert_eq!(img.get_pixel(700, 700)[0], 200, "the body untouched");
+            assert_eq!(img.get_pixel(eye.0, eye.1 - 70)[0], 200, "the forehead untouched");
+        }
+    }
+
+    /// Writes each fighter's rest-pose mesh (OBJ, in the game's model space: metres, y up) and
+    /// where its bones sit, for tools/blender/build_accessories.py to fit the accessories on:
+    /// `cargo test --release dump_fighter_refs -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_fighter_refs() {
+        let rig = crate::anim::shared().expect("rig");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/blender/ref");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bones = ["Head", "neck_01", "spine_01", "spine_02", "spine_03", "pelvis", "clavicle_l", "clavicle_r", "upperarm_l", "upperarm_r", "thigh_l", "thigh_r", "calf_l", "calf_r"];
+        let mut json = String::from("{\n");
+        for b in 0..COUNT {
+            let s = &SPECS[b];
+            // the fighter without its accessory: the shape the accessory is fitted to
+            let m = build(rig, b, false).unwrap();
+            let mut obj = String::new();
+            for v in &m.verts {
+                obj.push_str(&format!("v {:.5} {:.5} {:.5}\n", v.pos[0], v.pos[1], v.pos[2]));
+            }
+            for t in m.indices.chunks(3) {
+                obj.push_str(&format!("f {} {} {}\n", t[0] + 1, t[1] + 1, t[2] + 1));
+            }
+            let key = ["ranger", "huntress", "brawler", "striker"][b];
+            std::fs::write(dir.join(format!("{key}.obj")), obj).unwrap();
+            let sk = skeleton(&(s.skeleton)()).unwrap();
+            json.push_str(&format!("  \"{key}\": {{\n"));
+            let rows: Vec<String> = bones
+                .iter()
+                .filter_map(|n| sk.inv_bind.get(*n).map(|ib| (n, ib.inverse())))
+                .map(|(n, g)| {
+                    let p = g.w_axis.truncate();
+                    format!("    \"{n}\": [{:.5}, {:.5}, {:.5}]", p.x, p.y, p.z)
+                })
+                .collect();
+            json.push_str(&rows.join(",\n"));
+            json.push_str(if b + 1 < COUNT { "\n  },\n" } else { "\n  }\n" });
+        }
+        json.push_str("}\n");
+        std::fs::write(dir.join("anchors.json"), json).unwrap();
     }
 
     #[test]

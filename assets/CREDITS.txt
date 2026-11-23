@@ -87,3 +87,9 @@ assets/fonts/Inter.ttf (body text)
 
 assets/weapons/*.glb and assets/weapons/icons/*.png (the eleven weapon models and their icons)
   Original work made for this game with the scripts in tools/blender (no third-party parts).
+
+assets/characters/acc_*.glb and accessories.png (the fighters' signature accessories: Corvin Vale's
+  warden badge, Sable Rook's scarf, Bram Kask's pauldron and apron, Ilya Fen's hood)
+  Original work made for this game with tools/blender/build_accessories.py (no third-party parts),
+  fitted onto the Quaternius fighters above. The faces' painted lash lines and shading, the toon
+  shading and the outlines are the game's own (src/chars.rs, src/gpu.rs).

@@ -3877,6 +3877,34 @@ fn gallery_pose(g: &mut Game, page: &str) {
             }
             continue;
         }
+        // lineup pages (DUEL_GALLERY=lineup:<metres>[:front|:back]): the four fighters side by side
+        // that far from the camera, turned three-quarters (or facing it, or their backs to it), each
+        // in their own colour (for before / after pictures)
+        if let Some(rest) = page.strip_prefix("lineup:") {
+            let mut parts = rest.split(':');
+            let d = parts.next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(5.0).clamp(1.0, 40.0);
+            let face = parts.next().unwrap_or("");
+            let (p, yaw) = if i < 4 {
+                let turn = match face {
+                    "front" => 0.0,
+                    "back" => std::f32::consts::PI,
+                    _ if i % 2 == 0 => 0.45,
+                    _ => -0.45,
+                };
+                (v3(-1.95 + i as f32 * 1.3, 0.0, 5.2 + d), std::f32::consts::PI + turn)
+            } else {
+                (v3(0.0, 0.0, -30.0), 0.0)
+            };
+            f.pos = p;
+            f.prev_pos = p;
+            f.yaw = yaw;
+            f.loadout.body = (i % chars::COUNT) as u8;
+            f.loadout.melee = Weapon::Katana;
+            f.cur = 0;
+            f.weapon = Weapon::Katana;
+            f.switch_t = 0.0;
+            continue;
+        }
         // held pages (DUEL_GALLERY=held:<weapon number>[:run]): you (so the HUD names your weapon)
         // in profile and another fighter three-quarters on, both holding that weapon ready to fire
         // (or running with it), to check the model in hand is the one the HUD shows
