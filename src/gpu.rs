@@ -90,7 +90,8 @@ struct PostU {
     right: [f32; 4],
     up: [f32; 4],
     fwd: [f32; 4],
-    /// grading on, exposure, ambient occlusion strength, -
+    /// grading on, exposure, ambient occlusion strength, depth-of-field blur (pixels; flags.w is
+    /// the focus distance)
     misc2: [f32; 4],
 }
 
@@ -522,9 +523,37 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// depth of field: how far (pixels) a point at distance z blurs, focused at p.flags.w
+fn coc(z: f32) -> f32 {
+  let f = p.flags.w;
+  return p.misc2.w * smoothstep(0.06, 0.55, abs(z - f) / max(z, 0.1));
+}
+
 @fragment fn fs_comp(i: FOut) -> @location(0) vec4<f32> {
   let s = textureSampleLevel(ta, ls, i.uv, 0.0);
   var c = s.rgb;
+
+  if (p.misc2.w > 0.0) {
+    // gather: a nearby point adds to this pixel when its own blur reaches this far; things
+    // behind this pixel can't blur over it (so the sharp subject keeps clean edges)
+    let cc = coc(s.a);
+    var acc = c;
+    var wsum = 1.0;
+    for (var k = 0; k < 32; k = k + 1) {
+      let fk = f32(k) + 0.5;
+      let r = sqrt(fk / 32.0) * p.misc2.w;
+      let a = fk * 2.39996;
+      let t = textureSampleLevel(ta, ls, i.uv + vec2<f32>(cos(a), sin(a)) * r * p.size.xy, 0.0);
+      let tc = coc(t.a);
+      let reach = select(tc, min(tc, cc), t.a > s.a + 0.3);
+      let w = clamp(reach - r + 1.0, 0.0, 1.0);
+      acc = acc + t.rgb * w;
+      wsum = wsum + w;
+    }
+    c = acc / wsum;
+    // and darker the further out of focus, so the subject and the menus stand out
+    c = c * (1.0 - p.misc.w * smoothstep(0.0, 1.0, cc / p.misc2.w));
+  }
 
   if (p.flags.x > 0.5 && s.a < 900.0) {
     let ao = textureSampleLevel(tb, ls, i.uv, 0.0).r;
@@ -1511,7 +1540,19 @@ fn fighter_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, pos: V3, t
 const CLOTH_COLS: usize = 11;
 const CLOTH_ROWS: usize = 7;
 
-fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, sc: f32) {
+/// The cloth each fighter wears at the back: (how far round the waist it goes in radians, its
+/// length, its colour, its hem colour). The Ranger's long coat is in the team colour; the
+/// Huntress wears a shorter cape of her own brown leather with only a team-coloured hem, so the
+/// two read apart from behind.
+fn coat_style(body: u8, lk: &Look) -> (f32, f32, [f32; 4], [f32; 4]) {
+    match body {
+        1 => (3.0, 0.5, lin([112, 84, 56]), lin(lk.coat)),
+        _ => (4.4, 0.68, lin(lk.coat_dark), lin(lk.coat)),
+    }
+}
+
+fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, sc: f32, body: u8) {
+    let (span, length, base, trim) = coat_style(body, lk);
     let caps = &p.hit.caps;
     let (hips, legs) = (caps[4], [caps[9], caps[10], caps[11], caps[12]]);
     // the belt mostly stays level (it leans a little with the hips, not with the whole spine)
@@ -1524,12 +1565,12 @@ fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, 
     let right = right.norm();
     let fwd = right.cross(up).norm();
     let center = hips.b + up * (0.07 * sc);
-    let len = 0.68 * sc;
+    let len = length * sc;
     // the ring sits just outside the hips and thighs, so the body never fights the fabric
     let (rx, rz) = (0.235 * sc, 0.2 * sc);
     // the waist ring, from the right front, round the back, to the left front
     let ring = |c: usize, flare: f32| -> V3 {
-        let a = (c as f32 / (CLOTH_COLS - 1) as f32 - 0.5) * 4.4; // radians from straight back
+        let a = (c as f32 / (CLOTH_COLS - 1) as f32 - 0.5) * span; // radians from straight back
         center + right * (-a.sin() * rx * flare) - fwd * (a.cos() * rz * flare)
     };
     let n = CLOTH_COLS * CLOTH_ROWS;
@@ -1553,7 +1594,9 @@ fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, 
         let steps = 3;
         let h = dt / steps as f32;
         let lv = len / (CLOTH_ROWS - 1) as f32;
-        let gravity = v3(0.0, -9.8, 0.0) * (h * h);
+        // gravity, and a light breeze so the cloth is never quite still
+        let breeze = v3((time * 0.7).sin() * 0.7 + (time * 1.9).sin() * 0.25, 0.0, (time * 0.45).cos() * 0.5);
+        let gravity = (v3(0.0, -9.8, 0.0) + breeze) * (h * h);
         for _ in 0..steps {
             for i in CLOTH_COLS..n {
                 let cur = st.cloth[i];
@@ -1636,19 +1679,33 @@ fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, 
             }
         }
     }
-    // draw it, both sides lit by the same normal (the coat is thin)
-    let base = lin(lk.coat_dark);
-    let trim = lin(lk.coat);
+    // smooth normals: each point's from the patches around it, so the cloth shades softly
+    // instead of in flat facets
+    let mut normals = vec![V3::ZERO; n];
     for r in 0..CLOTH_ROWS - 1 {
         for c in 0..CLOTH_COLS - 1 {
             let q = [st.cloth[idx(r, c)], st.cloth[idx(r, c + 1)], st.cloth[idx(r + 1, c + 1)], st.cloth[idx(r + 1, c)]];
-            let nrm = (q[1] - q[0]).cross(q[3] - q[0]);
-            let nrm = if nrm.len() > 1e-6 { nrm.norm() } else { -fwd };
+            let fn_ = (q[1] - q[0]).cross(q[3] - q[0]) + (q[2] - q[1]).cross(q[0] - q[1]);
+            for k in [idx(r, c), idx(r, c + 1), idx(r + 1, c + 1), idx(r + 1, c)] {
+                normals[k] = normals[k] + fn_;
+            }
+        }
+    }
+    let normal = |k: usize| if normals[k].len() > 1e-8 { normals[k].norm() } else { -fwd };
+    // draw it, both sides lit by the same normals (the coat is thin)
+    for r in 0..CLOTH_ROWS - 1 {
+        for c in 0..CLOTH_COLS - 1 {
+            let ids = [idx(r, c), idx(r, c + 1), idx(r + 1, c + 1), idx(r + 1, c)];
+            let q = [st.cloth[ids[0]], st.cloth[ids[1]], st.cloth[ids[2]], st.cloth[ids[3]]];
             // the team colour runs along the hem
             let col = if r == CLOTH_ROWS - 2 { trim } else { base };
-            let (u0, u1) = (c as f32 / (CLOTH_COLS - 1) as f32 * 2.0, (c + 1) as f32 / (CLOTH_COLS - 1) as f32 * 2.0);
-            let (v0, v1) = (r as f32 / (CLOTH_ROWS - 1) as f32, (r + 1) as f32 / (CLOTH_ROWS - 1) as f32);
-            mb.quad(q, nrm, [[u0, v0], [u1, v0], [u1, v1], [u0, v1]], col, [7.0, 0.0, 1.0, 0.05]);
+            // a fine weave (repeated several times across the cloth, never big blocky squares)
+            let (u0, u1) = (c as f32 / (CLOTH_COLS - 1) as f32 * 9.0, (c + 1) as f32 / (CLOTH_COLS - 1) as f32 * 9.0);
+            let (v0, v1) = (r as f32 / (CLOTH_ROWS - 1) as f32 * 4.5, (r + 1) as f32 / (CLOTH_ROWS - 1) as f32 * 4.5);
+            let uv = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+            for k in [0, 1, 2, 0, 2, 3] {
+                mb.vert(q[k], normal(ids[k]), uv[k], col, [7.0, 0.0, 1.0, 0.05]);
+            }
         }
     }
 }
@@ -1666,7 +1723,7 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     if dressed {
         // the fighters have real hair; the long coat is cloth that swings and drapes
         if f.alive || f.death_t < 3.0 {
-            coat_cloth(mb, p, st, time, lk, sc);
+            coat_cloth(mb, p, st, time, lk, sc, f.loadout.body);
         }
     } else {
         // hair cap
@@ -1686,7 +1743,9 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
         mb.tube(waist, hem, 0.2 * sc, 0.31 * sc, side, 0.78, tint(lk.coat_dark), 7.0, 0.05);
     }
     // weapon
-    weapon_mesh(mb, add_mb, cam, f, p.hand, &p.weapon, time);
+    // a blade sits in the fist (its handle through it); guns sit at the wrist
+    let anchor = if f.weapon.is_melee() { p.grip } else { p.hand };
+    weapon_mesh(mb, add_mb, cam, f, anchor, &p.weapon, time);
     let w = f.weapon;
     // charging a heavy: the blade glows, then flashes once it's ready
     if w.is_melee() && f.alive && (f.charged || f.charge_t > 0.2) {
@@ -1702,11 +1761,11 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
             ([255, 170, 80], 0.11)
         };
         for k in 1..=5 {
-            let at = p.hand + p.weapon.z * (len * k as f32 / 5.0);
+            let at = anchor + p.weapon.z * (len * k as f32 / 5.0);
             add_mb.billboard(cam, at, size * sc, lina(col, if f.charged { 0.85 } else { 0.5 }));
         }
         if f.charged {
-            add_mb.billboard(cam, p.hand + p.weapon.z * (len * 0.6), 0.55 * sc * (0.8 + 0.2 * (time * 18.0).sin()), lina([255, 220, 150], 0.35));
+            add_mb.billboard(cam, anchor + p.weapon.z * (len * 0.6), 0.55 * sc * (0.8 + 0.2 * (time * 18.0).sin()), lina([255, 220, 150], 0.35));
         }
     }
     // swing trail: drawn along the blade's arc only while it's really cutting (from the end of
@@ -1730,13 +1789,13 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
         if let Some(u) = until {
             let k = if u > 0.0 { 1.0 - (u / 0.07).min(1.0) } else { 1.0 - (-u / 0.3).min(1.0) * 0.85 };
             if k > 0.02 {
-                st.trail.push_back((p.hand + p.weapon.z * (tip * 0.3), p.hand + p.weapon.z * tip, time, k));
+                st.trail.push_back((anchor + p.weapon.z * (tip * 0.3), anchor + p.weapon.z * tip, time, k));
             }
             // the tell: a glint runs up the blade through a heavy's or a launcher's wind-up
             let big = f.slash_idx == SLASH_HEAVY || f.slash_idx == 3 || w == Weapon::Greatsword || f.fin > 0;
             if big && u > 0.02 {
                 let g = (u / 0.2).min(1.0);
-                let at = p.hand + p.weapon.z * (tip * (0.35 + 0.65 * (1.0 - g)));
+                let at = anchor + p.weapon.z * (tip * (0.35 + 0.65 * (1.0 - g)));
                 add_mb.billboard(cam, at, 0.22 * sc, lina([255, 245, 215], 0.9 * g.sqrt()));
             }
         }
@@ -2017,6 +2076,9 @@ pub struct Gpu {
     pub dyn_scale: f32,
     /// Graphics effects in use (from Graphics settings).
     pub fx: Fx,
+    /// Depth of field for the menu: (focus distance in metres, largest blur in pixels at 720p);
+    /// a blur of 0 is off.
+    pub dof: [f32; 2],
     bgl: wgpu::BindGroupLayout,
     tex_view: wgpu::TextureView,
     ntex_view: wgpu::TextureView,
@@ -2543,6 +2605,7 @@ impl Gpu {
             quality: Quality::PRESETS[2].1,
             dyn_scale: 1.0,
             fx: Fx::ALL,
+            dof: [0.0, 0.0],
             bgl,
             tex_view,
             ntex_view,
@@ -2756,16 +2819,16 @@ impl Gpu {
         let pu = PostU {
             size: [1.0 / w as f32, 1.0 / h as f32, w as f32, h as f32],
             sun: [sun_u, sun_v, sun_vis, 0.0],
-            flags: [fx.ssao as u8 as f32, fx.bloom as u8 as f32, fx.rays as u8 as f32, 0.0],
+            flags: [fx.ssao as u8 as f32, fx.bloom as u8 as f32, fx.rays as u8 as f32, self.dof[0]],
             lift: [gr.lift[0], gr.lift[1], gr.lift[2], gr.saturation],
             gamma: [gr.gamma[0], gr.gamma[1], gr.gamma[2], gr.contrast],
             gain: [gr.gain[0], gr.gain[1], gr.gain[2], 0.0],
-            misc: [if fx.vignette { 0.32 } else { 0.0 }, 0.14, 0.35, 0.0],
+            misc: [if fx.vignette { 0.32 } else { 0.0 }, 0.14, 0.35, if self.dof[1] > 0.0 { 0.3 } else { 0.0 }],
             sun_col: [sky.sun_col[0], sky.sun_col[1], sky.sun_col[2], 0.0],
             right: [cam.right.x, cam.right.y, cam.right.z, 1.0 / sx],
             up: [cam.up.x, cam.up.y, cam.up.z, 1.0 / sy],
             fwd: [cam.fwd.x, cam.fwd.y, cam.fwd.z, 0.0],
-            misc2: [fx.grading as u8 as f32, gr.exposure, 0.35, 0.0],
+            misc2: [fx.grading as u8 as f32, gr.exposure, 0.35, self.dof[1] * h as f32 / 720.0],
         };
         rs.queue.write_buffer(&self.post.ubuf, 0, bytemuck::bytes_of(&pu));        rs.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
 
@@ -2789,7 +2852,11 @@ impl Gpu {
                 continue;
             }
             let posed = match (&self.skin, insts.len() < MAX_INST) {
-                (Some(sk), true) => character::animate_show(&sk.rig, &mut self.chars[i], f, pos, g.time, &g.tune),
+                (Some(sk), true) => {
+                    // the menu's fighter, and yours on the loadout screen, strike their hero pose
+                    let hero = i == g.local && (g.showcase == Some(i) || (g.mt.phase == crate::game::Phase::Loadout && !f.ready && !f.is_bot));
+                    character::animate_show_as(&sk.rig, &mut self.chars[i], f, pos, g.time, &g.tune, hero)
+                }
                 _ => None,
             };
             match posed {
@@ -3122,7 +3189,7 @@ mod cloth_tests {
             }
             let p = character::animate(rig, &mut st, &f, pos, t, &Tuning::default()).expect("posed");
             mb.v.clear();
-            coat_cloth(&mut mb, &p, &mut st, t, &lk, 1.0);
+            coat_cloth(&mut mb, &p, &mut st, t, &lk, 1.0, 0);
             let waist = p.hit.caps[4].b.y + 0.1;
             let _ = waist;
             let belt = st.cloth[..CLOTH_COLS].iter().fold(f32::MIN, |m, q| m.max(q.y));
@@ -3242,7 +3309,7 @@ mod final_kill_tests {
                 let pos = f.prev_pos.lerp(f.pos, alpha);
                 if let Some(p) = character::animate_show(rig, &mut self.chars[i], f, pos, g.time, &g.tune) {
                     mb.v.clear();
-                    coat_cloth(&mut mb, &p, &mut self.chars[i], g.time, &lk, g.tune.char_scale);
+                    coat_cloth(&mut mb, &p, &mut self.chars[i], g.time, &lk, g.tune.char_scale, f.loadout.body);
                 }
             }
         }

@@ -248,6 +248,11 @@ impl Rig {
         Ok(rig)
     }
 
+    /// A node's parent.
+    pub fn parent_of(&self, n: usize) -> Option<usize> {
+        self.parent.get(n).copied().flatten()
+    }
+
     pub fn node(&self, name: &str) -> Option<usize> {
         self.node_by_name.get(name).copied()
     }
@@ -416,6 +421,43 @@ mod rig_tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn probe_hands() {
+        let rig = Rig::load().expect("rig");
+        let mut names: Vec<_> = rig.clips.keys().cloned().collect();
+        names.sort();
+        println!("CLIPS: {}", names.join(", "));
+        let fingers: Vec<_> = rig.node_names.iter().filter(|n| n.contains("_r") && (n.contains("index") || n.contains("thumb") || n.contains("middle") || n.contains("ring") || n.contains("pinky"))).cloned().collect();
+        println!("FINGERS: {}", fingers.join(", "));
+        let fs = rig.fix_sign;
+        for clip in ["Idle_Loop", "Sword_Idle", "Pistol_Idle_Loop"] {
+            let mut pose = Vec::new();
+            rig.sample(clip, 0.5, true, &mut pose);
+            let g = rig.globals(&pose);
+            let p = |n: &str| g[rig.node(n).unwrap()].w_axis.truncate() * fs;
+            for side in ["r", "l"] {
+                let h = p(&format!("hand_{side}"));
+                let e = p(&format!("lowerarm_{side}"));
+                let i1 = p(&format!("index_01_{side}"));
+                let i3 = p(&format!("index_03_{side}"));
+                let m1 = p(&format!("middle_01_{side}"));
+                let k1 = p(&format!("pinky_01_{side}"));
+                let fore = (h - e).normalize();
+                let hand_ax = (m1 - h).normalize();
+                let finger = (i3 - i1).normalize();
+                let knuck = (i1 - k1).normalize();
+                println!("{clip} {side}: hand {:.2?} fore {:.2?} handax {:.2?} knuck {:.2?} finger·hand {:.2} curl(index tip to palm dist) {:.3}", h, fore, hand_ax, knuck, finger.dot(hand_ax), (i3 - h).length());
+                let has = |bone: &str| rig.clips.get(clip).map_or(false, |c| c.channels.iter().any(|ch| ch.node == rig.node(bone).unwrap()));
+                println!("   channels index_02_{side}: {}", has(&format!("index_02_{side}")));
+            }
+        }
+        let g = rig.globals(&rig.rest_pose());
+        for n in ["hand_r", "index_01_r", "index_02_r", "index_03_r", "thumb_01_r"] {
+            let (_, r, t) = g[rig.node(n).unwrap()].to_scale_rotation_translation();
+            println!("REST {n}: pos {:.3?} x {:.2?} y {:.2?} z {:.2?}", t * fs, (r * Vec3::X) * fs, (r * Vec3::Y) * fs, (r * Vec3::Z) * fs);
+        }
+    }
     #[test]
     #[ignore]
     fn print_melee_clips() {

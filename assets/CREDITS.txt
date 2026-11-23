@@ -70,3 +70,17 @@ assets/env/props/Rock_Medium_1, Rock_Medium_2, Plant_7 (.gltf, .bin), leaves.png
   (the vines are built from the leaf texture; textures shrunk to 1024 px)
   "Stylized Nature MegaKit [Standard]" by Quaternius (quaternius.com), CC0
   Source: https://quaternius.itch.io/stylized-nature-megakit
+
+------------------------------------------------------------------------------------------
+Fonts (SIL Open Font License 1.1 - https://openfontlicense.org; not CC0)
+The fonts are bundled inside the game; their full licence texts sit beside them.
+
+assets/fonts/Rajdhani-Bold.ttf (titles, buttons, the HUD's numbers)
+  "Rajdhani" by the Indian Type Foundry, Copyright (c) 2014 Indian Type Foundry
+  Source: Google Fonts, https://github.com/google/fonts/tree/main/ofl/rajdhani
+  Licence: assets/fonts/Rajdhani-OFL.txt
+
+assets/fonts/Inter.ttf (body text)
+  "Inter" by Rasmus Andersson and The Inter Project Authors, Copyright 2020
+  Source: Google Fonts, https://github.com/google/fonts/tree/main/ofl/inter
+  Licence: assets/fonts/Inter-OFL.txt

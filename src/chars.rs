@@ -1,4 +1,4 @@
-﻿//! The four fighters you can play as, built from CC0 parts by Quaternius ("Modular Character
+//! The four fighters you can play as, built from CC0 parts by Quaternius ("Modular Character
 //! Outfits - Fantasy" and "Universal Base Characters", both rigged to the same skeleton as the
 //! animation library). Each fighter is an outfit (body, arms, legs, boots, hood...), a head with
 //! face, eyes and eyebrows taken from a base character, and hair. Every part is moved onto the
@@ -119,7 +119,9 @@ const SPECS: [Spec; 4] = [
         blurb: "light hooded hunter with pauldrons, in forest colours",
         skeleton: female_ranger,
         parts: &[Part { file: female_ranger, head_only: false }, Part { file: hero_female, head_only: true }],
-        accent: &["Female_Ranger_Head_Hood", "Female_Ranger_Acc_Pauldrons"],
+        // only the pauldrons take the team colour: her hood keeps its own brown, so from behind she
+        // doesn't look like the Ranger
+        accent: &["Female_Ranger_Acc_Pauldrons"],
         swaps: &[("MI_Ranger", "ranger_alt")],
     },
     Spec {

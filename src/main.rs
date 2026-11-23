@@ -14,6 +14,7 @@ mod net;
 mod pad;
 mod platform;
 mod render;
+mod ui_kit;
 mod watchdog;
 mod world;
 
@@ -86,6 +87,8 @@ struct Settings {
     dyn_res: bool,
     /// Graphics effects (each preset sets them; each can be switched on its own).
     post: gpu::Fx,
+    /// Use the Steam name when Steam is running (otherwise the name as typed).
+    steam_name: bool,
 }
 
 /// Interface sizes: (name, zoom).
@@ -320,6 +323,7 @@ impl Default for Settings {
             ui_scale: 0,
             dyn_res: false,
             post: gpu::Quality::PRESETS[2].1.post,
+            steam_name: true,
         }
     }
 }
@@ -421,6 +425,7 @@ impl Settings {
                             "aim_assist" => s.aim_assist = v != "0",
                             "ui_scale" => s.ui_scale = v.parse().unwrap_or(0usize).min(UI_SCALES.len() - 1),
                             "dyn_res" => s.dyn_res = v == "1",
+                            "steam_name" => s.steam_name = v != "0",
                             k if k.starts_with("fx_") => fx_keys.push((k.to_string(), v != "0")),
                             "aim_v" => aim_v = v.parse().unwrap_or(0),
                             "cross_color" => {
@@ -508,7 +513,7 @@ impl Settings {
                 "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\naim_v=3\n",
                 self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8
             );
-            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8);
+            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8);
             let f = self.post;
             text += &format!(
                 "fx_soft_shadows={}\nfx_ssao={}\nfx_bloom={}\nfx_rays={}\nfx_grading={}\nfx_vignette={}\n",
@@ -531,6 +536,8 @@ const BOT_LEVELS: [(&str, f32); 4] = [("Easy", 0.2), ("Normal", 0.5), ("Hard", 0
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Main,
+    /// The mode picker behind the PLAY button.
+    Play,
     Practice,
     Host,
     Join,
@@ -591,6 +598,9 @@ struct App {
     rebinding: Option<(usize, u32)>,
     settings_tab: u8,
     pause_settings: bool,
+    /// The loadout screen opened from the pause menu (mid-match).
+    loadout_edit: bool,
+    lo_ui: ui_kit::LoadoutUi,
     icon_tex: Option<egui::TextureHandle>,
     frame_start: Option<std::time::Instant>,
     shown_fullscreen: Option<bool>,
@@ -609,7 +619,21 @@ struct App {
     demo_t: f32,
     audio: Option<audio::Audio>,
     lan_ip: Option<String>,
-    demo_cam: (V3, V3),
+    /// The main menu's loadout screen is open.
+    menu_loadout: bool,
+    /// Quick Play: seconds spent looking for an open game (Steam).
+    quick: Option<f32>,
+    /// A Quick Play lobby: keep it filled with bots.
+    quick_host: bool,
+    /// The News / Patch notes text.
+    news: String,
+    /// Where the menu fighter stands and which way the camera looks at them from.
+    show_spot: (V3, f32),
+    /// How far across the screen the menu fighter stands (eased).
+    menu_fx: f32,
+    /// Where the background fight happens (in view, left of the fighter), and who was alive last frame.
+    demo_stage: V3,
+    demo_alive: Vec<bool>,
     autoplay: bool,
     last_tap: Option<(Key, f64)>,
     cam_dist: std::cell::Cell<f32>,
@@ -721,6 +745,8 @@ impl App {
             rebinding: None,
             settings_tab: 0,
             pause_settings: false,
+            loadout_edit: false,
+            lo_ui: ui_kit::LoadoutUi::default(),
             icon_tex: None,
             frame_start: None,
             shown_fullscreen: None,
@@ -737,7 +763,14 @@ impl App {
             demo_t: 0.0,
             audio,
             lan_ip: net::local_ip(),
-            demo_cam: (V3::ZERO, V3::ZERO),
+            menu_loadout: false,
+            quick: None,
+            quick_host: false,
+            news: load_news(),
+            show_spot: (V3::ZERO, 0.0),
+            menu_fx: 0.64,
+            demo_stage: V3::ZERO,
+            demo_alive: Vec::new(),
             autoplay: false,
             last_tap: None,
             cam_dist: std::cell::Cell::new(5.0),
@@ -793,7 +826,15 @@ impl App {
                 }
             }
         }
-        // test switches: DUEL_QUALITY=0..3, DUEL_PAGE=settings:<tab> | join | main, DUEL_RECENT=1 (sample list)
+        // test switches: DUEL_BODY=0..3 picks the fighter, DUEL_MELEE=0..2 the blade
+        if let Some(b) = std::env::var("DUEL_BODY").ok().and_then(|v| v.parse::<u8>().ok()) {
+            app.settings.loadout.body = b.min(chars::COUNT as u8 - 1);
+        }
+        if let Some(m) = std::env::var("DUEL_MELEE").ok().and_then(|v| v.parse::<usize>().ok()) {
+            app.settings.loadout.melee = Weapon::MELEE[m.min(2)];
+        }
+        app.rebuild_showcase();
+        // test switches: DUEL_QUALITY=0..3, DUEL_PAGE=settings:<tab> | join | main | play | loadout, DUEL_RECENT=1 (sample list)
         if let Some(q) = std::env::var("DUEL_QUALITY").ok().and_then(|v| v.parse::<usize>().ok()) {
             app.settings.quality = q.min(gpu::Quality::PRESETS.len() - 1);
             app.settings.post = gpu::Quality::PRESETS[app.settings.quality].1.post;
@@ -827,6 +868,11 @@ impl App {
                 app.screen = Screen::Menu(Page::Join);
             } else if pg == "host" {
                 app.screen = Screen::Menu(Page::Host);
+            } else if pg == "play" {
+                app.screen = Screen::Menu(Page::Play);
+            } else if pg == "loadout" {
+                app.menu_loadout = true;
+                app.menu_fx = 0.80;
             }
         }
         // hidden test mode: a bot plays the local fighter (used to photograph gameplay)
@@ -953,6 +999,8 @@ impl App {
         self.screen = Screen::Menu(Page::Main);
         self.paused = false;
         self.disconnected = None;
+        self.quick_host = false;
+        self.news = load_news();
     }
 
     fn set_capture(&mut self, ctx: &egui::Context, on: bool) {
@@ -1602,14 +1650,26 @@ impl App {
         if step != 0 {
             self.settings_tab = (self.settings_tab as i32 + step).rem_euclid(4) as u8;
         }
-        ui.horizontal(|ui| {
-            for (k, t) in ["Game", "Controls", "Graphics", "Crosshair"].iter().enumerate() {
-                ui.selectable_value(&mut self.settings_tab, k as u8, egui::RichText::new(*t).size(17.0));
-            }
-        });
-        ui.separator();
+        ui_kit::tabs(ui, &mut self.settings_tab, &["Game", "Controls", "Graphics", "Crosshair"]);
+        ui.add_space(4.0);
         match self.settings_tab {
             0 => {
+                ui_kit::section(ui, "Profile");
+                let steam_name = self.steam.as_ref().map(|s| s.name.clone());
+                let locked = self.settings.steam_name && steam_name.is_some();
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.add_enabled(!locked, egui::TextEdit::singleline(&mut self.settings.name).char_limit(16).desired_width(240.0));
+                });
+                match &steam_name {
+                    Some(n) => {
+                        ui.checkbox(&mut self.settings.steam_name, format!("Use my Steam name ({n})"));
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("Steam isn't running, so the name above is used as typed (with Steam, your Steam name is used unless you untick it here).").size(12.5).color(Color32::from_gray(175)));
+                    }
+                }
+                ui_kit::section(ui, "Mouse and sound");
                 ui.add(egui::Slider::new(&mut self.settings.sens, 0.2..=3.0).text("mouse sensitivity"));
                 ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("field of view"));
                 ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("effects volume"));
@@ -1619,7 +1679,7 @@ impl App {
                     ui.label("(no sound device found)");
                 }
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Network test").size(18.0).color(ACCENT));
+                ui_kit::section(ui, "Network test");
                 ui.label(egui::RichText::new("Try online play on one PC: open the game twice, Host in one and Join 127.0.0.1 in the other. This adds fake lag and lost packets to this copy's connection. Press F3 in a match to see ping, packet loss and players.").size(13.0).color(Color32::from_gray(185)));
                 ui.checkbox(&mut self.settings.net_test, "Simulate a bad connection");
                 ui.add_enabled_ui(self.settings.net_test, |ui| {
@@ -1657,7 +1717,7 @@ impl App {
                     self.rebinding = None;
                 }
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Controller").size(18.0).color(ACCENT));
+                ui_kit::section(ui, "Controller");
                 let pad_name = self.pads.name.clone();
                 ui.label(egui::RichText::new(match &pad_name {
                     Some(n) => format!("Connected: {n}"),
@@ -1677,7 +1737,7 @@ impl App {
                 });
             }
             2 => {
-                ui.label("Quality preset");
+                ui_kit::section(ui, "Quality");
                 ui.horizontal(|ui| {
                     for (k, (n, q)) in gpu::Quality::PRESETS.iter().enumerate() {
                         if ui.selectable_value(&mut self.settings.quality, k, *n).clicked() {
@@ -1702,7 +1762,7 @@ impl App {
                     }
                 });
                 ui.checkbox(&mut self.settings.dyn_res, "Dynamic resolution (lowers the 3D detail for a moment to hold the frame rate)");
-                ui.label(egui::RichText::new("Effects").size(16.0).color(ACCENT));
+                ui_kit::section(ui, "Effects");
                 egui::Grid::new("fx").num_columns(2).spacing([18.0, 2.0]).show(ui, |ui| {
                     let f = &mut self.settings.post;
                     ui.checkbox(&mut f.soft_shadows, "Soft shadows");
@@ -1947,12 +2007,10 @@ fn main() -> eframe::Result<()> {
         "Duel Rush",
         options,
         Box::new(move |cc| {
+            ui_kit::install_fonts(&cc.egui_ctx);
             let mut style = (*cc.egui_ctx.global_style()).clone();
             style.visuals = egui::Visuals::dark();
-            style.spacing.button_padding = Vec2::new(14.0, 8.0);
-            style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(18.0));
-            style.text_styles.insert(egui::TextStyle::Body, FontId::proportional(16.0));
-            style.text_styles.insert(egui::TextStyle::Heading, FontId::proportional(26.0));
+            ui_kit::apply_style(&mut style);
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
             Ok(Box::new(App::new(screenshot)))
@@ -2118,18 +2176,56 @@ impl eframe::App for App {
             self.step_play(dt);
         } else {
             self.set_capture(&ctx, false);
-            // background demo match
+            // the menu's showcase: your fighter, standing on the map
             self.demo_t += dt;
+            if self.demo.world.map as u8 != self.settings.map.min(MapId::ALL.len() as u8 - 1) {
+                self.rebuild_showcase();
+            }
+            {
+                let lo = self.settings.loadout;
+                let slot = if self.menu_loadout { (self.lo_ui.slot as usize).min(2) } else { 0 };
+                let f = &mut self.demo.f[0];
+                if f.loadout != lo {
+                    f.loadout = lo;
+                    f.equip();
+                }
+                f.cur = slot;
+                f.weapon = f.slot_weapon(slot);
+            }
+            let want_fx = if self.menu_loadout { 0.80 } else { 0.64 };
+            self.menu_fx += (want_fx - self.menu_fx) * (dt * 4.0).min(1.0);
+            if self.demo.f.iter().filter(|f| f.present && f.is_bot).count() != self.demo_bots() {
+                self.rebuild_showcase();
+            }
+            let input = Input { yaw: self.show_spot.1, ..Input::default() };
+            // with Settings open the fight behind holds still (only your fighter breathes)
+            let hold = matches!(self.screen, Screen::Menu(Page::Settings));
             let mut a = self.acc + dt;
             let mut n = 0;
             while a >= TICK && n < 12 {
-                self.demo.tick(&Input::default());
+                if hold {
+                    self.demo.time += TICK;
+                } else {
+                    self.demo.tick(&input);
+                    self.keep_bots_back();
+                }
                 a -= TICK;
                 n += 1;
             }
             self.acc = a.min(TICK);
             self.demo.sounds.clear();
-            self.update_demo_cam(dt);
+        }
+
+        // the loadout screen's preview: your fighter holds what you're picking
+        if let Screen::Play { game, .. } = &mut self.screen {
+            let l = game.local;
+            if game.mt.phase == Phase::Loadout && !game.f[l].ready && !game.f[l].is_bot && self.disconnected.is_none() {
+                let slot = if game.mt.mode.melee_only() { 0 } else { (self.lo_ui.slot as usize).min(2) };
+                let f = &mut game.f[l];
+                f.loadout = self.settings.loadout;
+                f.cur = slot;
+                f.weapon = f.slot_weapon(slot);
+            }
         }
 
         // ---- drawing
@@ -2155,7 +2251,8 @@ impl eframe::App for App {
                 self.dynres.update(self.frame_dt, target)
             } else {
                 self.dynres = gpu::DynRes::default();
-                1.0
+                // the menu's background on the Steam Deck preset: drawn a little smaller
+                if !playing && self.settings.quality == gpu::Quality::DECK { 0.8 } else { 1.0 }
             };
         }
         let alpha = (self.acc / TICK).clamp(0.0, 1.0);
@@ -2166,6 +2263,7 @@ impl eframe::App for App {
                 let (cam, lp) = self.play_camera(game, rect);
                 ears = Some((cam.pos, cam.right, cam.fwd));
                 if let (Some(g3), Some(rs)) = (gpu.as_mut(), frame.wgpu_render_state()) {
+                    g3.dof = [0.0, 0.0];
                     if let Some(id) = g3.render(rs, game, &cam, rect, ppp, alpha, Some((game.local, lp))) {
                         painter.image(id, rect, full_uv, Color32::WHITE);
                     }
@@ -2177,8 +2275,9 @@ impl eframe::App for App {
                 }
             }
             _ => {
-                let cam = self.demo_camera(rect);
+                let (cam, focus) = self.menu_camera(rect);
                 if let (Some(g3), Some(rs)) = (gpu.as_mut(), frame.wgpu_render_state()) {
+                    g3.dof = [focus, 6.5];
                     if let Some(id) = g3.render(rs, &self.demo, &cam, rect, ppp, alpha, None) {
                         painter.image(id, rect, full_uv, Color32::WHITE);
                     }
@@ -2494,6 +2593,8 @@ impl App {
             if self.paused && self.pause_settings {
                 self.pause_settings = false; // Esc steps back out of the settings first
                 self.settings.save();
+            } else if self.paused && self.loadout_edit {
+                self.loadout_edit = false; // and out of the loadout screen
             } else {
                 self.paused = !self.paused;
             }
@@ -2631,7 +2732,7 @@ impl App {
         let autostart = self.autostart;
         let train_step = std::mem::take(&mut self.train_step);
         let sim = self.net_sim();
-        let fill_bots = self.settings.fill_bots;
+        let fill_bots = if self.quick_host { self.settings.fill_bots.max(4) } else { self.settings.fill_bots };
         let fill_skill = BOT_LEVELS[self.settings.bot_level.min(BOT_LEVELS.len() - 1)].1;
         self.watchdog.stage("Gauntlet leaderboard");
         self.gauntlet_frame();
@@ -2932,50 +3033,6 @@ impl App {
             ctx.request_repaint();
         }
     }
-    fn demo_target(&self) -> (V3, V3) {
-        let a = self.demo.f[0].pos;
-        let b = match self.demo.nearest_enemy(0) {
-            Some(j) => self.demo.f[j].pos,
-            None => self.demo.f[1].pos,
-        };
-        let mid = (a + b) * 0.5 + v3(0.0, 1.0, 0.0);
-        let sep = (b - a).flat().len();
-        let axis = if sep > 0.1 { (b - a).flat().norm() } else { v3(1.0, 0.0, 0.0) };
-        let swing = (self.demo_t * 0.13).sin() * 0.7;
-        let perp = v3(-axis.z, 0.0, axis.x);
-        let side = (perp * swing.cos() + axis * swing.sin()).norm();
-        let dist = (sep * 0.5 / 0.42).clamp(15.0, 21.0);
-        let mut pos = mid + side * dist + v3(0.0, 6.0, 0.0);
-        let to = pos - mid;
-        let l = to.len();
-        if let Some((t, _)) = self.demo.world.raycast(mid, to * (1.0 / l), l) {
-            pos = mid + to * ((t - 0.6).max(2.0) / l);
-        }
-        // stay inside the arena
-        pos.x = pos.x.clamp(-22.0, 22.0);
-        pos.z = pos.z.clamp(-22.0, 22.0);
-        (pos, mid)
-    }
-
-    fn update_demo_cam(&mut self, dt: f32) {
-        let (pos, look) = self.demo_target();
-        if self.demo_cam.0 == V3::ZERO {
-            self.demo_cam = (pos, look);
-        }
-        let k = (dt * 1.2).min(1.0);
-        self.demo_cam.0 = self.demo_cam.0.lerp(pos, k);
-        self.demo_cam.1 = self.demo_cam.1.lerp(look, (dt * 3.0).min(1.0));
-    }
-
-    fn demo_camera(&self, rect: Rect) -> Cam {
-        let (pos, look) = self.demo_cam;
-        let d = (look - pos).norm();
-        let yaw = d.x.atan2(d.z);
-        let pitch = d.y.asin();
-        // aim a little left so the duel shows to the right of the menu
-        Cam::new(pos, yaw - 0.27, pitch, 80.0, rect)
-    }
-
     fn play_camera(&self, game: &Game, rect: Rect) -> (Cam, V3) {
         self.cam_view_offset.set(V3::ZERO);
         if let (Some(v), true) = (test_view(), std::env::var_os("DUEL_GALLERY").is_some()) {
@@ -2992,6 +3049,10 @@ impl App {
         // test switch: DUEL_VIEW=x,y,z,yaw,pitch[,fov] puts the camera there (before / after pictures)
         if let Some(v) = test_view() {
             return (Cam::new(v3(v[0], v[1], v[2]), v[3], v[4], v[5], rect), body);
+        }
+        // choosing a loadout: a showcase shot of your fighter on the right of the screen
+        if self.loadout_open(game) && !f.is_bot && !f.spectate {
+            return (self.showcase_cam(game, body, f.yaw, rect), body);
         }
         // the camera follows the mouse right away, not at the next game tick
         let (yaw, pitch) = if f.is_bot { (f.yaw, f.pitch) } else { (self.aim_yaw, self.aim_pitch) };
@@ -3526,6 +3587,11 @@ fn headshot_icon(p: &egui::Painter, c: Pos2, r: f32, col: Color32) {
     p.circle_filled(c, r * 0.28, col);
 }
 
+/// Like text_shadow, in the display face (big numbers, titles).
+fn text_display(p: &egui::Painter, pos: Pos2, align: Align2, s: &str, size: f32, color: Color32) {
+    ui_kit::label(p, pos, align, s, ui_kit::display(size), color);
+}
+
 fn text_shadow(p: &egui::Painter, pos: Pos2, align: Align2, s: &str, size: f32, color: Color32) {
     let font = FontId::proportional(size);
     p.text(pos + Vec2::new(2.0, 2.0), align, s, font.clone(), Color32::from_black_alpha(170));
@@ -3594,7 +3660,7 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
     p.rect_stroke(r, 10.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 150, 70, 110)), egui::StrokeKind::Inside);
     let x0 = r.left() + 20.0;
     let mut y = r.top() + 16.0;
-    text_shadow(p, Pos2::new(x0, y), Align2::LEFT_TOP, &format!("PLAYERS  ({}/8)", rows.len()), 16.0, ACCENT);
+    text_display(p, Pos2::new(x0, y - 3.0), Align2::LEFT_TOP, &format!("PLAYERS  ({}/8)", rows.len()), 22.0, ACCENT);
     text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, if g.mt.mode.rounds() { "WINS" } else { "KILLS" }, 13.0, Color32::from_gray(200));
     text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, "DEATHS", 13.0, Color32::from_gray(200));
     text_shadow(p, Pos2::new(r.right() - 45.0, y), Align2::CENTER_TOP, "PING", 13.0, Color32::from_gray(200));
@@ -3636,8 +3702,8 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
         p.circle_filled(Pos2::new(x0 + 6.0, y + 9.0), 6.0, player_color(f.color_idx));
         text_shadow(p, Pos2::new(x0 + 20.0, y), Align2::LEFT_TOP, &name, 16.0, Color32::WHITE);
         let score = if g.mt.mode.rounds() { f.wins } else { f.kills };
-        text_shadow(p, Pos2::new(r.right() - 175.0, y), Align2::CENTER_TOP, &format!("{}", score), 16.0, Color32::WHITE);
-        text_shadow(p, Pos2::new(r.right() - 110.0, y), Align2::CENTER_TOP, &format!("{}", f.deaths), 16.0, Color32::from_gray(200));
+        text_display(p, Pos2::new(r.right() - 175.0, y - 2.0), Align2::CENTER_TOP, &format!("{}", score), 21.0, Color32::WHITE);
+        text_display(p, Pos2::new(r.right() - 110.0, y - 2.0), Align2::CENTER_TOP, &format!("{}", f.deaths), 21.0, Color32::from_gray(200));
         let ping = if f.is_bot || (f.slot == g.local && g.kind == Kind::Host) || g.kind == Kind::Offline { "-".to_string() } else { format!("{}", f.ping_ms) };
         let pc = if f.ping_ms > 150 { Color32::from_rgb(255, 140, 120) } else if f.ping_ms > 80 { Color32::from_rgb(255, 220, 140) } else { Color32::from_rgb(160, 230, 160) };
         text_shadow(p, Pos2::new(r.right() - 45.0, y), Align2::CENTER_TOP, &ping, 16.0, pc);
@@ -3689,6 +3755,59 @@ impl App {
             }
         }
         p.circle_filled(c, 1.6, Color32::from_rgb(230, 40, 40));
+    }
+
+    /// The pre-match loadout screen is up.
+    fn loadout_open(&self, g: &Game) -> bool {
+        g.mt.phase == Phase::Loadout && !g.f[g.local].ready && self.disconnected.is_none() && !self.paused
+    }
+
+    /// The loadout screen's camera: in front of your fighter, framed so they stand on the
+    /// right of the screen beside the cards, swaying slowly.
+    fn showcase_cam(&self, game: &Game, body: V3, yaw: f32, rect: Rect) -> Cam {
+        let fwd = yaw_fwd(yaw);
+        let side = v3(fwd.z, 0.0, -fwd.x);
+        let look = body + v3(0.0, 1.0, 0.0);
+        let sway = 0.32 + (self.wall_t * 0.3).sin() * 0.12;
+        let out = (fwd * sway.cos() + side * sway.sin() + v3(0.0, 0.1, 0.0)).norm();
+        let mut dist = 4.4;
+        if let Some((hit, _)) = game.world.raycast(look, out, dist + 0.3) {
+            dist = (hit - 0.3).max(1.4);
+        }
+        let pos = look + out * dist;
+        let d = (look - pos).norm();
+        let base = d.x.atan2(d.z);
+        let pitch = d.y.clamp(-1.0, 1.0).asin();
+        let fov = 50.0f32;
+        // turn the view so the fighter sits about 80% across
+        let half = (fov.to_radians() * 0.5).tan();
+        let ang = (0.6 * half).atan();
+        for y in [base + ang, base - ang] {
+            let cam = Cam::new(pos, y, pitch, fov, rect);
+            if cam.project(look).is_some_and(|sp| sp.x > rect.center().x) {
+                return cam;
+            }
+        }
+        Cam::new(pos, base, pitch, fov, rect)
+    }
+
+    fn loadout_view<'a>(&mut self, timer: Option<f32>, action: &'a str, subtitle: &'a str, back: bool) -> ui_kit::LoadoutView<'a> {
+        let n = self.pads.name.as_deref();
+        let keys = if self.pad_active {
+            ["←".to_string(), "→".to_string(), "→".to_string()]
+        } else {
+            [self.settings.binds[A_MELEE].name(), self.settings.binds[A_GUN1].name(), self.settings.binds[A_GUN2].name()]
+        };
+        let hint = if self.pad_active {
+            format!("{}: pick  ·  {}: {}  ·  LB / RB: fighter", pad::button_name(pad::btn::A, n), pad::button_name(pad::btn::B, n), if back { "back" } else { "pause" })
+        } else {
+            "Click a card to pick it  ·  arrow keys and Enter work too".to_string()
+        };
+        let melee_only = match &self.screen {
+            Screen::Play { game, .. } => game.mt.mode.melee_only(),
+            _ => false,
+        };
+        ui_kit::LoadoutView { timer, melee_only, pad: self.pad_active, tab_step: std::mem::take(&mut self.pad_tab), keys, hint, subtitle, action, back }
     }
 
     /// The HUD's size: follows the window, and the Couch / TV interface size on top (the UI's
@@ -3814,6 +3933,9 @@ impl App {
         if test_view().is_some() {
             return; // a clean picture of the map
         }
+        if (self.loadout_open(g) && !g.f[g.local].is_bot) || (self.paused && self.loadout_edit) {
+            return; // the loadout screen covers it
+        }
         let me = &g.f[g.local];
         let c = rect.center();
         // everything scales with the window so nothing overlaps at small sizes (and grows with
@@ -3846,7 +3968,7 @@ impl App {
                 p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - bar_h), Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
                 let a = ((kc.t / 0.3).min(1.0) * 255.0) as u8;
                 let title = if kc.tool == "EXECUTED" { "EXECUTION" } else { "FINAL KILL" };
-                text_shadow(p, Pos2::new(c.x, rect.top() + bar_h * 0.5), Align2::CENTER_CENTER, title, 30.0 * s, Color32::from_rgba_unmultiplied(255, 150, 70, a));
+                text_display(p, Pos2::new(c.x, rect.top() + bar_h * 0.5), Align2::CENTER_CENTER, title, 42.0 * s, Color32::from_rgba_unmultiplied(255, 150, 70, a));
                 let victim = &g.f[kc.victim].name;
                 let col = Color32::from_rgba_unmultiplied(240, 230, 220, a);
                 let mut parts: Vec<(String, Color32)> = Vec::new();
@@ -3916,7 +4038,7 @@ impl App {
                 let pop = 1.0 + 0.7 * ((d.life - 0.72) / 0.18).clamp(0.0, 1.0);
                 let size = (16.0 + (d.amount.min(80) as f32 / 80.0) * 12.0) * pop * s;
                 let col = if d.head { Color32::from_rgba_unmultiplied(255, 215, 50, a) } else if d.amount >= 40 { Color32::from_rgba_unmultiplied(255, 150, 90, a) } else { Color32::from_rgba_unmultiplied(255, 255, 255, a) };
-                text_shadow(p, sp, Align2::CENTER_CENTER, &format!("{}", d.amount), size, col);
+                text_display(p, sp, Align2::CENTER_CENTER, &format!("{}", d.amount), size * 1.2, col);
                 if d.head {
                     text_shadow(p, sp + Vec2::new(0.0, size * 0.75), Align2::CENTER_CENTER, "HEADSHOT", 11.0 * s, col);
                 }
@@ -4019,7 +4141,7 @@ impl App {
             }
             if g.headshot_t > 0.0 {
                 let a = (g.headshot_t / 0.7 * 255.0).min(255.0) as u8;
-                text_shadow(p, c - Vec2::new(0.0, (50.0 * s).max(ring_r + 14.0 * s)), Align2::CENTER_CENTER, "HEADSHOT", 16.0 * s, Color32::from_rgba_unmultiplied(255, 215, 50, a));
+                text_display(p, c - Vec2::new(0.0, (50.0 * s).max(ring_r + 14.0 * s)), Align2::CENTER_CENTER, "HEADSHOT", 22.0 * s, Color32::from_rgba_unmultiplied(255, 215, 50, a));
             }
         }
 
@@ -4047,7 +4169,7 @@ impl App {
             let y = c.y - 46.0 * s;
             let hot = mc.n + 1 >= COMBO_KO;
             let col = if hot { Color32::from_rgba_unmultiplied(255, 120, 60, a) } else { Color32::from_rgba_unmultiplied(255, 220, 140, a) };
-            text_shadow(p, Pos2::new(c.x, y), Align2::CENTER_CENTER, &format!("{} HIT COMBO", mc.n), 15.0 * s, col);
+            text_display(p, Pos2::new(c.x, y - 3.0 * s), Align2::CENTER_CENTER, &format!("{} HIT COMBO", mc.n), 23.0 * s, col);
             for k in 0..COMBO_KO {
                 let x = c.x + (k as f32 - (COMBO_KO as f32 - 1.0) * 0.5) * 11.0 * s;
                 let filled = k < mc.n;
@@ -4183,7 +4305,7 @@ impl App {
                 let pop = 1.0 + (me.flow_pop / 0.35).clamp(0.0, 1.0) * 0.35;
                 let col = if me.flow >= FLOW_MAX { Color32::from_rgb(255, 190, 80) } else { Color32::from_rgb(170, 230, 255) };
                 let text = format!("FLOW x{}  +{}%", me.flow, (me.flow.min(FLOW_MAX) as f32 * FLOW_STEP * 100.0).round() as i32);
-                text_shadow(p, Pos2::new(c.x, base_y), Align2::CENTER_CENTER, &text, 16.0 * s * pop, col);
+                text_display(p, Pos2::new(c.x, base_y), Align2::CENTER_CENTER, &text, 21.0 * s * pop, col);
                 // little pips
                 for k in 0..FLOW_MAX {
                     let pc = Pos2::new(c.x + (k as f32 - (FLOW_MAX as f32 - 1.0) * 0.5) * 14.0 * s, base_y + 15.0 * s);
@@ -4221,7 +4343,7 @@ impl App {
             let k = r * 0.6;
             p.line_segment([ic + Vec2::new(-k, -k), ic + Vec2::new(k, k)], Stroke::new(3.0 * s, Color32::from_rgba_unmultiplied(255, 255, 255, a)));
             p.line_segment([ic + Vec2::new(k, -k), ic + Vec2::new(-k, k)], Stroke::new(3.0 * s, Color32::from_rgba_unmultiplied(255, 255, 255, a)));
-            text_shadow(p, ic + Vec2::new(0.0, r + 12.0 * s), Align2::CENTER_CENTER, &format!("ELIMINATED {}", g.kill_name.to_uppercase()), 14.0 * s, Color32::from_rgba_unmultiplied(255, 120, 110, a));
+            text_display(p, ic + Vec2::new(0.0, r + 12.0 * s), Align2::CENTER_CENTER, &format!("ELIMINATED {}", g.kill_name.to_uppercase()), 19.0 * s, Color32::from_rgba_unmultiplied(255, 120, 110, a));
             let streak = match g.streak {
                 2 => Some("DOUBLE KILL"),
                 3 => Some("TRIPLE KILL"),
@@ -4229,81 +4351,111 @@ impl App {
                 _ => None,
             };
             if let Some(t) = streak {
-                text_shadow(p, ic + Vec2::new(0.0, r + 33.0 * s), Align2::CENTER_CENTER, t, 18.0 * s, Color32::from_rgba_unmultiplied(255, 190, 80, a));
+                text_display(p, ic + Vec2::new(0.0, r + 35.0 * s), Align2::CENTER_CENTER, t, 26.0 * s, Color32::from_rgba_unmultiplied(255, 190, 80, a));
             }
         }
 
-        // ---- bottom-left: health and armor
-        let pw = 300.0 * s;
-        let ph = 92.0 * s;
+        // ---- bottom-left: health and armour, big numbers in the display face
+        let pw = 270.0 * s;
+        let ph = 84.0 * s;
         let left = Rect::from_min_size(Pos2::new(rect.left() + margin, rect.bottom() - margin - ph), Vec2::new(pw, ph));
-        p.rect_filled(left, 8.0 * s, Color32::from_black_alpha(110));
+        let hud_fill = Color32::from_rgba_unmultiplied(10, 9, 18, 175);
+        p.rect_filled(left, 6.0 * s, hud_fill);
+        ui_kit::edge_marks(p, left, s, false);
         let pad = 12.0 * s;
-        text_shadow(p, left.left_top() + Vec2::new(pad, 8.0 * s), Align2::LEFT_TOP, &me.name, 16.0 * s, Color32::from_rgb(240, 230, 220));
-        let num_w = 44.0 * s;
-        let hp_r = Rect::from_min_size(left.left_top() + Vec2::new(pad, 36.0 * s), Vec2::new(pw - pad * 2.0 - num_w, 18.0 * s));
-        bar(p, hp_r, me.hp / MAX_HP, Color32::from_rgb(220, 60, 60));
-        text_shadow(p, Pos2::new(left.right() - pad, hp_r.center().y), Align2::RIGHT_CENTER, &format!("{}", me.hp.max(0.0).ceil() as i32), 18.0 * s, Color32::WHITE);
-        let ap_r = Rect::from_min_size(left.left_top() + Vec2::new(pad, 64.0 * s), Vec2::new((pw - pad * 2.0 - num_w) * 0.6, 12.0 * s));
-        bar(p, ap_r, me.ap / MAX_AP, Color32::from_rgb(80, 150, 240));
-        text_shadow(p, Pos2::new(ap_r.right() + 8.0 * s, ap_r.center().y), Align2::LEFT_CENTER, &format!("AP {}", me.ap.max(0.0).ceil() as i32), 13.0 * s, Color32::from_rgb(170, 200, 255));
+        let low = me.hp < 30.0 && me.alive;
+        let throb = if low { 0.5 + 0.5 * (g.time * 6.0).sin() } else { 0.0 };
+        let hp_col = ui_kit::mix(Color32::WHITE, Color32::from_rgb(255, 90, 80), throb);
+        let red = Color32::from_rgb(232, 64, 58);
+        let y1 = left.top() + 31.0 * s;
+        ui_kit::cross_icon(p, Pos2::new(left.left() + pad + 9.0 * s, y1), 8.0 * s, red);
+        text_display(p, Pos2::new(left.left() + pad + 24.0 * s, y1 + 2.0 * s), Align2::LEFT_CENTER, &format!("{}", me.hp.max(0.0).ceil() as i32), 46.0 * s, hp_col);
+        let bar_x = left.left() + pad + 96.0 * s;
+        let hp_r = Rect::from_min_max(Pos2::new(bar_x, y1 - 7.0 * s), Pos2::new(left.right() - pad, y1 + 7.0 * s));
+        ui_kit::seg_bar(p, hp_r, me.hp / MAX_HP, 5, red, Color32::from_white_alpha(26));
+        let y2 = left.top() + 66.0 * s;
+        let blue = Color32::from_rgb(90, 160, 250);
+        ui_kit::shield_icon(p, Pos2::new(left.left() + pad + 9.0 * s, y2), 8.0 * s, blue);
+        text_display(p, Pos2::new(left.left() + pad + 24.0 * s, y2 + 1.0 * s), Align2::LEFT_CENTER, &format!("{}", me.ap.max(0.0).ceil() as i32), 28.0 * s, Color32::from_rgb(190, 215, 255));
+        let ap_r = Rect::from_min_max(Pos2::new(bar_x, y2 - 4.0 * s), Pos2::new(left.right() - pad, y2 + 4.0 * s));
+        ui_kit::seg_bar(p, ap_r, me.ap / MAX_AP, 5, blue, Color32::from_white_alpha(26));
 
-        // ---- bottom-right: weapons, in three rows that never share space
-        let right = Rect::from_min_size(Pos2::new(rect.right() - margin - pw, rect.bottom() - margin - ph), Vec2::new(pw, ph));
-        p.rect_filled(right, 8.0 * s, Color32::from_black_alpha(110));
-        // row 1: weapon name (left) and ammo (right)
-        let ammo = match me.weapon {
-            w if w.is_melee() => {
-                if me.guard {
-                    "GUARD".to_string()
-                } else {
-                    "∞".to_string()
-                }
-            }
-            w => format!("{} / {}", me.mag[me.cur], w.mag()),
-        };
-        let ammo_col = if !me.weapon.is_melee() && me.reload_t > 0.0 { Color32::from_gray(140) } else { Color32::WHITE };
-        let ammo_g = p.layout_no_wrap(ammo, FontId::proportional(22.0 * s), ammo_col);
-        let ammo_w = ammo_g.size().x;
-        let row1_y = right.top() + 6.0 * s;
-        p.galley(Pos2::new(right.right() - pad - ammo_w, row1_y), ammo_g, Color32::WHITE);
-        let name_room = pw - pad * 3.0 - ammo_w;
-        fit_text(p, Pos2::new(right.left() + pad, row1_y + 4.0 * s), me.weapon.name(), 16.0 * s, name_room, ACCENT);
-        // row 2: the three slots
-        let slot_gap = 6.0 * s;
-        let slot_w = (pw - pad * 2.0 - slot_gap * 2.0) / 3.0;
-        let slot_h = 32.0 * s;
-        let row2_y = right.top() + 36.0 * s;
-        for k in 0..3usize {
-            let r = Rect::from_min_size(Pos2::new(right.left() + pad + k as f32 * (slot_w + slot_gap), row2_y), Vec2::new(slot_w, slot_h));
-            let sel = me.cur == k;
-            p.rect_filled(r, 5.0 * s, if sel { Color32::from_rgba_unmultiplied(255, 150, 70, 170) } else { Color32::from_black_alpha(120) });
-            text_shadow(p, r.left_center() + Vec2::new(6.0 * s, 0.0), Align2::LEFT_CENTER, &format!("{}", k + 1), 13.0 * s, Color32::from_gray(210));
-            fit_text(p, Pos2::new(r.left() + 18.0 * s, r.center().y - 7.0 * s), me.slot_weapon(k).name(), 12.0 * s, slot_w - 22.0 * s, Color32::WHITE);
+        // ---- bottom-right: weapon, ammo and the slot icons with their keys
+        let rw = 316.0 * s;
+        let rh = 112.0 * s;
+        let right = Rect::from_min_size(Pos2::new(rect.right() - margin - rw, rect.bottom() - margin - rh), Vec2::new(rw, rh));
+        p.rect_filled(right, 6.0 * s, hud_fill);
+        ui_kit::edge_marks(p, right, s, true);
+        let r1 = right.top() + 30.0 * s;
+        // ammo, right-aligned: the magazine big, what it holds small
+        let ammo_w;
+        if me.weapon.is_melee() {
+            let (txt, col) = if me.guard { ("GUARD", Color32::from_rgb(150, 205, 255)) } else { ("∞", Color32::WHITE) };
+            let font = if me.guard { ui_kit::display(30.0 * s) } else { ui_kit::body(34.0 * s) };
+            ammo_w = ui_kit::text_width(p, txt, font.clone());
+            ui_kit::label(p, Pos2::new(right.right() - pad - 6.0 * s, r1), Align2::RIGHT_CENTER, txt, font, col);
+        } else {
+            let mag = me.mag[me.cur];
+            let reloading = me.reload_t > 0.0;
+            let col = if reloading { Color32::from_gray(140) } else if mag == 0 { Color32::from_rgb(255, 110, 90) } else { Color32::WHITE };
+            let total = format!("/{}", me.weapon.mag());
+            let tf = ui_kit::display(22.0 * s);
+            let tw = ui_kit::text_width(p, &total, tf.clone());
+            ui_kit::label(p, Pos2::new(right.right() - pad - 6.0 * s, r1 + 7.0 * s), Align2::RIGHT_CENTER, &total, tf, Color32::from_gray(170));
+            let mf = ui_kit::display(50.0 * s);
+            let ms = format!("{mag}");
+            ammo_w = tw + 4.0 * s + ui_kit::text_width(p, &ms, mf.clone());
+            ui_kit::label(p, Pos2::new(right.right() - pad - 6.0 * s - tw - 4.0 * s, r1 + 2.0 * s), Align2::RIGHT_CENTER, &ms, mf, col);
         }
-        // row 3: item (left) and dash (right)
-        let row3_y = right.bottom() - 14.0 * s;
-        // dashes: one pip each, the refilling one fills up
+        // weapon name and dashes, left
+        let name = me.weapon.name().to_uppercase();
+        let room = rw - pad * 3.0 - ammo_w - 8.0 * s;
+        let nf = ui_kit::fitted(p, &name, ui_kit::display(24.0 * s), room);
+        ui_kit::label(p, Pos2::new(right.left() + pad, r1 - 3.0 * s), Align2::LEFT_BOTTOM, &name, nf, ACCENT);
         let most = g.tune.dash_charges.round().max(1.0) as usize;
         let pip = 9.0 * s;
         let pgap = 4.0 * s;
-        let pips_w = most as f32 * pip + (most as f32 - 1.0) * pgap;
-        let dash_g = p.layout_no_wrap("Dash".to_string(), FontId::proportional(13.0 * s), Color32::from_rgb(180, 220, 200));
-        let dash_w = dash_g.size().x + 6.0 * s + pips_w;
-        let px0 = right.right() - pad - pips_w;
-        p.galley(Pos2::new(right.right() - pad - dash_w, row3_y - dash_g.size().y * 0.5), dash_g, Color32::WHITE);
+        let dy = r1 + 7.0 * s;
+        text_display(p, Pos2::new(right.left() + pad, dy), Align2::LEFT_CENTER, "DASH", 14.0 * s, Color32::from_rgb(170, 220, 200));
+        let px0 = right.left() + pad + 40.0 * s;
         for k in 0..most {
             let fill = (me.dash_charges - k as f32).clamp(0.0, 1.0);
-            let r = Rect::from_min_size(Pos2::new(px0 + k as f32 * (pip + pgap), row3_y - pip * 0.5), Vec2::splat(pip));
-            p.rect_filled(r, 2.0 * s, Color32::from_black_alpha(140));
+            let r = Rect::from_min_size(Pos2::new(px0 + k as f32 * (pip * 1.6 + pgap), dy - pip * 0.5), Vec2::new(pip * 1.6, pip));
+            p.rect_filled(r, 2.0 * s, Color32::from_black_alpha(150));
             if fill > 0.0 {
                 let col = if fill >= 1.0 { Color32::from_rgb(120, 230, 190) } else { Color32::from_rgb(70, 120, 110) };
-                p.rect_filled(Rect::from_min_max(Pos2::new(r.left(), r.bottom() - pip * fill), r.max), 2.0 * s, col);
+                p.rect_filled(Rect::from_min_size(r.min, Vec2::new(r.width() * fill, r.height())), 2.0 * s, col);
             }
         }
-        let item = format!("G  {} x{}", ITEM_NAMES[me.loadout.item.min(2) as usize], me.items);
-        fit_text(p, Pos2::new(right.left() + pad, row3_y - 8.0 * s), &item, 13.0 * s, pw - pad * 3.0 - dash_w, Color32::from_rgb(220, 220, 180));
-
+        // the slots: blade, gun 1, gun 2, then the item
+        let pad_keys = self.pad_active;
+        let keys = if pad_keys {
+            ["←".to_string(), "→".to_string(), "→".to_string(), "↑".to_string()]
+        } else {
+            [self.settings.binds[A_MELEE].name(), self.settings.binds[A_GUN1].name(), self.settings.binds[A_GUN2].name(), self.settings.binds[A_ITEM].name()]
+        };
+        let tgap = 6.0 * s;
+        let tw = (rw - pad * 2.0 - tgap * 3.0) / 4.0;
+        let th = 50.0 * s;
+        let ty = right.bottom() - 10.0 * s - th;
+        for k in 0..4usize {
+            let r = Rect::from_min_size(Pos2::new(right.left() + pad + k as f32 * (tw + tgap), ty), Vec2::new(tw, th));
+            let sel = k < 3 && me.cur == k;
+            let empty = k == 3 && me.items == 0;
+            let locked = k > 0 && k < 3 && g.mt.mode.melee_only();
+            p.rect_filled(r, 4.0 * s, if sel { Color32::from_rgba_unmultiplied(110, 60, 30, 220) } else { Color32::from_black_alpha(130) });
+            p.rect_stroke(r, 4.0 * s, if sel { Stroke::new(2.0 * s, ACCENT) } else { Stroke::new(1.0, Color32::from_white_alpha(28)) }, egui::StrokeKind::Inside);
+            let ink = if sel { Color32::WHITE } else if empty || locked { Color32::from_gray(90) } else { Color32::from_gray(200) };
+            let icon = r.shrink2(Vec2::new(6.0 * s, 9.0 * s)).translate(Vec2::new(0.0, 4.0 * s));
+            if k < 3 {
+                ui_kit::weapon_icon(p, icon, me.slot_weapon(k), ink);
+            } else {
+                ui_kit::item_icon(p, icon.shrink(1.0 * s).translate(Vec2::new(-6.0 * s, 0.0)), me.loadout.item.min(2), ink);
+                text_display(p, r.right_bottom() - Vec2::new(5.0 * s, 3.0 * s), Align2::RIGHT_BOTTOM, &format!("x{}", me.items), 17.0 * s, if empty { Color32::from_gray(120) } else { Color32::WHITE });
+            }
+            let kw = (ui_kit::text_width(p, &keys[k], ui_kit::display(13.0 * s * 0.85)) + 10.0 * s * 0.85).max(18.0 * s * 0.85);
+            ui_kit::keycap(p, Pos2::new(r.left() + 3.0 * s + kw * 0.5, r.top() + 1.0 * s), &keys[k], s * 0.85);
+        }
         // ---- chat, above the health panel, wrapped to its own column
         let chat_w = (rect.width() * 0.42).max(pw);
         let mut cy = left.top() - 8.0 * s;
@@ -4348,7 +4500,7 @@ impl App {
             Phase::Loadout => format!("LOADOUT {:.0}", g.mt.timer.max(0.0)),
             Phase::MatchOver => "OVER".into(),
         };
-        text_shadow(p, sb.center() + Vec2::new(0.0, -6.0 * s), Align2::CENTER_CENTER, &tt, 18.0 * s, Color32::WHITE);
+        text_display(p, sb.center() + Vec2::new(0.0, -6.0 * s), Align2::CENTER_CENTER, &tt, 27.0 * s, Color32::WHITE);
         let sub = match &g.gauntlet {
             Some(gt) => format!("Gauntlet · best {}", gt.best),
             None => format!("{} · first to {} {}", g.mt.mode.name(), g.mt.target, g.mt.mode.goal_word()),
@@ -4359,22 +4511,22 @@ impl App {
             Mode::Gauntlet => {
                 let (wave, score) = g.gauntlet.as_ref().map_or((0, 0), |gt| (gt.wave, gt.score));
                 text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, -8.0 * s), Align2::LEFT_CENTER, "WAVE", 12.0 * s, Color32::from_gray(210));
-                text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, 10.0 * s), Align2::LEFT_CENTER, &format!("{wave}"), 19.0 * s, Color32::from_rgb(255, 190, 90));
+                text_display(p, sb.left_center() + Vec2::new(14.0 * s, 10.0 * s), Align2::LEFT_CENTER, &format!("{wave}"), 25.0 * s, Color32::from_rgb(255, 190, 90));
                 text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, 8.0 * s), Align2::RIGHT_CENTER, "SCORE", 12.0 * s, Color32::from_gray(210));
-                text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, -10.0 * s), Align2::RIGHT_CENTER, &format!("{score}"), 19.0 * s, Color32::WHITE);
+                text_display(p, sb.right_center() - Vec2::new(14.0 * s, -10.0 * s), Align2::RIGHT_CENTER, &format!("{score}"), 25.0 * s, Color32::WHITE);
             }
             Mode::Tdm | Mode::Ctf => {
                 text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, 0.0), Align2::LEFT_CENTER, "RED", 17.0 * s, red);
                 text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, 0.0), Align2::RIGHT_CENTER, "BLUE", 17.0 * s, blue);
-                text_shadow(p, sb.center() + Vec2::new(-95.0 * s, 0.0), Align2::CENTER_CENTER, &format!("{}", g.mt.team_score[0]), 30.0 * s, red);
-                text_shadow(p, sb.center() + Vec2::new(95.0 * s, 0.0), Align2::CENTER_CENTER, &format!("{}", g.mt.team_score[1]), 30.0 * s, blue);
+                text_display(p, sb.center() + Vec2::new(-95.0 * s, 0.0), Align2::CENTER_CENTER, &format!("{}", g.mt.team_score[0]), 40.0 * s, red);
+                text_display(p, sb.center() + Vec2::new(95.0 * s, 0.0), Align2::CENTER_CENTER, &format!("{}", g.mt.team_score[1]), 40.0 * s, blue);
             }
             _ => {
                 let rounds = g.mt.mode.rounds();
                 let sc = |f: &Fighter| if rounds { f.wins } else { f.kills };
                 let leader = g.f.iter().filter(|f| f.present).max_by_key(|f| sc(f));
                 text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, -8.0 * s), Align2::LEFT_CENTER, "YOU", 12.0 * s, Color32::from_gray(210));
-                text_shadow(p, sb.left_center() + Vec2::new(14.0 * s, 10.0 * s), Align2::LEFT_CENTER, &format!("{} {}", sc(me), if rounds { "wins" } else { "kills" }), 17.0 * s, player_color(me.color_idx));
+                text_display(p, sb.left_center() + Vec2::new(14.0 * s, 10.0 * s), Align2::LEFT_CENTER, &format!("{} {}", sc(me), if rounds { "WINS" } else { "KILLS" }), 22.0 * s, player_color(me.color_idx));
                 if let Some(l) = leader {
                     text_shadow(p, sb.right_center() - Vec2::new(14.0 * s, 8.0 * s), Align2::RIGHT_CENTER, "LEADER", 12.0 * s, Color32::from_gray(210));
                     let lt = format!("{} {}", l.name, sc(l));
@@ -4394,7 +4546,7 @@ impl App {
                 let a = ((t.combo_t / 0.4).min(1.0) * 255.0) as u8;
                 let hot = (t.combo as f32 / 10.0).min(1.0);
                 let col = Color32::from_rgba_unmultiplied(255, (220.0 - 140.0 * hot) as u8, (90.0 - 60.0 * hot) as u8, a);
-                text_shadow(p, Pos2::new(x, y), Align2::RIGHT_CENTER, &format!("{} HIT", t.combo), (30.0 + 10.0 * hot) * s, col);
+                text_display(p, Pos2::new(x, y), Align2::RIGHT_CENTER, &format!("{} HIT", t.combo), (40.0 + 12.0 * hot) * s, col);
                 text_shadow(p, Pos2::new(x, y + 30.0 * s), Align2::RIGHT_CENTER, "COMBO", 16.0 * s, Color32::from_rgba_unmultiplied(255, 240, 220, a));
                 text_shadow(p, Pos2::new(x, y + 52.0 * s), Align2::RIGHT_CENTER, &format!("{} damage", t.combo_dmg.round() as i32), 14.0 * s, Color32::from_rgba_unmultiplied(230, 230, 230, a));
                 // time left to keep it going
@@ -4547,66 +4699,8 @@ impl App {
     fn _unused_panel(&self) {}
 }
 
-fn loadout_picker(ui: &mut egui::Ui, lo: &mut Loadout) {
-    egui::Grid::new("loadout_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-        ui.colored_label(ACCENT, "Fighter");
-        ui.horizontal_wrapped(|ui| {
-            for k in 0..chars::COUNT as u8 {
-                ui.selectable_value(&mut lo.body, k, chars::name(k)).on_hover_text(chars::blurb(k));
-            }
-        });
-        ui.end_row();
-        ui.colored_label(ACCENT, "Melee");
-        ui.horizontal(|ui| {
-            for w in Weapon::MELEE {
-                ui.selectable_value(&mut lo.melee, w, w.name()).on_hover_text(w.blurb());
-            }
-        });
-        ui.end_row();
-        ui.colored_label(ACCENT, "Gun 1");
-        ui.horizontal_wrapped(|ui| {
-            for w in Weapon::GUNS {
-                ui.selectable_value(&mut lo.gun1, w, w.name()).on_hover_text(w.blurb());
-            }
-        });
-        ui.end_row();
-        ui.colored_label(ACCENT, "Gun 2");
-        ui.horizontal_wrapped(|ui| {
-            for w in Weapon::GUNS {
-                if w != lo.gun1 {
-                    ui.selectable_value(&mut lo.gun2, w, w.name()).on_hover_text(w.blurb());
-                }
-            }
-        });
-        ui.end_row();
-        ui.colored_label(ACCENT, "Item");
-        ui.horizontal(|ui| {
-            for k in 0..3u8 {
-                ui.selectable_value(&mut lo.item, k, ITEM_NAMES[k as usize]).on_hover_text(ITEM_BLURBS[k as usize]);
-            }
-        });
-        ui.end_row();
-    });
-    if lo.gun2 == lo.gun1 {
-        *lo = Loadout::from_bytes(lo.to_bytes());
-    }
-    ui.label(egui::RichText::new(format!(
-        "{}: {}  ·  {}: {}  ·  {}: {}  ·  {}: {}  ·  {}: {}",
-        chars::name(lo.body),
-        chars::blurb(lo.body),
-        lo.melee.name(),
-        lo.melee.blurb(),
-        lo.gun1.name(),
-        lo.gun1.blurb(),
-        lo.gun2.name(),
-        lo.gun2.blurb(),
-        ITEM_NAMES[lo.item.min(2) as usize],
-        ITEM_BLURBS[lo.item.min(2) as usize]
-    )).size(13.0).color(Color32::from_gray(200)));
-}
-
 fn map_picker(ui: &mut egui::Ui, map: &mut u8) {
-    ui.label("Map");
+    ui_kit::section(ui, "Map");
     ui.horizontal_wrapped(|ui| {
         for m in MapId::ALL {
             ui.selectable_value(map, m as u8, m.name()).on_hover_text(m.blurb());
@@ -4617,7 +4711,7 @@ fn map_picker(ui: &mut egui::Ui, map: &mut u8) {
 }
 
 fn mode_picker(ui: &mut egui::Ui, mode: &mut u8) {
-    ui.label("Mode");
+    ui_kit::section(ui, "Mode");
     ui.horizontal_wrapped(|ui| {
         for m in Mode::ALL {
             ui.selectable_value(mode, m as u8, m.name()).on_hover_text(m.blurb());
@@ -4630,34 +4724,33 @@ fn mode_picker(ui: &mut egui::Ui, mode: &mut u8) {
 /// A menu panel. When it's taller than the room below `pos` (a short window, a handheld, or the
 /// Couch / TV interface size) its contents scroll, and the selected button scrolls into view.
 fn panel<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
-        let room = (ctx.content_rect().bottom() - pos.y - 52.0).max(160.0);
+        let room = (ctx.content_rect().bottom() - pos.y - 66.0).max(160.0);
         egui::Area::new(egui::Id::unique(id))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(14, 12, 26, 225))
-                    .corner_radius(10.0)
-                    .inner_margin(20.0)
-                    .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 150, 70, 90)))
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt(id)
-                            .max_height(room)
-                            .show(ui, |ui| {
-                                ui.set_width(width);
-                                f(ui)
-                            })
-                            .inner
-                    })
-                    .inner
+                ui_kit::panel_frame(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(id)
+                        .max_height(room)
+                        .min_scrolled_height(room)
+                        .show(ui, |ui| {
+                            ui.set_width(width);
+                            f(ui)
+                        })
+                        .inner
+                })
             })
             .inner
 }
 
 impl App {
     fn big_button(ui: &mut egui::Ui, text: &str) -> bool {
-        let clicked = ui.add_sized([ui.available_width(), 44.0], egui::Button::new(egui::RichText::new(text).size(19.0))).clicked();
+        Self::big_button_h(ui, text, 46.0)
+    }
+
+    fn big_button_h(ui: &mut egui::Ui, text: &str, h: f32) -> bool {
+        let clicked = ui_kit::menu_button(ui, text, h).clicked();
         if clicked {
             let back = matches!(text, "Back" | "Cancel" | "Leave match" | "Back to menu" | "Quit");
             UI_SOUND.with(|u| u.set(Some(if back { Sfx::UiBack } else { Sfx::UiConfirm })));
@@ -4666,6 +4759,28 @@ impl App {
     }
 
     fn menu_ui(&mut self, ctx: &egui::Context, rect: Rect, page: Page) -> bool {
+        self.sync_steam_name();
+        self.quick_play_tick();
+        // the loadout screen, over your fighter
+        if page == Page::Main && self.menu_loadout {
+            if self.rebinding.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.menu_loadout = false;
+                self.settings.save();
+                return false;
+            }
+            let mut lo = self.settings.loadout;
+            let view = self.loadout_view(None, "Done", "What you bring to every match", true);
+            let act = ui_kit::loadout_screen(ctx, rect, &mut lo, &mut self.lo_ui, &view);
+            self.settings.loadout = lo;
+            if act != ui_kit::LoadoutAct::None {
+                self.menu_loadout = false;
+                self.settings.save();
+            }
+            return false;
+        }
+        if matches!(page, Page::Main | Page::Play) {
+            self.draw_profile(ctx, rect);
+        }
         let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("title")));
         // game icon beside the title
         if self.icon_tex.is_none() {
@@ -4680,8 +4795,8 @@ impl App {
             p.image(t.id(), Rect::from_min_size(ipos, Vec2::splat(72.0)), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
         }
         let tpos = Pos2::new(rect.left() + 128.0, rect.top() + 34.0);
-        p.text(tpos + Vec2::new(3.0, 3.0), Align2::LEFT_TOP, TITLE, FontId::proportional(64.0), Color32::from_black_alpha(200));
-        p.text(tpos, Align2::LEFT_TOP, TITLE, FontId::proportional(64.0), ACCENT);
+        p.text(tpos + Vec2::new(3.0, 3.0), Align2::LEFT_TOP, TITLE.to_uppercase(), ui_kit::display(76.0), Color32::from_black_alpha(200));
+        p.text(tpos, Align2::LEFT_TOP, TITLE.to_uppercase(), ui_kit::display(76.0), ACCENT);
         // a slow shine sweeping under the title
         let line_y = tpos.y + 72.0;
         let shine = (self.wall_t * 0.35).fract();
@@ -4706,21 +4821,19 @@ impl App {
             if page == Page::Settings {
                 self.settings.save();
             }
+            if page == Page::Play {
+                self.quick = None;
+            }
             next = Some(Page::Main);
         }
-        // recent servers, top right of the main page (when there's room)
-        if page == Page::Main && rect.width() >= 980.0 && !self.settings.recent.is_empty() {
-            let w = 330.0;
-            let mut join = None;
-            panel(ctx, "recent", Pos2::new(rect.right() - w - 88.0, rect.top() + 40.0), w, |ui| {
-                ui.label(egui::RichText::new("Recent servers").size(20.0).color(ACCENT));
-                join = self.recent_list_ui(ui);
-            });
-            if let Some(a) = join {
-                action = Some(Box::new(move |app: &mut App| app.join_server(&a)));
-            }
-        }
-        let width = if page == Page::Settings { 600.0 } else { 380.0 };
+        let width = match page {
+            Page::Settings => 600.0,
+            Page::Play => 520.0,
+            _ => 380.0,
+        };
+        if page == Page::Main {
+            self.main_page(ctx, rect, &mut next, &mut quit);
+        } else {
         panel(ctx, "menu", pos, width, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
             if let Some(m) = &msg {
@@ -4728,54 +4841,76 @@ impl App {
                 ui.add_space(4.0);
             }
             match page {
-                Page::Main => {
-                    ui.horizontal(|ui| {
-                        ui.label("Your name");
-                        ui.add(egui::TextEdit::singleline(&mut self.settings.name).char_limit(16).desired_width(220.0));
-                    });
-                    ui.add_space(6.0);
-                    if Self::big_button(ui, "Practice vs Bots") {
-                        next = Some(Page::Practice);
+                Page::Main => {}
+                Page::Play => {
+                    ui.heading("Play");
+                    let steam = self.steam.is_some();
+                    let gauntlet_desc = format!("Solo: survive waves of bots  ·  best {}", self.settings.gauntlet_best);
+                    let modes: [(&str, &str, bool); 6] = [
+                        ("Quick Play", if steam { "Join an open online game, or open one" } else { "Straight into a match against bots" }, true),
+                        ("Host Lobby", "Open a lobby friends can join", true),
+                        ("Find Games", if steam { "Browse open lobbies on Steam" } else { "Needs Steam running" }, steam),
+                        ("Practice vs Bots", "Pick the mode, map and bots", true),
+                        ("Gauntlet", &gauntlet_desc, true),
+                        ("Training", "Learn every move on practice dummies", true),
+                    ];
+                    let cw = ((ui.available_width() - 10.0) / 2.0).floor();
+                    let mut picked = None;
+                    for (row, pair) in modes.chunks(2).enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            for (k, (title, desc, on)) in pair.iter().enumerate() {
+                                if ui_kit::mode_card(ui, cw, 82.0, title, desc, *on).clicked() && *on {
+                                    picked = Some(row * 2 + k);
+                                }
+                            }
+                        });
                     }
-                    if Self::big_button(ui, "Training") {
-                        action = Some(Box::new(|app: &mut App| {
-                            let name = clean_name(&app.settings.name, 0);
-                            app.start_game(Game::training(&name), None);
-                        }));
+                    if self.quick.is_some() {
+                        ui.colored_label(ACCENT, "Looking for an open game…");
                     }
-                    if Self::big_button(ui, "Host a Lobby") {
-                        next = Some(Page::Host);
+                    if picked.is_some() {
+                        UI_SOUND.with(|u| u.set(Some(Sfx::UiConfirm)));
                     }
-                    if Self::big_button(ui, "Join a Friend") {
-                        next = Some(Page::Join);
+                    match picked {
+                        Some(0) => action = Some(Box::new(|app: &mut App| app.start_quick_play())),
+                        Some(1) => next = Some(Page::Host),
+                        Some(2) => {
+                            self.browse_asked = false;
+                            next = Some(Page::Browse);
+                        }
+                        Some(3) => next = Some(Page::Practice),
+                        Some(4) => {
+                            action = Some(Box::new(|app: &mut App| {
+                                let name = clean_name(&app.settings.name, 0);
+                                let mut g = Game::gauntlet(&name, app.settings.gauntlet_best);
+                                g.set_map(MapId::from_u8(app.settings.map));
+                                app.settings.save();
+                                app.start_game(g, None);
+                            }))
+                        }
+                        Some(5) => {
+                            action = Some(Box::new(|app: &mut App| {
+                                let name = clean_name(&app.settings.name, 0);
+                                app.start_game(Game::training(&name), None);
+                            }))
+                        }
+                        _ => {}
                     }
-                    if self.steam.is_some() && Self::big_button(ui, "Find Games (Steam)") {
-                        self.browse_asked = false;
-                        next = Some(Page::Browse);
+                    if Self::big_button(ui, "Back") {
+                        self.quick = None;
+                        next = Some(Page::Main);
                     }
-                    if Self::big_button(ui, &format!("Stats  ·  level {}", self.career.level())) {
-                        next = Some(Page::Stats);
-                    }
-                    if Self::big_button(ui, "How to Play") {
-                        next = Some(Page::HowTo);
-                    }
-                    if Self::big_button(ui, "Settings") {
-                        next = Some(Page::Settings);
-                    }
-                    if Self::big_button(ui, "Quit") {
-                        quit = true;
-                    }
-                }
-                Page::Stats => {
+                }                Page::Stats => {
                     let cr = self.career.clone();
                     ui.heading(format!("Level {}", cr.level()));
                     ui.add(egui::ProgressBar::new(cr.level_progress()).text(format!("{} XP  ·  {} to the next level", cr.xp, career::XP_PER_LEVEL - cr.xp % career::XP_PER_LEVEL)));
                     ui.add_space(6.0);
-                    ui.colored_label(ACCENT, "Combat");
+                    ui_kit::section(ui, "Combat");
                     let kd = if cr.deaths == 0 { cr.kills as f32 } else { cr.kills as f32 / cr.deaths as f32 };
                     ui.label(format!("Kills {}  ·  Deaths {}  ·  K/D {:.2}  ·  Headshots {}  ·  Matches {}  ·  Gauntlet waves {}", cr.kills, cr.deaths, kd, cr.headshots, cr.matches, cr.waves));
                     ui.add_space(6.0);
-                    ui.colored_label(ACCENT, "Finishers");
+                    ui_kit::section(ui, "Finishers");
                     let share = if cr.kills > 0 { cr.finishers as f32 * 100.0 / cr.kills as f32 } else { 0.0 };
                     ui.label(format!("Executions {}  ({share:.0}% of your kills)", cr.finishers));
                     if let Some(k) = cr.favourite_finisher() {
@@ -4807,15 +4942,6 @@ impl App {
                         }
                     });
                     ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
-                    if Self::big_button(ui, &format!("Gauntlet (solo waves)  ·  best {}", self.settings.gauntlet_best)) {
-                        action = Some(Box::new(|app: &mut App| {
-                            let name = clean_name(&app.settings.name, 0);
-                            let mut g = Game::gauntlet(&name, app.settings.gauntlet_best);
-                            g.set_map(MapId::from_u8(app.settings.map));
-                            app.settings.save();
-                            app.start_game(g, None);
-                        }));
-                    }
                     if Self::big_button(ui, "Fight!") {
                         action = Some(Box::new(|app: &mut App| {
                             let lvl = BOT_LEVELS[app.settings.bot_level].1;
@@ -4921,7 +5047,7 @@ impl App {
                         }));
                     }
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Recent servers").size(18.0).color(ACCENT));
+                    ui_kit::section(ui, "Recent servers");
                     egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
                         if let Some(a) = self.recent_list_ui(ui) {
                             action = Some(Box::new(move |app: &mut App| app.join_server(&a)));
@@ -4997,7 +5123,10 @@ impl App {
                 }
             }
         });
+        }
         if let Some(n) = next {
+            // the pages behind PLAY step back to it
+            let n = if n == Page::Main && matches!(page, Page::Practice | Page::Host | Page::Browse | Page::Join) { Page::Play } else { n };
             self.menu_msg = None;
             self.screen = Screen::Menu(n);
         }
@@ -5071,24 +5200,14 @@ impl App {
         }
 
         // loadout screen before each match
-        if phase == Phase::Loadout && !ready && self.disconnected.is_none() {
-            let pos = Pos2::new(rect.center().x - 320.0, rect.top() + 110.0);
-            let mut go = false;
+        if phase == Phase::Loadout && !ready && self.disconnected.is_none() && !self.paused {
             let mut lo = self.settings.loadout;
-            panel(ctx, "loadout", pos, 600.0, |ui| {
-                ui.heading("Choose your loadout");
-                ui.label(format!("The match starts when everyone is ready ({:.0}s left)", timer.max(0.0)));
-                ui.add_space(6.0);
-                loadout_picker(ui, &mut lo);
-                ui.add_space(6.0);
-                if App::big_button(ui, "Ready!") {
-                    go = true;
-                }
-            });
+            let view = self.loadout_view(Some(timer), "Ready", "The match starts when everyone is ready", false);
+            let act = ui_kit::loadout_screen(ctx, rect, &mut lo, &mut self.lo_ui, &view);
             if lo != self.settings.loadout {
                 self.settings.loadout = lo;
             }
-            if go {
+            if act == ui_kit::LoadoutAct::Ready {
                 self.ready_request = Some(self.settings.loadout);
                 self.settings.save();
             }
@@ -5169,6 +5288,23 @@ impl App {
             }
             return leave;
         }
+        if self.paused && self.loadout_edit {
+            let mut lo = self.settings.loadout;
+            let (action, sub) = if matches!(phase, Phase::Fight | Phase::MatchOver) { ("Use on respawn", "Your new loadout takes over when you next respawn") } else { ("Use loadout", "Pick what you bring") };
+            let view = self.loadout_view(None, action, sub, true);
+            let act = ui_kit::loadout_screen(ctx, rect, &mut lo, &mut self.lo_ui, &view);
+            self.settings.loadout = lo;
+            match act {
+                ui_kit::LoadoutAct::Ready => {
+                    self.ready_request = Some(lo);
+                    self.settings.save();
+                    self.loadout_edit = false;
+                }
+                ui_kit::LoadoutAct::Back => self.loadout_edit = false,
+                ui_kit::LoadoutAct::None => {}
+            }
+            return leave;
+        }
         if self.paused && self.pause_settings {
             let mut back = false;
             panel(ctx, "pause-settings", center, 600.0, |ui| {
@@ -5193,7 +5329,7 @@ impl App {
                     ui.label("The match keeps going while this menu is open!");
                 }
                 if let Some(st) = self.steam.as_ref().filter(|s| s.lobby.is_some()) {
-                    if ui.button("Invite Steam friends").clicked() {
+                    if App::big_button(ui, "Invite Steam friends") {
                         st.invite_friends();
                     }
                 }
@@ -5226,17 +5362,12 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("effects volume"));
                 ui.add(egui::Slider::new(&mut self.settings.music_volume, 0.0..=1.0).text("music volume"));
                 self.music_ui(ui);
-                if ui.button("All settings (controls, graphics, crosshair)…").clicked() {
+                if App::big_button(ui, "Change loadout") {
+                    self.loadout_edit = true;
+                }
+                if App::big_button(ui, "All settings") {
                     self.pause_settings = true;
                 }
-                ui.collapsing("Loadout", |ui| {
-                    loadout_picker(ui, &mut self.settings.loadout);
-                    let when = if matches!(phase, Phase::Fight | Phase::MatchOver) { "Use it from my next respawn" } else { "Use this loadout" };
-                    if ui.button(when).clicked() {
-                        self.ready_request = Some(self.settings.loadout);
-                        self.settings.save();
-                    }
-                });
                 if App::big_button(ui, "Resume") {
                     resume = true;
                 }
@@ -5248,6 +5379,8 @@ impl App {
                 self.paused = false;
                 self.settings.save();
             }
+        } else {
+            self.loadout_edit = false;
         }
         leave
     }
@@ -5264,6 +5397,451 @@ impl App {
     }
 }
 
+/// The News / Patch notes text: news.txt in the save folder or beside the game (or the
+/// project's assets folder while developing), else the copy built into the game.
+fn load_news() -> String {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(p) = platform::data_file("news.txt") {
+        paths.push(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            paths.push(d.join("news.txt"));
+            paths.push(d.join("../../assets/news.txt"));
+        }
+    }
+    for p in paths {
+        if let Ok(t) = std::fs::read_to_string(&p) {
+            if !t.trim().is_empty() {
+                return t;
+            }
+        }
+    }
+    include_str!("../assets/news.txt").to_string()
+}
+
+/// A good place to show off a fighter in the menu: open ground with room for the camera to
+/// arc around (±52°) without meeting a wall, and a deep view behind the fighter. Returns where
+/// to stand and the direction (as a yaw) the camera arc is centred on.
+fn showcase_spot(w: &world::World) -> (V3, f32) {
+    use std::f32::consts::TAU;
+    const N: usize = 48;
+    let r = 4.6;
+    let mut cands: Vec<V3> = w.spawn_points.iter().map(|(p, _)| *p).collect();
+    let h = w.half * 0.85;
+    let mut x = -h;
+    while x <= h {
+        let mut z = -h;
+        while z <= h {
+            if let Some((t, _)) = w.raycast(v3(x, 30.0, z), v3(0.0, -1.0, 0.0), 40.0) {
+                let y = 30.0 - t;
+                if y.abs() < 0.6 {
+                    cands.push(v3(x, y, z));
+                }
+            }
+            z += 3.0;
+        }
+        x += 3.0;
+    }
+    let mut best = (f32::MIN, V3::ZERO, 0.0f32);
+    for p in cands {
+        let chest = p + v3(0.0, 1.3, 0.0);
+        let knee = p + v3(0.0, 0.45, 0.0);
+        let mut ok = true;
+        let mut clear = [false; N];
+        let mut depth = [0.0f32; N];
+        for k in 0..N {
+            let a = k as f32 / N as f32 * TAU;
+            let d = v3(a.sin(), 0.0, a.cos());
+            if w.raycast(knee, d, 0.7).is_some() {
+                ok = false;
+                break;
+            }
+            let up = (d * r + v3(0.0, 0.4, 0.0)).norm();
+            clear[k] = w.raycast(chest, up, r + 0.6).is_none() && w.raycast(knee, d, r).is_none();
+            depth[k] = w.raycast(chest, d, 40.0).map_or(40.0, |(t, _)| t);
+        }
+        if !ok {
+            continue;
+        }
+        let half = 7i32;
+        for c in 0..N {
+            let mut score = 0.0;
+            let mut fine = true;
+            for o in -half..=half {
+                let k = (c as i32 + o).rem_euclid(N as i32) as usize;
+                if !clear[k] {
+                    fine = false;
+                    break;
+                }
+                // the view past the fighter: straight behind them and a little to each side
+                let back = (k + N / 2) % N;
+                score += depth[back].min(30.0) + 0.5 * depth[(back + 3) % N].min(30.0) + 0.5 * depth[(back + N - 3) % N].min(30.0);
+            }
+            if !fine {
+                continue;
+            }
+            score -= p.flat().len() * 0.5;
+            if score > best.0 {
+                best = (score, p, c as f32 / N as f32 * TAU);
+            }
+        }
+    }
+    if best.0 == f32::MIN {
+        let p = w.spawn_points.first().map_or(V3::ZERO, |s| s.0);
+        return (p, 0.0);
+    }
+    (best.1, best.2)
+}
+
+impl App {
+    /// The menu's showcase: your fighter alone on the chosen map, at its best spot.
+    fn rebuild_showcase(&mut self) {
+        let map = MapId::from_u8(self.settings.map.min(MapId::ALL.len() as u8 - 1));
+        let mut g = Game::new(Kind::Demo, 0, Mode::Ffa, 15);
+        g.set_map(map);
+        g.my_loadout = self.settings.loadout;
+        g.add_player(0, &clean_name(&self.settings.name, 0), true, None, 0);
+        let (pos, yaw) = showcase_spot(&g.world);
+        g.f[0].respawn_at(pos, yaw);
+        g.f[0].spawn_prot = 0.0;
+        g.f[0].loadout = self.settings.loadout;
+        g.f[0].equip();
+        g.showcase = Some(0);
+        g.tune = self.tune;
+        self.demo = g;
+        self.show_spot = (pos, yaw);
+        // a live fight behind them (fewer bots on the Deck), on open floor the camera sees just
+        // left of the fighter, 10-18 m off
+        let cam = self.menu_camera(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0))).0;
+        let axis = (pos - cam.pos).flat().norm();
+        let mut best: Option<(f32, V3)> = None;
+        for k in -8..=8 {
+            let a = k as f32 * 0.07;
+            let d = v3(axis.x * a.cos() - axis.z * a.sin(), 0.0, axis.x * a.sin() + axis.z * a.cos());
+            for dist in [14.0, 11.0, 17.0, 20.0] {
+                let p = cam.pos.flat() + d * dist;
+                let Some((t, _)) = self.demo.world.raycast(p + v3(0.0, 20.0, 0.0), v3(0.0, -1.0, 0.0), 30.0) else { continue };
+                let floor = p + v3(0.0, 20.0 - t, 0.0);
+                if floor.y.abs() > 0.6 || !self.demo.world.line_clear(cam.pos, floor + v3(0.0, 1.0, 0.0)) {
+                    continue;
+                }
+                let Some(sp) = cam.project(floor + v3(0.0, 1.0, 0.0)) else { continue };
+                let x = sp.x / 1280.0;
+                if !(0.12..=0.5).contains(&x) {
+                    continue;
+                }
+                let score = (x - 0.34).abs() + (dist - 14.0).abs() * 0.02;
+                if best.map_or(true, |(s, _)| score < s) {
+                    best = Some((score, floor));
+                }
+            }
+        }
+        self.demo_stage = best.map_or(pos - axis * 12.0, |(_, p)| p);
+        self.demo_alive.clear();
+        for s in 1..=self.demo_bots() {
+            self.demo.add_player(s, BOT_NAMES[s % BOT_NAMES.len()], true, Some(0.75), 0);
+            self.place_on_stage(s);
+            self.demo.f[s].spawn_prot = 0.0;
+        }
+    }
+
+    /// Put a background bot somewhere on the fight's stage.
+    fn place_on_stage(&mut self, s: usize) {
+        let k = s as f32 * 2.1 + self.demo_t * 1.7;
+        let mut p = self.demo_stage + v3(k.sin() * 3.0, 0.0, k.cos() * 3.0);
+        if let Some((t, _)) = self.demo.world.raycast(p + v3(0.0, 20.0, 0.0), v3(0.0, -1.0, 0.0), 30.0) {
+            p.y = 20.0 - t;
+        }
+        if p.y.abs() > 0.6 {
+            p = self.demo_stage;
+        }
+        let to = (self.demo_stage - p).flat();
+        let yaw = if to.len() > 0.1 { to.x.atan2(to.z) } else { 0.0 };
+        self.demo.f[s].respawn_at(p, yaw);
+    }
+
+    /// How many bots fight behind the menu (fewer on the Steam Deck preset).
+    fn demo_bots(&self) -> usize {
+        if self.settings.quality == gpu::Quality::DECK { 2 } else { 3 }
+    }
+
+    /// The menu camera's place on its slow arc around the showcased fighter.
+    fn menu_cam_dir(&self) -> V3 {
+        let phi = self.show_spot.1 + 0.6 * (self.demo_t * std::f32::consts::TAU / 50.0).sin();
+        v3(phi.sin(), 0.0, phi.cos())
+    }
+
+    /// Keep the background fight behind the showcased fighter: out of the space between them and
+    /// the camera, and out of the narrow wedge their silhouette covers on screen.
+    fn keep_bots_back(&mut self) {
+        // someone who just came back to life comes back on the stage
+        self.demo_alive.resize(self.demo.f.len(), true);
+        for s in 1..self.demo.f.len() {
+            let alive = self.demo.f[s].present && self.demo.f[s].alive;
+            if alive && !self.demo_alive[s] {
+                let prot = self.demo.f[s].spawn_prot;
+                self.place_on_stage(s);
+                self.demo.f[s].spawn_prot = prot;
+            }
+            self.demo_alive[s] = alive;
+        }
+        let c = self.demo.f[0].pos;
+        let d0 = self.menu_cam_dir();
+        let cam = c + d0 * 4.4;
+        for s in 1..self.demo.f.len() {
+            let f = &self.demo.f[s];
+            if !f.present || !f.alive {
+                continue;
+            }
+            let p = f.pos;
+            let mut push = V3::ZERO;
+            // a capsule from just behind the fighter to past the camera
+            let (a, b) = (c - d0 * 3.0, cam + d0 * 2.5);
+            let ab = (b - a).flat();
+            let t = ((p - a).flat().dot(ab) / ab.dot(ab).max(1e-4)).clamp(0.0, 1.0);
+            let off = (p - (a + ab * t)).flat();
+            let r = 4.0;
+            if off.len() < r {
+                push = if off.len() > 0.01 { off.norm() * (r - off.len()) } else { v3(d0.z, 0.0, -d0.x) * r };
+            }
+            // the wedge behind them, as the camera looks
+            let axis = (c - cam).flat().norm();
+            let v = (p - cam).flat();
+            let along = v.dot(axis);
+            if along > 0.0 {
+                let side = v - axis * along;
+                let half = along * 0.22 + 0.5;
+                if side.len() < half {
+                    let dir = if side.len() > 0.01 { side.norm() } else { v3(axis.z, 0.0, -axis.x) };
+                    push = push + dir * (half - side.len());
+                }
+            }
+            if push.len() > 0.0 {
+                let step = push * 0.5;
+                let f = &mut self.demo.f[s];
+                f.pos = f.pos + step;
+                f.prev_pos = f.prev_pos + step;
+            }
+        }
+    }
+
+    /// The menu camera: a slow arc around your fighter, who stands on the right of the screen
+    /// (further right while the loadout screen is open). Also returns the focus distance.
+    fn menu_camera(&self, rect: Rect) -> (Cam, f32) {
+        let alpha = (self.acc / TICK).clamp(0.0, 1.0);
+        let f = &self.demo.f[0];
+        let base = f.prev_pos.lerp(f.pos, alpha);
+        let d = self.menu_cam_dir();
+        let chest = base + v3(0.0, 1.3, 0.0);
+        let out = (d * 4.2 + v3(0.0, 0.25, 0.0)).norm();
+        let mut dist = 4.2;
+        if let Some((hit, _)) = self.demo.world.raycast(chest, out, dist + 0.4) {
+            dist = (hit - 0.4).max(1.4);
+        }
+        let pos = chest + out * dist;
+        let look = base + v3(0.0, 0.95, 0.0);
+        let dd = (look - pos).norm();
+        let yaw0 = dd.x.atan2(dd.z);
+        let pitch0 = dd.y.clamp(-1.0, 1.0).asin();
+        let aspect = (rect.width() / rect.height().max(1.0)).max(0.5);
+        let tv = (36f32.to_radians() * 0.5).tan();
+        let th = tv * aspect;
+        let hfov = 2.0 * th.atan().to_degrees();
+        let yaw_off = ((self.menu_fx - 0.5) * 2.0 * th).atan();
+        let pitch_off = ((0.5 - 0.42) * 2.0 * tv).atan();
+        let focus = (look - pos).len();
+        for y in [yaw0 + yaw_off, yaw0 - yaw_off] {
+            let cam = Cam::new(pos, y, pitch0 - pitch_off, hfov, rect);
+            if cam.project(look).is_some_and(|sp| sp.x > rect.center().x) {
+                return (cam, focus);
+            }
+        }
+        (Cam::new(pos, yaw0, pitch0, hfov, rect), focus)
+    }
+
+    /// The main page: one big PLAY, smaller buttons under it, the news on the right.
+    fn main_page(&mut self, ctx: &egui::Context, rect: Rect, next: &mut Option<Page>, quit: &mut bool) {
+        let x0 = rect.left() + 48.0;
+        let w = (rect.width() * 0.34).clamp(280.0, 380.0);
+        let msg = self.menu_msg.clone();
+        let pad = self.pad_active;
+        egui::Area::new(egui::Id::unique("main-menu")).fixed_pos(Pos2::new(x0, rect.top() + 156.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            ui.set_width(w);
+            ui.spacing_mut().item_spacing.y = 8.0;
+            if let Some(m) = &msg {
+                ui.colored_label(Color32::from_rgb(255, 180, 120), m);
+            }
+            let play = ui_kit::play_button(ui, "PLAY", "Quick Play · lobbies · bots · Gauntlet · Training", 92.0);
+            if pad && ui.ctx().memory(|m| m.focused().is_none()) {
+                play.request_focus();
+            }
+            if play.clicked() {
+                UI_SOUND.with(|u| u.set(Some(Sfx::UiConfirm)));
+                *next = Some(Page::Play);
+            }
+            ui.add_space(10.0);
+            if Self::big_button_h(ui, "Loadout", 42.0) {
+                self.menu_loadout = true;
+            }
+            if Self::big_button_h(ui, "Stats", 42.0) {
+                *next = Some(Page::Stats);
+            }
+            if Self::big_button_h(ui, "How to Play", 42.0) {
+                *next = Some(Page::HowTo);
+            }
+            if Self::big_button_h(ui, "Settings", 42.0) {
+                *next = Some(Page::Settings);
+            }
+            if Self::big_button_h(ui, "Quit", 42.0) {
+                *quit = true;
+            }
+        });
+        self.news_panel(ctx, rect);
+    }
+
+    /// Your name, level and XP under the menu fighter.
+    fn draw_profile(&self, ctx: &egui::Context, rect: Rect) {
+        let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("profile")));
+        let cx = rect.left() + rect.width() * self.menu_fx;
+        let pw = (rect.width() * 0.3).clamp(240.0, 340.0);
+        let top = rect.top() + rect.height() * 0.80;
+        let mut r = Rect::from_min_size(Pos2::new(cx - pw * 0.5 - 18.0, top - 6.0), Vec2::new(pw + 36.0, 92.0));
+        if r.right() > rect.right() - 10.0 {
+            r = r.translate(Vec2::new(rect.right() - 10.0 - r.right(), 0.0));
+        }
+        if r.bottom() > rect.bottom() - 26.0 {
+            r = r.translate(Vec2::new(0.0, rect.bottom() - 26.0 - r.bottom()));
+        }
+        p.rect_filled(r, 6.0, Color32::from_rgba_unmultiplied(10, 9, 18, 175));
+        ui_kit::edge_marks(&p, r, 1.0, false);
+        let name = self.settings.name.trim().to_uppercase();
+        let name = if name.is_empty() { "PLAYER".to_string() } else { name };
+        let nf = ui_kit::fitted(&p, &name, ui_kit::display(40.0), r.width() - 36.0);
+        ui_kit::label(&p, Pos2::new(r.center().x, r.top() + 4.0), Align2::CENTER_TOP, &name, nf, Color32::WHITE);
+        let lvl = self.career.level();
+        let into = self.career.xp % career::XP_PER_LEVEL;
+        let (x0, x1) = (r.left() + 20.0, r.right() - 18.0);
+        let y = r.top() + 58.0;
+        ui_kit::label(&p, Pos2::new(x0, y), Align2::LEFT_CENTER, &format!("LEVEL {lvl}"), ui_kit::display(21.0), ACCENT);
+        p.text(Pos2::new(x1, y + 1.0), Align2::RIGHT_CENTER, format!("{into} / {} XP", career::XP_PER_LEVEL), ui_kit::body(12.5), Color32::from_gray(200));
+        let bar = Rect::from_min_max(Pos2::new(x0, y + 13.0), Pos2::new(x1, y + 21.0));
+        p.rect_filled(bar, 3.0, Color32::from_white_alpha(30));
+        let mut fill = bar;
+        fill.set_width(bar.width() * self.career.level_progress().clamp(0.0, 1.0));
+        if fill.width() > 0.5 {
+            p.rect_filled(fill, 3.0, ACCENT);
+        }
+    }
+
+    /// The News / Patch notes panel, top right (when there's room beside the fighter).
+    fn news_panel(&self, ctx: &egui::Context, rect: Rect) {
+        let fighter_right = rect.left() + rect.width() * (self.menu_fx + 0.12);
+        let nw = (rect.right() - 20.0 - fighter_right).min(300.0);
+        if nw < 190.0 || self.news.trim().is_empty() {
+            return;
+        }
+        let max_h = (rect.height() * 0.42).min(300.0);
+        egui::Area::new(egui::Id::unique("news")).fixed_pos(Pos2::new(rect.right() - 20.0 - nw, rect.top() + 24.0)).order(egui::Order::Middle).show(ctx, |ui| {
+            ui_kit::panel_frame(ui, |ui| {
+                ui.set_width(nw - 50.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("NEWS").font(ui_kit::display(22.0)).color(ACCENT));
+                    ui.label(egui::RichText::new("patch notes").size(12.0).color(Color32::from_gray(160)));
+                });
+                egui::ScrollArea::vertical().id_salt("news-scroll").max_height(max_h).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    for line in self.news.lines() {
+                        let l = line.trim();
+                        if l.is_empty() {
+                            ui.add_space(3.0);
+                        } else if let Some(h) = l.strip_prefix('#') {
+                            ui.add_space(3.0);
+                            ui.label(egui::RichText::new(h.trim().to_uppercase()).font(ui_kit::display(17.0)).color(Color32::WHITE));
+                        } else if let Some(b) = l.strip_prefix('-') {
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append("•  ", 0.0, egui::TextFormat { font_id: ui_kit::body(13.0), color: ACCENT, ..Default::default() });
+                            job.append(b.trim(), 0.0, egui::TextFormat { font_id: ui_kit::body(13.0), color: Color32::from_gray(210), ..Default::default() });
+                            job.wrap.max_width = ui.available_width();
+                            ui.label(job);
+                        } else {
+                            ui.label(egui::RichText::new(l).size(13.0).color(Color32::from_gray(190)));
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    fn sync_steam_name(&mut self) {
+        if !self.settings.steam_name {
+            return;
+        }
+        if let Some(st) = &self.steam {
+            let n: String = st.name.chars().take(16).collect();
+            if !n.trim().is_empty() && self.settings.name != n {
+                self.settings.name = n;
+            }
+        }
+    }
+
+    /// Quick Play: with Steam, join the open game with the best ping (or open a public lobby,
+    /// kept busy by bots, when there's none); without Steam, straight into a match vs bots.
+    fn start_quick_play(&mut self) {
+        if self.steam.is_some() {
+            self.quick = Some(0.0);
+            self.browse_asked = true;
+            if let Some(st) = self.steam.as_mut() {
+                st.refresh(None);
+            }
+            self.menu_msg = Some("Quick Play: looking for an open game…".into());
+        } else {
+            let lvl = BOT_LEVELS[self.settings.bot_level.min(BOT_LEVELS.len() - 1)].1;
+            let name = clean_name(&self.settings.name, 0);
+            let mut g = Game::offline(&name, 3, lvl, Mode::Ffa, 15);
+            g.set_map(MapId::from_u8(self.settings.map));
+            self.menu_msg = None;
+            self.start_game(g, None);
+        }
+    }
+
+    fn quick_play_tick(&mut self) {
+        let Some(t) = self.quick else { return };
+        let t = t + self.frame_dt;
+        self.quick = Some(t);
+        let Some(st) = self.steam.as_mut() else {
+            self.quick = None;
+            return;
+        };
+        if (st.refreshing && t < 8.0) || t < 0.6 {
+            return;
+        }
+        self.quick = None;
+        let best = st.rows.iter().filter(|r| r.players > 0 && r.players < r.max).min_by_key(|r| r.ping.unwrap_or(999)).map(|r| r.id);
+        if let Some(id) = best {
+            st.join_lobby(id);
+            self.menu_msg = Some("Quick Play: joining a game through Steam…".into());
+            return;
+        }
+        // nobody's playing: open a public lobby, kept busy by bots until people join
+        let (mode, use_steam, public) = (self.settings.mode, self.settings.use_steam, self.settings.steam_public);
+        self.settings.mode = 0;
+        self.settings.use_steam = true;
+        self.settings.steam_public = true;
+        let port: u16 = self.settings.port.trim().parse().unwrap_or(net::DEFAULT_PORT);
+        let res = self.start_hosting(port);
+        self.settings.mode = mode;
+        self.settings.use_steam = use_steam;
+        self.settings.steam_public = public;
+        match res {
+            Ok(()) => {
+                self.quick_host = true;
+                self.menu_msg = None;
+            }
+            Err(e) => self.menu_msg = Some(e),
+        }
+    }
+}
 #[cfg(test)]
 mod settings_tests {
     use super::*;

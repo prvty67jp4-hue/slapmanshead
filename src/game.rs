@@ -1560,6 +1560,9 @@ pub struct Game {
     pub history: Vec<VecDeque<(f32, V3)>>,
     /// The loadout you'll respawn with.
     pub my_loadout: Loadout,
+    /// The menu's showcased fighter: posed in front of the camera, outside the match (nobody
+    /// targets, hits or bumps into it).
+    pub showcase: Option<usize>,
     pub hitmarker: f32,
     /// Where recent hits on you came from (world point, time left).
     pub hurt_dirs: Vec<(V3, f32)>,
@@ -1887,6 +1890,7 @@ impl Game {
             chat: Vec::new(),
             history: (0..MAX_PLAYERS).map(|_| VecDeque::new()).collect(),
             my_loadout: Loadout::default(),
+            showcase: None,
             hitmarker: 0.0,
             hurt_dirs: Vec::new(),
             kill_t: 0.0,
@@ -2462,6 +2466,9 @@ impl Game {
     }
 
     pub fn is_enemy(&self, a: usize, b: usize) -> bool {
+        if self.showcase.is_some_and(|s| s == a || s == b) {
+            return false;
+        }
         if self.mt.mode == Mode::Gauntlet {
             // the waves are all against you, never each other
             return a != b && self.f[b].present && !self.f[b].spectate && ((a == self.local) != (b == self.local));
@@ -2716,6 +2723,8 @@ impl Game {
                 self.resolve_through(i);
             }
         }
+        // enemies are solid to each other; teammates walk through one another
+        self.separate_bodies();
 
         if self.train.is_some() {
             self.update_training(dt);
@@ -2978,6 +2987,56 @@ impl Game {
             return None;
         }
         Some((pos, target))
+    }
+
+    /// Does this fighter's body block enemies right now? (Not while dead, watching, cutting
+    /// through with a katana dash, doing or caught in a finisher.)
+    fn solid_body(&self, i: usize) -> bool {
+        let f = &self.f[i];
+        f.present && f.alive && !f.spectate && f.through_t <= 0.0 && f.fin == 0 && f.held_by.is_none()
+    }
+
+    /// Enemies can't run through each other: a fighter of ours overlapping an enemy's body is
+    /// pushed back out (half each when both are ours, all of it when the enemy is someone else's,
+    /// whose own computer does the same). Teammates pass through freely.
+    fn separate_bodies(&mut self) {
+        let n = self.f.len();
+        let reach = RADIUS * 2.0;
+        for i in 0..n {
+            if !self.f[i].owned || !self.solid_body(i) {
+                continue;
+            }
+            for j in 0..n {
+                if i == j || !self.solid_body(j) || !self.is_enemy(i, j) {
+                    continue;
+                }
+                let (a, b) = (self.f[i].pos, self.f[j].pos);
+                // bodies overlap only at about the same height (you can jump over someone)
+                if (a.y - b.y).abs() > HEIGHT * 0.8 {
+                    continue;
+                }
+                let d = (a - b).flat();
+                let dist = d.len();
+                if dist >= reach {
+                    continue;
+                }
+                let dir = if dist > 1e-4 { d * (1.0 / dist) } else { yaw_fwd(self.f[i].yaw + i as f32 * 2.1) * -1.0 };
+                let share = if self.f[j].owned { 0.5 } else { 1.0 };
+                let to = a + dir * ((reach - dist) * share);
+                // never pushed into a wall
+                let clear = [0.3f32, 1.2].iter().all(|h| self.world.line_clear(a + v3(0.0, *h, 0.0), to + v3(0.0, *h, 0.0) + dir * RADIUS));
+                if !clear {
+                    continue;
+                }
+                let f = &mut self.f[i];
+                f.pos = to;
+                // stop running into them (sliding along is fine)
+                let into = -f.vel.flat().dot(dir);
+                if into > 0.0 {
+                    f.vel = f.vel + dir * into;
+                }
+            }
+        }
     }
 
     /// Someone died (on this computer, or we were told). Feed line, and the score on the authority.
@@ -5231,7 +5290,7 @@ impl Game {
     /// `damage` that also drains the victim's guard meter by `guard` (a blocked hit).
     #[allow(clippy::too_many_arguments)]
     fn damage_g(&mut self, attacker: usize, victim: usize, amount: f32, knock: V3, stun: f32, head: bool, at: V3, w: u8, o: V3, dir: V3, guard: f32) {
-        if self.f[victim].spawn_prot > 0.0 {
+        if self.f[victim].spawn_prot > 0.0 || self.showcase == Some(victim) {
             return;
         }
         if attacker == self.local && victim != self.local && (w < 3 || w == KICK_TOOL) {
@@ -8056,5 +8115,43 @@ mod finisher_tests {
         let mut healthy = setup();
         healthy.f[1].hp = 90.0;
         assert!(healthy.validate_claim(0, 1, EXEC_TOOL, LETHAL, o, d, false).is_none(), "no executing a healthy player");
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    /// Two fighters 3 m apart run straight at each other for a second.
+    fn run_at_each_other(mode: Mode, same_team: bool) -> f32 {
+        let mut g = Game::offline("P", 1, 0.5, mode, 50);
+        g.world = crate::game::lag_comp_tests::flat_world();
+        g.bots[1] = None;
+        g.f[1].is_bot = true;
+        g.mt.phase = Phase::Fight;
+        g.f[1].team = if same_team { g.f[0].team } else { 1 - g.f[0].team };
+        for k in 0..2 {
+            g.f[k].spawn_prot = 0.0;
+            g.f[k].vel = V3::ZERO;
+            g.f[k].on_ground = true;
+        }
+        g.f[0].pos = v3(0.0, 0.0, -1.5);
+        g.f[0].yaw = 0.0;
+        g.f[1].pos = v3(0.0, 0.0, 1.5);
+        g.f[1].yaw = std::f32::consts::PI;
+        for _ in 0..(1.0 / TICK) as usize {
+            // both push forward: the bot through its own input, us through ours
+            g.f[1].yaw = std::f32::consts::PI;
+            g.tick(&Input { fwd: 1.0, yaw: 0.0, ..Default::default() });
+        }
+        g.f[1].pos.z - g.f[0].pos.z
+    }
+
+    #[test]
+    fn enemies_block_each_other_and_teammates_pass_through() {
+        let gap = run_at_each_other(Mode::Ffa, false);
+        assert!(gap >= RADIUS * 2.0 - 0.05, "enemies stop body to body (gap {gap})");
+        let gap = run_at_each_other(Mode::Tdm, true);
+        assert!(gap < 0.0, "teammates walk through each other (gap {gap})");
     }
 }

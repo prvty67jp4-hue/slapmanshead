@@ -5,7 +5,7 @@ use crate::anim::{Rig, Trs, blend_into, blend_masked};
 use crate::game::{Capsule, FAN_THROW_TIME, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, SLASH_HEAVY, SLASH_SLAM, SLASH_THROUGH, THROW_TIME, Tuning, Weapon, finisher};
 use crate::math::{M3, V3, look_dir, v3, wrap_angle};
 use crate::render::{finisher_arm, finisher_body, sword_arm};
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat3, Mat4, Quat, Vec3};
 use std::collections::VecDeque;
 use std::f32::consts::PI;
 
@@ -172,6 +172,16 @@ pub struct Posed {
     pub head: V3,
     pub head_frame: M3,
     pub waist: V3,
+    /// Where a blade is anchored (its handle's middle; the fist sits near the guard). The hand
+    /// for guns and in the game's own poses.
+    pub grip: V3,
+    /// The right hand, from its bones: across the knuckles (little finger to index), and from
+    /// the wrist towards the knuckles; the forearm (elbow to wrist); how far the index
+    /// fingertip is from the wrist (small when the fist is closed).
+    pub knuckles: V3,
+    pub hand_axis: V3,
+    pub forearm: V3,
+    pub fingertip: f32,
     /// Hit shapes following the bones.
     pub hit: HitPose,
 }
@@ -191,6 +201,11 @@ struct Bones {
     lo_l: usize,
     hand_l: usize,
     clav_r: usize,
+    index1_r: usize,
+    index3_r: usize,
+    middle1_r: usize,
+    middle3_r: usize,
+    pinky1_r: usize,
     thigh_l: usize,
     calf_l: usize,
     foot_l: usize,
@@ -215,6 +230,11 @@ fn bones(rig: &Rig) -> Option<Bones> {
         lo_l: rig.node("lowerarm_l")?,
         hand_l: rig.node("hand_l")?,
         clav_r: rig.node("clavicle_r")?,
+        index1_r: rig.node("index_01_r")?,
+        index3_r: rig.node("index_03_r")?,
+        middle1_r: rig.node("middle_01_r")?,
+        middle3_r: rig.node("middle_03_r")?,
+        pinky1_r: rig.node("pinky_01_r")?,
         thigh_l: rig.node("thigh_l")?,
         calf_l: rig.node("calf_l")?,
         foot_l: rig.node("foot_l")?,
@@ -235,7 +255,7 @@ fn ours(rig: &Rig, axis: Vec3, angle: f32) -> Quat {
 /// `tn` sizes the whole character and sets how much it leans, squashes and plants its feet
 /// (the developer tuning panel changes them).
 pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning) -> Option<Posed> {
-    animate_with(rig, st, f, pos, now, tn, false)
+    animate_with(rig, st, f, pos, now, tn, false, false)
 }
 
 /// The picture: the same, but melee moves, blocks, staggers and knockbacks play real animation
@@ -243,10 +263,160 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
 /// does. The game keeps posing its hit shapes with `animate`, so timing, reach and hitboxes
 /// don't change.
 pub fn animate_show(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning) -> Option<Posed> {
-    animate_with(rig, st, f, pos, now, tn, true)
+    animate_with(rig, st, f, pos, now, tn, true, false)
 }
 
-fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning, show: bool) -> Option<Posed> {
+/// The picture, optionally in the fighter's hero pose (the menu and the loadout screen): each
+/// fighter's own stance, weight on one leg, breathing, the blade held their way.
+pub fn animate_show_as(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning, hero: bool) -> Option<Posed> {
+    animate_with(rig, st, f, pos, now, tn, true, hero)
+}
+
+/// How the blade leaves a closed fist: from the knuckle line (little finger to index) turned
+/// this far (radians) towards the hand's own axis, so it runs on from the forearm the way a
+/// sword held in a firm fist does, out on the thumb side.
+pub const GRIP_ANGLE: f32 = 0.87;
+
+/// The blade's direction and edge from the hand's knuckle line `a` and wrist-to-knuckles axis.
+pub fn grip_axes(a: V3, hand_axis: V3) -> (V3, V3) {
+    let a = a.norm();
+    let h = (hand_axis - a * hand_axis.dot(a)).norm();
+    let (c, s) = (GRIP_ANGLE.cos(), GRIP_ANGLE.sin());
+    ((a * c + h * s).norm(), (h * c - a * s).norm())
+}
+
+/// The right hand's frame in our space: knuckle line, wrist-to-knuckles axis (square to it).
+fn hand_frame(rig: &Rig, b: &Bones, pose: &[Trs]) -> (Vec3, Vec3, Vec3) {
+    let g = rig.globals(pose);
+    let p = |n: usize| g[n].w_axis.truncate() * rig.fix_sign;
+    let a = (p(b.index1_r) - p(b.pinky1_r)).normalize_or(Vec3::Z);
+    let h0 = (p(b.middle1_r) - p(b.hand_r)).normalize_or(Vec3::NEG_Y);
+    let h = (h0 - a * h0.dot(a)).normalize_or(h0);
+    (a, h, p(b.hand_r))
+}
+
+/// Turn the right hand (at the wrist) so the blade it holds points along `blade`, with its edge
+/// towards `edge` when given (otherwise the smallest turn).
+fn aim_hand(rig: &Rig, b: &Bones, pose: &mut [Trs], blade: Vec3, edge: Vec3) {
+    let (a, h, _) = hand_frame(rig, b, pose);
+    let (c, s) = (GRIP_ANGLE.cos(), GRIP_ANGLE.sin());
+    let cb = (a * c + h * s).normalize();
+    let ce = (h * c - a * s).normalize();
+    let blade = blade.normalize_or(cb);
+    let e = edge - blade * edge.dot(blade);
+    let r = if edge.length_squared() > 1e-6 && e.length() > 0.1 {
+        let e = e.normalize();
+        Mat3::from_cols(blade, e, blade.cross(e)) * Mat3::from_cols(cb, ce, cb.cross(ce)).transpose()
+    } else {
+        Mat3::from_quat(Quat::from_rotation_arc(cb, blade))
+    };
+    let sm = Mat3::from_diagonal(rig.fix_sign);
+    let q = Quat::from_mat3(&(sm * r * sm)).normalize();
+    let g = rig.globals(pose);
+    rig.rotate_global(pose, &g, b.hand_r, q);
+}
+
+/// Both hands closed into fists (the idle clip's fists): one round the handle, the other relaxed.
+fn close_fists(rig: &Rig, pose: &mut [Trs], scratch: &mut Vec<Trs>) {
+    rig.sample("Idle_Loop", 0.5, true, scratch);
+    for side in ["r", "l"] {
+        for finger in ["thumb", "index", "middle", "ring", "pinky"] {
+            for k in 1..=3 {
+                if let Some(n) = rig.node(&format!("{finger}_0{k}_{side}")) {
+                    pose[n].r = scratch[n].r;
+                }
+            }
+        }
+    }
+}
+
+/// A fighter's hero pose for the menu and the loadout screen, on top of the idle clip: their
+/// stance (weight on one leg, feet planted), a breath through the chest, and both arms placed
+/// their way. Returns the blade's direction and edge (our space).
+fn hero_pose(rig: &Rig, b: &Bones, pose: &mut Vec<Trs>, f: &Fighter, now: f32) -> Option<(Vec3, Vec3)> {
+    let s = rig.fix_sign;
+    let gpos = |pose: &Vec<Trs>, n: usize| rig.globals(pose)[n].w_axis.truncate() * s;
+    let body = f.loadout.body;
+    let great = f.weapon == Weapon::Greatsword;
+    // (pelvis shift, hip roll, left foot, right foot, chest turn, bounce)
+    let (shift, roll, foot_l, foot_r, twist, bounce) = match body {
+        // Ranger: calm, weight settled on the left leg
+        0 => (Vec3::new(-0.035, -0.012, 0.0), -0.05, Vec3::ZERO, Vec3::new(0.04, 0.0, 0.07), 0.06, 0.0),
+        // Huntress: poised, low, feet split front and back, chest turned
+        1 => (Vec3::new(0.01, -0.045, 0.0), 0.03, Vec3::new(-0.03, 0.0, 0.13), Vec3::new(0.05, 0.0, -0.09), 0.18, 0.003),
+        // Brawler: planted wide, chest out
+        2 => (Vec3::new(0.0, -0.02, 0.0), -0.02, Vec3::new(-0.08, 0.0, 0.02), Vec3::new(0.08, 0.0, -0.02), -0.06, 0.0),
+        // Striker: light on the feet, low and ready, bouncing a little
+        _ => (Vec3::new(0.01, -0.07, 0.02), 0.0, Vec3::new(-0.03, 0.0, 0.16), Vec3::new(0.04, 0.0, -0.1), 0.25, 0.012),
+    };
+    let breathe = (now * 1.7).sin();
+    let g = rig.globals(pose);
+    let rot = |n: usize| g[n].to_scale_rotation_translation().1;
+    let (rot_fl, rot_fr) = (rot(b.foot_l), rot(b.foot_r));
+    let fl = gpos(pose, b.foot_l) + foot_l;
+    let fr = gpos(pose, b.foot_r) + foot_r;
+    // the pelvis, in its parent's space
+    let pel = g[b.pelvis].w_axis.truncate();
+    let moved = pel + (shift + Vec3::Y * (bounce * (now * 3.2).sin().abs())) * s;
+    let parent = rig.parent_of(b.pelvis).map_or(Mat4::IDENTITY, |p| g[p]);
+    pose[b.pelvis].t = parent.inverse().transform_point3(moved);
+    let turn = |pose: &mut Vec<Trs>, n: usize, axis: Vec3, a: f32| {
+        let g = rig.globals(pose);
+        rig.rotate_global(pose, &g, n, ours(rig, axis, a));
+    };
+    turn(pose, b.pelvis, Vec3::Z, roll);
+    for bone in [b.spine2, b.spine3] {
+        turn(pose, bone, Vec3::Z, -roll * 0.6);
+        turn(pose, bone, Vec3::Y, twist * 0.5);
+    }
+    // chest up, and a slow breath
+    turn(pose, b.spine3, Vec3::X, -0.05 - 0.018 * breathe);
+    turn(pose, b.head, Vec3::X, 0.03 + 0.01 * breathe);
+    turn(pose, b.head, Vec3::Y, -twist * 0.6);
+    // feet back on the ground, knees forward, soles as they were
+    for (th, ca, ft, target, keep) in [(b.thigh_l, b.calf_l, b.foot_l, fl, rot_fl), (b.thigh_r, b.calf_r, b.foot_r, fr, rot_fr)] {
+        let knee = gpos(pose, ca);
+        rig.two_bone_ik(pose, th, ca, ft, target * s, (knee + Vec3::new(0.0, 0.0, 0.6)) * s);
+        let g = rig.globals(pose);
+        let cur = g[ft].to_scale_rotation_translation().1;
+        rig.rotate_global(pose, &g, ft, (keep * cur.inverse()).normalize());
+    }
+    // arms
+    let sh_r = gpos(pose, b.up_r);
+    let sh_l = gpos(pose, b.up_l);
+    let chest = (sh_r + sh_l) * 0.5;
+    let v = Vec3::new;
+    let shoulder_rest = great || body == 2;
+    let (hr, pr, blade, edge) = if shoulder_rest {
+        // the blade resting back over the right shoulder, the fist in front of it
+        let hr = sh_r + v(-0.06, -0.16, 0.2);
+        (hr, sh_r + v(0.15, -0.8, 0.35), (sh_r + v(0.05, 0.14, -0.12) - hr).normalize(), v(1.0, 0.0, 0.0))
+    } else {
+        match body {
+            // lowered at the side, point down and forward
+            0 => (sh_r + v(0.07, -0.47, 0.16), sh_r + v(0.35, -0.25, -0.4), v(0.22, -0.5, 0.84), v(0.0, -0.4, 1.0)),
+            // low in front, point up at the enemy
+            1 => (sh_r + v(-0.06, -0.4, 0.3), sh_r + v(0.35, -0.35, -0.2), v(-0.2, 0.32, 0.93), v(0.0, -1.0, 0.0)),
+            // ready: at the waist, angled up across the body
+            _ => (sh_r + v(-0.04, -0.34, 0.32), sh_r + v(0.3, -0.4, -0.2), v(-0.35, 0.5, 0.79), v(0.0, -1.0, 0.0)),
+        }
+    };
+    let (hl, pl) = match body {
+        // relaxed fist at the side
+        0 => (sh_l + v(-0.05, -0.5, 0.05), sh_l + v(-0.3, -0.3, -0.4)),
+        // a loose fist low in front of the hip
+        1 => (sh_l + v(0.06, -0.45, 0.16), sh_l + v(-0.35, -0.3, -0.3)),
+        // fist on the hip, elbow out
+        2 => (sh_l + v(-0.1, -0.42, -0.03), sh_l + v(-0.6, -0.2, -0.1)),
+        // a guard: left fist up in front of the chest
+        _ => (chest + v(-0.06, -0.1, 0.3), sh_l + v(-0.3, -0.5, 0.0)),
+    };
+    rig.two_bone_ik(pose, b.up_r, b.lo_r, b.hand_r, hr * s, pr * s);
+    rig.two_bone_ik(pose, b.up_l, b.lo_l, b.hand_l, hl * s, pl * s);
+    Some((blade, edge))
+}
+
+fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning, show: bool, hero: bool) -> Option<Posed> {
     let b = bones(rig)?;
     let scale = tn.char_scale;
     let dt = (now - st.last_time).clamp(0.0, 0.1);
@@ -260,6 +430,8 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     let local_v = v3(f.vel.dot(right), 0.0, f.vel.dot(fwd));
     let dashing = f.dash_t > 0.0;
     let melee = f.weapon.is_melee();
+    // the hero pose: standing still with a blade, in the menu or on the loadout screen
+    let hero = hero && show && melee && f.alive && f.on_ground && f.stun_t <= 0.0 && speed < 0.6 && f.slash_t <= 0.0 && f.fin == 0 && !f.guard;
     let mut target_yaw = 0.0;
     let want: Play = if !f.alive {
         Play::new("Death01", 1.0, false)
@@ -290,6 +462,8 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
         let sprint = speed > RUN_SPEED * 1.15;
         let rate = if sprint { (speed / 8.0).clamp(0.8, 1.6) } else { (speed / 4.6).clamp(0.7, 1.8) };
         Play::new(if sprint { "Sprint_Loop" } else { "Jog_Fwd_Loop" }, if back { -rate } else { rate }, true)
+    } else if hero {
+        Play::new("Idle_Loop", 1.0, true)
     } else if melee {
         Play::new("Sword_Idle", 1.0, true)
     } else if matches!(f.weapon, Weapon::Revolver | Weapon::HandCannon) {
@@ -380,7 +554,7 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     // ---- melee clips (the picture only): swings, finishers, the heavy's wind-up, the block,
     // and each swing's follow-through and recovery after it
     let mut clip_arm = false;
-    if show && f.alive && f.stun_t <= 0.0 && melee {
+    if show && f.alive && f.stun_t <= 0.0 && melee && !hero {
         if let Some((mp, w, full)) = melee_layer(rig, st, f, dt) {
             if full && f.on_ground && speed < 2.5 {
                 blend_into(&mut pose, &mp, w);
@@ -559,6 +733,40 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
         }
     }
 
+    // ---- the picture's grip: fists closed, and the sword hand turned so the blade leaves the fist
+    // where the swing (or the stance) wants it; the greatsword's other hand joins on the handle
+    if show && melee && f.alive {
+        let hero_blade = if hero { hero_pose(rig, &b, &mut pose, f, now) } else { None };
+        close_fists(rig, &mut pose, &mut st.scratch2);
+        // in a clip-driven swing the clip's hand is the grip; otherwise aim the hand
+        let want = if clip_drives {
+            None
+        } else if let Some(hb) = hero_blade {
+            Some(hb)
+        } else if let Some(d) = weapon_dir {
+            Some((d, Vec3::ZERO))
+        } else if f.on_ground && speed < 2.5 && f.stun_t <= 0.0 {
+            // held ready: the arm low and forward, the point forward and a little out
+            let sh = gpos(&pose, b.up_r);
+            rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(sh + Vec3::new(0.06, -0.4, 0.3)), to_model(sh + Vec3::new(0.35, -0.3, -0.4)));
+            Some((Vec3::new(0.25, -0.38, 0.89), Vec3::new(0.0, -1.0, 0.3)))
+        } else {
+            // on the move: the clip's own hand
+            None
+        };
+        if let Some((blade, edge)) = want {
+            aim_hand(rig, &b, &mut pose, blade, edge);
+        }
+        let two_hands = f.weapon == Weapon::Greatsword && hero_blade.is_none() && !clip_drives && f.slash_t <= 0.0 && f.fin == 0 && !f.guard && f.on_ground && speed < 2.5 && f.stun_t <= 0.0;
+        if two_hands {
+            let (a, h, wrist) = hand_frame(rig, &b, &pose);
+            let (blade, _) = grip_axes(ov(a), ov(h));
+            let target = wrist + h * 0.07 - gv(blade) * 0.13;
+            let pole = gpos(&pose, b.up_l) + Vec3::new(-0.4, -0.4, -0.2);
+            rig.two_bone_ik(&mut pose, b.up_l, b.lo_l, b.hand_l, to_model(target), to_model(pole));
+        }
+    }
+
     // ---- kick: the right leg snaps forward and back
     if show && f.alive && f.kick_t > 0.0 {
         show_kick(rig, &b, &mut pose, 1.0 - (f.kick_t / KICK_TIME).clamp(0.0, 1.0));
@@ -627,13 +835,23 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     let hand = wp(b.hand_r);
     let elbow = wp(b.lo_r);
     let to_world_dir = |d: Vec3| ov(body_rot * d).norm();
-    let z = match weapon_dir {
-        Some(d) => to_world_dir(d),
-        None => (hand - elbow).norm(),
+    let knuckles = (wp(b.index1_r) - wp(b.pinky1_r)).norm();
+    let hand_axis = (wp(b.middle1_r) - hand).norm();
+    let fingertip = (wp(b.index3_r) - hand).len() / (scale.clamp(0.2, 4.0) * norm).max(0.01);
+    let (x, y, z, grip) = if show && melee && f.alive {
+        // the blade comes out of the closed fist; its handle's middle sits just below the fist
+        let (z, y) = grip_axes(knuckles, hand_axis);
+        let fist = hand * 0.35 + wp(b.middle1_r) * 0.35 + wp(b.middle3_r) * 0.3;
+        (y.cross(z).norm(), y, z, fist - z * (0.05 * scale.clamp(0.2, 4.0)))
+    } else {
+        let z = match weapon_dir {
+            Some(d) => to_world_dir(d),
+            None => (hand - elbow).norm(),
+        };
+        let up_hint = if z.y.abs() > 0.9 { yaw_fwd_of(f.yaw) } else { v3(0.0, 1.0, 0.0) };
+        let x = up_hint.cross(z).norm();
+        (x, z.cross(x).norm(), z, hand)
     };
-    let up_hint = if z.y.abs() > 0.9 { yaw_fwd_of(f.yaw) } else { v3(0.0, 1.0, 0.0) };
-    let x = up_hint.cross(z).norm();
-    let y = z.cross(x).norm();
     let head = wp(b.head);
     let neck = wp(b.neck);
     let hy = (head - neck).norm();
@@ -662,7 +880,7 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
             cap(wp(b.calf_r), wp(b.foot_r), 0.065, Part::LegR),
         ],
     };
-    Some(Posed { palette, hand, weapon: M3 { x, y, z }, head, head_frame: M3 { x: hx, y: hy, z: hz }, waist: wp(b.spine1), hit })
+    Some(Posed { palette, hand, weapon: M3 { x, y, z }, head, head_frame: M3 { x: hx, y: hy, z: hz }, waist: wp(b.spine1), hit, grip, knuckles, hand_axis, forearm: (hand - elbow).norm(), fingertip })
 }
 // ---------------------------------------------------------------------------------- melee clips
 
@@ -987,6 +1205,77 @@ fn yaw_fwd_of(yaw: f32) -> V3 {
 #[cfg(test)]
 mod pose_tests {
     use super::*;
+
+    /// The sword sits in a closed fist and points where the hand says, in every state the
+    /// picture shows: held ready in a match, each fighter's hero pose, guarding and mid-swing.
+    /// (Guards against the grip breaking again: blade through the wrist, open hands, a blade
+    /// across the forearm or into the floor.)
+    #[test]
+    fn sword_grip_follows_the_hand() {
+        let rig = Rig::load().unwrap();
+        for body in 0..crate::chars::COUNT as u8 {
+            for w in Weapon::MELEE {
+                for state in ["ready", "hero", "guard", "slash"] {
+                    let mut f = Fighter::new("t", 0, true);
+                    f.present = true;
+                    f.alive = true;
+                    f.on_ground = true;
+                    f.loadout.body = body;
+                    f.loadout.melee = w;
+                    f.cur = 0;
+                    f.weapon = w;
+                    let mut st = CharState::new();
+                    let mut p = None;
+                    for k in 0..40 {
+                        let mut g = f.clone();
+                        match state {
+                            "guard" => g.guard = true,
+                            "slash" => {
+                                g.slash_idx = 0;
+                                g.slash_t = w.slash_dur() * (1.0 - (k as f32 / 40.0) * 0.6);
+                            }
+                            _ => {}
+                        }
+                        p = animate_show_as(&rig, &mut st, &g, V3::ZERO, k as f32 * 0.016, &Tuning::default(), state == "hero");
+                    }
+                    let p = p.expect("posed");
+                    let what = format!("{} {:?} {state}", crate::chars::name(body), w);
+                    // the blade leaves the fist at the grip's angle to the hand bones
+                    let (blade, edge) = grip_axes(p.knuckles, p.hand_axis);
+                    assert!(p.weapon.z.dot(blade) > 0.999, "{what}: blade {:?} vs hand {:?}", p.weapon.z, blade);
+                    assert!(p.weapon.y.dot(edge) > 0.99, "{what}: the edge follows the knuckles");
+                    // never back through the wrist or square across the forearm (resting on the
+                    // shoulder, the blade lies back and up over it instead)
+                    let along = p.weapon.z.dot(p.forearm);
+                    let shoulder = state == "hero" && (w == Weapon::Greatsword || body == 2);
+                    if shoulder {
+                        assert!(p.weapon.z.y > 0.3 && p.weapon.z.dot(f.fwd()) < 0.0, "{what}: back over the shoulder: {:?}", p.weapon.z);
+                    } else {
+                        assert!(along > 0.2, "{what}: blade vs forearm {along:.2}");
+                    }
+                    // the fist is closed and the hilt sits in it
+                    assert!(p.fingertip < 0.135, "{what}: hand open ({:.3})", p.fingertip);
+                    let fist = p.grip + p.weapon.z * 0.05;
+                    assert!((fist - p.hand).len() < 0.14, "{what}: hilt {:.3} m from the wrist", (fist - p.hand).len());
+                    // and the point stays off the floor while standing
+                    if state != "slash" {
+                        let reach = match w {
+                            Weapon::Dagger => 0.56,
+                            Weapon::Greatsword => 1.72,
+                            _ => 1.28,
+                        };
+                        let tip = p.grip + p.weapon.z * reach;
+                        assert!(tip.y > 0.0, "{what}: the point goes into the floor ({:.2})", tip.y);
+                    }
+                    if state == "ready" {
+                        let want = v3(0.25, -0.38, 0.89).norm();
+                        assert!(p.weapon.z.dot(want) > 0.9, "{what}: held ready low and forward: {:?}", p.weapon.z);
+                    }
+                    println!("{what:32} along forearm {along:.2}  fingertip {:.3}  blade ({:.2},{:.2},{:.2})", p.fingertip, p.weapon.z.x, p.weapon.z.y, p.weapon.z.z);
+                }
+            }
+        }
+    }
     #[test]
     fn guns_point_forward() {
         let rig = Rig::load().unwrap();

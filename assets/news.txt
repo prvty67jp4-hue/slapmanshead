@@ -1,0 +1,13 @@
+# Main menu redesign (Nov 2026)
+- Your fighter now stands on the map behind the menu, framed by a slow camera
+- One big PLAY button opens every way to play: Quick Play, lobbies, bots, Gauntlet, Training
+- Your Steam name is used automatically (change it in Settings > Game)
+- Loadout: one gun grid, two slots. Click a slot, then a gun to fill it
+
+# Look and feel
+- New fonts, menus and HUD
+- Weapon cards with stats on the loadout screen
+- Full controller support in every menu
+
+# Tip
+- Edit this panel in the file news.txt (lines starting with # are headings, - are bullets)
