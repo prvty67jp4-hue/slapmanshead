@@ -8,6 +8,9 @@ pub enum Mat {
     Metal,
     Crate,
     Trim,
+    /// Collides, but isn't drawn: a prop shows it (a bridge railing, an archway's pillars, a
+    /// crane's mast).
+    Hidden,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -25,14 +28,18 @@ pub enum MapId {
     Courtyard = 1,
     /// 30 x 30 m, tight and vertical: narrow corridors, lots of cover, dash gaps.
     CloseQuarters = 2,
+    /// 60 x 60 m, 4v4 team map at dusk: two mirrored bases across a river, three lanes (a long
+    /// riverside quay, a stone bridge and plaza, covered workshops), three height levels.
+    Bridgeworks = 3,
 }
 
 impl MapId {
-    pub const ALL: [MapId; 3] = [MapId::Arena, MapId::Courtyard, MapId::CloseQuarters];
+    pub const ALL: [MapId; 4] = [MapId::Arena, MapId::Courtyard, MapId::CloseQuarters, MapId::Bridgeworks];
     pub fn from_u8(v: u8) -> MapId {
         match v {
             1 => MapId::Courtyard,
             2 => MapId::CloseQuarters,
+            3 => MapId::Bridgeworks,
             _ => MapId::Arena,
         }
     }
@@ -41,6 +48,7 @@ impl MapId {
             MapId::Arena => "Arena",
             MapId::Courtyard => "Open Courtyard",
             MapId::CloseQuarters => "Close Quarters",
+            MapId::Bridgeworks => "Varrow Bridgeworks",
         }
     }
     pub fn blurb(self) -> &'static str {
@@ -48,7 +56,20 @@ impl MapId {
             MapId::Arena => "a clear centre with a tower, three lanes from each spawn, wall-run corridors and balconies",
             MapId::Courtyard => "big and open: long sight lines around a central dais",
             MapId::CloseQuarters => "small and vertical: tight wall-run corridors, three levels, gaps to dash across",
+            MapId::Bridgeworks => "4v4 at dusk: two bases across a river, a sniper quay, a stone bridge plaza and covered workshops",
         }
+    }
+    /// The team map is for team modes only; the duel maps suit every mode.
+    pub fn fits(self, teams: bool) -> bool {
+        teams || self != MapId::Bridgeworks
+    }
+    /// What a mode starts on: the team map for team modes, the Arena otherwise.
+    pub fn default_for(teams: bool) -> MapId {
+        if teams { MapId::Bridgeworks } else { MapId::Arena }
+    }
+    /// The maps a mode can be played on.
+    pub fn for_mode(teams: bool) -> Vec<MapId> {
+        MapId::ALL.iter().copied().filter(|m| m.fits(teams)).collect()
     }
 }
 
@@ -68,9 +89,26 @@ pub enum PropKind {
     RockA,
     RockB,
     Plant,
+    // Varrow Bridgeworks' own pieces (made by tools/blender/build_props.py)
+    /// A bridge railing, 3 m long (stands on a hidden railing block).
+    Railing,
+    /// A stone archway 3.6 m wide (its pillars are hidden blocks).
+    Archway,
+    /// A dock crane: mast, jib, pulley and hook (on a stone plinth; its mast is a hidden block).
+    Crane,
+    /// Three strapped cargo crates.
+    CrateStack,
+    /// A lantern on a wall bracket (it lights the wall: see World::torches).
+    Lantern,
 }
 
 impl PropKind {
+    /// Pieces that are part of the structure (railings, archways, a crane): they stand on or
+    /// round the blocks that carry them, out in the open.
+    #[cfg(test)]
+    pub fn structural(self) -> bool {
+        matches!(self, PropKind::Railing | PropKind::Archway | PropKind::Crane)
+    }
     /// Rough footprint radius on the ground at scale 1 (0 for things hung on walls).
     #[cfg(test)]
     pub fn radius(self) -> f32 {
@@ -81,7 +119,9 @@ impl PropKind {
             PropKind::Rubble => 0.42,
             PropKind::RockA | PropKind::RockB => 1.8,
             PropKind::Plant => 0.5,
-            PropKind::BannerA | PropKind::BannerB | PropKind::Shield | PropKind::Torch => 0.0,
+            PropKind::CrateStack => 0.9,
+            PropKind::Railing | PropKind::Archway | PropKind::Crane => 0.5,
+            PropKind::BannerA | PropKind::BannerB | PropKind::Shield | PropKind::Torch | PropKind::Lantern => 0.0,
         }
     }
     #[cfg(test)]
@@ -125,6 +165,8 @@ pub struct World {
     pub map: MapId,
     /// Capture-the-flag bases (red, blue).
     pub flags: [V3; 2],
+    /// Water surfaces (flat boxes: the top is the surface): drawn only, nothing collides.
+    pub water: Vec<Aabb>,
 }
 
 fn bx(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, mat: Mat) -> Block {
@@ -150,9 +192,14 @@ fn mirrored_spawns(half: &[(f32, f32, f32)]) -> Vec<(V3, f32)> {
     s
 }
 
-/// Outer walls with battlements on top, pilasters along them and banners.
+/// Outer walls with battlements on top, pilasters along them and banners (and the floor).
 fn enclosure(v: &mut Vec<Block>, h: f32, wall_h: f32, banner_y: f32, banner_gap: f32) -> (Vec<Block>, Vec<(V3, V3, u8)>) {
     v.push(bx(-h, -1.0, -h, h, 0.0, h, Mat::Floor));
+    walls(v, h, wall_h, banner_y, banner_gap)
+}
+
+/// The outer walls only (a map that lays its own floor).
+fn walls(v: &mut Vec<Block>, h: f32, wall_h: f32, banner_y: f32, banner_gap: f32) -> (Vec<Block>, Vec<(V3, V3, u8)>) {
     v.push(bx(-h - 1.0, 0.0, -h - 1.0, h + 1.0, wall_h, -h, Mat::Wall));
     v.push(bx(-h - 1.0, 0.0, h, h + 1.0, wall_h, h + 1.0, Mat::Wall));
     v.push(bx(-h - 1.0, 0.0, -h, -h, wall_h, h, Mat::Wall));
@@ -250,6 +297,7 @@ impl World {
             MapId::Arena => World::arena(),
             MapId::Courtyard => World::courtyard(),
             MapId::CloseQuarters => World::close_quarters(),
+            MapId::Bridgeworks => World::bridgeworks(),
         }
     }
 
@@ -345,6 +393,7 @@ impl World {
             torches,
             map: MapId::Arena,
             flags: [v3(0.0, 0.0, -17.2), v3(0.0, 0.0, 17.2)],
+            water: Vec::new(),
         }
     }
 
@@ -449,6 +498,7 @@ impl World {
             torches,
             map: MapId::CloseQuarters,
             flags: [v3(0.0, 0.0, -13.8), v3(0.0, 0.0, 13.8)],
+            water: Vec::new(),
         }
     }
 
@@ -543,6 +593,274 @@ impl World {
             torches,
             map: MapId::Courtyard,
             flags: [v3(0.0, 0.0, -21.5), v3(0.0, 0.0, 21.5)],
+            water: Vec::new(),
+        }
+    }
+
+    /// Varrow Bridgeworks: a 60 x 60 m team map at dusk, mirrored across the river that runs
+    /// east-west through the middle (red's base in the south, z < 0; blue's in the north).
+    ///
+    /// - Each base: a roofed barracks to spawn in (two exits: a screened door to the yard and a
+    ///   door into the flag room), a flag room with its doors off the main line, ramparts along
+    ///   the front wall, and three gates (west, middle, east) onto the three lanes.
+    /// - West lane, the riverside quay: long and open (the sniper lane), across a wooden
+    ///   footbridge; a crane, a lock hut and crates for cover; a warehouse with a balcony.
+    /// - Middle: a wide stone bridge between two plazas, a monument in its middle breaking the
+    ///   line between the gates, low walls and crates (mid-range fights), a tower and a platform.
+    /// - East lane: covered workshops (corridors, a hall, a wall-run passage) and a covered bridge
+    ///   whose roof is broken in the middle: a 7 m gap only a dash crosses.
+    /// - Levels: the ground, 3.5 m (ramparts, balconies, the workshop roofs, the platform) and
+    ///   7 m (the warehouse roofs and the towers); and the riverbed below, wading deep, with steps
+    ///   out on each lane.
+    pub fn bridgeworks() -> World {
+        let h = 30.0;
+        let wall_h = 10.0;
+        let l2 = 3.5;
+        let l3 = 7.0;
+        let mut v = Vec::new();
+        let (deco, banners) = walls(&mut v, h, wall_h, 7.6, 12.0);
+        // mirrored across the river (z -> -z): blue's half written, red's made from it
+        let zm = |v: &mut Vec<Block>, b: Block| {
+            v.push(b);
+            v.push(Block { b: Aabb::new(v3(b.b.min.x, b.b.min.y, -b.b.max.z), v3(b.b.max.x, b.b.max.y, -b.b.min.z)), mat: b.mat });
+        };
+
+        // ---- the ground and the river: quays at 0, a stone bank wall, the bed 3 m down
+        zm(&mut v, bx(-h, -1.0, 4.6, h, 0.0, h, Mat::Floor));
+        zm(&mut v, bx(-h, -3.0, 4.0, h, 0.0, 4.6, Mat::Stone));
+        v.push(bx(-h, -4.0, -4.0, h, -3.0, 4.0, Mat::Floor));
+        // steps up out of the river on each lane (against the bank, 0.5 m each)
+        for (x0, dir) in [(-20.5f32, 1.0f32), (10.5, 1.0), (26.0, 1.0)] {
+            for k in 1..=6 {
+                let a = x0 + dir * 0.5 * (k - 1) as f32;
+                zm(&mut v, bx(a, -3.0, 2.6, a + dir * 0.5, -3.0 + 0.5 * k as f32, 4.0, Mat::Stone));
+            }
+        }
+
+        // ---- the three bridges
+        // west: a wooden footbridge with railings (the sniper lane crosses here)
+        v.push(bx(-26.0, -0.45, -4.0, -22.0, 0.0, 4.0, Mat::Trim));
+        v.push(bx(-26.0, 0.0, -4.0, -25.8, 1.0, 4.0, Mat::Hidden));
+        v.push(bx(-22.2, 0.0, -4.0, -22.0, 1.0, 4.0, Mat::Hidden));
+        // middle: the stone bridge, its railings, the monument at its middle
+        v.push(bx(-8.0, -0.8, -4.0, 8.0, 0.0, 4.0, Mat::Stone));
+        v.push(bx(-8.0, 0.0, -4.0, -7.8, 1.0, 4.0, Mat::Hidden));
+        v.push(bx(7.8, 0.0, -4.0, 8.0, 1.0, 4.0, Mat::Hidden));
+        v.push(bx(-1.5, 0.0, -1.5, 1.5, 2.6, 1.5, Mat::Stone));
+        // east: the covered bridge, walls on both sides, its roof broken over the middle
+        v.push(bx(19.0, -0.45, -4.0, 24.0, 0.0, 4.0, Mat::Trim));
+        v.push(bx(18.5, 0.0, -5.0, 19.0, l2, 5.0, Mat::Wall));
+        v.push(bx(24.0, 0.0, -5.0, 24.5, l2, 5.0, Mat::Wall));
+        zm(&mut v, bx(18.5, l2, 3.5, 24.5, l2 + 0.4, 5.0, Mat::Trim));
+        // a crate halfway across (cover in the corridor)
+        v.push(bx(19.4, 0.0, -0.6, 20.6, 1.2, 0.6, Mat::Crate));
+
+        // ---- west lane: the riverside quay
+        // the warehouse between the quay and the plaza (roof: level 3)
+        zm(&mut v, bx(-17.0, 0.0, 6.0, -12.0, l3, 13.0, Mat::Wall));
+        // its balcony over the quay (level 2), on two posts, stairs up from the base end
+        zm(&mut v, bx(-19.5, l2 - 0.3, 6.0, -17.0, l2, 13.0, Mat::Stone));
+        zm(&mut v, bx(-19.5, 0.0, 6.0, -19.0, l2 - 0.3, 6.5, Mat::Stone));
+        zm(&mut v, bx(-19.5, 0.0, 9.3, -19.0, l2 - 0.3, 9.8, Mat::Stone));
+        for k in 1..=7 {
+            let z0 = 13.0 + 0.5 * (7 - k) as f32;
+            zm(&mut v, bx(-19.5, 0.0, z0, -17.5, 0.5 * k as f32, z0 + 0.5, Mat::Stone));
+        }
+        // stone steps from the balcony up to the warehouse roof (level 3); a crate on the
+        // balcony's far end for cover
+        for k in 1..=7 {
+            let z1 = 13.0 - 0.5 * k as f32;
+            zm(&mut v, bx(-19.5, l2, z1 - 0.5, -17.0, l2 + 0.5 * k as f32, z1, Mat::Stone));
+        }
+        zm(&mut v, bx(-19.3, l2, 6.4, -18.1, l2 + 1.2, 7.6, Mat::Crate));
+        // the crane on its plinth (the mast is a hidden block: the prop draws it)
+        zm(&mut v, bx(-29.6, 0.0, 9.0, -27.6, 1.0, 11.0, Mat::Stone));
+        zm(&mut v, bx(-28.85, 1.0, 9.75, -28.35, 7.2, 10.25, Mat::Hidden));
+        // the lock-keeper's hut and crates (cover along the quay)
+        zm(&mut v, bx(-29.5, 0.0, 5.2, -27.0, 2.6, 7.4, Mat::Stone));
+        zm(&mut v, bx(-24.6, 0.0, 11.6, -23.4, 1.2, 12.8, Mat::Crate));
+        zm(&mut v, bx(-21.2, 0.0, 14.6, -20.0, 1.2, 15.8, Mat::Crate));
+
+        // ---- middle: the plazas
+        // the west tower at the bridge (level 3: reached from the warehouse roof)
+        zm(&mut v, bx(-11.0, 0.0, 4.6, -8.5, l3, 7.6, Mat::Stone));
+        // the east platform (level 2) with steps up from the plaza; the workshop roof is a step on
+        zm(&mut v, bx(9.0, 0.0, 4.6, 12.6, l2, 8.0, Mat::Stone));
+        for k in 1..=7 {
+            let a = 5.5 + 0.5 * (k - 1) as f32;
+            zm(&mut v, bx(a, 0.0, 6.0, a + 0.5, 0.5 * k as f32, 7.4, Mat::Stone));
+        }
+        // mid-range cover: low walls, crates, a pair of archways on the way to each gate
+        zm(&mut v, bx(-6.0, 0.0, 9.0, -2.5, 1.1, 9.6, Mat::Stone));
+        zm(&mut v, bx(2.5, 0.0, 11.6, 6.0, 1.1, 12.2, Mat::Stone));
+        zm(&mut v, bx(-10.6, 0.0, 12.0, -9.4, 1.2, 13.2, Mat::Crate));
+        zm(&mut v, bx(8.4, 0.0, 13.4, 9.6, 1.2, 14.6, Mat::Crate));
+        zm(&mut v, bx(-3.3, 0.0, 14.2, -2.7, 4.2, 14.8, Mat::Hidden));
+        zm(&mut v, bx(2.7, 0.0, 14.2, 3.3, 4.2, 14.8, Mat::Hidden));
+
+        // ---- east lane: the workshops (walls 3.5 m, a walkable roof over them)
+        // west wall onto the plaza, a door in it
+        zm(&mut v, bx(13.0, 0.0, 5.0, 13.6, l2, 9.5, Mat::Wall));
+        zm(&mut v, bx(13.0, 0.0, 12.0, 13.6, l2, 16.0, Mat::Wall));
+        // the river side, open where the covered bridge comes in
+        zm(&mut v, bx(13.6, 0.0, 5.0, 18.5, l2, 5.6, Mat::Wall));
+        zm(&mut v, bx(24.5, 0.0, 5.0, h, l2, 5.6, Mat::Wall));
+        // the corridor on from the bridge, into the hall
+        zm(&mut v, bx(18.5, 0.0, 5.6, 19.0, l2, 9.0, Mat::Wall));
+        zm(&mut v, bx(24.0, 0.0, 5.6, 24.5, l2, 9.0, Mat::Wall));
+        // a narrow passage along the outer wall (wall-runs), open into the hall
+        zm(&mut v, bx(27.0, 0.0, 5.6, 27.5, l2, 13.0, Mat::Wall));
+        // the hall's back wall, its door lined up with the base's east gate
+        zm(&mut v, bx(13.6, 0.0, 15.6, 24.0, l2, 16.0, Mat::Wall));
+        zm(&mut v, bx(28.0, 0.0, 15.6, h, l2, 16.0, Mat::Wall));
+        // the roof, with an opening over the stairs up to it
+        zm(&mut v, bx(13.0, l2, 5.0, h, l2 + 0.4, 13.6, Mat::Trim));
+        zm(&mut v, bx(18.0, l2, 13.6, h, l2 + 0.4, 16.0, Mat::Trim));
+        for k in 1..=7 {
+            let a = 14.0 + 0.5 * (k - 1) as f32;
+            zm(&mut v, bx(a, 0.0, 13.8, a + 0.5, 0.5 * k as f32, 15.6, Mat::Stone));
+        }
+        // the furnace (big cover in the hall) and crates
+        zm(&mut v, bx(20.0, 0.0, 11.0, 22.5, 1.6, 13.0, Mat::Metal));
+        zm(&mut v, bx(15.0, 0.0, 9.6, 16.2, 1.2, 10.8, Mat::Crate));
+        zm(&mut v, bx(25.0, 0.0, 10.2, 26.2, 1.2, 11.4, Mat::Crate));
+
+        // ---- the bases
+        // the front wall with three gates; its top is the rampart (level 2)
+        for (x0, x1) in [(-h, -25.0f32), (-21.0, -2.0), (2.0, 24.0), (28.0, h)] {
+            zm(&mut v, bx(x0, 0.0, 17.0, x1, l2, 19.0, Mat::Wall));
+        }
+        // steps up to the rampart, both sides of the middle gate
+        for (x0, dir) in [(-8.5f32, -1.0f32), (8.5, 1.0)] {
+            for k in 1..=7 {
+                let a = x0 + dir * 0.5 * (k - 1) as f32;
+                zm(&mut v, bx(a, 0.0, 19.0, a + dir * 0.5, 0.5 * k as f32, 20.5, Mat::Stone));
+            }
+        }
+        // the barracks (spawn): a front wall with a door, a screen inside it, a door into the
+        // flag room; roofed (level 2 above)
+        zm(&mut v, bx(-h, 0.0, 22.0, -20.0, l2, 22.5, Mat::Wall));
+        zm(&mut v, bx(-17.0, 0.0, 22.0, -5.0, l2, 22.5, Mat::Wall));
+        zm(&mut v, bx(-22.5, 0.0, 23.8, -13.5, 2.8, 24.3, Mat::Wall));
+        // and one inside the door from the flag room (walk round its north end)
+        zm(&mut v, bx(-8.0, 0.0, 24.8, -7.5, 2.8, h, Mat::Wall));
+        zm(&mut v, bx(-5.5, 0.0, 22.5, -5.0, l2, 26.0, Mat::Wall));
+        zm(&mut v, bx(-5.5, 0.0, 28.0, -5.0, l2, h, Mat::Wall));
+        // the flag room: its door to the yard off to one side, a side door to the east yard
+        zm(&mut v, bx(-5.0, 0.0, 22.0, 2.0, l2, 22.5, Mat::Wall));
+        zm(&mut v, bx(4.5, 0.0, 22.0, 5.5, l2, 22.5, Mat::Wall));
+        zm(&mut v, bx(5.0, 0.0, 22.5, 5.5, l2, 26.0, Mat::Wall));
+        zm(&mut v, bx(5.0, 0.0, 28.0, 5.5, l2, h, Mat::Wall));
+        zm(&mut v, bx(-h, l2, 22.0, 5.5, l2 + 0.4, h, Mat::Trim));
+        // the east yard: an armoury bench and crates
+        zm(&mut v, bx(12.0, 0.0, 26.0, 16.0, 1.0, 27.2, Mat::Trim));
+        zm(&mut v, bx(20.0, 0.0, 23.5, 21.2, 1.2, 24.7, Mat::Crate));
+
+        // ---- braziers: the monument, the tower tops, the east platform
+        let mut braziers = Vec::new();
+        let fire = |v: &mut Vec<Block>, b: &mut Vec<V3>, x: f32, y: f32, z: f32| {
+            v.push(bx(x - 0.25, y, z - 0.25, x + 0.25, y + 0.7, z + 0.25, Mat::Metal));
+            b.push(v3(x, y + 0.75, z));
+        };
+        fire(&mut v, &mut braziers, 0.0, 2.6, 0.0);
+        for s in [1.0f32, -1.0] {
+            fire(&mut v, &mut braziers, -9.75, l3, 6.1 * s);
+            fire(&mut v, &mut braziers, 12.0, l2, 7.4 * s);
+        }
+
+        // ---- set dressing
+        use PropKind::*;
+        let mut props: Vec<Prop> = banner_props(&banners, 0.36);
+        // a prop on blue's side and its mirror on red's (banners swap colour)
+        let pm = |p: &mut Vec<Prop>, kind: PropKind, x: f32, y: f32, z: f32, yaw: f32, scale: f32, team: u8| {
+            p.push(Prop { kind, pos: v3(x, y, z), yaw, scale, team });
+            let other = if team < 2 { 1 - team } else { team };
+            p.push(Prop { kind, pos: v3(x, y, -z), yaw: std::f32::consts::PI - yaw, scale, team: other });
+        };
+        let pi = std::f32::consts::PI;
+        let half_pi = std::f32::consts::FRAC_PI_2;
+        // railings along the bridges (blue's half of each, mirrored)
+        for (x, yaw) in [(-25.9f32, half_pi), (-22.1, -half_pi), (-7.9, half_pi), (7.9, -half_pi)] {
+            for z in [0.75f32, 2.75] {
+                pm(&mut props, Railing, x, 0.0, z, yaw, 1.0, 255);
+            }
+        }
+        // the archways on the way to the middle gates
+        pm(&mut props, Archway, 0.0, 0.0, 14.5, 0.0, 1.0, 255);
+        // the crane over the river
+        pm(&mut props, Crane, -28.6, 1.0, 10.0, pi, 1.0, 255);
+        // banners on the front walls, facing out (team colours)
+        for x in [-15.0f32, -7.0, 7.0, 15.0] {
+            pm(&mut props, if x < 0.0 { BannerA } else { BannerB }, x, 3.2, 16.99, pi, 1.0, 1);
+        }
+        // cargo, barrels and rubble along the walls
+        pm(&mut props, CrateStack, -14.5, 0.0, 5.1, pi, 1.0, 255);
+        pm(&mut props, CrateStack, 29.0, 0.0, 21.0, -half_pi, 1.0, 255);
+        pm(&mut props, Barrel, -12.5, 0.0, 15.6, 0.3, 1.0, 255);
+        pm(&mut props, Barrel, -13.3, 0.0, 15.7, 1.4, 1.0, 255);
+        pm(&mut props, Crate, 14.3, 0.0, 6.3, 0.2, 1.0, 255);
+        pm(&mut props, Barrel, 29.2, 0.0, 14.9, 0.0, 1.0, 255);
+        pm(&mut props, Rubble, -16.5, 0.0, 16.4, 0.8, 0.9, 255);
+        pm(&mut props, WeaponStand, 13.0, 0.0, 29.48, pi, 1.0, 255);
+        pm(&mut props, Shield, 12.3, 1.85, 30.0, pi, 1.0, 255);
+        pm(&mut props, Shield, 13.7, 1.85, 30.0, pi, 1.0, 255);
+        pm(&mut props, Plant, -12.7, 0.0, 22.95, 0.0, 1.0, 255);
+        // lanterns: warm light on the walls (each also a light: torches)
+        let mut torches = Vec::new();
+        let lantern = |p: &mut Vec<Prop>, t: &mut Vec<V3>, x: f32, y: f32, z: f32, out: V3| {
+            let yaw = out.x.atan2(out.z);
+            for s in [1.0f32, -1.0] {
+                let o = v3(out.x, 0.0, out.z * s);
+                p.push(Prop { kind: Lantern, pos: v3(x, y, z * s), yaw: o.x.atan2(o.z), scale: 1.0, team: 255 });
+                t.push(v3(x, y, z * s) + o * 0.32 - v3(0.0, 0.32, 0.0));
+            }
+            let _ = yaw;
+        };
+        let (px, nx, pz, nz) = (v3(1.0, 0.0, 0.0), v3(-1.0, 0.0, 0.0), v3(0.0, 0.0, 1.0), v3(0.0, 0.0, -1.0));
+        lantern(&mut props, &mut torches, -11.0, 3.1, 17.0, nz);
+        lantern(&mut props, &mut torches, 11.0, 3.1, 17.0, nz);
+        lantern(&mut props, &mut torches, -26.5, 3.1, 17.0, nz);
+        lantern(&mut props, &mut torches, -12.0, 4.2, 9.5, px);
+        lantern(&mut props, &mut torches, -17.0, 5.3, 11.0, nx);
+        lantern(&mut props, &mut torches, -8.5, 4.6, 6.1, px);
+        lantern(&mut props, &mut torches, 13.6, 3.0, 14.0, px);
+        lantern(&mut props, &mut torches, 19.0, 3.0, 7.3, px);
+        lantern(&mut props, &mut torches, 21.0, 3.0, 15.6, nz);
+        lantern(&mut props, &mut torches, -25.0, 3.0, 22.5, pz);
+        lantern(&mut props, &mut torches, 0.0, 3.0, 30.0, nz);
+        lantern(&mut props, &mut torches, 24.0, 3.0, 30.0, nz);
+        // ivy down the outer walls and the warehouses
+        let mut vines = Vec::new();
+        for (k, (x, len)) in [(-22.0f32, 3.6f32), (-3.0, 4.0), (16.0, 3.0)].iter().enumerate() {
+            vines.push(Vine { top: v3(*x, wall_h, h), out: nz, len: *len, seed: k as u32 + 101 });
+            vines.push(Vine { top: v3(*x, wall_h, -h), out: pz, len: *len, seed: k as u32 + 111 });
+        }
+        for (k, z) in [8.0f32, 11.5].iter().enumerate() {
+            vines.push(Vine { top: v3(-12.0, l3, *z), out: px, len: 2.6, seed: k as u32 + 121 });
+            vines.push(Vine { top: v3(-12.0, l3, -*z), out: px, len: 2.6, seed: k as u32 + 131 });
+        }
+
+        // spawns: in the back of the barracks, away from its doors
+        let blue = [(-28.0f32, 25.0f32), (-28.0, 28.5), (-25.0, 29.0), (-22.5, 28.5), (-12.5, 29.0), (-8.5, 29.0)];
+        let mut spawn_points = Vec::new();
+        for &(x, z) in &blue {
+            spawn_points.push((v3(x, 0.0, -z), 0.0));
+        }
+        for &(x, z) in &blue {
+            spawn_points.push((v3(x, 0.0, z), pi));
+        }
+        World {
+            blocks: v,
+            spawn_points,
+            half: h,
+            deco,
+            braziers,
+            props,
+            vines,
+            torches,
+            map: MapId::Bridgeworks,
+            flags: [v3(0.0, 0.0, -27.0), v3(0.0, 0.0, 27.0)],
+            water: vec![Aabb::new(v3(-h, -3.0, -4.0), v3(h, -2.62, 4.0))],
         }
     }
 
@@ -578,7 +896,7 @@ impl World {
     /// A copy of this world (tests).
     #[cfg(test)]
     pub fn clone_world(&self) -> World {
-        World { blocks: self.blocks.clone(), spawn_points: self.spawn_points.clone(), half: self.half, deco: self.deco.clone(), braziers: self.braziers.clone(), props: self.props.clone(), vines: self.vines.clone(), torches: self.torches.clone(), map: self.map, flags: self.flags }
+        World { blocks: self.blocks.clone(), spawn_points: self.spawn_points.clone(), half: self.half, deco: self.deco.clone(), braziers: self.braziers.clone(), props: self.props.clone(), vines: self.vines.clone(), torches: self.torches.clone(), map: self.map, flags: self.flags, water: self.water.clone() }
     }
 
     /// What's under someone's feet: the material of the highest surface just below `p`.
@@ -623,15 +941,40 @@ mod prop_tests {
         for map in MapId::ALL {
             let w = World::build(map);
             assert!(!w.props.is_empty() && !w.vines.is_empty() && !w.torches.is_empty(), "{map:?} is dressed");
-            let floor: Vec<&Prop> = w.props.iter().filter(|p| !p.kind.on_wall()).collect();
+            let floor: Vec<&Prop> = w.props.iter().filter(|p| !p.kind.on_wall() && !p.kind.structural()).collect();
             for p in &w.props {
                 let tag = format!("{map:?} {:?} at {:?}", p.kind, p.pos);
+                if p.kind.structural() {
+                    // carried by its blocks: a railing on its hidden railing block, an archway on
+                    // its two hidden pillars, a crane on its plinth with its hidden mast
+                    let hidden_at = |q: V3| w.blocks.iter().any(|bl| bl.mat == Mat::Hidden && bl.b.contains(q));
+                    let side = yaw_right(p.yaw);
+                    match p.kind {
+                        PropKind::Railing => assert!(hidden_at(p.pos + v3(0.0, 0.5, 0.0)), "{tag}: on its railing block"),
+                        PropKind::Archway => {
+                            assert!(hidden_at(p.pos + side * 3.0 + v3(0.0, 1.0, 0.0)) && hidden_at(p.pos - side * 3.0 + v3(0.0, 1.0, 0.0)), "{tag}: its pillars")
+                        }
+                        _ => {
+                            assert!(hidden_at(p.pos + v3(0.0, 2.0, 0.0)), "{tag}: its mast");
+                            assert!((w.ground_below(p.pos + v3(0.0, 0.05, 0.0)) - p.pos.y).abs() < 0.02, "{tag}: on its plinth");
+                        }
+                    }
+                    continue;
+                }
                 if p.kind.on_wall() {
                     // hung on a wall face, above heads
                     let back = p.pos - yaw_fwd(p.yaw) * 0.06;
                     assert!(inside_block(&w, back), "{tag}: a wall right behind it");
                     let min_y = if p.kind == PropKind::Shield { 1.5 } else { 3.0 };
                     assert!(p.pos.y >= min_y, "{tag}: high enough not to brush anyone");
+                    continue;
+                }
+                if p.kind.structural() {
+                    // part of the structure: on the blocks that carry it (a hidden block for its
+                    // body, or the floor / plinth under it), never over the edge of the map
+                    let g = w.ground_below(p.pos + v3(0.0, 0.05, 0.0));
+                    assert!((g - p.pos.y).abs() < 0.02, "{tag}: stands on something ({g})");
+                    assert!(p.pos.x.abs() < w.half && p.pos.z.abs() < w.half, "{tag}: inside the map");
                     continue;
                 }
                 let r = p.kind.radius() * p.scale;
@@ -669,7 +1012,7 @@ mod prop_tests {
                 assert!(v.top.y - v.len >= 2.2, "{map:?} vine at {:?} ends above heads", v.top);
             }
             for t in &w.torches {
-                assert!(t.y >= 3.5, "torch flames burn high up");
+                assert!(t.y >= 2.6, "torch and lantern flames burn above heads");
             }
         }
     }

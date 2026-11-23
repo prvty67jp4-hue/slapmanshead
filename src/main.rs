@@ -12,6 +12,7 @@ mod env;
 mod game;
 mod gpu;
 mod math;
+mod nav;
 mod net;
 mod pad;
 mod platform;
@@ -566,7 +567,61 @@ impl Settings {
 
 const BOT_LEVELS: [(&str, f32); 4] = [("Easy", 0.2), ("Normal", 0.5), ("Hard", 0.8), ("Brutal", 1.0)];
 
-#[derive(Clone, Copy, PartialEq)]
+/// A card in the PLAY picker.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PlayPick {
+    Quick,
+    Host,
+    Find,
+    JoinIp,
+    Practice,
+    Gauntlet,
+    Training,
+}
+
+impl PlayPick {
+    /// The menu page the card opens (None: it starts a match straight away).
+    fn page(self) -> Option<Page> {
+        match self {
+            PlayPick::Host => Some(Page::Host),
+            PlayPick::Find => Some(Page::Browse),
+            PlayPick::JoinIp => Some(Page::Join),
+            PlayPick::Practice => Some(Page::Practice),
+            PlayPick::Quick | PlayPick::Gauntlet | PlayPick::Training => None,
+        }
+    }
+}
+
+/// The PLAY picker's cards in order (two to a row): what each does, its line of text, and
+/// whether it can be picked. Join by IP is always on, with or without Steam.
+fn play_cards(steam: bool, gauntlet_best: u32) -> Vec<(PlayPick, &'static str, String, bool)> {
+    vec![
+        (PlayPick::Quick, "Quick Play", (if steam { "Join an open online game, or open one" } else { "Straight into a match against bots" }).into(), true),
+        (PlayPick::Host, "Host Lobby", "Open a lobby friends can join".into(), true),
+        (PlayPick::Find, "Find Games", (if steam { "Browse open lobbies on Steam" } else { "Needs Steam running" }).into(), steam),
+        (PlayPick::JoinIp, "Join by IP", "Join a friend's game with their address".into(), true),
+        (PlayPick::Practice, "Practice vs Bots", "Pick the mode, map and bots".into(), true),
+        (PlayPick::Gauntlet, "Gauntlet", format!("Solo: survive waves of bots  ·  best {gauntlet_best}"), true),
+        (PlayPick::Training, "Training", "Learn every move on practice dummies".into(), true),
+    ]
+}
+
+/// Where the main menu's PLAY button goes.
+const MAIN_PLAY_PAGE: Page = Page::Play;
+
+/// The menu pages each page opens on the way into a match (what the menu draws: the PLAY
+/// button, the PLAY picker's enabled cards, Find Games' Join by IP button).
+#[cfg_attr(not(test), allow(dead_code))]
+fn menu_links(page: Page, steam: bool) -> Vec<Page> {
+    match page {
+        Page::Main => vec![MAIN_PLAY_PAGE],
+        Page::Play => play_cards(steam, 0).into_iter().filter(|c| c.3).filter_map(|c| c.0.page()).collect(),
+        Page::Browse => vec![Page::Join],
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Page {
     Main,
     /// The mode picker behind the PLAY button.
@@ -635,6 +690,8 @@ struct App {
     chat_text: String,
     chat_send: Option<String>,
     vote_request: bool,
+    /// A vote for the next map, from the match-over panel.
+    map_vote_request: Option<MapId>,
     ready_request: Option<Loadout>,
     test_chat_done: bool,
     paused: bool,
@@ -795,6 +852,7 @@ impl App {
             chat_text: String::new(),
             chat_send: None,
             vote_request: false,
+            map_vote_request: None,
             ready_request: None,
             test_chat_done: false,
             paused: false,
@@ -1486,7 +1544,7 @@ impl App {
     fn browser_ui(&mut self, ui: &mut egui::Ui) -> Option<u64> {
         let mut join = None;
         let Some(st) = self.steam.as_mut() else {
-            ui.label("Steam isn't running, so there's no lobby list. Start Steam and restart the game, or use Join a Friend with an IP address.");
+            ui.label("Steam isn't running, so there's no lobby list. Start Steam and restart the game, or press Join by IP below to join a friend with their address.");
             return None;
         };
         if st.rows.is_empty() && !st.refreshing && ui.ctx().input(|i| i.time) > 0.0 && !self.browse_asked {
@@ -3080,6 +3138,7 @@ impl App {
             }
         }
         let vote_req = std::mem::take(&mut self.vote_request);
+        let map_vote_req = self.map_vote_request.take();
         let ready_req = self.ready_request.take();
         let start_req = std::mem::take(&mut self.start_request);
         let autostart = self.autostart;
@@ -3095,6 +3154,9 @@ impl App {
         let Screen::Play { game, net } = &mut self.screen else { return };
         if let Some(n) = net.as_mut() {
             n.sim = sim;
+        }
+        if let Some(m) = map_vote_req.filter(|_| game.mt.phase == Phase::MatchOver) {
+            game.vote_map(m);
         }
         if train_step != 0 {
             game.train_skip(train_step);
@@ -4105,6 +4167,7 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
         if s != g.local {
             g.f[s].ready = e.ready;
             g.f[s].vote = e.vote;
+            g.f[s].map_vote = e.map_vote;
         }
     }
     let l = g.local;
@@ -5552,12 +5615,29 @@ impl App {
     // ------------------------------------------------------------------ menus
 
     fn _unused_panel(&self) {}
+
+    /// The mode, then the maps for it: choosing a team mode (Team Deathmatch, Capture the Flag)
+    /// switches to its default map, Varrow Bridgeworks.
+    fn mode_and_map(&mut self, ui: &mut egui::Ui) {
+        let before = self.settings.mode;
+        mode_picker(ui, &mut self.settings.mode);
+        let teams = Mode::from_u8(self.settings.mode).teams();
+        if self.settings.mode != before {
+            self.settings.map = MapId::default_for(teams) as u8;
+        }
+        map_picker(ui, &mut self.settings.map, teams);
+    }
 }
 
-fn map_picker(ui: &mut egui::Ui, map: &mut u8) {
+/// The maps that suit the mode (the team map only for team modes); a map that doesn't fit is
+/// swapped for the mode's default.
+fn map_picker(ui: &mut egui::Ui, map: &mut u8, teams: bool) {
+    if !MapId::from_u8(*map).fits(teams) || *map as usize >= MapId::ALL.len() {
+        *map = MapId::default_for(teams) as u8;
+    }
     ui_kit::section(ui, "Map");
     ui.horizontal_wrapped(|ui| {
-        for m in MapId::ALL {
+        for m in MapId::for_mode(teams) {
             ui.selectable_value(map, m as u8, m.name()).on_hover_text(m.blurb());
         }
     });
@@ -5722,23 +5802,15 @@ impl App {
                 Page::Play => {
                     ui.heading("Play");
                     let steam = self.steam.is_some();
-                    let gauntlet_desc = format!("Solo: survive waves of bots  ·  best {}", self.settings.gauntlet_best);
-                    let modes: [(&str, &str, bool); 6] = [
-                        ("Quick Play", if steam { "Join an open online game, or open one" } else { "Straight into a match against bots" }, true),
-                        ("Host Lobby", "Open a lobby friends can join", true),
-                        ("Find Games", if steam { "Browse open lobbies on Steam" } else { "Needs Steam running" }, steam),
-                        ("Practice vs Bots", "Pick the mode, map and bots", true),
-                        ("Gauntlet", &gauntlet_desc, true),
-                        ("Training", "Learn every move on practice dummies", true),
-                    ];
+                    let modes = play_cards(steam, self.settings.gauntlet_best);
                     let cw = ((ui.available_width() - 10.0) / 2.0).floor();
                     let mut picked = None;
-                    for (row, pair) in modes.chunks(2).enumerate() {
+                    for pair in modes.chunks(2) {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
-                            for (k, (title, desc, on)) in pair.iter().enumerate() {
+                            for (pick, title, desc, on) in pair.iter() {
                                 if ui_kit::mode_card(ui, cw, 82.0, title, desc, *on).clicked() && *on {
-                                    picked = Some(row * 2 + k);
+                                    picked = Some(*pick);
                                 }
                             }
                         });
@@ -5750,14 +5822,13 @@ impl App {
                         UI_SOUND.with(|u| u.set(Some(Sfx::UiConfirm)));
                     }
                     match picked {
-                        Some(0) => action = Some(Box::new(|app: &mut App| app.start_quick_play())),
-                        Some(1) => next = Some(Page::Host),
-                        Some(2) => {
+                        Some(PlayPick::Quick) => action = Some(Box::new(|app: &mut App| app.start_quick_play())),
+                        Some(PlayPick::Find) => {
                             self.browse_asked = false;
-                            next = Some(Page::Browse);
+                            next = PlayPick::Find.page();
                         }
-                        Some(3) => next = Some(Page::Practice),
-                        Some(4) => {
+                        Some(p @ (PlayPick::Host | PlayPick::JoinIp | PlayPick::Practice)) => next = p.page(),
+                        Some(PlayPick::Gauntlet) => {
                             action = Some(Box::new(|app: &mut App| {
                                 let name = clean_name(&app.settings.name, 0);
                                 let mut g = Game::gauntlet(&name, app.settings.gauntlet_best);
@@ -5766,13 +5837,13 @@ impl App {
                                 app.start_game(g, None);
                             }))
                         }
-                        Some(5) => {
+                        Some(PlayPick::Training) => {
                             action = Some(Box::new(|app: &mut App| {
                                 let name = clean_name(&app.settings.name, 0);
                                 app.start_game(Game::training(&name), None);
                             }))
                         }
-                        _ => {}
+                        None => {}
                     }
                     if Self::big_button(ui, "Back") {
                         self.quick = None;
@@ -5861,8 +5932,7 @@ impl App {
                 }
                 Page::Practice => {
                     ui.heading("Practice vs Bots");
-                    mode_picker(ui, &mut self.settings.mode);
-                    map_picker(ui, &mut self.settings.map);
+                    self.mode_and_map(ui);
                     ui.checkbox(&mut self.settings.abilities, "Abilities (off: Classic)").on_hover_text("Each fighter's ability (Q / LB) and passive.");
                     ui.add(egui::Slider::new(&mut self.settings.bots, 1..=7).text("bots"));
                     ui.label("Bot difficulty");
@@ -5927,8 +5997,7 @@ impl App {
                     });
                     self.firewall_ui(ui);
                     ui.label(egui::RichText::new("Friends join your Internet address (UDP port forwarded to this PC). You can't join it yourself from home: test with a friend, or 127.0.0.1 from a second copy.").size(13.5).color(Color32::from_gray(200)));
-                    mode_picker(ui, &mut self.settings.mode);
-                    map_picker(ui, &mut self.settings.map);
+                    self.mode_and_map(ui);
                     ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
                     ui.checkbox(&mut self.settings.abilities, "Abilities: On / Off (Classic)").on_hover_text("Each fighter's ability (Q / LB) and passive.");
                     ui.add(egui::Slider::new(&mut self.settings.fill_bots, 0..=MAX_PLAYERS).text("fill with bots up to this many fighters (0 = none)"))
@@ -5962,6 +6031,11 @@ impl App {
                                 app.menu_msg = Some("Joining through Steam...".into());
                             }
                         }));
+                    }
+                    // joining by address works with or without Steam
+                    if Self::big_button(ui, "Join by IP") {
+                        UI_SOUND.with(|u| u.set(Some(Sfx::UiConfirm)));
+                        next = Some(Page::Join);
                     }
                     if Self::big_button(ui, "Back") {
                         next = Some(Page::Main);
@@ -6200,6 +6274,12 @@ impl App {
                 _ => CombatStats::default(),
             };
             let first_win_ready = self.career.first_win_ready(career::today());
+            // the vote for the next map: the maps that suit the mode, each with its votes
+            let (tally, my_map_vote) = match &self.screen {
+                Screen::Play { game, .. } if game.mt.mode != Mode::Gauntlet => (game.map_tally(), game.f[game.local].map_vote),
+                _ => (Vec::new(), 255),
+            };
+            let mut map_pick: Option<MapId> = None;
             panel(ctx, "over", Pos2::new(center.x, center.y + 60.0), 360.0, |ui| {
                 if run.is_none() {
                     ui.heading(if won { "Victory" } else { "Match over" });
@@ -6213,6 +6293,18 @@ impl App {
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new(format!("Accuracy {:.0}%   Headshots {:.0}%   ({} of {} shots hit)", ms.accuracy() * 100.0, ms.headshot_rate() * 100.0, ms.hits, ms.shots)).size(13.0).color(Color32::from_gray(225)));
                     ui.label(egui::RichText::new(format!("Parries {}   Whiffs {}   Counter-strafe stops {}", ms.parries, ms.whiffs, ms.cs_stops)).size(13.0).color(Color32::from_gray(225)));
+                    if tally.len() > 1 {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Next map: vote (the most votes wins)").size(13.5).color(Color32::from_gray(235)));
+                        ui.horizontal_wrapped(|ui| {
+                            for (m, n) in &tally {
+                                let text = format!("{}  {}", m.name(), if *n == 1 { "1 vote".to_string() } else { format!("{n} votes") });
+                                if ui.selectable_label(my_map_vote == *m as u8, text).on_hover_text(m.blurb()).clicked() {
+                                    map_pick = Some(*m);
+                                }
+                            }
+                        });
+                    }
                     ui.add_space(4.0);
                 }
                 if let Some(gt) = &run {
@@ -6262,6 +6354,9 @@ impl App {
             }
             if vote {
                 self.vote_request = true;
+            }
+            if map_pick.is_some() {
+                self.map_vote_request = map_pick;
             }
             return leave;
         }
@@ -6659,13 +6754,13 @@ impl App {
             if let Some(m) = &msg {
                 ui.colored_label(Color32::from_rgb(255, 180, 120), m);
             }
-            let play = ui_kit::play_button(ui, "PLAY", "Quick Play · lobbies · bots · Gauntlet · Training", 92.0);
+            let play = ui_kit::play_button(ui, "PLAY", "Quick Play · lobbies · join by IP · bots · Gauntlet · Training", 92.0);
             if pad && ui.ctx().memory(|m| m.focused().is_none()) {
                 play.request_focus();
             }
             if play.clicked() {
                 UI_SOUND.with(|u| u.set(Some(Sfx::UiConfirm)));
-                *next = Some(Page::Play);
+                *next = Some(MAIN_PLAY_PAGE);
             }
             ui.add_space(10.0);
             if Self::big_button_h(ui, "Loadout", 42.0) {
@@ -6901,6 +6996,7 @@ mod aim_tests {
             torches: Vec::new(),
             map: crate::world::MapId::Arena,
             flags: [V3::ZERO, V3::ZERO],
+            water: Vec::new(),
         }
     }
 
@@ -6974,5 +7070,39 @@ mod aim_tests {
             };
             assert!(moving <= still * cap + 1e-6, "{w:?}: moving {moving} vs still {still}");
         }
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    /// Every page the menu leads to from the main menu.
+    fn reachable(steam: bool) -> Vec<Page> {
+        let mut seen = vec![Page::Main];
+        let mut k = 0;
+        while k < seen.len() {
+            for p in menu_links(seen[k], steam) {
+                if !seen.contains(&p) {
+                    seen.push(p);
+                }
+            }
+            k += 1;
+        }
+        seen
+    }
+
+    #[test]
+    fn the_join_page_is_reachable_from_the_main_menu_without_steam() {
+        for steam in [false, true] {
+            assert!(reachable(steam).contains(&Page::Join), "Join a Friend can't be reached (Steam running: {steam})");
+            let cards = play_cards(steam, 0);
+            let join = cards.iter().find(|c| c.0 == PlayPick::JoinIp).expect("a Join by IP card");
+            assert!(join.3, "Join by IP is greyed out (Steam running: {steam})");
+            assert_eq!(join.0.page(), Some(Page::Join));
+        }
+        // without Steam, Find Games is greyed but still offers Join by IP once opened
+        assert!(!play_cards(false, 0).iter().any(|c| c.0 == PlayPick::Find && c.3));
+        assert_eq!(menu_links(Page::Browse, false), vec![Page::Join]);
     }
 }

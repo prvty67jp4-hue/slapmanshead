@@ -268,6 +268,10 @@ fn write_ev(w: &mut W, ev: &Ev) {
         }
         Ev::Ready => w.u8(7),
         Ev::Vote => w.u8(8),
+        Ev::MapVote { map } => {
+            w.u8(13);
+            w.u8(*map);
+        }
         Ev::Ability { who, kind, p, d } => {
             w.u8(11);
             w.u8(*who);
@@ -304,6 +308,7 @@ fn read_ev(r: &mut R) -> Option<Ev> {
         6 => Ev::Item { kind: r.u8()?.min(1) },
         7 => Ev::Ready,
         8 => Ev::Vote,
+        13 => Ev::MapVote { map: r.u8()?.min(crate::world::MapId::ALL.len() as u8 - 1) },
         9 => Ev::Deflect { by: r.u8()?, dmg: r.f()?.clamp(0.0, 60.0) },
         11 => Ev::Ability { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.min(3), p: r.v()?, d: clamp_v(r.v()?, 40.0) },
         12 => Ev::Confirm { attacker: r.u8()?.min(MAX_PLAYERS as u8 - 1), victim: r.u8()?.min(MAX_PLAYERS as u8 - 1), hp: r.f()?.clamp(0.0, 999.0), ap: r.f()?.clamp(0.0, 999.0), head: r.u8()? != 0 },
@@ -330,6 +335,8 @@ pub struct RosterEntry {
     pub vote: bool,
     pub spectate: bool,
     pub wins: i32,
+    /// Their vote for the next map (255: none).
+    pub map_vote: u8,
 }
 
 /// Everything the host tells a player each update.
@@ -1009,7 +1016,7 @@ impl Net {
         let mode_byte = r.u8()?;
         let classic = mode_byte & 0x80 != 0;
         let mode = Mode::from_u8(mode_byte & 0x7f);
-        let map = r.u8()?.min(2);
+        let map = r.u8()?.min(crate::world::MapId::ALL.len() as u8 - 1);
         let phase = Phase::from_u8(r.u8()?);
         let timer = r.f()?;
         let target = r.u16()?;
@@ -1037,7 +1044,8 @@ impl Net {
             let loss = r.u8()?;
             let bits = r.u8()?;
             let wins = r.i16()? as i32;
-            roster.push(RosterEntry { slot, name, team, kills, deaths, ping, loss, ready: bits & 1 != 0, vote: bits & 2 != 0, spectate: bits & 4 != 0, wins });
+            let map_vote = r.u8()?;
+            roster.push(RosterEntry { slot, name, team, kills, deaths, ping, loss, ready: bits & 1 != 0, vote: bits & 2 != 0, spectate: bits & 4 != 0, wins, map_vote });
         }
         if !stale {
             // a slot taken by someone new starts its event count again
@@ -1203,6 +1211,7 @@ impl Net {
                     w.u8((loss * 100.0).round().min(100.0) as u8);
                     w.u8((f.ready as u8) | ((f.vote as u8) << 1) | ((f.spectate as u8) << 2));
                     w.i16(f.wins.clamp(-999, 9999) as i16);
+                    w.u8(f.map_vote);
                 }
                 let others: Vec<usize> = present.iter().copied().filter(|&s| s != slot).collect();
                 w.u8(others.len() as u8);

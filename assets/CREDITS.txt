@@ -93,3 +93,9 @@ assets/characters/acc_*.glb and accessories.png (the fighters' signature accesso
   Original work made for this game with tools/blender/build_accessories.py (no third-party parts),
   fitted onto the Quaternius fighters above. The faces' painted lash lines and shading, the toon
   shading and the outlines are the game's own (src/chars.rs, src/gpu.rs).
+
+assets/env/props/varrow_*.glb and varrow_props.png (Varrow Bridgeworks: bridge railings, the archway,
+  the dockside crane, stacked crates and the wall lanterns)
+  Original work made for this game with tools/blender/build_props.py (no third-party parts).
+Varrow Bridgeworks' dusk sky and its river water are drawn by the game's own code (src/env.rs,
+  src/gpu.rs); the map's stone and wood reuse the Poly Haven CC0 textures listed above.

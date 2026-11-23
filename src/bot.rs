@@ -1,5 +1,6 @@
 use crate::game::{Ability, CHARGE_TIME, GUARD_MAX, Game, Input, KICK_RANGE, SCOPE_IN, STAR_SPEED, Weapon};
 use crate::math::*;
+use crate::nav::Move;
 
 /// A simple practice opponent.
 pub struct Bot {
@@ -29,6 +30,18 @@ pub struct Bot {
     guard_tap: f32,
     /// Until the next think about the ability.
     ab_wait: f32,
+    /// Somewhere to go regardless of anything else (tests).
+    pub goto: Option<V3>,
+    /// The way it's following (see crate::nav): the places, the next one, where it leads, and
+    /// time until it's worked out again.
+    nav_path: Vec<(V3, Move)>,
+    nav_i: usize,
+    nav_goal: V3,
+    nav_t: f32,
+    /// A dash to make once in the air (crossing a wide gap), and time without progress.
+    dash_armed: bool,
+    nav_stuck: f32,
+    nav_last: V3,
 }
 
 impl Bot {
@@ -58,18 +71,116 @@ impl Bot {
             slash_next: false,
             guard_tap: 0.0,
             ab_wait: 2.0,
+            goto: None,
+            nav_path: Vec::new(),
+            nav_i: 0,
+            nav_goal: V3::ZERO,
+            nav_t: 0.0,
+            dash_armed: false,
+            nav_stuck: 0.0,
+            nav_last: V3::ZERO,
         }
     }
 
     pub fn reset(&mut self) {
         self.target = None;
         self.retarget = 0.0;
+        self.nav_path.clear();
+        self.nav_t = 0.0;
+    }
+
+    /// Head for `goal` along the level's navigation: steer to the next place on the way, jump up
+    /// ledges and over gaps, dash across the wide ones. `look`: face the way it's going (when
+    /// there's nobody in sight to aim at).
+    fn follow(&mut self, g: &Game, i: usize, goal: V3, inp: &mut Input, dt: f32, look: bool) {
+        let me = &g.f[i];
+        // no progress for a while: think again (and hop)
+        if (me.pos - self.nav_last).len() < dt * 0.8 {
+            self.nav_stuck += dt;
+        } else {
+            self.nav_stuck = (self.nav_stuck - dt).max(0.0);
+        }
+        self.nav_last = me.pos;
+        self.nav_t -= dt;
+        if self.nav_t <= 0.0 || (goal - self.nav_goal).len() > 2.5 || self.nav_stuck > 1.2 {
+            let nav = crate::nav::for_world(&g.world);
+            self.nav_path = nav.path(me.pos, goal).unwrap_or_default();
+            self.nav_i = 0;
+            self.nav_goal = goal;
+            self.nav_t = 0.7 + self.rng.f() * 0.3;
+            if self.nav_stuck > 1.2 && me.on_ground {
+                inp.jump = true;
+            }
+            self.nav_stuck = 0.0;
+        }
+        // past the places already reached
+        while let Some(&(p, _)) = self.nav_path.get(self.nav_i) {
+            if (p - me.pos).flat().len() < 0.65 && (p.y - me.pos.y).abs() < 1.3 {
+                self.nav_i += 1;
+            } else {
+                break;
+            }
+        }
+        let (target, how) = match self.nav_path.get(self.nav_i) {
+            Some(&(p, h)) => (p, h),
+            None => (goal, Move::Walk),
+        };
+        let to = (target - me.pos).flat();
+        let d = to.len();
+        if d < 0.3 && self.nav_i >= self.nav_path.len() {
+            inp.fwd = 0.0;
+            inp.right = 0.0;
+            return;
+        }
+        let dir = if d > 1e-3 { to * (1.0 / d) } else { yaw_fwd(me.yaw) };
+        if look {
+            let want = dir.x.atan2(dir.z);
+            let turn = 9.0 * dt;
+            inp.yaw = me.yaw + wrap_angle(want - me.yaw).clamp(-turn, turn);
+            inp.pitch = approach(me.pitch, 0.0, turn);
+        }
+        let f = dir.dot(yaw_fwd(inp.yaw));
+        let r = dir.dot(yaw_right(inp.yaw));
+        let m = f.abs().max(r.abs()).max(1e-3);
+        inp.fwd = f / m;
+        inp.right = r / m;
+        inp.crouch = false;
+        // the ground ahead runs out: a gap (or a ledge to drop from)
+        let ahead = me.pos + dir * 0.7 + v3(0.0, 0.3, 0.0);
+        let edge = g.world.ground_below(ahead) < me.pos.y - 0.6;
+        match how {
+            Move::Jump if target.y > me.pos.y + 0.5 => {
+                if me.on_ground && d < 1.7 {
+                    inp.jump = true;
+                }
+            }
+            Move::Jump | Move::Dash => {
+                if me.on_ground && edge {
+                    inp.jump = true;
+                    self.dash_armed = how == Move::Dash;
+                }
+            }
+            _ => {}
+        }
+        if self.dash_armed && !me.on_ground && me.vel.y < 6.0 && me.dash_charges >= 1.0 {
+            inp.dash = true;
+            self.dash_armed = false;
+        }
+        if me.on_ground && !edge {
+            self.dash_armed = false;
+        }
     }
 
     pub fn think(&mut self, g: &Game, i: usize, dt: f32) -> Input {
         let me = &g.f[i];
         let mut inp = Input { yaw: me.yaw, pitch: me.pitch, ..Default::default() };
         if !me.alive {
+            return inp;
+        }
+        if let Some(goal) = self.goto {
+            if !g.frozen() {
+                self.follow(g, i, goal, &mut inp, dt, true);
+            }
             return inp;
         }
         // keep a target for a while, re-pick now and then
@@ -205,19 +316,20 @@ impl Bot {
             inp.right = self.strafe * 0.3;
         }
 
-        // objective modes: go for the flag, bring it home, or return ours
-        if let Some(goal) = g.objective(i) {
-            let carrying = g.mt.flags.iter().any(|fl| fl.state == 1 && fl.carrier as usize == i);
-            if carrying || !visible || dist > 11.0 {
-                let to = goal - me.pos;
-                if to.flat().len() > 0.5 {
-                    inp.yaw = to.x.atan2(to.z);
-                    inp.pitch = 0.0;
-                    inp.fwd = 1.0;
-                    inp.right = self.strafe * 0.15;
-                }
-            }
+        // where to go when there's more to it than strafing: the flag (objective modes), an enemy
+        // out of sight, or one on another level; the way there comes from the level's navigation
+        let carrying = g.mt.flags.iter().any(|fl| fl.state == 1 && fl.carrier as usize == i);
+        let travel = match g.objective(i) {
+            Some(goal) if carrying || !visible || dist > 11.0 => Some((goal, !visible || carrying)),
+            _ if !visible && en.alive => Some((en.pos, true)),
+            _ if visible && melee && (en.pos.y - me.pos.y).abs() > 1.2 => Some((en.pos, false)),
+            _ => None,
+        };
+        let me_pos = me.pos;
+        if let Some((goal, look)) = travel.filter(|(gp, _)| (*gp - me_pos).flat().len() > 1.0 || (gp.y - me_pos.y).abs() > 1.0) {
+            self.follow(g, i, goal, &mut inp, dt, look);
         }
+        let me = &g.f[i];
         // unstick: jump and wall-run over things
         let moved = (me.pos - self.last_pos).flat().len();
         self.last_pos = me.pos;
@@ -362,5 +474,68 @@ impl Bot {
             inp.item = true;
         }
         inp
+    }
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::*;
+    use crate::game::{Mode, Phase, TICK};
+    use crate::world::MapId;
+
+    /// A bot that only travels, from one team's spawn to `to`: how long it took (None: never).
+    fn travel(from_blue: bool, to: V3, limit: f32) -> Option<f32> {
+        let mut g = Game::offline("A", 1, 1.0, Mode::Tdm, 50);
+        g.set_map(MapId::Bridgeworks);
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = 999.0;
+        g.f[0].present = false;
+        g.f[0].alive = false;
+        let n = g.world.spawn_points.len();
+        let (p, yaw) = g.world.spawn_points[if from_blue { n / 2 + 2 } else { 2 }];
+        g.f[1].respawn_at(p, yaw);
+        g.f[1].spawn_prot = 0.0;
+        let mut b = Bot::new(1.0, 7);
+        b.goto = Some(to);
+        g.bots[1] = Some(b);
+        let mut t = 0.0;
+        while t < limit {
+            g.tick(&Input::default());
+            t += TICK;
+            let f = &g.f[1];
+            if (f.pos - to).flat().len() < 1.4 && (f.pos.y - to.y).abs() < 1.0 {
+                return Some(t);
+            }
+        }
+        let f = &g.f[1];
+        println!("  stopped at {:?}", f.pos);
+        None
+    }
+
+    /// Bots get everywhere on the team map: every lane and level (rooftops, ramparts, the
+    /// balcony, the riverbed, both flag rooms), from both bases, walking, jumping and dashing.
+    #[test]
+    fn bots_navigate_every_lane_and_level_of_bridgeworks() {
+        let spots = crate::nav::tests::BRIDGEWORKS_SPOTS;
+        let results: Vec<(String, bool, Option<f32>)> = std::thread::scope(|s| {
+            let hs: Vec<_> = spots
+                .iter()
+                .flat_map(|(name, p)| [false, true].map(|blue| (name.to_string(), blue, v3(p[0], p[1], p[2]))))
+                .map(|(name, blue, p)| s.spawn(move || (name, blue, travel(blue, p, 60.0))))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut failed = Vec::new();
+        for (name, blue, t) in &results {
+            let side = if *blue { "blue" } else { "red" };
+            match t {
+                Some(t) => println!("{side} -> {name}: {t:.1} s"),
+                None => {
+                    println!("{side} -> {name}: NOT REACHED");
+                    failed.push(format!("{side} -> {name}"));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "bots couldn't get to: {failed:?}");
     }
 }

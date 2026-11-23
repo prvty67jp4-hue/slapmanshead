@@ -28,7 +28,10 @@ pub const L_ROCKS: u32 = 13;
 pub const L_BRICK: u32 = 14;
 pub const L_SLATE: u32 = 15;
 pub const L_BLOCKS: u32 = 16;
-pub const LAYERS: u32 = 17;
+/// Varrow Bridgeworks' props (railings, archways, the crane, cargo, lanterns): one baked atlas
+/// (tools/blender/build_props.py).
+pub const L_BRIDGE: u32 = 17;
+pub const LAYERS: u32 = 18;
 
 /// Where a texture comes from.
 enum Src {
@@ -71,6 +74,7 @@ fn source(layer: u32) -> Src {
         L_TRIM_PROPS => Src::Trim { diff: prop_tex!("trim_props_diff.jpg"), nor: prop_tex!("trim_props_nor.jpg"), orm: prop_tex!("trim_props_orm.jpg") },
         L_LEAVES => Src::Plain { diff: prop_tex!("leaves.png"), rough: 0.7 },
         L_ROCKS => Src::Plain { diff: prop_tex!("rocks_diff.jpg"), rough: 0.85 },
+        L_BRIDGE => Src::Plain { diff: prop_tex!("varrow_props.png"), rough: 0.75 },
         _ => Src::Procedural,
     }
 }
@@ -105,28 +109,40 @@ pub struct Surface {
 /// - Arena: warm sandstone walls, a pale stone floor, dark wood trim (iron braziers).
 /// - Close Quarters: cool grey stone, a slate floor, iron as the accent.
 /// - Open Courtyard: white marble, light sandstone, blue banners as the accent.
+/// - Varrow Bridgeworks: warm grey cobbles, rough river stone, dressed sandstone, dark wood and
+///   iron as the accent (the lantern light does the rest).
 pub fn surface(map: MapId, m: Mat) -> Surface {
     let s = |layer, tint, shine| Surface { layer, tint, shine };
+    if m == Mat::Hidden {
+        return s(L_BLOCKS, [128, 128, 128], 0.0); // (never drawn)
+    }
     match map {
+        MapId::Bridgeworks => match m {
+            Mat::Floor => s(L_BLOCKS, [124, 116, 108], 0.25),
+            Mat::Wall => s(L_RUBBLE_STONE, [142, 130, 116], 0.05),
+            Mat::Stone => s(L_SANDSTONE, [150, 132, 110], 0.08),
+            Mat::Metal => s(L_IRON, [98, 94, 90], 0.4),
+            Mat::Trim | Mat::Crate | Mat::Hidden => s(L_WOOD, [96, 74, 58], 0.1),
+        },
         MapId::Arena => match m {
             Mat::Floor => s(L_FLOOR_SLABS, [176, 166, 146], 0.3),
             Mat::Wall => s(L_SANDSTONE, [176, 149, 115], 0.05),
             Mat::Stone => s(L_SANDSTONE, [166, 140, 107], 0.08),
             Mat::Metal => s(L_SANDSTONE, [160, 135, 103], 0.08),
-            Mat::Trim | Mat::Crate => s(L_WOOD, [92, 71, 55], 0.1),
+            Mat::Trim | Mat::Crate | Mat::Hidden => s(L_WOOD, [92, 71, 55], 0.1),
         },
         MapId::CloseQuarters => match m {
             Mat::Floor => s(L_SLATE, [104, 108, 116], 0.2),
             Mat::Wall => s(L_BLOCKS, [136, 141, 150], 0.05),
             Mat::Stone => s(L_BLOCKS, [122, 127, 136], 0.08),
             Mat::Metal => s(L_BLOCKS, [116, 121, 130], 0.08),
-            Mat::Trim | Mat::Crate => s(L_IRON, [112, 115, 122], 0.4),
+            Mat::Trim | Mat::Crate | Mat::Hidden => s(L_IRON, [112, 115, 122], 0.4),
         },
         MapId::Courtyard => match m {
             Mat::Floor => s(L_MARBLE, [142, 141, 136], 0.35),
             Mat::Wall => s(L_BRICK, [168, 153, 126], 0.05),
             Mat::Stone | Mat::Metal => s(L_MARBLE, [172, 170, 162], 0.3),
-            Mat::Trim | Mat::Crate => s(L_SANDSTONE, [160, 146, 120], 0.08),
+            Mat::Trim | Mat::Crate | Mat::Hidden => s(L_SANDSTONE, [160, 146, 120], 0.08),
         },
     }
 }
@@ -279,7 +295,8 @@ pub struct Grade {
 }
 
 struct SkySrc {
-    hdr: &'static [u8],
+    /// The picture (Radiance HDR); None paints the dusk sky (see dusk_sky).
+    hdr: Option<&'static [u8]>,
     /// Which way the sunlight should come from (azimuth, radians, as yaw_fwd) and how high
     /// (elevation clamped to this range, so shadows stay readable).
     sun_azimuth: f32,
@@ -293,7 +310,7 @@ fn sky_src(map: MapId) -> SkySrc {
     match map {
         // golden late afternoon: warm, rich, long shadows
         MapId::Arena => SkySrc {
-            hdr: include_bytes!("../assets/env/sky/qwantani_late_afternoon_puresky.hdr"),
+            hdr: Some(include_bytes!("../assets/env/sky/qwantani_late_afternoon_puresky.hdr")),
             sun_azimuth: 0.69,
             elevation: (0.5, 0.75),
             sun_power: 2.3,
@@ -302,7 +319,7 @@ fn sky_src(map: MapId) -> SkySrc {
         },
         // bright partly cloudy midday: crisp and cool
         MapId::Courtyard => SkySrc {
-            hdr: include_bytes!("../assets/env/sky/kloofendal_48d_partly_cloudy_puresky.hdr"),
+            hdr: Some(include_bytes!("../assets/env/sky/kloofendal_48d_partly_cloudy_puresky.hdr")),
             sun_azimuth: -0.9,
             elevation: (0.75, 0.95),
             sun_power: 2.25,
@@ -311,14 +328,91 @@ fn sky_src(map: MapId) -> SkySrc {
         },
         // stormy sunset: teal shadows, orange light, heavy and moody
         MapId::CloseQuarters => SkySrc {
-            hdr: include_bytes!("../assets/env/sky/wasteland_clouds_puresky.hdr"),
+            hdr: Some(include_bytes!("../assets/env/sky/wasteland_clouds_puresky.hdr")),
             sun_azimuth: 2.3,
             elevation: (0.42, 0.6),
             sun_power: 1.9,
             fog_density: 0.0055,
             grade: Grade { lift: [0.0, 0.008, 0.016], gamma: [0.99, 1.0, 1.02], gain: [1.05, 0.99, 0.93], saturation: 0.95, contrast: 1.06, exposure: 0.85 },
         },
+        // dusk over the river: the sun just down, a band of orange under violet, warm lanterns
+        MapId::Bridgeworks => SkySrc {
+            hdr: None,
+            sun_azimuth: -1.9,
+            elevation: (0.38, 0.44),
+            sun_power: 1.35,
+            fog_density: 0.004,
+            grade: Grade { lift: [0.004, 0.0, 0.018], gamma: [1.0, 0.99, 1.02], gain: [1.04, 0.98, 0.94], saturation: 0.9, contrast: 1.05, exposure: 0.8 },
+        },
     }
+}
+
+/// The dusk sky, painted: violet overhead to a warm band at the horizon, brightest round the
+/// sun (low in the west), with long streaks of cloud lit pink near it. Equirect RGB, linear.
+fn dusk_sky(w: u32, h: u32) -> Vec<f32> {
+    let sun_az = -1.9f32;
+    let sun = v3(sun_az.sin() * 0.995, 0.1, sun_az.cos() * 0.995).norm();
+    let hash = |x: i32, y: i32| -> f32 {
+        let mut n = (x as u32).wrapping_mul(374_761_393) ^ (y as u32).wrapping_mul(668_265_263);
+        n = (n ^ (n >> 13)).wrapping_mul(1_274_126_177);
+        (n ^ (n >> 16)) as f32 / u32::MAX as f32
+    };
+    let noise = |x: f32, y: f32| -> f32 {
+        let (xi, yi) = (x.floor() as i32, y.floor() as i32);
+        let (fx, fy) = (x - x.floor(), y - y.floor());
+        let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+        let a = hash(xi, yi) + (hash(xi + 1, yi) - hash(xi, yi)) * sx;
+        let b = hash(xi, yi + 1) + (hash(xi + 1, yi + 1) - hash(xi, yi + 1)) * sx;
+        a + (b - a) * sy
+    };
+    let mix = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    let ss = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let mut px = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let (u, vv) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+            let d = equirect_dir(u, vv);
+            let e = d.y.clamp(-1.0, 1.0).asin();
+            let toward = d.dot(sun).clamp(-1.0, 1.0);
+            let ang = toward.acos();
+            let zenith = [0.03, 0.045, 0.12];
+            let mid = [0.14, 0.12, 0.22];
+            let band = [0.78, 0.46, 0.3];
+            let mut c = mix(band, mid, ss(0.0, 0.32, e));
+            c = mix(c, zenith, ss(0.25, 1.2, e));
+            // the horizon glows most towards the sun
+            let side = 0.35 + 0.65 * ((toward + 1.0) * 0.5).powf(2.0);
+            if e < 0.3 {
+                for ch in c.iter_mut() {
+                    *ch *= 0.55 + 0.45 * side;
+                }
+            }
+            // clouds: long streaks, lit pink near the sun, violet-grey away from it
+            let ph = d.x.atan2(d.z);
+            let n = noise(ph * 2.2 + 11.0, e * 22.0) * 0.6 + noise(ph * 7.0, e * 60.0) * 0.4;
+            let cloud = ss(0.56, 0.74, n) * ss(0.04, 0.12, e) * (1.0 - ss(0.45, 0.8, e));
+            let lit = ((toward + 1.0) * 0.5).powf(3.0);
+            let cc = mix([0.13, 0.09, 0.16], [1.1, 0.48, 0.4], lit);
+            c = mix(c, cc, cloud * 0.85);
+            // the sun's glow and its last sliver
+            let glow = (-ang * 3.2).exp() * 1.4 + (-ang * 18.0).exp() * 5.0;
+            for (k, s) in [1.0f32, 0.55, 0.28].iter().enumerate() {
+                c[k] += glow * s;
+            }
+            if ang < 0.025 {
+                c = [40.0, 24.0, 12.0];
+            }
+            // below the horizon: dark ground
+            if e < 0.0 {
+                c = mix(c, [0.05, 0.045, 0.055], ss(0.0, -0.06, e));
+            }
+            px.extend_from_slice(&c);
+        }
+    }
+    px
 }
 
 /// Direction of an equirect pixel centre (v down from the top).
@@ -350,9 +444,10 @@ pub fn f16(x: f32) -> u16 {
 
 fn build_sky(map: MapId) -> Sky {
     let src = sky_src(map);
-    let img = image::load_from_memory_with_format(src.hdr, image::ImageFormat::Hdr).map(|i| i.to_rgb32f()).ok();
+    let img = src.hdr.and_then(|b| image::load_from_memory_with_format(b, image::ImageFormat::Hdr).map(|i| i.to_rgb32f()).ok());
     let (w, h, px) = match img {
         Some(i) => (i.width(), i.height(), i.into_raw()),
+        None if src.hdr.is_none() => (1024, 512, dusk_sky(1024, 512)),
         None => (2, 1, vec![0.6, 0.65, 0.8, 0.6, 0.65, 0.8]),
     };
     let lum = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -504,7 +599,7 @@ fn build_sky(map: MapId) -> Sky {
 
 /// A map's sky (worked out once, the first time it's needed).
 pub fn sky(map: MapId) -> &'static Sky {
-    static SKIES: [OnceLock<Sky>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static SKIES: [OnceLock<Sky>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
     SKIES[map as usize].get_or_init(|| build_sky(map))
 }
 
@@ -519,6 +614,8 @@ pub struct PropVert {
     pub uv: [f32; 2],
     pub layer: u32,
     pub cloth: bool,
+    /// Glows by itself (a lantern's glass): drawn unlit and warm.
+    pub glow: bool,
     /// The model's own vertex colour (Quaternius uses it to tint some pieces).
     pub tint: [f32; 3],
 }
@@ -549,6 +646,7 @@ fn model_src(kind: PropKind) -> ModelSrc {
         PropKind::RockA => model!("Rock_Medium_1", v3(0.0, 0.27, 0.0)),
         PropKind::RockB => model!("Rock_Medium_2", v3(0.0, 0.27, 0.0)),
         PropKind::Plant => model!("Plant_7", V3::ZERO),
+        _ => model!("Crate_Wooden", V3::ZERO),
     }
 }
 
@@ -569,7 +667,51 @@ fn layer_for(material: &str) -> u32 {
     }
 }
 
+/// Varrow Bridgeworks' own props (tools/blender/build_props.py): glTF binaries textured from
+/// the L_BRIDGE atlas; `glass` glows.
+fn bridge_glb(kind: PropKind) -> Option<&'static [u8]> {
+    Some(match kind {
+        PropKind::Railing => include_bytes!("../assets/env/props/varrow_railing.glb"),
+        PropKind::Archway => include_bytes!("../assets/env/props/varrow_archway.glb"),
+        PropKind::Crane => include_bytes!("../assets/env/props/varrow_crane.glb"),
+        PropKind::CrateStack => include_bytes!("../assets/env/props/varrow_crates.glb"),
+        PropKind::Lantern => include_bytes!("../assets/env/props/varrow_lantern.glb"),
+        _ => return None,
+    })
+}
+
+fn load_glb(bytes: &[u8]) -> Vec<PropVert> {
+    let Ok(g) = gltf::Gltf::from_slice(bytes) else { return Vec::new() };
+    let Some(blob) = g.blob.clone() else { return Vec::new() };
+    let get = |_b: gltf::Buffer| Some(blob.as_slice());
+    let mut out = Vec::new();
+    for mesh in g.document.meshes() {
+        for prim in mesh.primitives() {
+            let r = prim.reader(get);
+            let Some(pos) = r.read_positions() else { continue };
+            let pos: Vec<[f32; 3]> = pos.collect();
+            let nrm: Vec<[f32; 3]> = r.read_normals().map(|i| i.collect()).unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; pos.len()]);
+            let uv: Vec<[f32; 2]> = r.read_tex_coords(0).map(|t| t.into_f32().collect()).unwrap_or_else(|| vec![[0.0, 0.0]; pos.len()]);
+            let idx: Vec<u32> = r.read_indices().map(|i| i.into_u32().collect()).unwrap_or_else(|| (0..pos.len() as u32).collect());
+            let glow = prim.material().name().unwrap_or("").starts_with("glass");
+            for &i in &idx {
+                let i = i as usize;
+                if i >= pos.len() {
+                    continue;
+                }
+                let p = pos[i];
+                let n = nrm.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
+                out.push(PropVert { pos: v3(p[0], p[1], p[2]), nrm: v3(n[0], n[1], n[2]), uv: uv.get(i).copied().unwrap_or([0.0, 0.0]), layer: L_BRIDGE, cloth: false, glow, tint: [1.0, 1.0, 1.0] });
+            }
+        }
+    }
+    out
+}
+
 fn load_model(kind: PropKind) -> Vec<PropVert> {
+    if let Some(b) = bridge_glb(kind) {
+        return load_glb(b);
+    }
     let src = model_src(kind);
     let Ok(g) = gltf::Gltf::from_slice(src.json.as_bytes()) else { return Vec::new() };
     let doc = g.document;
@@ -597,7 +739,7 @@ fn load_model(kind: PropKind) -> Vec<PropVert> {
                 let p = pos[i];
                 let n = nrm.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
                 let c = cols.get(i).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
-                out.push(PropVert { pos: v3(p[0], p[1], p[2]) + src.offset, nrm: v3(n[0], n[1], n[2]), uv: uv.get(i).copied().unwrap_or([0.0, 0.0]), layer, cloth, tint: [c[0], c[1], c[2]] });
+                out.push(PropVert { pos: v3(p[0], p[1], p[2]) + src.offset, nrm: v3(n[0], n[1], n[2]), uv: uv.get(i).copied().unwrap_or([0.0, 0.0]), layer, cloth, glow: false, tint: [c[0], c[1], c[2]] });
             }
         }
     }
@@ -606,7 +748,7 @@ fn load_model(kind: PropKind) -> Vec<PropVert> {
 
 /// A prop's mesh (loaded once).
 pub fn prop_mesh(kind: PropKind) -> &'static [PropVert] {
-    const N: usize = 11;
+    const N: usize = 16;
     static MESHES: [OnceLock<Vec<PropVert>>; N] = [const { OnceLock::new() }; N];
     MESHES[kind as usize].get_or_init(|| load_model(kind))
 }
@@ -617,7 +759,7 @@ mod tests {
 
     #[test]
     fn every_prop_loads_and_every_sky_lights_from_above() {
-        for k in [PropKind::BannerA, PropKind::BannerB, PropKind::Barrel, PropKind::WeaponStand, PropKind::Crate, PropKind::Rubble, PropKind::Shield, PropKind::Torch, PropKind::RockA, PropKind::RockB, PropKind::Plant] {
+        for k in [PropKind::BannerA, PropKind::BannerB, PropKind::Barrel, PropKind::WeaponStand, PropKind::Crate, PropKind::Rubble, PropKind::Shield, PropKind::Torch, PropKind::RockA, PropKind::RockB, PropKind::Plant, PropKind::Railing, PropKind::Archway, PropKind::Crane, PropKind::CrateStack, PropKind::Lantern] {
             let m = prop_mesh(k);
             assert!(m.len() >= 3 && m.len() % 3 == 0, "{k:?} has triangles");
             assert!(m.iter().all(|v| v.pos.x.is_finite() && v.uv[0].is_finite()));

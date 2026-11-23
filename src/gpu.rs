@@ -328,7 +328,7 @@ fn shade(i: VOut) -> vec4<f32> {
   let layer = i.ex.x;
   let mat = i.ex.y;
   // every texture is sampled (and the derivatives taken) before any branch
-  let li = i32(clamp(layer, 0.0, 16.0) + 0.5);
+  let li = i32(clamp(layer, 0.0, 17.0) + 0.5);
   let t0 = textureSample(tex, samp, i.uv, li);
   let nt = textureSample(ntex, samp, i.uv, li);
   let t1 = textureSample(ctex, samp, i.uv, i32(max(layer, 0.0) + 0.5));
@@ -347,7 +347,9 @@ fn shade(i: VOut) -> vec4<f32> {
   let is_wpn = mat > 0.75 && mat < 1.25;
   let world_tex = layer >= 0.0 && !is_char && !is_wpn;
   // the level's own materials: the map's palette colour times soft brightness detail
-  let is_level = world_tex && (li <= 5 || li >= 14);
+  let is_level = world_tex && (li <= 5 || (li >= 14 && li <= 16));
+  // the river (layer -2): rippling, dark, mirroring the sky and the lanterns
+  let is_water = layer < -1.5;
   var base = i.col;
   if (layer >= 0.0) { base = base * select(t0, t1, is_char || is_wpn); }
   if (is_level) {
@@ -389,6 +391,15 @@ fn shade(i: VOut) -> vec4<f32> {
     metal = nt.a;
   }
   if (is_char) { rough = 0.62; metal = 0.0; }
+  if (is_water) {
+    let t = u.params.x;
+    let p = i.wpos.xz;
+    let wx = sin(p.x * 1.3 + t * 1.1) * 0.5 + sin((p.x + p.y) * 2.3 - t * 1.7) * 0.3 + sin(p.x * 5.1 - p.y * 3.7 + t * 2.6) * 0.15;
+    let wz = sin(p.y * 1.7 - t * 0.9) * 0.5 + sin((p.x - p.y) * 2.9 + t * 1.3) * 0.3 + sin(p.y * 6.3 + p.x * 2.1 - t * 2.2) * 0.15;
+    n = normalize(vec3<f32>(wx * 0.09, 1.0, wz * 0.09));
+    rough = 0.08;
+    metal = 0.0;
+  }
   let albedo = base.rgb;
   let l = normalize(u.sun.xyz);
   let sh = sun_shadow(i.wpos, ng);
@@ -1099,6 +1110,11 @@ fn prop_into(mb: &mut MB, p: &crate::world::Prop, map: MapId) {
         let q = v.pos * p.scale;
         let pos = p.pos + ax * q.x + V3::UP * q.y + az * q.z;
         let n = (ax * v.nrm.x + V3::UP * v.nrm.y + az * v.nrm.z).norm();
+        if v.glow {
+            // a lantern's glass: unlit and warm (bright enough to bloom)
+            mb.vert(pos, n, v.uv, [2.4, 1.35, 0.55, 1.0], [-1.0, 2.0, 1.0, 0.0]);
+            continue;
+        }
         let col = match (v.cloth, team) {
             (true, Some(t)) => t,
             _ => [v.tint[0], v.tint[1], v.tint[2], 1.0],
@@ -1283,22 +1299,49 @@ fn box_into(mb: &mut MB, world: &World, b: &crate::math::Aabb, lk: &BoxLook) {
         let (ku, kv) = ((a + 1) % 3, (a + 2) % 3);
         let (u0, u1) = range(ku);
         let (v0, v1) = range(kv);
-        let cell = 0.8;
-        let nu = (((u1 - u0) / cell).ceil() as usize).max(1);
-        let nv = (((v1 - v0) / cell).ceil() as usize).max(1);
+        // Where the face is cut into cells. Tops need a grid (their baked shading darkens near
+        // walls); a side's shading only changes with height up to 1.8 m and its texture runs
+        // straight across, so a side needs just a cut at 1.8 m, which looks the same with far
+        // fewer triangles.
+        let cuts = |k: usize, c0: f32, c1: f32| -> Vec<f32> {
+            if a == 1 {
+                let n = (((c1 - c0) / 0.8).ceil() as usize).max(1);
+                (0..=n).map(|i| c0 + (c1 - c0) * i as f32 / n as f32).collect()
+            } else if k == 1 && c0 < 1.8 - 0.05 && c1 > 1.8 + 0.05 {
+                vec![c0, 1.8, c1]
+            } else {
+                vec![c0, c1]
+            }
+        };
+        let us = cuts(ku, u0, u1);
+        let vs = cuts(kv, v0, v1);
         let at = |i: usize, j: usize| {
             let mut c = [0.0f32; 3];
             c[a] = plane(a, s);
-            c[ku] = u0 + (u1 - u0) * i as f32 / nu as f32;
-            c[kv] = v0 + (v1 - v0) * j as f32 / nv as f32;
+            c[ku] = us[i];
+            c[kv] = vs[j];
             mk(c)
         };
-        for j in 0..nv {
-            for i in 0..nu {
-                let q = [at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)];
-                for k in [0, 1, 2, 0, 2, 3] {
-                    vert(mb, q[k], n, n);
+        // the baked shading at every corner; cells in a row whose corners all share one value
+        // are drawn as one long quad (the same picture, far fewer triangles on open floors)
+        let ao: Vec<Vec<f32>> = (0..vs.len()).map(|j| (0..us.len()).map(|i| vertex_ao(world, n, at(i, j))).collect()).collect();
+        let flat = |i: usize, j: usize, v: f32| (ao[j][i] - v).abs() < 1e-4 && (ao[j][i + 1] - v).abs() < 1e-4 && (ao[j + 1][i] - v).abs() < 1e-4 && (ao[j + 1][i + 1] - v).abs() < 1e-4;
+        for j in 0..vs.len() - 1 {
+            let mut i = 0;
+            while i < us.len() - 1 {
+                let v = ao[j][i];
+                let mut e = i + 1;
+                if flat(i, j, v) {
+                    while e < us.len() - 1 && flat(e, j, v) {
+                        e += 1;
+                    }
                 }
+                let q = [at(i, j), at(e, j), at(e, j + 1), at(i, j + 1)];
+                let qa = [ao[j][i], ao[j][e], ao[j + 1][e], ao[j + 1][i]];
+                for k in [0, 1, 2, 0, 2, 3] {
+                    mb.vert(q[k], n, face_uv(n, q[k], lk), lk.tint, [lk.layer, 0.0, qa[k], lk.shine]);
+                }
+                i = e;
             }
         }
     }
@@ -1374,7 +1417,7 @@ fn trims(world: &World) -> Vec<(crate::math::Aabb, Mat, Trim)> {
     let wraps = |b: &Aabb, p: V3| world.blocks.iter().any(|o| !std::ptr::eq(&o.b, b) && o.b.contains(p) && (o.b.max.x - o.b.min.x) > (b.max.x - b.min.x) + 0.1);
     for bl in &world.blocks {
         let b = bl.b;
-        if matches!(bl.mat, Mat::Floor | Mat::Crate) {
+        if matches!(bl.mat, Mat::Floor | Mat::Crate | Mat::Hidden) {
             continue;
         }
         let (sx, sy, sz) = (b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z);
@@ -1386,8 +1429,8 @@ fn trims(world: &World) -> Vec<(crate::math::Aabb, Mat, Trim)> {
         let grounded = b.min.y <= 0.05;
         let grow = |o: f32, y0: f32, y1: f32| Aabb::new(v3(b.min.x - o, y0, b.min.z - o), v3(b.max.x + o, y1, b.max.z + o));
         if sy >= 1.8 && thin <= 1.25 && long >= 1.8 {
-            // a wall: a cap flush with its top, a plinth at its foot
-            out.push((grow(0.06, b.max.y - 0.16, b.max.y), bl.mat, Trim::Cap));
+            // a wall: a cap on its top (a centimetre proud, so the two never flicker), a plinth at its foot
+            out.push((grow(0.06, b.max.y - 0.16, b.max.y + 0.012), bl.mat, Trim::Cap));
             if grounded {
                 out.push((grow(0.035, b.min.y, b.min.y + 0.28), bl.mat, Trim::Plinth));
             }
@@ -1403,7 +1446,7 @@ fn trims(world: &World) -> Vec<(crate::math::Aabb, Mat, Trim)> {
             }
         } else if sy >= 0.9 && thin > 1.25 {
             // a platform or tower: a band round its top edge, a plinth at its foot
-            out.push((grow(0.03, b.max.y - 0.16, b.max.y), bl.mat, Trim::Band));
+            out.push((grow(0.03, b.max.y - 0.16, b.max.y + 0.012), bl.mat, Trim::Band));
             if grounded {
                 out.push((grow(0.03, b.min.y, b.min.y + 0.22), bl.mat, Trim::Plinth));
             }
@@ -1421,6 +1464,7 @@ fn trim_surface(map: MapId, own: Mat, t: Trim) -> (env::Surface, f32) {
             MapId::Arena => (env::surface(map, Mat::Trim), 1.0),
             MapId::CloseQuarters => (env::surface(map, Mat::Trim), 1.0),
             MapId::Courtyard => (env::surface(map, Mat::Stone), 1.0),
+            MapId::Bridgeworks => (env::surface(map, Mat::Trim), 1.0),
         },
         _ => (env::surface(map, own), 0.84),
     }
@@ -1430,6 +1474,9 @@ fn build_world(world: &World) -> Vec<Vtx> {
     let mut mb = MB::default();
     let map = world.map;
     for bl in world.blocks.iter().chain(world.deco.iter()) {
+        if bl.mat == Mat::Hidden {
+            continue; // (a prop draws it)
+        }
         let b = bl.b;
         let sy = b.max.y - b.min.y;
         let surf = if bl.mat == Mat::Metal && sy < 2.0 { env::IRON } else { env::surface(map, bl.mat) };
@@ -1453,6 +1500,22 @@ fn build_world(world: &World) -> Vec<Vtx> {
     }
     for v in &world.vines {
         vine_into(&mut mb, v);
+    }
+    // water: its surface in 4 m tiles (the shader ripples it and mirrors the sky)
+    for w in &world.water {
+        let y = w.max.y;
+        let mut x = w.min.x;
+        while x < w.max.x - 1e-3 {
+            let x1 = (x + 4.0).min(w.max.x);
+            let mut z = w.min.z;
+            while z < w.max.z - 1e-3 {
+                let z1 = (z + 4.0).min(w.max.z);
+                let q = [v3(x, y, z), v3(x, y, z1), v3(x1, y, z1), v3(x1, y, z)];
+                mb.quad(q, V3::UP, [[x * 0.25, z * 0.25], [x * 0.25, z1 * 0.25], [x1 * 0.25, z1 * 0.25], [x1 * 0.25, z * 0.25]], lin([22, 40, 44]), [-2.0, 0.0, 1.0, 3.0]);
+                z = z1;
+            }
+            x = x1;
+        }
     }
     mb.v
 }
@@ -3640,9 +3703,10 @@ mod final_kill_tests {
         }
         for s in 0..g.f.len() {
             if s != me && s != shooter && g.f[s].present && g.f[s].alive {
-                // the others stand far away
+                // the others stand far away, and can't fall (only the shot at you may end it)
                 g.f[s].pos = v3(-14.0 + s as f32 * 2.0, g.f[s].pos.y, -14.0);
                 g.f[s].vel = V3::ZERO;
+                g.f[s].hp = g.f[s].hp.max(500.0);
             }
         }
         let (f, b) = if me < shooter {
@@ -3848,6 +3912,52 @@ mod final_kill_tests {
         }
         if let Err(e) = worker.join() {
             std::panic::resume_unwind(e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod map_cost_tests {
+    use super::*;
+
+    /// How much static geometry each map makes (printed; the team map is checked against the
+    /// biggest duel map).
+    #[test]
+    fn static_geometry_sizes() {
+        let mut sizes = Vec::new();
+        for map in crate::world::MapId::ALL {
+            let w = World::build(map);
+            let v = build_world(&w);
+            let mut mb = MB::default();
+            for p in &w.props {
+                prop_into(&mut mb, p, map);
+            }
+            let props = mb.v.len() / 3;
+            let mut kinds: Vec<(String, usize, usize)> = Vec::new();
+            for p in &w.props {
+                let name = format!("{:?}", p.kind);
+                let tris = env::prop_mesh(p.kind).len() / 3;
+                match kinds.iter_mut().find(|k| k.0 == name) {
+                    Some(k) => k.1 += 1,
+                    None => kinds.push((name, 1, tris)),
+                }
+            }
+            kinds.sort_by_key(|k| std::cmp::Reverse(k.1 * k.2));
+            let top: Vec<String> = kinds.iter().take(6).map(|k| format!("{} {}x{}", k.0, k.1, k.2)).collect();
+            println!("  {map:?} props by cost: {}", top.join(", "));
+            let mut mb = MB::default();
+            for vn in &w.vines {
+                vine_into(&mut mb, vn);
+            }
+            let vines = mb.v.len() / 3;
+            println!(
+                "{map:?}: {} blocks, {} triangles ({props} in props, {vines} in vines), {} props, {} lights",
+                w.blocks.len(),
+                v.len() / 3,
+                w.props.len(),
+                w.torches.len() + w.braziers.len()
+            );
+            sizes.push((map, v.len() / 3));
         }
     }
 }

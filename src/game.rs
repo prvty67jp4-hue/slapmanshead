@@ -1254,6 +1254,8 @@ pub struct Fighter {
     pub cur: usize,
     pub ready: bool,
     pub vote: bool,
+    /// The map this player wants next (MapId as a number; 255: no vote yet).
+    pub map_vote: u8,
     pub ping_ms: u16,
     pub walk_phase: f32,
     pub hurt_t: f32,
@@ -1454,6 +1456,7 @@ impl Fighter {
             cur: 1,
             ready: false,
             vote: false,
+            map_vote: 255,
             ping_ms: 0,
             walk_phase: 0.0,
             hurt_t: 0.0,
@@ -2045,6 +2048,8 @@ pub enum Ev {
     Item { kind: u8 },
     Ready,
     Vote,
+    /// "I'd like this map next" (crate::world::MapId as a number).
+    MapVote { map: u8 },
 }
 
 #[derive(Clone, Debug)]
@@ -4257,6 +4262,16 @@ impl Game {
     fn end_match(&mut self) {
         self.start_killcam();
         self.mt.phase = Phase::MatchOver;
+        // the bots vote for the next map (a fair coin each)
+        if self.is_authority() {
+            let choices = self.map_choices();
+            for i in 0..self.f.len() {
+                if self.f[i].present && self.f[i].is_bot && !choices.is_empty() {
+                    let k = (self.rng.f() * choices.len() as f32) as usize;
+                    self.f[i].map_vote = choices[k.min(choices.len() - 1)] as u8;
+                }
+            }
+        }
         self.mt.timer = if self.kind == Kind::Demo { 5.0 } else { 9999.0 };
         self.banner = Some((self.leader_text(), 9999.0));
         if self.kind != Kind::Demo {
@@ -4548,8 +4563,18 @@ impl Game {
         }
     }
 
-    /// Start (or restart) the match: scores reset and everyone respawns.
+    /// Start (or restart) the match: scores reset and everyone respawns (on the map the vote
+    /// chose, after a match).
     pub fn start_match(&mut self) {
+        if self.mt.phase == Phase::MatchOver && self.is_authority() {
+            if let Some(m) = self.map_vote_winner() {
+                self.set_map(m);
+            }
+        }
+        // a map that doesn't suit the mode (the team map in a duel) gives way to one that does
+        if !self.world.map.fits(self.mt.mode.teams()) && self.is_authority() && self.mt.mode != Mode::Gauntlet {
+            self.set_map(MapId::default_for(self.mt.mode.teams()));
+        }
         if self.mt.mode == Mode::Gauntlet {
             // a new run: the bots go, the score starts again (the best is kept)
             let best = self.gauntlet.as_ref().map_or(0, |g| g.best);
@@ -4587,6 +4612,7 @@ impl Game {
                 self.life_stats[i] = CombatStats::default();
                 self.f[i].deaths = 0;
                 self.f[i].vote = false;
+                self.f[i].map_vote = 255;
                 self.f[i].ready = self.f[i].is_bot;
                 if i == self.local && !self.f[i].is_bot {
                     self.f[i].loadout = self.my_loadout;
@@ -7168,6 +7194,37 @@ impl Game {
         }
     }
 
+    /// The maps the next match can be on (the vote's choices): the ones that suit the mode.
+    pub fn map_choices(&self) -> Vec<MapId> {
+        MapId::for_mode(self.mt.mode.teams())
+    }
+
+    /// Votes for each choice, in order.
+    pub fn map_tally(&self) -> Vec<(MapId, usize)> {
+        self.map_choices().into_iter().map(|m| (m, self.f.iter().filter(|f| f.present && f.map_vote == m as u8).count())).collect()
+    }
+
+    /// The map the votes chose (None: nobody voted). A tie keeps the map being played if it's
+    /// among the leaders, otherwise the first of them.
+    pub fn map_vote_winner(&self) -> Option<MapId> {
+        let tally = self.map_tally();
+        let top = tally.iter().map(|t| t.1).max().unwrap_or(0);
+        if top == 0 {
+            return None;
+        }
+        let leaders: Vec<MapId> = tally.iter().filter(|t| t.1 == top).map(|t| t.0).collect();
+        Some(if leaders.contains(&self.world.map) { self.world.map } else { leaders[0] })
+    }
+
+    /// Vote for the next map at the end of a match.
+    pub fn vote_map(&mut self, m: MapId) {
+        let l = self.local;
+        self.f[l].map_vote = m as u8;
+        if self.kind == Kind::Client {
+            self.out_events.push(Ev::MapVote { map: m as u8 });
+        }
+    }
+
     /// Vote for a rematch at the end of a match.
     pub fn vote_rematch(&mut self) {
         let l = self.local;
@@ -7809,6 +7866,11 @@ impl Game {
                     self.f[from].vote = true;
                 }
             }
+            Ev::MapVote { map } => {
+                if self.kind == Kind::Host && from < self.f.len() && self.map_choices().iter().any(|m| *m as u8 == map) {
+                    self.f[from].map_vote = map;
+                }
+            }
         }    }
 }
 
@@ -7911,6 +7973,7 @@ pub(crate) mod lag_comp_tests {
             torches: Vec::new(),
             map: MapId::Arena,
             flags: [v3(0.0, 0.0, -21.5), v3(0.0, 0.0, 21.5)],
+            water: Vec::new(),
         }
     }
 
@@ -11094,5 +11157,61 @@ mod skill_tests {
         assert_eq!(tn.kill_heal, 20.0);
         assert_eq!(tn.finish_heal, 30.0);
         assert_eq!(tn.mark_time, 2.5);
+    }
+}
+
+/// The team map belongs to the team modes, and a match ends with a vote for the next map.
+#[cfg(test)]
+mod map_vote_tests {
+    use super::*;
+
+    #[test]
+    fn the_team_map_is_for_team_modes_and_the_default_there() {
+        assert_eq!(MapId::default_for(true), MapId::Bridgeworks);
+        assert_eq!(MapId::default_for(false), MapId::Arena);
+        assert!(MapId::for_mode(true).contains(&MapId::Bridgeworks));
+        assert!(!MapId::for_mode(false).contains(&MapId::Bridgeworks), "duel maps only for Duel and Free-for-All");
+        assert_eq!(MapId::for_mode(false), vec![MapId::Arena, MapId::Courtyard, MapId::CloseQuarters]);
+        assert_eq!(MapId::from_u8(3), MapId::Bridgeworks);
+        // a duel can't be played on the team map: it moves to the Arena when it starts
+        let mut g = Game::offline("A", 1, 0.5, Mode::Duel, 5);
+        g.set_map(MapId::Bridgeworks);
+        g.start_match();
+        assert_eq!(g.world.map, MapId::Arena);
+    }
+
+    #[test]
+    fn the_next_map_is_the_one_most_voted_for() {
+        let mut g = Game::offline("A", 3, 0.5, Mode::Tdm, 5);
+        g.set_map(MapId::Bridgeworks);
+        g.start_match();
+        g.end_match();
+        // the bots voted for something the mode allows
+        for s in 1..4 {
+            assert!(MapId::for_mode(true).iter().any(|m| *m as u8 == g.f[s].map_vote), "bot {s} voted");
+        }
+        // three for the Courtyard, one for the bridge: the Courtyard it is
+        g.vote_map(MapId::Courtyard);
+        g.f[1].map_vote = MapId::Courtyard as u8;
+        g.f[2].map_vote = MapId::Courtyard as u8;
+        g.f[3].map_vote = MapId::Bridgeworks as u8;
+        assert_eq!(g.map_vote_winner(), Some(MapId::Courtyard));
+        g.start_match();
+        assert_eq!(g.world.map, MapId::Courtyard);
+        assert!(g.f.iter().all(|f| f.map_vote == 255), "votes start again");
+        // a tie keeps the map being played
+        g.end_match();
+        g.vote_map(MapId::Courtyard);
+        g.f[1].map_vote = MapId::Arena as u8;
+        g.f[2].map_vote = 255;
+        g.f[3].map_vote = 255;
+        assert_eq!(g.map_vote_winner(), Some(MapId::Courtyard));
+        // nobody voting changes nothing
+        for f in g.f.iter_mut() {
+            f.map_vote = 255;
+        }
+        assert_eq!(g.map_vote_winner(), None);
+        g.start_match();
+        assert_eq!(g.world.map, MapId::Courtyard);
     }
 }

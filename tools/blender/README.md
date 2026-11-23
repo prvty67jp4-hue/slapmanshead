@@ -78,3 +78,19 @@ What it writes:
 Conventions: the game's model space for the fighter (metres, y up, the fighter faces +z, their left is +x),
 read from `ref/anchors.json` (bone positions) and `ref/<name>.obj` (the body, in its rest T-pose). Pieces are
 fitted with ray casts and an "outside surface" shrink-wrap, so nothing sinks into the body.
+
+# Varrow Bridgeworks props (Blender)
+
+The team map's own set pieces are built by `build_props.py`:
+
+    blender --background --factory-startup --python app/tools/blender/build_props.py
+
+- `railing`: a 2 m bridge railing (dark wood posts with iron caps, two wooden rails held by iron straps).
+- `archway`: a stone arch over a 6 m opening (pillar centres at +-3 m, the arch's top at 4.6 m).
+- `crane`: a dockside crane (6.2 m mast, a jib along -Y with a pulley, rope, hook and counterweight).
+- `crates`: a stack of three crates.
+- `lantern`: a wall lantern (its bracket starts at the wall face); its `glass` material is drawn unlit and warm.
+
+What it writes: `app/assets/env/props/varrow_<name>.glb`, one shared 1024 x 1024 texture
+`app/assets/env/props/varrow_props.png`, and previews in `app/shots/varrow/props/`. The props are looks only:
+the map (`World::bridgeworks` in `src/world.rs`) places invisible blocks where players must collide with them.

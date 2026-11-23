@@ -45,6 +45,32 @@ The cost is about 0.3 ms at the 1% low on the RTX 3060. Scaled to the Deck as ab
 slower), that's roughly 2.5 ms more in the worst frames, still far inside the 16.7 ms a 60 fps frame allows:
 the Steam Deck preset still holds 60 fps (estimated; not measured on a Deck).
 
+## Varrow Bridgeworks (4v4 team map)
+
+The team map is about 60 x 60 m with three height levels, so it shows far more of the level at once than the
+duel maps. Its level is about 102,000 triangles (the Arena about 61,000); walls are no longer cut into a 0.8 m grid
+and open floor is drawn in long strips, which looks the same and took the map down from 167,000 (and every
+other map down by 5 to 10%).
+
+Timed with the Steam Deck preset (1280x800, 8 fighters, Team Deathmatch) with `tools/capture_varrow.ps1
+-Bench`. The game was also open in the background during these runs, sharing the graphics card, so every number
+here is slower than in the table above; the map is judged against the Arena timed the same way, back to back:
+
+| Run (20 s each, back to back) | Average | 1% low | 3D drawing (processor) |
+| --- | --- | --- | --- |
+| Arena, Team Deathmatch | 240 fps (4.17 ms) | 151 to 154 fps | 1.48 ms |
+| Varrow Bridgeworks, Team Deathmatch | 190 to 204 fps (4.9 to 5.25 ms) | 135 to 145 fps | 1.45 ms |
+| Varrow Bridgeworks, 60 s | 214 fps (4.68 ms) | 122 fps (8.2 ms) | 1.33 ms |
+| Arena, tiny picture (processor cost only) | 293 fps (3.41 ms) | 172 fps | 1.50 ms |
+| Varrow Bridgeworks, tiny picture | 276 fps (3.62 ms) | 162 fps | 1.40 ms |
+
+The processor's share is the same as the Arena's; the graphics share (full picture minus tiny picture) is about
+1.85 times the Arena's, from the larger, more open view. Steam Deck estimate, scaled as above from the clean
+Arena run (graphics share 0.2 ms average and 0.6 ms at the 1% low, times 1.85, then times 8; processor 1.04 and
+1.86 ms times 3): about 6 ms average and 15 ms in the worst 1% of frames, inside the 16.7 ms of a 60 fps frame
+(and the Deck starts with dynamic resolution on, which lowers the picture's resolution in the busiest moments).
+It is the tightest of the maps; worth confirming on a real Deck.
+
 ## Memory
 
 - The game's own lists (effects, replays, histories, logs) stay flat through a 30-minute match: checked every
