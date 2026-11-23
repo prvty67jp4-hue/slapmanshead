@@ -72,6 +72,7 @@ pub enum PropKind {
 
 impl PropKind {
     /// Rough footprint radius on the ground at scale 1 (0 for things hung on walls).
+    #[cfg(test)]
     pub fn radius(self) -> f32 {
         match self {
             PropKind::Barrel => 0.36,
@@ -83,6 +84,7 @@ impl PropKind {
             PropKind::BannerA | PropKind::BannerB | PropKind::Shield | PropKind::Torch => 0.0,
         }
     }
+    #[cfg(test)]
     pub fn on_wall(self) -> bool {
         self.radius() == 0.0
     }
@@ -116,7 +118,6 @@ pub struct World {
     pub half: f32,
     pub deco: Vec<Block>,
     pub braziers: Vec<V3>,
-    pub banners: Vec<(V3, V3, u8)>,
     pub props: Vec<Prop>,
     pub vines: Vec<Vine>,
     /// Wall torches: where their flames burn (they light the walls around them).
@@ -339,7 +340,6 @@ impl World {
             half: h,
             deco,
             braziers,
-            banners,
             props,
             vines,
             torches,
@@ -444,7 +444,6 @@ impl World {
             half: h,
             deco,
             braziers,
-            banners,
             props,
             vines,
             torches,
@@ -539,7 +538,6 @@ impl World {
             half: h,
             deco,
             braziers,
-            banners,
             props,
             vines,
             torches,
@@ -580,7 +578,7 @@ impl World {
     /// A copy of this world (tests).
     #[cfg(test)]
     pub fn clone_world(&self) -> World {
-        World { blocks: self.blocks.clone(), spawn_points: self.spawn_points.clone(), half: self.half, deco: self.deco.clone(), braziers: self.braziers.clone(), banners: self.banners.clone(), props: self.props.clone(), vines: self.vines.clone(), torches: self.torches.clone(), map: self.map, flags: self.flags }
+        World { blocks: self.blocks.clone(), spawn_points: self.spawn_points.clone(), half: self.half, deco: self.deco.clone(), braziers: self.braziers.clone(), props: self.props.clone(), vines: self.vines.clone(), torches: self.torches.clone(), map: self.map, flags: self.flags }
     }
 
     /// What's under someone's feet: the material of the highest surface just below `p`.

@@ -1,4 +1,4 @@
-﻿use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct V3 {
@@ -36,9 +36,6 @@ impl V3 {
     }
     pub fn lerp(self, o: V3, t: f32) -> V3 {
         self + (o - self) * t
-    }
-    pub fn mulv(self, o: V3) -> V3 {
-        v3(self.x * o.x, self.y * o.y, self.z * o.z)
     }
 }
 

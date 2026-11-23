@@ -1,7 +1,7 @@
 //! Freeze watchdog: the game loop checks in every frame; a helper thread notices when it hasn't
 //! for over 3 seconds and writes a hang report (what was on screen, the match phase, the kill
 //! cam, slow motion, the camera, the last events, and which part of the frame it stopped in)
-//! to `hang_report.txt` beside the career stats. When the game comes back it notes how long the
+//! to `hang_report.txt` in the Bug reports folder (see `reports`). When the game comes back it notes how long the
 //! stall lasted.
 
 use std::io::Write;
@@ -32,7 +32,15 @@ pub struct Watchdog {
 }
 
 pub fn report_path() -> Option<PathBuf> {
-    crate::platform::data_file("hang_report.txt")
+    Some(crate::reports::dir()?.join("hang_report.txt"))
+}
+
+/// The game's last check-in picture, for a crash report (empty before the first frame).
+static LAST_SNAPSHOT: Mutex<String> = Mutex::new(String::new());
+
+pub fn last_snapshot() -> String {
+    // (a crash while the snapshot is being written: say so rather than wait)
+    LAST_SNAPSHOT.try_lock().map(|s| s.clone()).unwrap_or_else(|_| "(being updated when it crashed)".to_string())
 }
 
 impl Watchdog {
@@ -67,6 +75,9 @@ impl Watchdog {
 
     /// What the game looks like now, for a report.
     pub fn snapshot(&self, text: String) {
+        if let Ok(mut s) = LAST_SNAPSHOT.lock() {
+            s.clone_from(&text);
+        }
         if let Ok(mut s) = self.shared.snapshot.lock() {
             *s = text;
         }
@@ -119,8 +130,9 @@ fn watch(sh: Arc<Shared>, path: Option<PathBuf>) {
 pub fn report_text(quiet_ms: u64, stage: &str, snapshot: &str) -> String {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!(
-        "=== Duel Rush hang report (unix time {stamp}, version {}) ===\nThe game loop stopped for over {:.1} s.\nStuck in: {stage}\n{snapshot}\n",
-        env!("CARGO_PKG_VERSION"),
+        "=== Duel Rush hang report (unix time {stamp}, {}, version {}) ===\nThe game loop stopped for over {:.1} s.\nStuck in: {stage}\n{snapshot}\n",
+        crate::reports::stamp(),
+        crate::VERSION,
         quiet_ms as f64 / 1000.0
     )
 }

@@ -84,3 +84,6 @@ assets/fonts/Inter.ttf (body text)
   "Inter" by Rasmus Andersson and The Inter Project Authors, Copyright 2020
   Source: Google Fonts, https://github.com/google/fonts/tree/main/ofl/inter
   Licence: assets/fonts/Inter-OFL.txt
+
+assets/weapons/*.glb and assets/weapons/icons/*.png (the eleven weapon models and their icons)
+  Original work made for this game with the scripts in tools/blender (no third-party parts).

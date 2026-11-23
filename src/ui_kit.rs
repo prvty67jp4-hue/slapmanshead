@@ -315,8 +315,34 @@ pub fn keycap(p: &Painter, c: Pos2, key: &str, s: f32) -> Rect {
 
 // ------------------------------------------------------------------ icons
 
-/// A weapon's silhouette, pointing right, centred in `r`.
+/// A weapon's icon texture: rendered from its model in Blender (grey shades the colour tints),
+/// made once and kept.
+fn weapon_icon_tex(ctx: &egui::Context, w: Weapon) -> Option<egui::TextureHandle> {
+    let id = egui::Id::unique(("weapon-icon", w as u8));
+    if let Some(t) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
+        return t;
+    }
+    let t = crate::weapons::icon_pixels(w).map(|(px, size)| ctx.load_texture(format!("weapon-icon-{}", w as u8), egui::ColorImage::from_rgba_unmultiplied(size, &px), egui::TextureOptions::LINEAR));
+    ctx.data_mut(|d| d.insert_temp(id, t.clone()));
+    t
+}
+
+/// A weapon's picture, pointing right, centred in `r`, in the colour `col`: its model's icon,
+/// or (if that's missing) a drawn silhouette.
 pub fn weapon_icon(p: &Painter, r: Rect, w: Weapon, col: Color32) {
+    if let Some(t) = weapon_icon_tex(p.ctx(), w) {
+        let [iw, ih] = t.size();
+        let aspect = iw as f32 / ih.max(1) as f32;
+        let bw = r.width().min(r.height() * aspect);
+        let b = Rect::from_center_size(r.center(), Vec2::new(bw, bw / aspect));
+        p.image(t.id(), b, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), col);
+        return;
+    }
+    weapon_silhouette(p, r, w, col);
+}
+
+/// The drawn silhouette (the fallback for a missing icon).
+fn weapon_silhouette(p: &Painter, r: Rect, w: Weapon, col: Color32) {
     let aspect = 2.6;
     let bw = r.width().min(r.height() * aspect);
     let b = Rect::from_center_size(r.center(), Vec2::new(bw, bw / aspect));
@@ -942,6 +968,12 @@ pub fn loadout_screen(ctx: &egui::Context, rect: Rect, lo: &mut Loadout, st: &mu
         p.rect_filled(Rect::from_min_size(back.min, Vec2::new(3.0 * k, back.height())), 1.0, ACCENT);
         ability_icon(&p, Rect::from_center_size(Pos2::new(br.right() - tw - 16.0 * k, ay - 9.0 * k), Vec2::splat(20.0 * k)), ab, ACCENT);
         label(&p, Pos2::new(br.right(), ay), Align2::RIGHT_BOTTOM, &at, aw, Color32::from_rgb(255, 210, 170));
+        // what the ability does, under it
+        let ad = ab.blurb();
+        let af = fitted(&p, ad, body(12.5 * k), right_w - m * 1.5);
+        let adw = text_width(&p, ad, af.clone());
+        p.rect_filled(Rect::from_min_max(Pos2::new(br.right() - adw - 10.0 * k, ay + 3.0 * k), Pos2::new(br.right() + 6.0 * k, ay + 24.0 * k)), 4.0 * k, Color32::from_rgba_unmultiplied(10, 9, 18, 200));
+        p.text(Pos2::new(br.right(), ay + 6.0 * k), Align2::RIGHT_TOP, ad, af, Color32::from_gray(215));
         let held = match st.slot {
             1 => lo.gun1,
             2 => lo.gun2,

@@ -240,6 +240,7 @@ impl Career {
     }
 
     /// Count one thing (today, playing no fighter in particular); returns the XP it earned.
+    #[cfg(test)]
     pub fn apply(&mut self, ev: CareerEv) -> u32 {
         self.apply_as(ev, None, today())
     }

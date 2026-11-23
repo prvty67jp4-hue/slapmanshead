@@ -106,6 +106,68 @@ pub fn data_file(name: &str) -> Option<PathBuf> {
     Some(data_dir()?.join(name))
 }
 
+/// How much memory the game holds right now, in MB: on Windows its private (committed) bytes,
+/// elsewhere its resident set. None when the system won't say.
+pub fn memory_mb() -> Option<f64> {
+    memory().map(|m| m.0)
+}
+
+/// Memory in MB: (private / committed, resident in RAM). On Linux both are the resident set.
+pub fn memory() -> Option<(f64, f64)> {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct Counters {
+            cb: u32,
+            page_faults: u32,
+            peak_working_set: usize,
+            working_set: usize,
+            quota_peak_paged: usize,
+            quota_paged: usize,
+            quota_peak_nonpaged: usize,
+            quota_nonpaged: usize,
+            pagefile: usize,
+            peak_pagefile: usize,
+        }
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+        }
+        let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, page_faults: 0, peak_working_set: 0, working_set: 0, quota_peak_paged: 0, quota_paged: 0, quota_peak_nonpaged: 0, quota_nonpaged: 0, pagefile: 0, peak_pagefile: 0 };
+        // SAFETY: a plain query about this process into a struct of the documented layout
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+        if ok != 0 { Some((mb(c.pagefile), mb(c.working_set))) } else { None }
+    }
+    #[cfg(not(windows))]
+    {
+        // /proc/self/statm: sizes in pages; the second is what's resident
+        let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: f64 = s.split_whitespace().nth(1)?.parse().ok()?;
+        let mb = pages * 4096.0 / (1024.0 * 1024.0);
+        Some((mb, mb))
+    }
+}
+
+/// Open a folder in the system's file manager, with `select` highlighted when given (Windows).
+/// Returns whether a file manager could be started.
+pub fn open_folder(dir: &std::path::Path, select: Option<&std::path::Path>) -> bool {
+    let _ = std::fs::create_dir_all(dir);
+    let spawned = if cfg!(windows) {
+        let mut c = std::process::Command::new("explorer.exe");
+        match select {
+            Some(f) => c.arg(format!("/select,{}", f.display())),
+            None => c.arg(dir),
+        };
+        c.spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(dir).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(dir).spawn()
+    };
+    spawned.is_ok()
+}
+
 /// Write a save file, making its folder first. Writes a temporary file and swaps it in, so a
 /// crash or power loss (a handheld's battery running out) never leaves a half-written save.
 pub fn save_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {

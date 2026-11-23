@@ -14,7 +14,10 @@ mod net;
 mod pad;
 mod platform;
 mod render;
+mod reports;
 mod ui_kit;
+mod update;
+mod weapons;
 mod watchdog;
 mod world;
 
@@ -28,6 +31,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const TITLE: &str = "DUEL RUSH";
+/// The version playtesters see on the main menu and in every report: the release number and the
+/// build number (GitHub's run number; a build made anywhere else says `dev build` and when it
+/// was built, UTC `YYMMDD.HHMM`).
+pub const VERSION: &str = env!("DUEL_VERSION_TEXT");
 const ACCENT: Color32 = Color32::from_rgb(255, 150, 70);
 
 #[derive(Clone)]
@@ -93,6 +100,8 @@ struct Settings {
     outfits: [u8; 4],
     /// Lobbies and practice with abilities (off: Classic).
     abilities: bool,
+    /// Look for a new build on start and offer it (Settings, on by default).
+    auto_update: bool,
 }
 
 /// Interface sizes: (name, zoom).
@@ -334,6 +343,7 @@ impl Default for Settings {
             steam_name: true,
             outfits: [0; 4],
             abilities: true,
+            auto_update: true,
         }
     }
 }
@@ -437,6 +447,7 @@ impl Settings {
                             "dyn_res" => s.dyn_res = v == "1",
                             "steam_name" => s.steam_name = v != "0",
                             "abilities" => s.abilities = v != "0",
+            "auto_update" => s.auto_update = v != "0",
                             "outfits" => {
                                 for (slot, x) in s.outfits.iter_mut().zip(v.split(',')) {
                                     *slot = x.trim().parse::<u8>().unwrap_or(0).min(3);
@@ -533,7 +544,7 @@ impl Settings {
                 "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\naim_v=3\n",
                 self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8
             );
-            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\nabilities={}\noutfits={},{},{},{}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8, self.abilities as u8, self.outfits[0], self.outfits[1], self.outfits[2], self.outfits[3]);
+            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\nabilities={}\nauto_update={}\noutfits={},{},{},{}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8, self.abilities as u8, self.auto_update as u8, self.outfits[0], self.outfits[1], self.outfits[2], self.outfits[3]);
             let f = self.post;
             text += &format!(
                 "fx_soft_shadows={}\nfx_ssao={}\nfx_bloom={}\nfx_rays={}\nfx_grading={}\nfx_vignette={}\n",
@@ -594,6 +605,16 @@ struct App {
     screen: Screen,
     demo: Game,
     gpu: Option<gpu::Gpu>,
+    /// The graphics card and driver, for bug reports.
+    gpu_name: String,
+    /// What the Report a bug button just did (shown under it for a while).
+    report_note: Option<(String, f32)>,
+    /// The auto-updater (it works in the background; see update.rs).
+    updater: update::Updater,
+    /// The performance run (test switch DUEL_BENCH), and this frame's game-logic and drawing times.
+    bench: Option<Bench>,
+    sim_ms: f32,
+    draw_ms: f32,
     settings: Settings,
     menu_msg: Option<String>,
     screenshot: Option<PathBuf>,
@@ -738,7 +759,9 @@ impl App {
         let demo = Game::demo();
         let settings = Settings::load();
         let audio_test = std::env::var_os("DUEL_AUDIO_TEST").is_some();
+        memlog("before audio");
         let audio = if screenshot.is_none() || audio_test { audio::Audio::new() } else { None };
+        memlog("after audio");
         if audio_test {
             eprintln!("audio device: {}", if audio.is_some() { "ok" } else { "none" });
         }
@@ -746,6 +769,12 @@ impl App {
             screen: Screen::Menu(Page::Main),
             demo,
             gpu: None,
+            gpu_name: String::new(),
+            report_note: None,
+            updater: update::Updater::new(),
+            bench: None,
+            sim_ms: 0.0,
+            draw_ms: 0.0,
             settings,
             menu_msg: None,
             screenshot,
@@ -880,6 +909,25 @@ impl App {
             app.settings.net_loss = it.next().unwrap_or(5.0);
         }
         app.show_debug = std::env::var_os("DUEL_DEBUG").is_some();
+        // test switch DUEL_BENCH=<seconds>[,<results file>]: a performance and memory run, with the
+        // frame rate unlocked (no vsync, no limit, no dynamic resolution) so it shows the headroom
+        // updates: clear what the last update left, then look for a new build in the background (not
+        // for test runs, which must stay as they are)
+        update::cleanup_old();
+        let test_run = app.screenshot.is_some() || std::env::var_os("DUEL_AUTOPLAY").is_some() || std::env::var_os("DUEL_BENCH").is_some();
+        // (DUEL_UPDATE_URL points at a test server: then test runs check too)
+        if app.settings.auto_update && (!test_run || std::env::var_os("DUEL_UPDATE_URL").is_some()) {
+            app.updater.check(false);
+        }
+        if let Ok(v) = std::env::var("DUEL_BENCH") {
+            let mut it = v.splitn(2, ',');
+            let secs = it.next().and_then(|s| s.trim().parse::<f32>().ok()).unwrap_or(60.0).max(5.0);
+            let out = it.next().map(|s| PathBuf::from(s.trim())).unwrap_or_else(|| std::env::temp_dir().join("duel_bench.txt"));
+            app.settings.vsync = false;
+            app.settings.fps_cap = 0;
+            app.settings.dyn_res = false;
+            app.bench = Some(Bench::new(secs, out));
+        }
         // test switch: DUEL_TUNING opens the tuning panel (and puts a dummy 15 m ahead)
         app.show_tuning = std::env::var_os("DUEL_TUNING").is_some();
         if std::env::var_os("DUEL_RECENT").is_some() {
@@ -1735,6 +1783,30 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.settings.net_lag, 0.0..=300.0).step_by(10.0).suffix(" ms").text("extra lag"));
                     ui.add(egui::Slider::new(&mut self.settings.net_loss, 0.0..=20.0).step_by(1.0).suffix(" %").text("packet loss"));
                 });
+                ui.add_space(6.0);
+                ui_kit::section(ui, "Updates");
+                ui.label(egui::RichText::new(format!("This is {VERSION}.")).size(13.0).color(Color32::from_gray(200)));
+                ui.checkbox(&mut self.settings.auto_update, "Auto-update on start (look for a new build and offer it; never during a match)");
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.updater.busy(), egui::Button::new("Check for updates")).clicked() {
+                        if let Ok(mut s) = self.updater.state.lock() {
+                            s.dismissed = None;
+                        }
+                        self.updater.check(true);
+                    }
+                    let status = match self.updater.phase() {
+                        update::Phase::Idle => String::new(),
+                        update::Phase::Checking { .. } => "Checking...".into(),
+                        update::Phase::UpToDate => "You have the newest build.".into(),
+                        update::Phase::Dev => "This is a development build: it doesn't update itself.".into(),
+                        update::Phase::Available(m) => format!("Build {} is out (see the top of the menu).", m.build),
+                        update::Phase::Downloading { build, .. } => format!("Downloading build {build}..."),
+                        update::Phase::Installing { build } | update::Phase::Restart { build } => format!("Build {build} is ready: it starts from the menu."),
+                        update::Phase::Failed(e) => format!("Update failed: {e}"),
+                        update::Phase::CheckFailed(e) => format!("Couldn't check: {e}"),
+                    };
+                    ui.label(egui::RichText::new(status).size(13.0).color(Color32::from_gray(190)));
+                });
             }
             1 => {
                 ui.label(egui::RichText::new("Click a control, then press the key or mouse button you want. Esc cancels.").color(Color32::from_gray(200)));
@@ -1928,14 +2000,22 @@ fn draw_crosshair(p: &egui::Painter, c: Pos2, style: u8, col: Color32, dot_col: 
         }
     };
     if circle {
-        // the scattergun: its ten pellets, exactly where they'll go
-        let pr = (1.6 * size).max(1.4);
-        for (x, y) in SHOTGUN_PATTERN {
-            let at = c + Vec2::new(x * gap, -y * gap);
-            p.circle_filled(at, pr + 1.0, outline);
-            p.circle_filled(at, pr, if x == 0.0 && y == 0.0 { dot_col } else { col });
+        // the pump: a clean thin circle exactly as wide as the pellet spread, a centre dot and
+        // four small ticks on the circle
+        let r = gap;
+        let thin = (1.2 * size).max(1.0);
+        p.circle_stroke(c, r, Stroke::new(thin + 2.0, outline));
+        p.circle_stroke(c, r, Stroke::new(thin, col));
+        let tick = (4.0 * size).max(3.0);
+        for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            let d = Vec2::new(dx, dy);
+            let (a, b) = (c + d * (r - tick * 0.5), c + d * (r + tick * 0.5));
+            p.line_segment([a - d, b + d], Stroke::new(thin + 2.0, outline));
+            p.line_segment([a, b], Stroke::new(thin, col));
         }
-        p.circle_stroke(c, gap, Stroke::new(1.0, col.gamma_multiply(0.35)));
+        let dr = (1.1 * size).max(1.0);
+        p.circle_filled(c, dr + 1.0, outline);
+        p.circle_filled(c, dr, dot_col);
         return;
     }
     match style {
@@ -2024,6 +2104,9 @@ fn icon_pixels(n: u32) -> (Vec<u8>, u32) {
 }
 
 fn main() -> eframe::Result<()> {
+    // a crash leaves a report in the Bug reports folder
+    reports::install_crash_log();
+    memlog("start");
     let args: Vec<String> = std::env::args().collect();
     let mut screenshot = None;
     let mut i = 1;
@@ -2067,6 +2150,7 @@ fn main() -> eframe::Result<()> {
         "Duel Rush",
         options,
         Box::new(move |cc| {
+            memlog("window made");
             ui_kit::install_fonts(&cc.egui_ctx);
             let mut style = (*cc.egui_ctx.global_style()).clone();
             style.visuals = egui::Visuals::dark();
@@ -2173,6 +2257,9 @@ impl eframe::App for App {
         if let Some(t0) = self.frame_start {
             let dt = t0.elapsed().as_secs_f32().max(1e-4);
             self.fps += (1.0 / dt - self.fps) * 0.05;
+            if self.bench.is_some() {
+                self.bench_frame(&ctx, dt * 1000.0);
+            }
         }
         self.frame_start = Some(std::time::Instant::now());
         // fullscreen (F11 toggles it too)
@@ -2206,8 +2293,45 @@ impl eframe::App for App {
             self.applied_vsync = Some(self.settings.vsync);
         }
         self.frames += 1;
+        // test switch DUEL_UPDATE_NOW: press Update now as soon as an update is offered
+        if std::env::var_os("DUEL_UPDATE_NOW").is_some() && matches!(self.screen, Screen::Menu(_)) {
+            if let update::Phase::Available(m) = self.updater.phase() {
+                self.updater.update(m);
+            }
+        }
+        // a downloaded update: start it, but only from a menu (never in the middle of a match)
+        if let update::Phase::Restart { .. } = self.updater.phase() {
+            if matches!(self.screen, Screen::Menu(_)) {
+                self.settings.save();
+                match update::relaunch() {
+                    Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                    Err(e) => {
+                        if let Ok(mut s) = self.updater.state.lock() {
+                            s.phase = update::Phase::Failed(e);
+                        }
+                    }
+                }
+            }
+        }
+        // test switch DUEL_CRASH_TEST: crash on purpose (checks the crash report is written)
+        if matches!(self.frames, 2 | 30 | 300) {
+            memlog(&format!("frame {}", self.frames));
+        }
+        if self.frames == 90 && std::env::var_os("DUEL_CRASH_TEST").is_some() {
+            panic!("crash test (DUEL_CRASH_TEST)");
+        }
+        // test switch DUEL_REPORT_TEST: press Report a bug (the screenshot shows its note)
+        if self.frames == 60 && std::env::var_os("DUEL_REPORT_TEST").is_some() {
+            self.report_bug();
+        }
         let rect = ui.max_rect();
         let dt = ctx.input(|i| i.unstable_dt).clamp(0.0, 0.1);
+        if let Some((_, t)) = self.report_note.as_mut() {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.report_note = None;
+            }
+        }
         self.frame_dt = dt;
         self.wall_t += dt;
         self.handle_screenshot(&ctx);
@@ -2239,7 +2363,9 @@ impl eframe::App for App {
             self.watchdog.stage("reading input");
             sample_keys(&ctx, &self.settings.binds);
             self.read_play_input(&ctx);
+            let t_sim = std::time::Instant::now();
             self.step_play(dt);
+            self.sim_ms = t_sim.elapsed().as_secs_f32() * 1000.0;
         } else {
             self.set_capture(&ctx, false);
             // the menu's showcase: your fighter, standing on the map
@@ -2300,12 +2426,19 @@ impl eframe::App for App {
         let ppp = ctx.pixels_per_point();
         if self.gpu.is_none() {
             if let Some(rs) = frame.wgpu_render_state() {
+                memlog("before gpu");
                 self.gpu = Some(gpu::Gpu::new(rs, &self.demo.world));
+                memlog("after gpu");
+                let info = rs.adapter.get_info();
+                self.gpu_name = format!("{} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
             }
         }
         let mut gpu = self.gpu.take();
         if let (Some(g3), Some(rs)) = (gpu.as_mut(), frame.wgpu_render_state()) {
-            let q = gpu::Quality::PRESETS[self.settings.quality.min(gpu::Quality::PRESETS.len() - 1)].1;
+            let mut q = gpu::Quality::PRESETS[self.settings.quality.min(gpu::Quality::PRESETS.len() - 1)].1;
+            if let Some(k) = render_scale_override() {
+                q.scale *= k;
+            }
             if g3.quality != q {
                 g3.set_quality(rs, q);
             }
@@ -2335,9 +2468,11 @@ impl eframe::App for App {
                 ears = Some((cam.pos, cam.right, cam.fwd));
                 if let (Some(g3), Some(rs)) = (gpu.as_mut(), frame.wgpu_render_state()) {
                     g3.dof = [0.0, 0.0];
+                    let t_draw = std::time::Instant::now();
                     if let Some(id) = g3.render(rs, game, &cam, rect, ppp, alpha, Some((game.local, lp))) {
                         painter.image(id, rect, full_uv, Color32::WHITE);
                     }
+                    self.draw_ms = t_draw.elapsed().as_secs_f32() * 1000.0;
                 }
                 self.watchdog.stage("drawing the HUD");
                 self.draw_hud(&painter, rect, &cam, game);
@@ -2463,6 +2598,140 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The update banner at the top of the menus: a new build to install (with what changed),
+    /// the download's progress, or what went wrong (with the page to download it by hand).
+    fn update_banner(&mut self, ctx: &egui::Context, rect: Rect) {
+        let phase = self.updater.phase();
+        let show = match &phase {
+            update::Phase::Available(m) => self.updater.dismissed() != Some(m.build),
+            update::Phase::Downloading { .. } | update::Phase::Installing { .. } | update::Phase::Restart { .. } | update::Phase::Failed(_) => true,
+            _ => false,
+        };
+        if !show {
+            return;
+        }
+        // between the title and the news panel (centred on narrow windows)
+        let x0 = (rect.center().x - 230.0).max(rect.left() + 490.0);
+        let w = (rect.right() - 330.0 - x0).clamp(320.0, 520.0);
+        let x0 = if x0 + w > rect.right() - 10.0 { rect.center().x - w * 0.5 } else { x0 };
+        let mut action: Option<u8> = None; // 1 update now, 2 later, 3 open the page, 4 close
+        egui::Area::new(egui::Id::unique("update-banner")).fixed_pos(Pos2::new(x0, rect.top() + 10.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Frame::new().fill(Color32::from_rgba_unmultiplied(18, 16, 28, 240)).stroke(Stroke::new(1.5, ACCENT)).corner_radius(6.0).inner_margin(10.0).show(ui, |ui| {
+                ui.set_width(w);
+                match &phase {
+                    update::Phase::Available(m) => {
+                        ui.label(egui::RichText::new(format!("Update available (build {})", m.build)).size(17.0).strong().color(ACCENT));
+                        if !m.notes.trim().is_empty() {
+                            let notes: String = m.notes.lines().take(6).collect::<Vec<_>>().join("\n");
+                            ui.label(egui::RichText::new(notes).size(12.5).color(Color32::from_gray(210)));
+                        }
+                        ui.horizontal(|ui| {
+                            if update::platform() == "linux" {
+                                if ui.button("Download").clicked() {
+                                    action = Some(3);
+                                }
+                            } else if ui.button(egui::RichText::new("Update now").strong()).clicked() {
+                                action = Some(1);
+                            }
+                            if ui.button("Later").clicked() {
+                                action = Some(2);
+                            }
+                        });
+                    }
+                    update::Phase::Downloading { build, got, total } => {
+                        ui.label(egui::RichText::new(format!("Downloading build {build}...")).size(15.0).color(ACCENT));
+                        let k = if *total > 0 { *got as f32 / *total as f32 } else { 0.0 };
+                        ui.add(egui::ProgressBar::new(k).show_percentage().desired_width(w));
+                        ui.label(egui::RichText::new(format!("{:.1} of {:.1} MB", *got as f32 / 1e6, *total as f32 / 1e6)).size(12.0).color(Color32::from_gray(190)));
+                    }
+                    update::Phase::Installing { build } => {
+                        ui.label(egui::RichText::new(format!("Checking and installing build {build}...")).size(15.0).color(ACCENT));
+                        ui.add(egui::ProgressBar::new(1.0).desired_width(w));
+                    }
+                    update::Phase::Restart { build } => {
+                        ui.label(egui::RichText::new(format!("Build {build} is installed: restarting...")).size(15.0).color(ACCENT));
+                    }
+                    update::Phase::Failed(e) => {
+                        ui.label(egui::RichText::new("Update failed - download manually").size(16.0).strong().color(Color32::from_rgb(255, 140, 120)));
+                        let mut why = e.clone();
+                        if let Some(c) = why.get(0..1) {
+                            why.replace_range(0..1, &c.to_uppercase());
+                        }
+                        ui.label(egui::RichText::new(format!("{why}. Your current version still works.")).size(12.5).color(Color32::from_gray(210)));
+                        ui.horizontal(|ui| {
+                            if ui.button("Open the downloads page").clicked() {
+                                action = Some(3);
+                            }
+                            if ui.button("Close").clicked() {
+                                action = Some(4);
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            });
+        });
+        match action {
+            Some(1) => {
+                if let update::Phase::Available(m) = phase {
+                    self.updater.update(m);
+                }
+            }
+            Some(2) => {
+                if let update::Phase::Available(m) = &phase {
+                    self.updater.dismiss(m.build);
+                }
+            }
+            Some(3) => ctx.open_url(egui::OpenUrl::new_tab(update::releases_page())),
+            Some(4) => {
+                if let Ok(mut s) = self.updater.state.lock() {
+                    s.phase = update::Phase::Idle;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The Report a bug button: write what a developer needs into the Bug reports folder (the
+    /// build, the system and graphics card, the settings and what the game looks like right now)
+    /// and open that folder with the report picked out.
+    fn report_bug(&mut self) {
+        use std::fmt::Write as _;
+        self.settings.save();
+        let mut s = reports::header("bug report");
+        let q = gpu::Quality::PRESETS[self.settings.quality.min(gpu::Quality::PRESETS.len() - 1)].0;
+        let _ = writeln!(s, "graphics: {}", if self.gpu_name.is_empty() { "unknown" } else { &self.gpu_name });
+        let _ = writeln!(s, "quality: {q}  vsync: {}  fps limit: {}  dynamic resolution: {}  fullscreen: {}", self.settings.vsync, self.settings.fps_cap, self.settings.dyn_res, self.settings.fullscreen);
+        let _ = writeln!(s, "frame rate now: {:.0} fps ({:.1} ms)  running for {:.0} s", self.fps, 1000.0 / self.fps.max(1.0), self.wall_t);
+        let _ = writeln!(s, "freeze log: {}", self.watchdog.path().map_or("off".to_string(), |p| p.display().to_string()));
+        let _ = writeln!(s, "\nwhat the game looked like:\n{}", watchdog::last_snapshot());
+        // the settings, without the player's name or the address they last joined
+        if let Some(text) = settings_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+            let _ = writeln!(s, "\nsettings:");
+            for line in text.lines().filter(|l| !l.starts_with("name=") && !l.starts_with("join=") && !l.starts_with("steam_name=")) {
+                let _ = writeln!(s, "  {line}");
+            }
+        }
+        // the other reports already there, newest first, so the developer knows what to ask for
+        if let Some(d) = reports::dir() {
+            let mut others: Vec<String> = std::fs::read_dir(&d).map(|rd| rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect()).unwrap_or_default();
+            others.sort();
+            others.reverse();
+            let _ = writeln!(s, "\nalso in this folder: {}", if others.is_empty() { "nothing yet".to_string() } else { others.join(", ") });
+        }
+        let _ = writeln!(s, "\nwhat happened (write it here before sending):\n\n");
+        let note = match (reports::write("bug-report", &s), reports::dir()) {
+            (Some(path), Some(dir)) => {
+                let opened = self.screenshot.is_none() && !self.autoplay && platform::open_folder(&dir, Some(&path));
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let first = if opened { format!("Saved {name} (its folder is open).") } else { format!("Saved {name}.") };
+                format!("{first} Send the developer the newest files in:\n{}", dir.display())
+            }
+            _ => "Couldn't save a bug report (the save folder isn't writable).".to_string(),
+        };
+        self.report_note = Some((note, 12.0));
+    }
+
     /// What the game looks like right now, in words, for a hang report.
     fn hang_snapshot(&self, ears: Option<(V3, V3, V3)>) -> String {
         use std::fmt::Write as _;
@@ -2871,7 +3140,7 @@ impl App {
                             self.disconnected = Some("The host closed the lobby.".into());
                         }
                     }
-                    Incoming::Full | Incoming::WrongVersion => {}
+                    Incoming::Full | Incoming::WrongVersion | Incoming::WrongBuild { .. } => {}
                 }
             }
             // the host went quiet: after a few seconds the best-connected player takes over
@@ -2950,7 +3219,7 @@ impl App {
             game.hurt_dirs = vec![(me + right * 6.0, 1.0), (me - yaw_fwd(game.f[l].yaw) * 6.0, 0.6)];
             if game.dmg_nums.is_empty() {
                 let p = me + yaw_fwd(game.f[l].yaw) * 6.0 + v3(0.0, 1.8, 0.0);
-                game.dmg_nums.push(DmgNum { pos: p, amount: if pump { 168 } else { 42 }, life: 0.8, head: true, victim: 255 });
+                game.dmg_nums.push(DmgNum { pos: p, amount: if pump { 168 } else { 42 }, life: 0.8, head: true, victim: 255, confirmed: true, armour: 0, exact: 0.0, exact_ap: 0.0, conf_t: 0.0 });
             }
             if game.chat.is_empty() {
                 game.add_chat(1, "that was a clean launch, rematch after this?");
@@ -3018,6 +3287,24 @@ impl App {
         if let Ok(page) = std::env::var("DUEL_GALLERY") {
             gallery_pose(game, &page);
         }
+        // test switch DUEL_HOLD=<weapon number>: everyone holds that weapon (to photograph it in play)
+        if self.autoplay {
+            if let Some(w) = std::env::var("DUEL_HOLD").ok().and_then(|v| v.parse::<u8>().ok()) {
+                let w = Weapon::from_u8(w);
+                for f in game.f.iter_mut().filter(|f| f.present) {
+                    let slot = if w.is_melee() {
+                        f.loadout.melee = w;
+                        0
+                    } else {
+                        f.loadout.gun1 = w;
+                        1
+                    };
+                    f.cur = slot;
+                    f.weapon = w;
+                    f.switch_t = 0.0;
+                }
+            }
+        }
         if self.autoplay && self.show_tuning && std::env::var_os("DUEL_TUNING").is_some() && game.time > 1.0 && !game.f.iter().any(|f| f.present && f.name == "Dummy 15m") {
             let _ = game.spawn_dummy(15.0);
         }
@@ -3084,6 +3371,13 @@ impl App {
                 }
                 Incoming::WrongVersion => {
                     self.menu_msg = Some("The host has a different version of Duel Rush. You both need the same build: share the newest one and try again.".into());
+                    self.screen = Screen::Menu(Page::Join);
+                    return;
+                }
+                Incoming::WrongBuild { host } => {
+                    let mine = update::local_build();
+                    let what = if host > mine { "update first (Settings > Updates, or the downloads page)" } else { "the host needs to update first" };
+                    self.menu_msg = Some(format!("Your build ({mine}) doesn't match the host's ({host}) - {what}."));
                     self.screen = Screen::Menu(Page::Join);
                     return;
                 }
@@ -3359,6 +3653,142 @@ fn sample_keys(ctx: &egui::Context, b: &[Bind; N_ACTIONS]) {
     KEYS.with(|c| *c.borrow_mut() = k);
 }
 
+/// Test switch DUEL_RENDER_SCALE=<factor>: draw the 3D picture this much bigger or smaller than
+/// the quality preset says (a performance run uses it to draw as many pixels as a bigger screen
+/// than the one it runs on).
+fn render_scale_override() -> Option<f32> {
+    std::env::var("DUEL_RENDER_SCALE").ok()?.trim().parse::<f32>().ok().map(|s| s.clamp(0.3, 2.0))
+}
+
+/// Test switch DUEL_MEMLOG=<file>: memory in use at each start-up stage, appended to the file.
+fn memlog(stage: &str) {
+    if let Some(p) = std::env::var_os("DUEL_MEMLOG") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{stage:24} {:8.1} MB", platform::memory_mb().unwrap_or(0.0));
+        }
+    }
+}
+
+/// A performance and memory run (test switch DUEL_BENCH): once a match is under way (after a
+/// few seconds to settle) every frame's time, game-logic time and 3D-drawing time (on the
+/// processor) is kept, and every 10 s the memory in use and the size of each of the game's
+/// lists. The match clock is held open so it's one long match. At the end the results go to a
+/// text file and the game closes.
+struct Bench {
+    secs: f32,
+    out: PathBuf,
+    start: Option<std::time::Instant>,
+    frames: Vec<f32>,
+    sim: Vec<f32>,
+    draw: Vec<f32>,
+    mem: Vec<(f32, (f64, f64), Vec<(&'static str, usize)>)>,
+    next_mem: f32,
+    px: [f32; 2],
+}
+
+/// Seconds a performance run waits before it starts counting (shaders, first spawns).
+const BENCH_WARM: f32 = 5.0;
+
+impl Bench {
+    fn new(secs: f32, out: PathBuf) -> Bench {
+        Bench { secs, out, start: None, frames: Vec::new(), sim: Vec::new(), draw: Vec::new(), mem: Vec::new(), next_mem: 0.0, px: [0.0, 0.0] }
+    }
+}
+
+/// The value below which `share` of the sorted list lies.
+fn percentile(sorted: &[f32], share: f32) -> f32 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted[((sorted.len() - 1) as f32 * share).round() as usize]
+}
+
+impl App {
+    /// One frame of a performance run: `frame_ms` since the last one.
+    fn bench_frame(&mut self, ctx: &egui::Context, frame_ms: f32) {
+        let Screen::Play { game, .. } = &mut self.screen else { return };
+        // one long match: nobody reaches the kill limit and, once it's on, the clock never runs out
+        game.mt.target = game.mt.target.max(9999);
+        if game.mt.phase != Phase::Fight {
+            return;
+        }
+        game.mt.timer = game.mt.timer.max(60.0);
+        let counts = game.mem_counts();
+        let rect = ctx.content_rect();
+        let ppp = ctx.pixels_per_point();
+        let (sim, draw) = (self.sim_ms, self.draw_ms);
+        let Some(b) = self.bench.as_mut() else { return };
+        let start = *b.start.get_or_insert_with(std::time::Instant::now);
+        let t = start.elapsed().as_secs_f32();
+        b.px = [rect.width() * ppp, rect.height() * ppp];
+        if t >= b.next_mem {
+            b.mem.push((t, platform::memory().unwrap_or((0.0, 0.0)), counts));
+            b.next_mem += 10.0;
+        }
+        if t > BENCH_WARM {
+            b.frames.push(frame_ms);
+            b.sim.push(sim);
+            b.draw.push(draw);
+        }
+        if t > BENCH_WARM + b.secs {
+            let text = self.bench_results();
+            if let Some(b) = &self.bench {
+                if let Some(d) = b.out.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                let _ = std::fs::write(&b.out, &text);
+            }
+            eprint!("{text}");
+            self.bench = None;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+    }
+
+    fn bench_results(&self) -> String {
+        use std::fmt::Write as _;
+        let Some(b) = &self.bench else { return String::new() };
+        let sorted = |v: &[f32]| {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.total_cmp(b));
+            s
+        };
+        let (fr, sim, draw) = (sorted(&b.frames), sorted(&b.sim), sorted(&b.draw));
+        let total: f32 = b.frames.iter().sum::<f32>() / 1000.0;
+        let avg = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+        let q = gpu::Quality::PRESETS[self.settings.quality.min(gpu::Quality::PRESETS.len() - 1)].0;
+        let mut s = String::new();
+        let _ = writeln!(s, "=== Duel Rush performance run, {} ===", VERSION);
+        let _ = writeln!(s, "graphics: {}", self.gpu_name);
+        let _ = writeln!(s, "system: {} ({})", platform::system().name(), std::env::consts::OS);
+        let rs = gpu::Quality::PRESETS[self.settings.quality.min(gpu::Quality::PRESETS.len() - 1)].1.scale * render_scale_override().unwrap_or(1.0);
+        let _ = writeln!(s, "window: {:.0}x{:.0} pixels; 3D picture drawn at {:.0}x{:.0} ({:.2} million pixels; 1920x1080 is 2.07)", b.px[0], b.px[1], b.px[0] * rs, b.px[1] * rs, b.px[0] * rs * b.px[1] * rs / 1e6);
+        let _ = writeln!(s, "quality {q}, vsync off, no frame limit, no dynamic resolution");
+        if let Screen::Play { game, .. } = &self.screen {
+            let _ = writeln!(s, "match: {:?} on {:?}, {} fighters", game.mt.mode, game.world.map, game.f.iter().filter(|f| f.present).count());
+        }
+        let _ = writeln!(s, "counted: {} frames over {:.0} s (after {BENCH_WARM:.0} s to settle)", fr.len(), total);
+        let _ = writeln!(s, "average: {:.0} fps ({:.2} ms a frame)", fr.len() as f32 / total.max(1e-3), avg(&b.frames));
+        let _ = writeln!(s, "1% low: {:.0} fps  (99th percentile frame {:.2} ms)", 1000.0 / percentile(&fr, 0.99).max(1e-3), percentile(&fr, 0.99));
+        let _ = writeln!(s, "0.1% low: {:.0} fps  (99.9th percentile frame {:.2} ms), slowest frame {:.1} ms", 1000.0 / percentile(&fr, 0.999).max(1e-3), percentile(&fr, 0.999), fr.last().copied().unwrap_or(0.0));
+        let _ = writeln!(s, "median frame: {:.2} ms  (95th percentile {:.2} ms)", percentile(&fr, 0.5), percentile(&fr, 0.95));
+        let _ = writeln!(s, "game logic: {:.2} ms average, {:.2} ms 99th percentile", avg(&b.sim), percentile(&sim, 0.99));
+        let _ = writeln!(s, "3D drawing (processor side): {:.2} ms average, {:.2} ms 99th percentile", avg(&b.draw), percentile(&draw, 0.99));
+        let over = |ms: f32| fr.iter().filter(|&&f| f > ms).count() as f32 / fr.len().max(1) as f32 * 100.0;
+        let _ = writeln!(s, "frames slower than 144 fps (6.94 ms): {:.2}%   slower than 60 fps (16.7 ms): {:.2}%", over(1000.0 / 144.0), over(1000.0 / 60.0));
+        let _ = writeln!(s, "\nmemory (every 10 s): time, MB committed / MB in RAM, then each game list's size");
+        for (t, mb, counts) in &b.mem {
+            let list: Vec<String> = counts.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{k} {n}")).collect();
+            let _ = writeln!(s, "{t:6.0} s  {:7.1} / {:7.1} MB  {}", mb.0, mb.1, list.join(", "));
+        }
+        if let (Some(first), Some(last)) = (b.mem.iter().find(|m| m.0 >= 60.0).or(b.mem.first()), b.mem.last()) {
+            let mins = ((last.0 - first.0) / 60.0).max(1e-3);
+            let _ = writeln!(s, "memory from {:.0} s to {:.0} s: committed {:.1} -> {:.1} MB ({:+.2} MB a minute), in RAM {:.1} -> {:.1} MB ({:+.2} MB a minute)", first.0, last.0, first.1 .0, last.1 .0, (last.1 .0 - first.1 .0) / mins as f64, first.1 .1, last.1 .1, (last.1 .1 - first.1 .1) / mins as f64);
+        }
+        s
+    }
+}
+
 /// Test switch DUEL_VIEW=x,y,z,yaw,pitch[,fov]: a fixed camera (for before / after pictures).
 fn test_view() -> Option<[f32; 6]> {
     let s = std::env::var("DUEL_VIEW").ok()?;
@@ -3408,6 +3838,41 @@ fn gallery_pose(g: &mut Game, page: &str) {
         f.weapon = Weapon::Revolver;
         let fwd = f.fwd();
         let right = v3(fwd.z, 0.0, -fwd.x);
+        // carry pages (DUEL_GALLERY=carry:<blade 0-2>:<0 run, 1 strafe, 2 jump, 3 wall-run>): the
+        // four fighters side by side doing that move, blade in hand, turned three-quarters so the
+        // sword side shows (anyone else stands out of sight)
+        if let Some(rest) = page.strip_prefix("carry:") {
+            let mut it = rest.split(':').filter_map(|x| x.parse::<usize>().ok());
+            let blade = Weapon::MELEE[it.next().unwrap_or(1).min(2)];
+            let mv = it.next().unwrap_or(0).min(3);
+            // (DUEL_GALLERY_Z moves the row further away, e.g. to see how far a blade reads)
+            let z = std::env::var("DUEL_GALLERY_Z").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(9.5);
+            let p = if i < 4 { v3(-2.7 + i as f32 * 1.8, 0.0, z) } else { v3(0.0, 0.0, -30.0) };
+            f.pos = p;
+            f.prev_pos = p;
+            f.yaw = std::f32::consts::PI + 0.75;
+            let fwd = f.fwd();
+            let right = v3(fwd.z, 0.0, -fwd.x);
+            f.loadout.body = (i % 4) as u8;
+            f.loadout.melee = blade;
+            f.cur = 0;
+            f.weapon = blade;
+            f.switch_t = 0.0;
+            match mv {
+                0 => f.vel = fwd * RUN_SPEED,
+                1 => f.vel = right * RUN_SPEED,
+                2 => {
+                    f.on_ground = false;
+                    f.vel = v3(0.0, 4.0, 0.0) + fwd * 4.0;
+                }
+                _ => {
+                    f.on_ground = false;
+                    f.wall = Some(WallRun { normal: right, dir: fwd, t: 0.2, vertical: false, speed: 10.0 });
+                    f.vel = fwd * 10.0;
+                }
+            }
+            continue;
+        }
         if let Some(phase) = melee_at {
             // phase: 0 = the blow lands now, + = that share of the wind-up still to go, - = that
             // share of the follow-through done
@@ -4239,15 +4704,29 @@ impl App {
             }
         }
 
-        // damage numbers: pop in, drift up, bigger for bigger hits, gold for headshots
+        // damage numbers: the prediction in grey until the host confirms it, then what was
+        // really dealt (health in white, gold for headshots; armour soaked in small blue)
         for d in &g.dmg_nums {
             if let Some(sp) = cam.project(d.pos) {
                 let a = (d.life / 0.9 * 255.0).clamp(0.0, 255.0) as u8;
                 let pop = 1.0 + 0.7 * ((d.life - 0.72) / 0.18).clamp(0.0, 1.0);
-                let size = (16.0 + (d.amount.min(80) as f32 / 80.0) * 12.0) * pop * s;
-                let col = if d.head { Color32::from_rgba_unmultiplied(255, 215, 50, a) } else if d.amount >= 40 { Color32::from_rgba_unmultiplied(255, 150, 90, a) } else { Color32::from_rgba_unmultiplied(255, 255, 255, a) };
-                text_display(p, sp, Align2::CENTER_CENTER, &format!("{}", d.amount), size * 1.2, col);
-                if d.head {
+                let main = if d.confirmed && d.amount == 0 { d.armour } else { d.amount };
+                let size = (16.0 + (main.min(80) as f32 / 80.0) * 12.0) * pop * s;
+                let col = if !d.confirmed {
+                    Color32::from_rgba_unmultiplied(160, 160, 165, a)
+                } else if d.amount == 0 && d.armour > 0 {
+                    Color32::from_rgba_unmultiplied(110, 180, 255, a)
+                } else if d.head {
+                    Color32::from_rgba_unmultiplied(255, 215, 50, a)
+                } else {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, a)
+                };
+                text_display(p, sp, Align2::CENTER_CENTER, &format!("{main}"), size * 1.2, col);
+                if d.confirmed && d.amount > 0 && d.armour > 0 {
+                    let blue = Color32::from_rgba_unmultiplied(110, 180, 255, a);
+                    text_shadow(p, sp + Vec2::new(size * 0.9, -size * 0.35), Align2::LEFT_CENTER, &format!("+{}", d.armour), 12.0 * s, blue);
+                }
+                if d.head && d.confirmed {
                     text_shadow(p, sp + Vec2::new(0.0, size * 0.75), Align2::CENTER_CENTER, "HEADSHOT", 11.0 * s, col);
                 }
             }
@@ -5066,6 +5545,28 @@ impl App {
             "F11 fullscreen  ·  Settings has controls, graphics and crosshair".to_string()
         };
         p.text(Pos2::new(rect.right() - 16.0, rect.bottom() - 12.0), Align2::RIGHT_BOTTOM, corner, FontId::proportional(13.0), Color32::from_rgba_unmultiplied(230, 220, 210, 160));
+        self.update_banner(ctx, rect);
+        // the build, so playtesters can say which one they played, and the way to report a bug
+        if matches!(page, Page::Main | Page::Play) {
+            p.text(Pos2::new(rect.left() + 16.0, rect.bottom() - 12.0), Align2::LEFT_BOTTOM, VERSION, FontId::proportional(13.0), Color32::from_rgba_unmultiplied(230, 220, 210, 170));
+            let mut report = false;
+            egui::Area::new(egui::Id::unique("report-bug")).fixed_pos(Pos2::new(rect.left() + 14.0, rect.bottom() - 64.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+                let b = egui::Button::new(egui::RichText::new("Report a bug").size(14.0)).min_size(Vec2::new(130.0, 28.0));
+                report = ui.add(b).on_hover_text("Saves a bug report and opens the folder with it, your crash and freeze logs: send the newest files to the developer").clicked();
+            });
+            // what it did, in a box beside the button
+            if let Some((note, _)) = &self.report_note {
+                egui::Area::new(egui::Id::unique("report-note")).fixed_pos(Pos2::new(rect.left() + 180.0, rect.bottom() - 58.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(10, 9, 18, 220)).corner_radius(4.0).inner_margin(6.0).show(ui, |ui| {
+                        ui.set_max_width((rect.width() * 0.5).min(620.0));
+                        ui.label(egui::RichText::new(note.as_str()).size(12.5).color(Color32::from_rgb(255, 210, 170)));
+                    });
+                });
+            }
+            if report {
+                self.report_bug();
+            }
+        }
         let mut next: Option<Page> = None;
         let mut action: Option<Box<dyn FnOnce(&mut App)>> = None;
         let pos = Pos2::new(rect.left() + 48.0, rect.top() + 150.0);
@@ -5670,6 +6171,7 @@ impl App {
         }
         if self.paused {
             let mut resume = false;
+        let mut report = false;
             panel(ctx, "pause", center, 360.0, |ui| {
                 ui.heading("Paused");
                 if kind != Kind::Offline {
@@ -5715,6 +6217,12 @@ impl App {
                 if App::big_button(ui, "All settings") {
                     self.pause_settings = true;
                 }
+                if App::big_button(ui, "Report a bug") {
+                    report = true;
+                }
+                if let Some((note, _)) = &self.report_note {
+                    ui.label(egui::RichText::new(note.as_str()).size(12.0).color(Color32::from_rgb(255, 210, 170)));
+                }
                 if App::big_button(ui, "Resume") {
                     resume = true;
                 }
@@ -5722,6 +6230,9 @@ impl App {
                     leave = true;
                 }
             });
+            if report {
+                self.report_bug();
+            }
             if resume {
                 self.paused = false;
                 self.settings.save();
@@ -6256,7 +6767,6 @@ mod aim_tests {
             half: 80.0,
             deco: Vec::new(),
             braziers: Vec::new(),
-            banners: Vec::new(),
             props: Vec::new(),
             vines: Vec::new(),
             torches: Vec::new(),

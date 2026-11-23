@@ -235,11 +235,13 @@ fn shade(i: VOut) -> vec4<f32> {
   let duv1 = dpdx(i.uv);
   let duv2 = dpdy(i.uv);
   let is_char = mat > 0.25 && mat < 0.75;
-  let world_tex = layer >= 0.0 && !is_char;
+  // a weapon: its baked, hand-painted texture in the fighters' array
+  let is_wpn = mat > 0.75 && mat < 1.25;
+  let world_tex = layer >= 0.0 && !is_char && !is_wpn;
   // the level's own materials: the map's palette colour times soft brightness detail
   let is_level = world_tex && (li <= 5 || li >= 14);
   var base = i.col;
-  if (layer >= 0.0) { base = base * select(t0, t1, is_char); }
+  if (layer >= 0.0) { base = base * select(t0, t1, is_char || is_wpn); }
   if (is_level) {
     base = vec4<f32>(i.col.rgb * t0.rgb * 2.0, 1.0);
     // large-scale colour drift and patches of grime and wear, so no tile repeats show
@@ -1749,7 +1751,7 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     }
     // weapon
     // a blade sits in the fist (its handle through it); guns sit at the wrist
-    let anchor = if f.weapon.is_melee() { p.grip } else { p.hand };
+    let anchor = p.grip;
     weapon_mesh(mb, add_mb, cam, f, anchor, &p.weapon, time);
     let w = f.weapon;
     // charging a heavy: the blade glows, then flashes once it's ready
@@ -1826,8 +1828,46 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     }
 }
 
-/// A weapon held at `hand`, pointing along `wf.z`.
+/// How far the revolver's cylinder has turned: a sixth of a turn for each shot fired, and a
+/// quick spin while it's reloaded.
+fn revolver_turn(f: &Fighter) -> f32 {
+    let fired = f.weapon.mag().saturating_sub(f.mag[f.cur.min(2)]) as f32;
+    let spin = if f.reload_t > 0.0 { f.reload_t * 24.0 } else { 0.0 };
+    fired * PI / 3.0 + spin
+}
+
+/// A weapon held at `hand`, pointing along `wf.z`: its model from `assets/weapons` (with the pump
+/// racked and the cylinder turned), or simple shapes if the model didn't load.
 fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, wf: &M3, time: f32) {
+    // out of sight: nothing to draw (well behind the camera or far off to the side)
+    let to = hand - cam.pos;
+    let dist = to.len();
+    if dist > 2.5 && to.dot(cam.fwd) < dist * 0.15 {
+        return;
+    }
+    let m = if dist > crate::weapons::FAR { crate::weapons::model_far(f.weapon) } else { crate::weapons::model(f.weapon) };
+    if let Some(m) = m {
+        mb.v.reserve(m.parts.iter().map(|p| p.tris.len()).sum());
+        use crate::weapons::PartKind;
+        let slide = if f.weapon == Weapon::Shotgun { f.pump_k() * crate::weapons::PUMP_TRAVEL } else { 0.0 };
+        let (s, c) = if matches!(f.weapon, Weapon::Revolver | Weapon::HandCannon) { revolver_turn(f).sin_cos() } else { (0.0, 1.0) };
+        let turn = |v: V3| v3(v.x * c - v.y * s, v.x * s + v.y * c, v.z);
+        for part in &m.parts {
+            for v in &part.tris {
+                let (p, n) = match part.kind {
+                    PartKind::Body => (v.p, v.n),
+                    PartKind::Pump => (v.p - v3(0.0, 0.0, slide), v.n),
+                    PartKind::Cylinder => (part.pivot + turn(v.p - part.pivot), turn(v.n)),
+                };
+                mb.vert(hand + wf.apply(p), wf.apply(n), v.uv, v.col, v.ex);
+            }
+        }
+        if f.weapon.is_melee() && f.guard {
+            let len = m.max.z * 0.85;
+            add_mb.billboard(cam, hand + wf.apply(v3(0.0, 0.0, len)), 0.5 + (time * 20.0).sin().abs() * 0.08, lina([90, 150, 255], 0.5));
+        }
+        return;
+    }
     let steel = lin([200, 206, 218]);
     let wood = lin([70, 46, 30]);
     let gunmetal = lin([60, 62, 70]);
@@ -2461,7 +2501,12 @@ impl Gpu {
         let tex_view = upload_array(rs, "duel materials", env::TEX, wgpu::TextureFormat::Rgba8UnormSrgb, &cols);
         let ntex_view = upload_array(rs, "duel surfaces", env::TEX, wgpu::TextureFormat::Rgba8Unorm, &surfs);
         // the fighters' textures
-        let cdata = build_char_textures();
+        // the fighters' textures, then the weapons' (four to a layer)
+        let mut cdata = build_char_textures();
+        debug_assert_eq!(cdata.len(), crate::weapons::first_layer());
+        if CHAR_TEX == crate::weapons::LAYER {
+            cdata.extend(crate::weapons::texture_layers());
+        }
         let ctex_view = upload_array(rs, "fighter textures", CHAR_TEX, wgpu::TextureFormat::Rgba8UnormSrgb, &cdata);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("duel sampler"),
@@ -2852,8 +2897,19 @@ impl Gpu {
             if !f.present || f.spectate {
                 continue;
             }
-            // vanished (Afterimage): nobody else sees them
+            // vanished (Afterimage): nobody else sees them, except as a faint shimmer up close
             if f.invis_t > 0.0 && i != g.local {
+                let p = f.prev_pos.lerp(f.pos, alpha.clamp(0.0, 1.0));
+                let me = g.f.get(g.local).map_or(cam.pos, |m| m.pos);
+                let d = (p - me).len();
+                if f.alive && d < crate::game::SHIMMER_RANGE {
+                    let k = (1.0 - d / crate::game::SHIMMER_RANGE).clamp(0.0, 1.0);
+                    for (n, h) in [0.35f32, 0.85, 1.3, 1.7].iter().enumerate() {
+                        let wob = (g.time * 9.0 + n as f32 * 1.7).sin();
+                        let at = p + v3(wob * 0.08, *h, (g.time * 7.0 + n as f32).cos() * 0.08);
+                        ad.billboard(cam, at, 0.38 + 0.06 * wob, lina([200, 215, 255], (0.05 + 0.05 * wob.abs()) * (0.4 + 0.6 * k)));
+                    }
+                }
                 continue;
             }
             let mut pos = f.prev_pos.lerp(f.pos, alpha.clamp(0.0, 1.0));

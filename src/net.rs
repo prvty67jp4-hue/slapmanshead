@@ -9,9 +9,9 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
-const MAGIC: [u8; 4] = *b"DRB1";
+const MAGIC: [u8; 4] = *b"DRB2";
 /// The protocol version as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA8";
+pub const PROTOCOL: &str = "DRA9";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
@@ -48,6 +48,8 @@ const K_PEERS: u8 = 6;
 const K_REJOIN: u8 = 7;
 /// "I'm a different version": the packet is just the 4-byte mark and this kind.
 const K_VERSION: u8 = 8;
+/// (host) "we're on different builds": the host's build number follows.
+const K_BUILD: u8 = 9;
 pub const DEFAULT_PORT: u16 = 27960;
 const EVENT_WINDOW: f32 = 0.5;
 const MAX_EVENTS: usize = 48;
@@ -268,6 +270,14 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.v(*p);
             w.v(*d);
         }
+        Ev::Confirm { attacker, victim, hp, ap, head } => {
+            w.u8(12);
+            w.u8(*attacker);
+            w.u8(*victim);
+            w.f(*hp);
+            w.f(*ap);
+            w.u8(*head as u8);
+        }
         Ev::Finisher { target, kind } => {
             w.u8(10);
             w.u8(*target);
@@ -291,6 +301,7 @@ fn read_ev(r: &mut R) -> Option<Ev> {
         8 => Ev::Vote,
         9 => Ev::Deflect { by: r.u8()?, dmg: r.f()?.clamp(0.0, 60.0) },
         11 => Ev::Ability { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.min(3), p: r.v()?, d: clamp_v(r.v()?, 40.0) },
+        12 => Ev::Confirm { attacker: r.u8()?.min(MAX_PLAYERS as u8 - 1), victim: r.u8()?.min(MAX_PLAYERS as u8 - 1), hp: r.f()?.clamp(0.0, 999.0), ap: r.f()?.clamp(0.0, 999.0), head: r.u8()? != 0 },
         10 => Ev::Finisher { target: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.clamp(1, crate::game::FINISHERS.len() as u8) },
         _ => return None,
     })
@@ -361,6 +372,8 @@ pub enum Incoming {
     Full,
     /// (player) the host runs a different version of the game
     WrongVersion,
+    /// (player) the host runs a different build (its number)
+    WrongBuild { host: u32 },
 }
 
 /// Network test: pretend the connection is slow and drops packets.
@@ -485,6 +498,8 @@ struct Peer {
 pub struct Net {
     sock: UdpSocket,
     pub is_host: bool,
+    /// The build number this side says it is (this build's; tests set others).
+    pub build: u32,
     host_addr: Option<SocketAddr>,
     peers: Vec<Peer>,
     out: VecDeque<(u8, u32, Instant, Ev)>,
@@ -524,6 +539,12 @@ pub struct Net {
 }
 
 impl Net {
+    /// The port this computer listens on (tests host on a free one).
+    #[cfg(test)]
+    pub fn local_port(&self) -> u16 {
+        self.sock.local_addr().map(|a| a.port()).unwrap_or(0)
+    }
+
     pub fn host(port: u16) -> Result<Net, String> {
         let ip = std::env::var("DUEL_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
         let sock = UdpSocket::bind((ip.as_str(), port)).map_err(|e| format!("Couldn't open port {port}: {e}"))?;
@@ -538,11 +559,6 @@ impl Net {
         let mut n = Net::make(sock, false, Some(steam_addr(host)), DEFAULT_PORT);
         n.steam = Some(client);
         Ok(n)
-    }
-
-    /// Whether we talk to the host through Steam.
-    pub fn via_steam(&self) -> bool {
-        self.host_addr.as_ref().is_some_and(|a| addr_steam(a).is_some()) || (self.is_host && self.steam.is_some())
     }
 
     pub fn join(addr: &str) -> Result<Net, String> {
@@ -566,6 +582,7 @@ impl Net {
         Net {
             sock,
             is_host,
+            build: crate::update::local_build(),
             host_addr,
             peers: Vec::new(),
             out: VecDeque::new(),
@@ -871,6 +888,11 @@ impl Net {
                     }
                 }
                 K_FULL => out.push(Incoming::Full),
+                K_BUILD => {
+                    if let Some(host) = r.u32() {
+                        out.push(Incoming::WrongBuild { host });
+                    }
+                }
                 K_PEERS => {
                     if let Some(s) = parse_peers(&mut r) {
                         self.succession = Some(s);
@@ -886,6 +908,14 @@ impl Net {
         match kind {
             K_HELLO => {
                 let name = r.s().unwrap_or_default();
+                // different builds can't play together: say which build we are instead
+                let build = r.u32().unwrap_or(0);
+                if !crate::update::builds_compatible(build, self.build) {
+                    let mut w = self.head(K_BUILD, from);
+                    w.u32(self.build);
+                    self.send_to(w.0, from);
+                    return;
+                }
                 if let Some(i) = idx {
                     self.peers[i].last_recv = Instant::now();
                     self.peers[i].link.see(seq);
@@ -1055,6 +1085,7 @@ impl Net {
         if let Some(h) = self.host_addr {
             let mut w = self.head(K_HELLO, h);
             w.s(name);
+            w.u32(self.build);
             self.send_to(w.0, h);
         }
     }
@@ -1545,10 +1576,52 @@ mod migration_tests {
         assert_eq!(parse_peers(&mut R { b: &w.0, i: 0 }), Some(s));
     }
 
+    /// A player on another build is told the host's build instead of joining; the same build joins.
+    #[test]
+    fn different_builds_are_told_instead_of_joining() {
+        let mut h = Net::host(0).expect("host");
+        h.build = 57;
+        let port = h.sock.local_addr().unwrap().port();
+        let mut c = Net::join(&format!("127.0.0.1:{port}")).unwrap();
+        c.build = 58;
+        let (mut joined, mut told) = (false, None);
+        for _ in 0..200 {
+            c.send_hello("Bo", 0.3);
+            for m in h.poll() {
+                joined |= matches!(m, Incoming::Join { .. });
+            }
+            for m in c.poll() {
+                if let Incoming::WrongBuild { host } = m {
+                    told = Some(host);
+                }
+            }
+            if told.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        assert_eq!(told, Some(57), "the player hears the host's build");
+        assert!(!joined, "and doesn't join");
+        // the same build joins
+        let mut c2 = Net::join(&format!("127.0.0.1:{port}")).unwrap();
+        c2.build = 57;
+        for _ in 0..200 {
+            c2.send_hello("Ann", 0.3);
+            for m in h.poll() {
+                joined |= matches!(m, Incoming::Join { .. });
+            }
+            if joined {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        assert!(joined, "the same build joins");
+    }
+
     /// A host and two players on this computer; the host leaves mid-match and the game goes on.
     #[test]
     fn the_match_survives_the_host_leaving() {
-        let mut h = Net::host(0).expect("host");
+        let h = Net::host(0).expect("host");
         let port = h.sock.local_addr().unwrap().port();
         let mut hg = Game::new(Kind::Host, 0, Mode::Ffa, 50);
         hg.add_player(0, "Host", true, None, 0);
@@ -1558,7 +1631,7 @@ mod migration_tests {
         let names = ["Ann", "Bo"];
         let mut games: [Option<Game>; 2] = [None, None];
         let dt = 1.0 / 60.0;
-        let mut step = |h: Option<&mut (Net, Game)>, nets: &mut [Net; 2], games: &mut [Option<Game>; 2], hosts_seen: &mut [u32; 2]| {
+        let step = |h: Option<&mut (Net, Game)>, nets: &mut [Net; 2], games: &mut [Option<Game>; 2], hosts_seen: &mut [u32; 2]| {
             if let Some((hn, hg)) = h {
                 for m in hn.poll() {
                     match m {

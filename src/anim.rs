@@ -107,7 +107,7 @@ fn interval(times: &[f32], t: f32) -> (usize, usize, f32) {
 /// Animation clips of a glTF document. `map` turns its node index into ours (None: skip the
 /// channel). With `rotations_only`, bone translations are dropped (but the hips and root keep
 /// theirs), so clips from another file keep our skeleton's proportions.
-fn read_clips<'a>(doc: &'a gltf::Document, get: &(dyn Fn(gltf::Buffer<'a>) -> Option<&'a [u8]>), map: impl Fn(usize) -> Option<usize>, rotations_only: bool) -> HashMap<String, Clip> {
+fn read_clips<'a>(doc: &'a gltf::Document, get: &dyn Fn(gltf::Buffer<'a>) -> Option<&'a [u8]>, map: impl Fn(usize) -> Option<usize>, rotations_only: bool) -> HashMap<String, Clip> {
     let mut clips = HashMap::new();
     for anim in doc.animations() {
         let mut channels = Vec::new();

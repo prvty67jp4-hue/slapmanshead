@@ -30,11 +30,6 @@ pub const L_SLATE: u32 = 15;
 pub const L_BLOCKS: u32 = 16;
 pub const LAYERS: u32 = 17;
 
-/// Is this layer one of the level's palette-coloured materials?
-pub fn is_level_layer(l: u32) -> bool {
-    l <= 5 || l >= 14
-}
-
 /// Where a texture comes from.
 enum Src {
     /// Poly Haven set: colour, OpenGL normal map, roughness; a fixed metalness. Turned into soft
@@ -48,11 +43,6 @@ enum Src {
     Procedural,
 }
 
-macro_rules! tex {
-    ($n:literal) => {
-        include_bytes!(concat!("../assets/env/tex/", $n))
-    };
-}
 macro_rules! prop_tex {
     ($n:literal) => {
         include_bytes!(concat!("../assets/env/props/", $n))
@@ -262,7 +252,9 @@ pub struct Sky {
     pub mips: Vec<Vec<u16>>,
     /// Turn applied to the picture so its sun sits where the map's sunlight comes from.
     pub yaw: f32,
-    /// Picture brightness (scaled so the sky averages about 1).
+    /// Picture brightness (scaled so the sky averages about 1; checked by the tests, the
+    /// renderer's grading sets its own).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub exposure: f32,
     /// Sunlight: direction towards the sun, colour, strength.
     pub sun_dir: V3,

@@ -61,6 +61,8 @@ pub struct CharState {
     pub cloth_time: f32,
     scratch: Vec<Trs>,
     scratch2: Vec<Trs>,
+    /// How the blade is carried right now (eased towards each state's carry, so it never snaps).
+    carry: Option<Carry>,
 }
 
 impl CharState {
@@ -89,6 +91,7 @@ impl CharState {
             cloth_time: 0.0,
             scratch: Vec::new(),
             scratch2: Vec::new(),
+            carry: None,
         }
     }
 }
@@ -166,7 +169,9 @@ fn throw_phases(tp: f32) -> (f32, f32, f32) {
 /// What a posed character gives back to the renderer.
 pub struct Posed {
     pub palette: Vec<Mat4>,
-    /// Right hand position and the weapon's frame (z = where the weapon points).
+    /// Right hand position (the wrist; the tests read it) and the weapon's frame (z = where the
+    /// weapon points).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub hand: V3,
     pub weapon: M3,
     pub head: V3,
@@ -177,11 +182,20 @@ pub struct Posed {
     pub grip: V3,
     /// The right hand, from its bones: across the knuckles (little finger to index), and from
     /// the wrist towards the knuckles; the forearm (elbow to wrist); how far the index
-    /// fingertip is from the wrist (small when the fist is closed).
+    /// fingertip is from the wrist (small when the fist is closed). (Read by the grip tests.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub knuckles: V3,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub hand_axis: V3,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub forearm: V3,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fingertip: f32,
+    /// The blade is held in a reverse grip (the dagger on the move): it leaves the fist on the
+    /// little-finger side, exactly opposite the usual grip. (The weapon frame already says so;
+    /// the tests read this.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub reverse: bool,
     /// Hit shapes following the bones.
     pub hit: HitPose,
 }
@@ -262,6 +276,7 @@ pub fn animate(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn
 /// clips (CC0 Quaternius), timed so each blow's contact frame lands exactly when the game's hit
 /// does. The game keeps posing its hit shapes with `animate`, so timing, reach and hitboxes
 /// don't change.
+#[cfg(test)]
 pub fn animate_show(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning) -> Option<Posed> {
     animate_with(rig, st, f, pos, now, tn, true, false)
 }
@@ -276,6 +291,11 @@ pub fn animate_show_as(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now:
 /// this far (radians) towards the hand's own axis, so it runs on from the forearm the way a
 /// sword held in a firm fist does, out on the thumb side.
 pub const GRIP_ANGLE: f32 = 0.87;
+
+/// Where a gun model's origin (the top of its grip) sits from the middle of the closed fist, along
+/// the gun's up and forward: the grip's middle runs through the fist.
+pub const GUN_GRIP_UP: f32 = 0.045;
+pub const GUN_GRIP_FWD: f32 = 0.012;
 
 /// The blade's direction and edge from the hand's knuckle line `a` and wrist-to-knuckles axis.
 pub fn grip_axes(a: V3, hand_axis: V3) -> (V3, V3) {
@@ -314,6 +334,141 @@ fn aim_hand(rig: &Rig, b: &Bones, pose: &mut [Trs], blade: Vec3, edge: Vec3) {
     let q = Quat::from_mat3(&(sm * r * sm)).normalize();
     let g = rig.globals(pose);
     rig.rotate_global(pose, &g, b.hand_r, q);
+}
+
+/// How a blade is carried when no swing, guard or finisher holds it (our space: +x right, +y up,
+/// +z forward): where the sword hand is from the right shoulder, the way the hand's usual grip
+/// axis points (`aim`, with the edge towards `edge`; in a reverse grip the blade points the
+/// opposite way), the elbow's pole, how much the other hand holds the handle (the greatsword)
+/// and how far into a reverse grip it is (the dagger: past half, it's held reversed).
+#[derive(Clone, Copy, Debug)]
+pub struct Carry {
+    pub hand: Vec3,
+    pub aim: Vec3,
+    pub edge: Vec3,
+    pub pole: Vec3,
+    pub two: f32,
+    pub reverse: f32,
+}
+
+impl Carry {
+    fn new(hand: [f32; 3], blade: [f32; 3], edge: [f32; 3], pole: [f32; 3]) -> Carry {
+        Carry { hand: Vec3::from(hand), aim: Vec3::from(blade).normalize(), edge: Vec3::from(edge).normalize(), pole: Vec3::from(pole), two: 0.0, reverse: 0.0 }
+    }
+    /// The same carry with the blade held reversed: the hand's grip axis points away from it.
+    fn reversed(self, blade: [f32; 3], edge: [f32; 3]) -> Carry {
+        Carry { aim: -Vec3::from(blade).normalize(), edge: -Vec3::from(edge).normalize(), reverse: 1.0, ..self }
+    }
+    fn mix(self, o: Carry, k: f32) -> Carry {
+        let k = k.clamp(0.0, 1.0);
+        let dir = |a: Vec3, b: Vec3| {
+            let m = a.lerp(b, k);
+            if m.length() > 1e-3 { m.normalize() } else { b }
+        };
+        Carry {
+            hand: self.hand.lerp(o.hand, k),
+            aim: dir(self.aim, o.aim),
+            edge: dir(self.edge, o.edge),
+            pole: self.pole.lerp(o.pole, k),
+            two: self.two + (o.two - self.two) * k,
+            reverse: self.reverse + (o.reverse - self.reverse) * k,
+        }
+    }
+}
+
+fn smooth01(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// Speeds (m/s) between which a greatsword goes from both hands to the shoulder.
+const GREAT_WALK: f32 = 2.6;
+const GREAT_RUN: f32 = 3.6;
+
+/// The carry each movement state wants, blended by speed and direction. `local_v` is the
+/// velocity in the body's frame (x right, z forward); `wall_away` the wall's outward normal
+/// in that frame.
+fn carry_for(f: &Fighter, speed: f32, local_v: V3, wall_away: Option<Vec3>) -> Carry {
+    let great = f.weapon == Weapon::Greatsword;
+    let dagger = f.weapon == Weapon::Dagger;
+    // held ready: the arm low and forward, the point forward and a little out
+    let ready = Carry::new([0.06, -0.4, 0.3], [0.25, -0.38, 0.89], [0.0, -1.0, 0.3], [0.35, -0.3, -0.4]);
+    // the greatsword on the right shoulder, the fist in front of it, the blade lying back
+    // (angled back across the shoulders to the left, away from the over-the-right-shoulder camera,
+    // so your own greatsword never fills the middle of the screen)
+    let shoulder = Carry::new([-0.05, -0.16, 0.2], [-0.5, 0.62, -0.6], [1.0, 0.0, 0.0], [0.15, -0.8, 0.35]);
+    // the dagger reversed: the fist low in front of the hip, the blade lying back along the
+    // outside of the forearm, edge out front
+    let rev = |c: Carry| Carry { hand: c.hand.lerp(Vec3::new(0.14, -0.36, 0.22), 0.75), pole: Vec3::new(0.4, -0.4, -0.4), ..c.reversed([0.14, -0.33, -0.93], [0.2, -1.0, 0.3]) };
+    if f.stun_t > 0.0 {
+        // knocked off balance: the sword arm flung out to the side, the point out and down
+        return Carry::new([0.3, -0.42, 0.08], [0.62, -0.3, 0.72], [0.0, -1.0, 0.0], [0.4, -0.4, -0.3]);
+    }
+    if let Some(away) = wall_away {
+        let c = if away.y.abs() < 0.9 && away.z > -0.7 {
+            // running along a wall: the blade out on the open side, away from it (raised a
+            // little: the body leans over that way)
+            let out = Carry::new([0.38, -0.18, -0.02], [0.75, 0.2, -0.62], [0.0, -1.0, 0.0], [0.25, -0.6, -0.4]);
+            let across = Carry::new([-0.12, -0.32, 0.32], [-0.55, -0.22, 0.8], [0.0, -1.0, 0.0], [0.4, -0.5, -0.2]);
+            across.mix(out, smooth01(away.x * 0.5 + 0.5))
+        } else {
+            // up the wall: out to the side and trailing back, clear of the wall and the body
+            Carry::new([0.36, -0.3, 0.0], [0.8, -0.2, -0.55], [0.0, -1.0, 0.0], [0.2, -0.6, -0.4])
+        };
+        return if great { shoulder } else if dagger { rev(c) } else { c };
+    }
+    if f.sliding > 0.0 && f.on_ground {
+        // sliding: low, the blade trailing behind
+        // (tilted up a little: the body leans back into the slide)
+        let c = Carry::new([0.26, -0.3, -0.3], [0.45, 0.12, -0.88], [0.0, -1.0, 0.0], [0.45, -0.5, 0.1]);
+        return if great { shoulder } else if dagger { rev(c) } else { c };
+    }
+    if f.dash_t > 0.0 {
+        // dashing: swept back
+        let c = Carry::new([0.24, -0.34, -0.22], [0.3, -0.05, -0.95], [0.0, -1.0, 0.0], [0.4, -0.2, -0.5]);
+        return if great { shoulder } else if dagger { rev(c) } else { c };
+    }
+    if !f.on_ground {
+        // in the air: the blade out to the side for balance, a little higher when falling
+        let rise = Carry::new([0.4, -0.22, 0.04], [0.8, -0.14, -0.58], [0.0, -1.0, 0.0], [0.2, -0.6, -0.4]);
+        let fall = Carry::new([0.42, -0.1, 0.0], [0.85, 0.05, -0.5], [0.0, -1.0, 0.0], [0.2, -0.6, -0.4]);
+        let c = rise.mix(fall, smooth01(-f.vel.y / 6.0));
+        return if great {
+            shoulder
+        } else if dagger {
+            Carry { hand: Vec3::new(0.38, -0.2, 0.14), pole: c.pole, ..c.reversed([-0.2, -0.5, -0.84], [0.0, -1.0, 0.3]) }
+        } else {
+            c
+        };
+    }
+    // on the ground: ready when still, then by where you're going
+    // (trailing back and out to the side, so the blade shows beside the body from the front)
+    let fwd_run = Carry::new([0.2, -0.48, -0.03], [0.74, -0.3, -0.6], [0.0, -1.0, 0.0], [0.5, -0.2, -0.35]);
+    let sprint = Carry::new([0.21, -0.46, -0.09], [0.72, -0.22, -0.66], [0.0, -1.0, 0.0], [0.5, -0.15, -0.38]);
+    let strafe = Carry::new([0.16, -0.46, 0.1], [0.6, -0.32, 0.73], [0.0, -1.0, 0.0], [0.4, -0.3, -0.4]);
+    let back = Carry::new([0.06, -0.38, 0.28], [0.18, -0.22, 0.96], [0.0, -1.0, 0.2], [0.35, -0.3, -0.4]);
+    let run = fwd_run.mix(sprint, smooth01((speed - RUN_SPEED) / (RUN_SPEED * 0.3)));
+    let dir = if local_v.flat().len() > 0.1 { local_v.flat().norm() } else { v3(0.0, 0.0, 1.0) };
+    let (fz, sx) = (dir.z, dir.x.abs());
+    // forward, sideways, backward shares (they add up to one)
+    let wf = fz.max(0.0);
+    let wb = (-fz).max(0.0);
+    let ws = sx;
+    let sum = (wf + wb + ws).max(1e-3);
+    let moving = run.mix(strafe, ws / (ws + wf).max(1e-3)).mix(back, wb / sum);
+    let k = smooth01((speed - 0.6) / (2.5 - 0.6));
+    if great {
+        // both hands on it standing and walking, on the shoulder once running
+        let walk = Carry { two: 1.0, ..ready.mix(back, 0.3 * k) };
+        let up = smooth01((speed - GREAT_WALK) / (GREAT_RUN - GREAT_WALK));
+        return walk.mix(shoulder, up);
+    }
+    let c = ready.mix(moving, k);
+    if dagger && k > 0.0 {
+        // the dagger flips into a reverse grip as soon as you get going
+        return ready.mix(rev(moving), smooth01((speed - 0.6) / 1.2));
+    }
+    c
 }
 
 /// Both hands closed into fists (the idle clip's fists): one round the handle, the other relaxed.
@@ -694,19 +849,23 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
                 }
                 Weapon::Rocket => {
                     let hr = sh_r + aim * 0.22 + down * 0.12;
-                    (hr, Some(hr + aim * 0.32 - side * 0.12 + down * 0.04))
+                    (hr, Some(hr + aim * 0.3 - side * 0.04 + down * 0.04))
                 }
                 Weapon::Smg => {
                     let hr = chest + side * 0.1 + aim * 0.42 + down * 0.1;
                     (hr, Some(hr + aim * 0.18 - side * 0.04))
                 }
                 _ => {
-                    let hr = chest + side * 0.12 + aim * 0.32 + down * 0.08;
+                    // (shouldered: the stock against the shoulder, so the front hand reaches the fore-end)
+                    let hr = chest + side * 0.12 + aim * 0.26 + down * 0.08;
                     // the scattergun's pump: the front hand racks it back and forward after a shot
-                    let pump = f.pump_k() * 0.12;
-                    (hr, Some(hr + aim * (0.36 - pump) - side * 0.06 + down * 0.02))
+                    // (on the scattergun it holds the pump, racked back after a shot)
+                    let reach = if f.weapon == Weapon::Shotgun { crate::weapons::PUMP_HOLD - f.pump_k() * crate::weapons::PUMP_TRAVEL } else { 0.36 };
+                    (hr, Some(hr + aim * reach - side * 0.02))
                 }
             };
+            // (in the picture the gun sits up in the fist, so the front hand follows it)
+            let hl = if show { hl.map(|h| h - down * GUN_GRIP_UP + aim * 0.07) } else { hl };
             let reload = f.reload_t > 0.0;
             let hr = if reload { hr + down * 0.15 - aim * 0.05 } else { hr };
             // the throw: the hand starts tucked in across the chest and whips out forward and
@@ -747,27 +906,48 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
             Some(hb)
         } else if let Some(d) = weapon_dir {
             Some((d, Vec3::ZERO))
-        } else if f.on_ground && speed < 2.5 && f.stun_t <= 0.0 {
-            // held ready: the arm low and forward, the point forward and a little out
-            let sh = gpos(&pose, b.up_r);
-            rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(sh + Vec3::new(0.06, -0.4, 0.3)), to_model(sh + Vec3::new(0.35, -0.3, -0.4)));
-            Some((Vec3::new(0.25, -0.38, 0.89), Vec3::new(0.0, -1.0, 0.3)))
         } else {
-            // on the move: the clip's own hand
-            None
+            // carried: held ready, or the way this movement wants it (eased, never snapping)
+            let away = f.wall.map(|w| {
+                let n = w.normal;
+                Vec3::new(n.dot(right), n.y, n.dot(fwd))
+            });
+            let target = carry_for(f, speed, local_v, away);
+            let c = match st.carry {
+                Some(c) => c.mix(target, (dt * 12.0).min(1.0)),
+                None => target,
+            };
+            st.carry = Some(c);
+            let sh = gpos(&pose, b.up_r);
+            rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(sh + c.hand), to_model(sh + c.pole));
+            Some((c.aim, c.edge))
         };
         if let Some((blade, edge)) = want {
             aim_hand(rig, &b, &mut pose, blade, edge);
         }
-        let two_hands = f.weapon == Weapon::Greatsword && hero_blade.is_none() && !clip_drives && f.slash_t <= 0.0 && f.fin == 0 && !f.guard && f.on_ground && speed < 2.5 && f.stun_t <= 0.0;
-        if two_hands {
+        let free = hero_blade.is_none() && !clip_drives && weapon_dir.is_none();
+        if !free {
+            st.carry = None;
+        }
+        let two = if f.weapon == Weapon::Greatsword && free { st.carry.map_or(0.0, |c| c.two) } else { 0.0 };
+        if two > 0.01 {
+            // the other hand joins on the handle (eased on and off as the sword goes to the shoulder)
             let (a, h, wrist) = hand_frame(rig, &b, &pose);
             let (blade, _) = grip_axes(ov(a), ov(h));
-            let target = wrist + h * 0.07 - gv(blade) * 0.13;
+            let handle = wrist + h * 0.07 - gv(blade) * 0.13;
+            let target = gpos(&pose, b.hand_l).lerp(handle, two);
             let pole = gpos(&pose, b.up_l) + Vec3::new(-0.4, -0.4, -0.2);
             rig.two_bone_ik(&mut pose, b.up_l, b.lo_l, b.hand_l, to_model(target), to_model(pole));
         }
+    } else {
+        st.carry = None;
+        // a gun in the picture: both hands closed round it (the grip, and the pump or fore-end)
+        if show && f.alive && f.weapon != Weapon::Shuriken {
+            close_fists(rig, &mut pose, &mut st.scratch2);
+        }
     }
+    // the dagger on the move: held reversed
+    let reverse = show && melee && f.alive && f.weapon == Weapon::Dagger && st.carry.is_some_and(|c| c.reverse > 0.5);
 
     // ---- kick: the right leg snaps forward and back
     if show && f.alive && f.kick_t > 0.0 {
@@ -843,6 +1023,7 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     let (x, y, z, grip) = if show && melee && f.alive {
         // the blade comes out of the closed fist; its handle's middle sits just below the fist
         let (z, y) = grip_axes(knuckles, hand_axis);
+        let (z, y) = if reverse { (-z, -y) } else { (z, y) };
         let fist = hand * 0.35 + wp(b.middle1_r) * 0.35 + wp(b.middle3_r) * 0.3;
         (y.cross(z).norm(), y, z, fist - z * (0.05 * scale.clamp(0.2, 4.0)))
     } else {
@@ -852,7 +1033,16 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
         };
         let up_hint = if z.y.abs() > 0.9 { yaw_fwd_of(f.yaw) } else { v3(0.0, 1.0, 0.0) };
         let x = up_hint.cross(z).norm();
-        (x, z.cross(x).norm(), z, hand)
+        let y = z.cross(x).norm();
+        // in the picture a gun's grip runs through the closed fist: its model's origin (the top of
+        // the grip) sits a little above and ahead of the fist's middle (stars stay between the fingers)
+        let grip = if show && f.alive && !melee && f.weapon != Weapon::Shuriken {
+            let fist = hand * 0.35 + wp(b.middle1_r) * 0.35 + wp(b.middle3_r) * 0.3;
+            fist + y * GUN_GRIP_UP + z * GUN_GRIP_FWD
+        } else {
+            hand
+        };
+        (x, y, z, grip)
     };
     let head = wp(b.head);
     let neck = wp(b.neck);
@@ -883,7 +1073,7 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
             cap(wp(b.calf_r), wp(b.foot_r), 0.065, Part::LegR),
         ],
     };
-    Some(Posed { palette, hand, weapon: M3 { x, y, z }, head, head_frame: M3 { x: hx, y: hy, z: hz }, waist: wp(b.spine1), hit, grip, knuckles, hand_axis, forearm: (hand - elbow).norm(), fingertip })
+    Some(Posed { palette, hand, weapon: M3 { x, y, z }, head, head_frame: M3 { x: hx, y: hy, z: hz }, waist: wp(b.spine1), hit, grip, knuckles, hand_axis, forearm: (hand - elbow).norm(), fingertip, reverse })
 }
 // ---------------------------------------------------------------------------------- melee clips
 
@@ -1210,15 +1400,29 @@ mod pose_tests {
     use super::*;
 
     /// The sword sits in a closed fist and points where the hand says, in every state the
-    /// picture shows: held ready in a match, each fighter's hero pose, guarding and mid-swing.
-    /// (Guards against the grip breaking again: blade through the wrist, open hands, a blade
-    /// across the forearm or into the floor.)
+    /// picture shows: held ready, each fighter's hero pose, guarding, mid-swing, and every way of
+    /// moving (run, sprint, strafe both ways, backpedal, jump, fall, wall-run both sides and up,
+    /// dash, slide, stagger). (Guards against the grip breaking again: blade through the wrist,
+    /// open hands, a blade across the forearm, into the body or into the floor, or a blade that
+    /// just follows the unarmed run clip.)
     #[test]
     fn sword_grip_follows_the_hand() {
         let rig = Rig::load().unwrap();
+        let mut fails: Vec<String> = Vec::new();
+        macro_rules! check {
+            ($c:expr, $($a:tt)*) => {
+                if !$c {
+                    fails.push(format!($($a)*));
+                }
+            };
+        }
+        let states = [
+            "ready", "hero", "guard", "slash", "walk", "run", "sprint", "strafe_l", "strafe_r", "backpedal", "jump", "fall", "wall_l", "wall_r", "wall_up", "dash", "slide", "stagger",
+        ];
+        let moving = |s: &str| !matches!(s, "ready" | "hero" | "guard" | "slash" | "stagger");
         for body in 0..crate::chars::COUNT as u8 {
             for w in Weapon::MELEE {
-                for state in ["ready", "hero", "guard", "slash"] {
+                for state in states {
                     let mut f = Fighter::new("t", 0, true);
                     f.present = true;
                     f.alive = true;
@@ -1227,6 +1431,46 @@ mod pose_tests {
                     f.loadout.melee = w;
                     f.cur = 0;
                     f.weapon = w;
+                    let wall = |normal: V3, vertical: bool| Some(crate::game::WallRun { normal, dir: v3(0.0, 0.0, 1.0), t: 0.3, vertical, speed: 10.0 });
+                    match state {
+                        "walk" => f.vel = v3(0.0, 0.0, 2.0),
+                        "run" => f.vel = v3(0.0, 0.0, RUN_SPEED),
+                        "sprint" => f.vel = v3(0.0, 0.0, RUN_SPEED * 1.3),
+                        "strafe_l" => f.vel = v3(-RUN_SPEED, 0.0, 0.0),
+                        "strafe_r" => f.vel = v3(RUN_SPEED, 0.0, 0.0),
+                        "backpedal" => f.vel = v3(0.0, 0.0, -RUN_SPEED * 0.8),
+                        "jump" => {
+                            f.on_ground = false;
+                            f.vel = v3(0.0, 6.0, 4.0);
+                        }
+                        "fall" => {
+                            f.on_ground = false;
+                            f.vel = v3(0.0, -7.0, 4.0);
+                        }
+                        // the wall on her left (its normal points right), then on her right
+                        "wall_l" | "wall_r" | "wall_up" => {
+                            f.on_ground = false;
+                            f.vel = v3(0.0, 0.5, 10.0);
+                            f.wall = match state {
+                                "wall_l" => wall(v3(1.0, 0.0, 0.0), false),
+                                "wall_r" => wall(v3(-1.0, 0.0, 0.0), false),
+                                _ => wall(v3(0.0, 0.0, -1.0), true),
+                            };
+                        }
+                        "dash" => {
+                            f.dash_t = 0.15;
+                            f.vel = v3(0.0, 0.0, 16.0);
+                        }
+                        "slide" => {
+                            f.sliding = 0.6;
+                            f.vel = v3(0.0, 0.0, 10.0);
+                        }
+                        "stagger" => {
+                            f.stun_t = 0.5;
+                            f.stagger_t = 0.5;
+                        }
+                        _ => {}
+                    }
                     let mut st = CharState::new();
                     let mut p = None;
                     for k in 0..40 {
@@ -1243,42 +1487,172 @@ mod pose_tests {
                     }
                     let p = p.expect("posed");
                     let what = format!("{} {:?} {state}", crate::chars::name(body), w);
-                    // the blade leaves the fist at the grip's angle to the hand bones
+                    // the blade leaves the fist at the grip's angle to the hand bones (straight
+                    // out the other side in the dagger's reverse grip)
                     let (blade, edge) = grip_axes(p.knuckles, p.hand_axis);
-                    assert!(p.weapon.z.dot(blade) > 0.999, "{what}: blade {:?} vs hand {:?}", p.weapon.z, blade);
-                    assert!(p.weapon.y.dot(edge) > 0.99, "{what}: the edge follows the knuckles");
-                    // never back through the wrist or square across the forearm (resting on the
-                    // shoulder, the blade lies back and up over it instead)
+                    let sign = if p.reverse { -1.0 } else { 1.0 };
+                    check!(p.weapon.z.dot(blade) * sign > 0.999, "{what}: blade {:?} vs hand {:?}", p.weapon.z, blade);
+                    check!(p.weapon.y.dot(edge) * sign > 0.99, "{what}: the edge follows the knuckles");
+                    // the dagger goes into a reverse grip on the move, and only then
+                    let want_rev = w == Weapon::Dagger && moving(state) && state != "walk";
+                    if state != "walk" {
+                        check!(p.reverse == want_rev, "{what}: reverse grip {}", p.reverse);
+                    }
+                    // never back through the wrist or square across the forearm (on the shoulder,
+                    // the blade lies back and up over it; reversed, it lies back along it)
                     let along = p.weapon.z.dot(p.forearm);
-                    let shoulder = state == "hero" && (w == Weapon::Greatsword || body == 2);
+                    let great_carry = w == Weapon::Greatsword && matches!(state, "run" | "sprint" | "strafe_l" | "strafe_r" | "backpedal" | "jump" | "fall" | "wall_l" | "wall_r" | "wall_up" | "dash" | "slide");
+                    let shoulder = (state == "hero" && (w == Weapon::Greatsword || body == 2)) || great_carry;
                     if shoulder {
-                        assert!(p.weapon.z.y > 0.3 && p.weapon.z.dot(f.fwd()) < 0.0, "{what}: back over the shoulder: {:?}", p.weapon.z);
+                        // (a little flatter when the whole body leans back up a wall)
+                        check!(p.weapon.z.y > if great_carry { 0.2 } else { 0.3 } && p.weapon.z.dot(f.fwd()) < 0.0, "{what}: back over the shoulder: {:?}", p.weapon.z);
+                    } else if p.reverse {
+                        check!(along < -0.2, "{what}: reversed, the blade lies back along the forearm: {along:.2}");
                     } else {
-                        assert!(along > 0.2, "{what}: blade vs forearm {along:.2}");
+                        // (moving between held ready and the run's trailing carry, a little less)
+                        let min = if state == "walk" { 0.1 } else { 0.2 };
+                        check!(along > min, "{what}: blade vs forearm {along:.2}");
                     }
                     // the fist is closed and the hilt sits in it
-                    assert!(p.fingertip < 0.135, "{what}: hand open ({:.3})", p.fingertip);
+                    check!(p.fingertip < 0.135, "{what}: hand open ({:.3})", p.fingertip);
                     let fist = p.grip + p.weapon.z * 0.05;
-                    assert!((fist - p.hand).len() < 0.14, "{what}: hilt {:.3} m from the wrist", (fist - p.hand).len());
-                    // and the point stays off the floor while standing
+                    check!((fist - p.hand).len() < 0.14, "{what}: hilt {:.3} m from the wrist", (fist - p.hand).len());
+                    let reach = match w {
+                        Weapon::Dagger => 0.56,
+                        Weapon::Greatsword => 1.72,
+                        _ => 1.28,
+                    };
+                    let tip = p.grip + p.weapon.z * reach;
                     if state != "slash" {
-                        let reach = match w {
-                            Weapon::Dagger => 0.56,
-                            Weapon::Greatsword => 1.72,
-                            _ => 1.28,
-                        };
-                        let tip = p.grip + p.weapon.z * reach;
-                        assert!(tip.y > 0.0, "{what}: the point goes into the floor ({:.2})", tip.y);
+                        // the point stays off the floor
+                        check!(tip.y > 0.0, "{what}: the point goes into the floor ({:.2})", tip.y);
+                        // and out of the body: the outer part of the blade clears the head, chest,
+                        // hips and thighs
+                        if state != "hero" && !shoulder {
+                            for k in 4..=10 {
+                                let q = p.grip + p.weapon.z * (reach * k as f32 / 10.0);
+                                for c in [0usize, 2, 4, 9, 11] {
+                                    let cap = p.hit.caps[c];
+                                    let d = seg_dist(q, cap.a, cap.b);
+                                    check!(d > cap.r * 0.9, "{what}: the blade goes into the body (part {c}, {:.0}% along, {d:.3} m)", k * 10);
+                                }
+                            }
+                        }
                     }
                     if state == "ready" {
                         let want = v3(0.25, -0.38, 0.89).norm();
-                        assert!(p.weapon.z.dot(want) > 0.9, "{what}: held ready low and forward: {:?}", p.weapon.z);
+                        check!(p.weapon.z.dot(want) > 0.9, "{what}: held ready low and forward: {:?}", p.weapon.z);
                     }
-                    println!("{what:32} along forearm {along:.2}  fingertip {:.3}  blade ({:.2},{:.2},{:.2})", p.fingertip, p.weapon.z.x, p.weapon.z.y, p.weapon.z.z);
+                    // the greatsword: both hands on it standing and walking
+                    if w == Weapon::Greatsword && matches!(state, "ready" | "walk") {
+                        let left = p.hit.caps[6].b;
+                        check!((left - p.grip).len() < 0.25, "{what}: two hands on the handle ({:.2} m apart)", (left - p.grip).len());
+                    }
+                    // moving, the carry is its own: not the unarmed run clip's swinging hand
+                    if moving(state) && !shoulder {
+                        check!(p.weapon.z.y < 0.4, "{what}: carried, not waved overhead: {:?}", p.weapon.z);
+                    }
+                    println!("{what:34} along {along:5.2}  rev {}  tip y {:.2}  blade ({:.2},{:.2},{:.2})", p.reverse as u8, tip.y, p.weapon.z.x, p.weapon.z.y, p.weapon.z.z);
                 }
             }
         }
+        for m in &fails {
+            println!("FAIL {m}");
+        }
+        assert!(fails.is_empty(), "{} grip problems (listed above)", fails.len());
     }
+
+    fn seg_dist(p: V3, a: V3, b: V3) -> f32 {
+        let ab = b - a;
+        let t = ((p - a).dot(ab) / ab.dot(ab).max(1e-9)).clamp(0.0, 1.0);
+        (p - (a + ab * t)).len()
+    }
+
+    /// Moving between states never snaps the blade: from a run into a strafe, a jump and a
+    /// landing, the blade turns only a little each frame.
+    #[test]
+    fn the_carried_blade_blends_between_states() {
+        let rig = Rig::load().unwrap();
+        for w in Weapon::MELEE {
+            let mut f = Fighter::new("t", 0, true);
+            f.present = true;
+            f.alive = true;
+            f.on_ground = true;
+            f.weapon = w;
+            f.loadout.melee = w;
+            f.cur = 0;
+            let mut st = CharState::new();
+            let mut prev: Option<(V3, bool)> = None;
+            for k in 0..200 {
+                let t = k as f32 * (1.0 / 60.0);
+                // stand, run, strafe, jump, land
+                match k {
+                    0..=29 => f.vel = V3::ZERO,
+                    30..=79 => f.vel = v3(0.0, 0.0, (RUN_SPEED * (k as f32 - 29.0) / 10.0).min(RUN_SPEED)),
+                    80..=119 => f.vel = v3(RUN_SPEED, 0.0, 0.0),
+                    120..=159 => {
+                        f.on_ground = false;
+                        f.vel = v3(RUN_SPEED, 6.0 - (k - 120) as f32 * 0.3, 0.0);
+                    }
+                    _ => {
+                        f.on_ground = true;
+                        f.vel = v3(RUN_SPEED * 0.5, 0.0, 0.0);
+                    }
+                }
+                let p = animate_show_as(&rig, &mut st, &f, V3::ZERO, t, &Tuning::default(), false).expect("posed");
+                if let Some((z, rev)) = prev {
+                    // (the dagger's flip into a reverse grip is the one deliberate turn-over)
+                    if rev == p.reverse {
+                        let turn = z.dot(p.weapon.z).clamp(-1.0, 1.0).acos();
+                        assert!(turn < 0.35, "{w:?} frame {k}: the blade snaps {turn:.2} rad");
+                    }
+                }
+                prev = Some((p.weapon.z, p.reverse));
+            }
+        }
+    }
+    /// In the picture each gun sits in the right fist and the left hand holds it where a hand
+    /// should (the pump, the fore-end, the fore-grip), not hanging in the air below it.
+    #[test]
+    fn support_hand_holds_the_gun() {
+        let rig = Rig::load().unwrap();
+        // (weapon, where the left wrist should be in the gun's frame: x right, y up, z forward)
+        let holds = [
+            (Weapon::Shotgun, v3(-0.03, -0.03, crate::weapons::PUMP_HOLD - 0.06)),
+            (Weapon::Rifle, v3(-0.03, -0.02, 0.28)),
+            (Weapon::Sniper, v3(-0.03, -0.04, 0.25)),
+            (Weapon::Rocket, v3(-0.03, -0.0, 0.25)),
+        ];
+        let mut worst: f32 = 0.0;
+        for body in 0..crate::chars::COUNT as u8 {
+            for (w, want) in holds {
+                let mut f = Fighter::new("t", 0, true);
+                f.present = true;
+                f.alive = true;
+                f.on_ground = true;
+                f.loadout.body = body;
+                f.loadout.gun1 = w;
+                f.cur = 1;
+                f.weapon = w;
+                let mut st = CharState::new();
+                let mut p = None;
+                for k in 0..30 {
+                    p = animate_show_as(&rig, &mut st, &f, V3::ZERO, k as f32 * 0.016, &Tuning::default(), false);
+                }
+                let p = p.unwrap();
+                let wf = &p.weapon;
+                let target = p.grip + wf.x * want.x + wf.y * want.y + wf.z * want.z;
+                let wrist = p.hit.caps[6].b;
+                let d = (wrist - target).len();
+                worst = worst.max(d);
+                let o = wrist - p.grip;
+                println!("{} {w:?}: left wrist {d:.3} m from where it should hold (it's at x {:.2} y {:.2} z {:.2} in the gun's frame)", crate::chars::name(body), o.dot(wf.x), o.dot(wf.y), o.dot(wf.z));
+            }
+        }
+        println!("worst {worst:.3}");
+        assert!(worst < 0.09, "a front hand is {worst:.2} m off its gun");
+    }
+
     #[test]
     fn guns_point_forward() {
         let rig = Rig::load().unwrap();

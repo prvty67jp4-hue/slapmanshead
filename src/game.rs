@@ -213,7 +213,7 @@ impl Weapon {
     }
     pub fn gun(self) -> GunStats {
         match self {
-            Weapon::Shotgun => GunStats { pellets: 10, spread_still: 0.07, move_cap: 1.0, bloom: 0.0, dmg: 11.0, range: 40.0, head: 2.0, knock: 1.0 },
+            Weapon::Shotgun => GunStats { pellets: 10, spread_still: 0.0455, move_cap: 1.0, bloom: 0.0, dmg: 11.0, range: 40.0, head: 2.0, knock: 1.0 },
             Weapon::Smg => GunStats { pellets: 1, spread_still: 0.012, move_cap: 1.5, bloom: 0.25, dmg: 9.0, range: 80.0, head: 1.4, knock: 0.4 },
             Weapon::Rifle => GunStats { pellets: 1, spread_still: 0.003, move_cap: 2.0, bloom: 0.6, dmg: 34.0, range: 200.0, head: 2.0, knock: 2.0 },
             Weapon::HandCannon => GunStats { pellets: 1, spread_still: 0.012, move_cap: 1.5, bloom: 1.5, dmg: 45.0, range: 160.0, head: 1.0, knock: 2.6 },
@@ -551,7 +551,7 @@ impl Ability {
             Ability::Mark => "throw a marker: enemies within 12 m show through walls for 4 s",
             Ability::Grapple => "pull yourself to a wall, ledge or pillar within 20 m (2 charges; jump lets go)",
             Ability::Wall => "a 2.5 s frontal shield: stops bullets, throws back blades",
-            Ability::Afterimage => "vanish for 0.6 s while a decoy runs on and fakes an attack",
+            Ability::Afterimage => "vanish for 3 s while a decoy runs on (attacking or being hit shows you)",
         }
     }
     pub fn passive(self) -> &'static str {
@@ -596,6 +596,13 @@ pub struct Decoy {
     pub owner: usize,
     pub t: f32,
 }
+
+/// Within this distance an invisible fighter (Afterimage) shows a faint shimmer.
+pub const SHIMMER_RANGE: f32 = 4.0;
+/// Pressing the opposite direction stops you from a run in this long (counter-strafing).
+pub const COUNTER_STOP: f32 = 0.06;
+/// Below this share of run speed, guns are as accurate as standing still.
+pub const STILL_SPEED: f32 = 0.3;
 
 /// Feel settings the developer tuning panel (F4) changes live. The defaults are the game's own.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -677,7 +684,8 @@ impl Default for Tuning {
         Tuning {
             run_speed: RUN_SPEED,
             accel_time: 0.12,
-            stop_time: 0.1,
+            // letting go of the keys stops you in about 0.12 s (pressing the other way brakes faster)
+            stop_time: 0.12,
             air_control: 22.0,
             // a touch lighter than thrown things fall, so jumps hang a little and read easily
             gravity: 23.0,
@@ -694,7 +702,8 @@ impl Default for Tuning {
             shoulder: 0.78,
             cam_smooth: 0.04,
             char_scale: 1.0,
-            turn_slow: 0.3,
+            // only a full about-turn while sprinting forward costs a little speed
+            turn_slow: 0.15,
             skid: 1.0,
             lean: 1.0,
             land_squash: 1.0,
@@ -716,8 +725,8 @@ impl Default for Tuning {
             grapple_pull: 24.0,
             shield_cd: 22.0,
             shield_time: 2.5,
-            after_cd: 18.0,
-            invis_time: 0.6,
+            after_cd: 25.0,
+            invis_time: 3.0,
             decoy_time: 1.6,
             glint_hide: 1.0,
             guard_bonus: 0.3,
@@ -788,7 +797,7 @@ pub const TUNE_FIELDS: [TuneField; 45] = [
     TuneField { key: "shoulder", label: "Shoulder offset", min: -1.5, max: 1.5, unit: "m", group: "Camera", get: |t| t.shoulder, set: |t, v| t.shoulder = v },
     TuneField { key: "cam_smooth", label: "Camera smoothing", min: 0.0, max: 0.4, unit: "s", group: "Camera", get: |t| t.cam_smooth, set: |t, v| t.cam_smooth = v },
     TuneField { key: "char_scale", label: "Character scale", min: 0.5, max: 2.0, unit: "×", group: "Characters", get: |t| t.char_scale, set: |t, v| t.char_scale = v },
-    TuneField { key: "turn_slow", label: "Sharp-turn slowdown", min: 0.0, max: 0.8, unit: "×", group: "Movement feel", get: |t| t.turn_slow, set: |t, v| t.turn_slow = v },
+    TuneField { key: "turn_slow", label: "About-turn slowdown (sprinting)", min: 0.0, max: 0.8, unit: "×", group: "Movement feel", get: |t| t.turn_slow, set: |t, v| t.turn_slow = v },
     TuneField { key: "skid", label: "Stop skid (dust, planted feet)", min: 0.0, max: 2.0, unit: "×", group: "Movement feel", get: |t| t.skid, set: |t, v| t.skid = v },
     TuneField { key: "dash_windup", label: "Dash anticipation crouch", min: 0.0, max: 0.12, unit: "s", group: "Movement feel", get: |t| t.dash_windup, set: |t, v| t.dash_windup = v },
     TuneField { key: "dash_blur", label: "Dash edge blur", min: 0.0, max: 1.5, unit: "×", group: "Movement feel", get: |t| t.dash_blur, set: |t, v| t.dash_blur = v },
@@ -810,7 +819,7 @@ pub const TUNE_FIELDS: [TuneField; 45] = [
     TuneField { key: "shield_cd", label: "Iron Wall cooldown", min: 2.0, max: 60.0, unit: "s", group: "Abilities", get: |t| t.shield_cd, set: |t, v| t.shield_cd = v },
     TuneField { key: "shield_time", label: "Iron Wall duration", min: 0.5, max: 8.0, unit: "s", group: "Abilities", get: |t| t.shield_time, set: |t, v| t.shield_time = v },
     TuneField { key: "after_cd", label: "Afterimage cooldown", min: 2.0, max: 60.0, unit: "s", group: "Abilities", get: |t| t.after_cd, set: |t, v| t.after_cd = v },
-    TuneField { key: "invis_time", label: "Afterimage invisibility", min: 0.1, max: 3.0, unit: "s", group: "Abilities", get: |t| t.invis_time, set: |t, v| t.invis_time = v },
+    TuneField { key: "invis_time", label: "Afterimage invisibility", min: 0.1, max: 6.0, unit: "s", group: "Abilities", get: |t| t.invis_time, set: |t, v| t.invis_time = v },
     TuneField { key: "decoy_time", label: "Afterimage decoy life", min: 0.3, max: 4.0, unit: "s", group: "Abilities", get: |t| t.decoy_time, set: |t, v| t.decoy_time = v },
     TuneField { key: "glint_hide", label: "Sable: hidden sniper glint", min: 0.0, max: 3.0, unit: "s", group: "Passives", get: |t| t.glint_hide, set: |t, v| t.glint_hide = v },
     TuneField { key: "guard_bonus", label: "Bram: extra guard meter", min: 0.0, max: 1.0, unit: "×", group: "Passives", get: |t| t.guard_bonus, set: |t, v| t.guard_bonus = v },
@@ -1351,6 +1360,7 @@ impl Fighter {
     }
 
     /// Speed bonus from chained moves (1.0 to 1.3).
+    #[cfg(test)]
     pub fn flow_mult(&self) -> f32 {
         self.flow_mult_by(FLOW_STEP)
     }
@@ -1402,9 +1412,6 @@ impl Fighter {
     }
     pub fn body_box(&self) -> Aabb {
         Aabb::new(self.pos + v3(-0.42, 0.0, -0.42), self.pos + v3(0.42, 1.5, 0.42))
-    }
-    pub fn head_box(&self) -> Aabb {
-        Aabb::new(self.pos + v3(-0.22, 1.5, -0.22), self.pos + v3(0.22, 1.9, 0.22))
     }
     pub fn slashing(&self) -> bool {
         self.slash_t > 0.0
@@ -1705,6 +1712,15 @@ pub struct DmgNum {
     pub head: bool,
     /// Who was hit (255: nobody in particular); a volley's pellets add up into one number.
     pub victim: u8,
+    /// Confirmed by the one who keeps the health (the host, or this computer offline): then
+    /// `amount` is the health actually lost and `armour` the armour; before that it's the
+    /// prediction, drawn grey.
+    pub confirmed: bool,
+    pub armour: i32,
+    /// The exact sums behind the numbers, and when it was last confirmed (pellets join it).
+    pub exact: f32,
+    pub exact_ap: f32,
+    pub conf_t: f32,
 }
 
 /// A kill feed line.
@@ -1726,6 +1742,8 @@ pub enum Ev {
     /// Someone used their ability: what (Ability), where from / to, which way. From a player
     /// about themselves; from the host, passed on once it checked out.
     Ability { who: u8, kind: u8, p: V3, d: V3 },
+    /// From the host to whoever hit: what the hit really did (health and armour lost).
+    Confirm { attacker: u8, victim: u8, hp: f32, ap: f32, head: bool },
     /// From a player: "I hit them" (the host checks it). From the host: "you were hit".
     /// `guard` drains the victim's guard meter (a blocked hit).
     Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3, guard: f32 },
@@ -1824,7 +1842,13 @@ pub struct Game {
     potm_stash: Option<(Vec<Fighter>, Vec<Tracer>, Vec<Particle>, f32)>,
     flow_noted: Vec<bool>,
     /// The phase last tick (to notice a match ending on every computer).
-    seen_phase: Phase,    pub hitmarker: f32,
+    seen_phase: Phase,
+    /// (host) seconds since this round started, whether it can end yet (everyone back in, or 3 s
+    /// passed), and the last round that was finished (each finishes once).
+    round_since: f32,
+    round_armed: bool,
+    round_finished: (u32, u32),
+    pub hitmarker: f32,
     /// Where recent hits on you came from (world point, time left).
     pub hurt_dirs: Vec<(V3, f32)>,
     /// Kill confirmation: time left, who, kills in a row.
@@ -2191,6 +2215,9 @@ impl Game {
             potm_stash: None,
             flow_noted: vec![false; MAX_PLAYERS],
             seen_phase: Phase::Warmup,
+            round_since: 0.0,
+            round_armed: false,
+            round_finished: (u32::MAX, 0),
             hitmarker: 0.0,
             hurt_dirs: Vec::new(),
             kill_t: 0.0,
@@ -2789,7 +2816,7 @@ impl Game {
         let me = self.f[i].eye();
         let mut best: Option<(f32, usize)> = None;
         for j in 0..self.f.len() {
-            if !self.is_enemy(i, j) || !self.f[j].alive || self.f[j].invis_t > 0.0 {
+            if !self.is_enemy(i, j) || !self.f[j].alive || (self.f[j].invis_t > 0.0 && (self.f[j].pos - self.f[i].pos).len() > SHIMMER_RANGE) {
                 continue;
             }
             let mut d = (self.f[j].pos - self.f[i].pos).len();
@@ -3015,6 +3042,16 @@ impl Game {
                 *local_input
             };
             let acts = self.step_fighter(i, &input, dt, frozen);
+            if self.f[i].invis_t > 0.0 {
+                let attacks = acts.iter().any(|a| match a {
+                    Act::Gun { .. } | Act::Slash | Act::Throw | Act::Star { .. } | Act::FinishStart => true,
+                    Act::Ability { kind, .. } => *kind != Ability::Afterimage,
+                    _ => false,
+                });
+                if attacks || self.f[i].kick_t > 0.0 {
+                    self.f[i].invis_t = 0.0;
+                }
+            }
             for a in acts {
                 self.do_action(i, a);
             }
@@ -3935,6 +3972,16 @@ impl Game {
             }
             return;
         }
+        // a new round can't end before everyone is back in it: players on other computers stay
+        // down here until their own game respawns them (or 3 s pass)
+        self.round_since += dt;
+        if !self.round_armed {
+            if parts.iter().all(|&i| self.f[i].alive) || self.round_since >= 3.0 {
+                self.round_armed = true;
+            } else {
+                return;
+            }
+        }
         if alive.len() <= 1 || self.mt.timer <= 0.0 {
             let winner = if alive.len() == 1 { Some(alive[0]) } else { None };
             self.finish_round(winner);
@@ -3942,6 +3989,11 @@ impl Game {
     }
 
     fn finish_round(&mut self, winner: Option<usize>) {
+        // each round ends once
+        if self.round_finished == (self.mt.number, self.mt.round) {
+            return;
+        }
+        self.round_finished = (self.mt.number, self.mt.round);
         if self.mt.mode == Mode::Duel {
             self.duel_loser = self.mt.duel.iter().map(|&d| d as usize).find(|&d| d < self.f.len() && Some(d) != winner);
         }
@@ -3958,9 +4010,44 @@ impl Game {
         self.check_win();
     }
 
+    /// How many things the game holds in each list that changes during play (effects, logs,
+    /// recordings, histories). For the memory checks: none of these may keep growing in a long
+    /// match.
+    pub fn mem_counts(&self) -> Vec<(&'static str, usize)> {
+        let rec_items: usize = self.rec.iter().map(|r| r.f.len() + r.tracers.len() + r.particles.len()).sum();
+        let potm_items: usize = self.potm.as_ref().map_or(0, |h| h.frames.iter().map(|r| r.f.len() + r.tracers.len() + r.particles.len()).sum());
+        vec![
+            ("particles", self.particles.len()),
+            ("tracers", self.tracers.len()),
+            ("damage numbers", self.dmg_nums.len()),
+            ("casings", self.casings.len()),
+            ("flashes", self.flashes.len()),
+            ("grenades", self.grenades.len()),
+            ("feed", self.feed.len()),
+            ("chat", self.chat.len()),
+            ("marks", self.marks.len()),
+            ("decoys", self.decoys.len()),
+            ("hurt arcs", self.hurt_dirs.len()),
+            ("sounds", self.sounds.len()),
+            ("events out", self.out_events.len()),
+            ("career events", self.career.len()),
+            ("replay frames", self.rec.len()),
+            ("replay items", rec_items),
+            ("play of the match items", potm_items),
+            ("position history", self.history.iter().map(|h| h.len()).sum()),
+            ("pose history", self.pose_history.iter().map(|h| h.len()).sum()),
+            ("ability uses", self.ab_uses.iter().map(|u| u.len()).sum()),
+            ("blade trails", self.anim.iter().map(|a| a.trail.len()).sum()),
+            ("cloth points", self.anim.iter().map(|a| a.cloth.len()).sum()),
+            ("duel queue", self.queue.len()),
+        ]
+    }
+
     /// Next round: everyone taking part respawns; in a duel the loser goes to the back of the line.
     pub fn start_round(&mut self) {
         self.mt.round += 1;
+        self.round_since = 0.0;
+        self.round_armed = false;
         self.mt.round_end = 0.0;
         self.mt.timer = ROUND_TIME;
         self.grenades.clear();
@@ -4325,12 +4412,20 @@ impl Game {
         ff.since_shot += dt;
         ff.spam = (ff.spam - SPAM_RECOVER * dt).max(0.0);
         if !ff.weapon.is_melee() {
-            // moving costs a little accuracy, eased in and out so the crosshair moves smoothly
+            // on the ground accuracy follows how fast you're actually going, right now (stop, or
+            // counter-strafe, and the next shot is accurate): below 30% of run speed it's as
+            // good as standing. In the air, on a wall or dashing it eases as before.
             let cap = ff.weapon.gun().move_cap;
-            let speed_k = if ff.on_ground && ff.wall.is_none() { ((ff.vel.flat().len() - 1.0) / (RUN_SPEED - 1.0)).clamp(0.0, 1.0) } else { 1.0 };
-            let want = 1.0 + (cap - 1.0) * speed_k;
-            let rate = if want > ff.move_spread { 10.0 } else { 7.0 };
-            ff.move_spread += (want - ff.move_spread) * (dt * rate).min(1.0);
+            let grounded = ff.on_ground && ff.wall.is_none() && ff.dash_t <= 0.0;
+            if grounded {
+                let run = tn.run_speed.max(1.0);
+                let speed_k = ((ff.vel.flat().len() - run * STILL_SPEED) / (run * (1.0 - STILL_SPEED))).clamp(0.0, 1.0);
+                ff.move_spread = 1.0 + (cap - 1.0).max(0.0) * speed_k;
+            } else {
+                let want = cap.max(1.0);
+                let rate = if want > ff.move_spread { 10.0 } else { 7.0 };
+                ff.move_spread += (want - ff.move_spread) * (dt * rate).min(1.0);
+            }
             ff.move_spread = ff.move_spread.clamp(1.0, cap.max(1.0));
         }
         ff.jump_buf = (ff.jump_buf - dt).max(0.0);
@@ -4815,9 +4910,11 @@ impl Game {
                     ff.carry_t = 0.15;
                 }
             } else {
-                // a sharp turn at speed costs momentum for a moment
+                // only a full about-turn while sprinting forward costs a little momentum (strafing,
+                // A/D switches and turning the mouse never do)
                 let sp = cur.len();
-                if tn.turn_slow > 0.0 && ff.turn_cd <= 0.0 && sp > run * 0.8 && wish.len() > 0.5 && cur.norm().dot(wish.norm()) < 0.2 {
+                let about_turn = sp > run * 0.9 && wish.len() > 0.5 && cur.norm().dot(fwd) > 0.7 && cur.norm().dot(wish.norm()) < -0.8;
+                if tn.turn_slow > 0.0 && ff.turn_cd <= 0.0 && about_turn {
                     ff.vel.x *= 1.0 - tn.turn_slow;
                     ff.vel.z *= 1.0 - tn.turn_slow;
                     ff.carry = 0.0;
@@ -4831,7 +4928,11 @@ impl Game {
                 let diff = target - cur;
                 let carrying = ff.carry > speed;
                 let slowing = target.len() + 0.01 < cur.len();
-                let acc = if wish.len() > 0.1 {
+                // counter-strafing: pressing the other way brakes hard (a stop in about 0.06 s)
+                let counter = wish.len() > 0.1 && cur.len() > 0.5 && wish.norm().dot(cur.norm()) < -0.5;
+                let acc = if counter && !carrying {
+                    run / COUNTER_STOP
+                } else if wish.len() > 0.1 {
                     if carrying && slowing { 30.0 } else { tn.accel() }
                 } else if carrying {
                     25.0
@@ -5254,17 +5355,6 @@ impl Game {
     }
 
     // ------------------------------------------------------------------ combat
-
-    /// Third-person camera for a fighter: (camera position, look direction).
-    pub fn camera_for(&self, i: usize) -> (V3, V3) {
-        let ff = &self.f[i];
-        self.camera_from(ff.pos, ff.yaw, ff.pitch)
-    }
-
-    pub fn camera_from(&self, pos: V3, yaw: f32, pitch: f32) -> (V3, V3) {
-        let (pivot, dir, dist) = self.camera_rig(pos, yaw, pitch);
-        (pivot - dir * dist, dir)
-    }
 
     /// Over-the-right-shoulder camera: the point it orbits around, the look direction and how far
     /// back it can sit before hitting a wall (camera collision).
@@ -6213,14 +6303,19 @@ impl Game {
             let volley = self.time - self.hit_chain_t < 0.02;
             // and one number per shot: a volley's pellets on the same target add up (gold if any
             // of them was a headshot)
+            // on a client: the predicted number, grey until the host confirms what was really
+            // dealt (offline and on the host the confirmed one comes straight from the hit)
             let gold = head || amount >= LETHAL;
-            match self.dmg_nums.last_mut().filter(|d| volley && d.victim == victim as u8 && d.life > 0.85) {
-                Some(d) => {
-                    d.amount += shown.round() as i32;
-                    d.head |= gold;
-                    d.life = 0.9;
+            if !self.is_authority() {
+                match self.dmg_nums.last_mut().filter(|d| volley && d.victim == victim as u8 && d.life > 0.85 && !d.confirmed) {
+                    Some(d) => {
+                        d.exact += shown;
+                        d.amount = d.exact.round() as i32;
+                        d.head |= gold;
+                        d.life = 0.9;
+                    }
+                    None => self.dmg_nums.push(DmgNum { pos: at + v3(0.0, 0.3, 0.0), amount: shown.round() as i32, life: 0.9, head: gold, victim: victim as u8, confirmed: false, armour: 0, exact: shown, exact_ap: 0.0, conf_t: 0.0 }),
                 }
-                None => self.dmg_nums.push(DmgNum { pos: at + v3(0.0, 0.3, 0.0), amount: shown.round() as i32, life: 0.9, head: gold, victim: victim as u8 }),
             }
             if !volley {
                 self.hit_chain = if self.time - self.hit_chain_t < 1.5 { (self.hit_chain + 1).min(14) } else { 0 };
@@ -6255,8 +6350,61 @@ impl Game {
         self.authority_hit_g(victim, attacker, amount, knock, stun, head, w, 0.0);
     }
 
+    /// The host's (or this computer's) final word on a hit, and what it really did (health and
+    /// armour lost) told to whoever hit: that's the number they see.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_hit_g(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8, guard: f32) {
+        let before = self.f.get(victim).map(|f| (f.hp.max(0.0), f.ap.max(0.0), f.alive));
+        self.authority_hit_inner(victim, attacker, amount, knock, stun, head, w, guard);
+        if let (Some((hp0, ap0, true)), Some(a)) = (before, attacker) {
+            if a != victim && a < self.f.len() {
+                let f = &self.f[victim];
+                let (hp, ap) = ((hp0 - f.hp.max(0.0)).max(0.0), (ap0 - f.ap.max(0.0)).max(0.0));
+                if hp > 0.0 || ap > 0.0 {
+                    self.confirm_hit(a, victim, hp, ap, head);
+                }
+            }
+        }
+    }
+
+    /// A hit really dealt `hp` health and `ap` armour: the attacker's number shows that.
+    fn confirm_hit(&mut self, a: usize, victim: usize, hp: f32, ap: f32, head: bool) {
+        if a == self.local {
+            self.show_confirmed(victim, hp, ap, head);
+        } else if self.kind == Kind::Host && !self.f[a].owned {
+            self.out_events.push(Ev::Confirm { attacker: a as u8, victim: victim as u8, hp, ap, head });
+        }
+    }
+
+    /// Our damage number for a confirmed hit: the waiting prediction turns into it, the rest of
+    /// a volley adds up into it, or a new one appears.
+    pub fn show_confirmed(&mut self, victim: usize, hp: f32, ap: f32, head: bool) {
+        let now = self.time;
+        let v = victim as u8;
+        if let Some(d) = self.dmg_nums.iter_mut().rev().find(|d| d.victim == v && !d.confirmed && d.life > 0.2) {
+            d.confirmed = true;
+            d.exact = hp;
+            d.exact_ap = ap;
+            d.head = head;
+            d.conf_t = now;
+            d.life = d.life.max(0.8);
+        } else if let Some(d) = self.dmg_nums.iter_mut().rev().find(|d| d.victim == v && d.confirmed && now - d.conf_t < 0.06) {
+            d.exact += hp;
+            d.exact_ap += ap;
+            d.head |= head;
+            d.conf_t = now;
+        } else {
+            let at = self.f.get(victim).map_or(V3::ZERO, |f| f.chest()) + v3(0.0, 0.5, 0.0);
+            self.dmg_nums.push(DmgNum { pos: at, amount: 0, life: 0.9, head, victim: v, confirmed: true, armour: 0, exact: hp, exact_ap: ap, conf_t: now });
+        }
+        if let Some(d) = self.dmg_nums.iter_mut().rev().find(|d| d.victim == v && d.confirmed) {
+            d.amount = d.exact.round() as i32;
+            d.armour = d.exact_ap.round() as i32;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authority_hit_inner(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8, guard: f32) {
         if !self.f[victim].present || !self.f[victim].alive || self.f[victim].spawn_prot > 0.0 {
             return;
         }
@@ -6335,7 +6483,7 @@ impl Game {
         }
     }
 
-    /// Where a fighter was 	 seconds into the game (from the host's recent history).
+    /// Where a fighter was `t` seconds into the game (from the host's recent history).
     pub fn pos_at(&self, slot: usize, t: f32) -> V3 {
         let h = &self.history[slot];
         let mut prev: Option<(f32, V3)> = None;
@@ -6451,7 +6599,8 @@ impl Game {
             let range = wpn.gun().range + 2.0;
             if pose.ray(o, d, range, 0.25).is_some() {
                 hit = true;
-                if head && pose.ray_part(o, d, range, 0.12, Part::Head) {
+                // the same bigger head as everyone's, with the same assist, plus room for network jitter
+                if head && pose.ray_part(o, d, range, HEAD_ASSIST + 0.07, Part::Head) {
                     head_ok = true;
                 }
                 if pose.ray_core(o, d, range, 0.15) {
@@ -6518,6 +6667,7 @@ impl Game {
             self.out_events.push(Ev::Vote);
         }
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn apply_hit(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8, src: Option<V3>) {
         self.apply_hit_g(victim, attacker, amount, knock, stun, head, w, src, 0.0);
@@ -6534,6 +6684,9 @@ impl Game {
             }
         }
         let mut stun = stun;
+        if amount > 0.0 {
+            self.f[victim].invis_t = 0.0; // taking damage shows an Afterimage
+        }
         // hit by someone else in the middle of a finisher: it's cut short (fair in team fights)
         if amount > 0.0 && self.f[victim].fin > 0 && attacker != Some(self.f[victim].fin_target) {
             self.f[victim].fin = 0;
@@ -6923,7 +7076,7 @@ impl Game {
                 if owner == self.local && j != self.local {
                     self.combo_hit(dmg);
                     self.hitmarker = 0.25;
-                    self.dmg_nums.push(DmgNum { pos: c + v3(0.0, 0.5, 0.0), amount: dmg.round() as i32, life: 0.9, head: false, victim: 255 });
+                    self.dmg_nums.push(DmgNum { pos: c + v3(0.0, 0.5, 0.0), amount: dmg.round() as i32, life: 0.9, head: false, victim: 255, confirmed: true, armour: 0, exact: 0.0, exact_ap: 0.0, conf_t: 0.0 });
                 }
                 self.authority_hit(j, Some(owner), dmg, knock, 0.3, false, w);
             }
@@ -7034,6 +7187,9 @@ impl Game {
                     // a player says they hit someone: check it against the recent past
                     if from != 0 {
                         if let Some(chk) = self.validate_claim(from, v, w, dmg, o, dir, head) {
+                            if dmg > 0.0 {
+                                self.f[v].invis_t = 0.0;
+                            }
                             let wpn = Weapon::from_u8(w);
                             let gs = wpn.gun();
                             let mut dmg = dmg;
@@ -7071,6 +7227,11 @@ impl Game {
                     self.out_events.push(Ev::Ability { who, kind: kind as u8, p, d }); // passed on
                 } else if from == 0 && w != self.local {
                     self.ability_fx(w, kind, p, d);
+                }
+            }
+            Ev::Confirm { attacker, victim, hp, ap, head } => {
+                if self.kind == Kind::Client && from == 0 && attacker as usize == self.local && (victim as usize) < self.f.len() {
+                    self.show_confirmed(victim as usize, hp.clamp(0.0, 999.0), ap.clamp(0.0, 999.0), head);
                 }
             }
             Ev::Finisher { target, kind } => {
@@ -7226,7 +7387,6 @@ mod lag_comp_tests {
             half: 80.0,
             deco: Vec::new(),
             braziers: Vec::new(),
-            banners: Vec::new(),
             props: Vec::new(),
             vines: Vec::new(),
             torches: Vec::new(),
@@ -7745,13 +7905,13 @@ mod movement_tests {
             }
         }
         let t_stop = t_stop.expect("stops");
-        assert!((0.06..=0.14).contains(&t_stop), "stopped after {t_stop}s");
-        // a sharp turn at full speed bleeds speed for a moment
+        assert!((0.09..=0.15).contains(&t_stop), "letting go stops in about 0.12 s: {t_stop}s");
+        // a full about-turn while sprinting forward still costs a little
         run(&mut g, 0.4, FWD);
         let before = g.f[0].vel.flat().len();
         g.tick(&Input { fwd: -1.0, ..FWD });
         let after = g.f[0].vel.flat().len();
-        assert!(after < before * (1.0 - tn.turn_slow * 0.8), "sharp turn slows: {before} -> {after}");
+        assert!(after < before * (1.0 - tn.turn_slow * 0.8), "about-turn slows: {before} -> {after}");
         // the dash crouches for a split second, then bursts well beyond running speed
         let mut g = arena();
         run(&mut g, 0.4, FWD);
@@ -7777,6 +7937,83 @@ mod movement_tests {
             g.tick(&Input { fwd: 0.0, ..FWD });
         }
         assert!(g.f[0].land_impact > low + 0.3, "higher fall, harder landing: {low} vs {}", g.f[0].land_impact);
+    }
+
+    /// Holding A while turning the mouse half a turn a second: speed stays steady, with no
+    /// tick-to-tick drops (the old sharp-turn slowdown made this stutter).
+    #[test]
+    fn strafing_while_turning_keeps_speed_steady() {
+        let mut g = arena();
+        let run_speed = g.tune.run_speed;
+        let mut yaw = 0.0f32;
+        let left = |yaw: f32| Input { fwd: 0.0, right: -1.0, yaw, ..FWD };
+        run(&mut g, 0.5, left(yaw));
+        let mut prev = speed(&g);
+        assert!(prev > run_speed * 0.95, "up to speed: {prev}");
+        for _ in 0..(2.0 / TICK) as usize {
+            yaw += std::f32::consts::PI * TICK;
+            g.tick(&left(yaw));
+            let s = speed(&g);
+            assert!(s > run_speed * 0.9, "steady while turning: {s}");
+            assert!(s > prev * 0.99, "no drop from one tick to the next: {prev} -> {s}");
+            prev = s;
+        }
+        // switching A to D never triggers the about-turn slowdown either
+        run(&mut g, 0.5, Input { right: 1.0, ..left(yaw) });
+        assert!(g.f[0].turn_cd <= 0.0, "a strafe switch isn't an about-turn");
+        assert!(speed(&g) > run_speed * 0.95);
+    }
+
+    /// Counter-strafing: the opposite key brakes in about 0.06 s, letting go in about 0.12 s, and
+    /// below 30% of run speed guns are as accurate as standing still.
+    #[test]
+    fn counter_strafing_stops_fast_and_restores_accuracy() {
+        let rifle = |g: &mut Game| {
+            g.f[0].loadout.gun1 = Weapon::Rifle;
+            g.f[0].cur = 1;
+            g.f[0].weapon = Weapon::Rifle;
+            g.f[0].switch_t = 0.0;
+        };
+        let cap = Weapon::Rifle.gun().move_cap;
+        assert!(cap > 1.0);
+        let stop_time = |counter: bool| -> (f32, f32) {
+            let mut g = arena();
+            rifle(&mut g);
+            let r = Input { fwd: 0.0, right: 1.0, ..FWD };
+            run(&mut g, 0.6, r);
+            assert!((g.f[0].move_spread - cap).abs() < 1e-3, "full speed, moving accuracy: {}", g.f[0].move_spread);
+            let dir = g.f[0].vel.flat().norm();
+            let brake = Input { right: if counter { -1.0 } else { 0.0 }, ..r };
+            let mut accurate_at = None;
+            for k in 0..60 {
+                g.tick(&brake);
+                let along = g.f[0].vel.flat().dot(dir);
+                if accurate_at.is_none() && g.f[0].move_spread <= 1.0 {
+                    accurate_at = Some((k + 1) as f32 * TICK);
+                    assert!(along < g.tune.run_speed * STILL_SPEED + 0.05, "accurate only below 30% speed: {along}");
+                }
+                if along < 0.2 {
+                    return ((k + 1) as f32 * TICK, accurate_at.unwrap());
+                }
+            }
+            panic!("never stopped (counter {counter})");
+        };
+        let (counter, counter_acc) = stop_time(true);
+        let (release, release_acc) = stop_time(false);
+        assert!(counter <= 0.075, "counter-strafe stops in about 0.06 s: {counter}");
+        assert!((0.09..=0.15).contains(&release), "letting go stops in about 0.12 s: {release}");
+        assert!(counter_acc < release_acc, "counter-strafing gets you accurate sooner: {counter_acc} vs {release_acc}");
+        // a little drift is still standing accuracy
+        let mut g = arena();
+        rifle(&mut g);
+        g.tick(&FWD);
+        g.tick(&FWD);
+        assert!(speed(&g) < g.tune.run_speed * STILL_SPEED && g.f[0].move_spread == 1.0, "slow drift: standing accuracy");
+        // in the air the old rules stay: moving accuracy
+        let mut g = arena();
+        rifle(&mut g);
+        run(&mut g, 0.3, Input { jump: true, ..FWD });
+        assert!(!g.f[0].on_ground && g.f[0].move_spread > 1.2, "airborne: {}", g.f[0].move_spread);
     }
 
     #[test]
@@ -7970,7 +8207,10 @@ mod weapon_tests {
         // shown as one number for the whole shot
         let nums: Vec<&DmgNum> = g.dmg_nums.iter().filter(|n| n.victim == 1).collect();
         assert_eq!(nums.len(), 1, "one damage number per shot");
-        assert!((nums[0].amount as f32 - lost).abs() <= 2.0, "the number is the shot's total: {} vs {lost}", nums[0].amount);
+        // confirmed: health lost as the big number, the armour it took beside it
+        assert!(nums[0].confirmed);
+        assert_eq!(nums[0].amount, (MAX_HP - g.f[1].hp).round() as i32, "health actually lost");
+        assert!(((nums[0].amount + nums[0].armour) as f32 - lost).abs() <= 2.0, "health + armour is the shot's total: {} + {} vs {lost}", nums[0].amount, nums[0].armour);
         assert!(!nums[0].head);
     }
 
@@ -7982,7 +8222,7 @@ mod weapon_tests {
         assert!(!g.f[1].alive, "a point-blank headshot kills through full armour");
         let n = g.dmg_nums.iter().find(|n| n.victim == 1).expect("a number");
         println!("point-blank head: {}", n.amount);
-        assert!(n.head && n.amount >= 160, "a gold 160+: {} (head {})", n.amount, n.head);
+        assert!(n.head && n.confirmed && n.amount == MAX_HP as i32, "a gold number for every point of health it took: {} (head {})", n.amount, n.head);
     }
 
     #[test]
@@ -8184,8 +8424,8 @@ mod tuning_tests {
         // the defaults are the game''s own numbers
         let d = Tuning::default();
         assert!((d.jump_vel() - (2.0 * d.gravity * d.jump_height).sqrt()).abs() < 1e-3, "jump speed follows gravity and height");
-        // full speed in 0.12 s, a stop in 0.1 s, whatever the run speed
-        assert!((d.accel() - d.run_speed / 0.12).abs() < 1e-3 && (d.decel() - d.run_speed / 0.1).abs() < 1e-3);
+        // full speed in 0.12 s, a stop in 0.12 s (when you just let go), whatever the run speed
+        assert!((d.accel() - d.run_speed / 0.12).abs() < 1e-3 && (d.decel() - d.run_speed / 0.12).abs() < 1e-3);
     }
 
     #[test]
@@ -9386,12 +9626,45 @@ mod ability_tests {
         assert!((g.decoys[0].pos - start).len() > 2.0, "the decoy runs");
         let fake = g.decoy_fighter(&g.decoys[0]).expect("drawn as you");
         assert_eq!(fake.loadout.body, 3);
-        run(&mut g, 0.4, Input::default());
-        assert_eq!(g.f[0].invis_t, 0.0, "back in sight");
+        assert_eq!(g.tune.invis_time, 3.0, "3 s unseen");
+        assert_eq!(g.tune.after_cd, 25.0, "25 s cooldown");
+        run(&mut g, 2.0, Input::default());
+        assert!(g.f[0].invis_t > 0.0, "still unseen after 2.4 s");
         let life = g.tune.decoy_time;
-        run(&mut g, life, Input::default());
-        assert!(g.decoys.is_empty(), "the decoy fades");
+        assert!(g.decoys.is_empty() || life > 2.4, "the decoy fades");
+        run(&mut g, 0.8, Input::default());
+        assert_eq!(g.f[0].invis_t, 0.0, "back in sight after 3 s");
+        // up close (4 m) bots can find her
+        let mut g = arena(3);
+        press(&mut g, 0.0);
+        g.f[1].pos = g.f[0].pos + v3(0.0, 0.0, 3.0);
+        assert_eq!(g.nearest_enemy(1), Some(0), "within 4 m she shimmers");
+        g.f[1].pos = g.f[0].pos + v3(0.0, 0.0, 8.0);
+        assert_ne!(g.nearest_enemy(1), Some(0));
     }
+
+    #[test]
+    fn afterimage_breaks_on_attacking_or_being_hit() {
+        // attacking shows her
+        let mut g = arena(3);
+        press(&mut g, 0.0);
+        assert!(g.f[0].invis_t > 0.0);
+        g.f[0].fire_cd = 0.0;
+        for _ in 0..30 {
+            g.tick(&Input { fire: true, fire_pressed: true, ..Default::default() });
+            if g.f[0].invis_t <= 0.0 {
+                break;
+            }
+        }
+        assert_eq!(g.f[0].invis_t, 0.0, "attacking breaks it");
+        // taking damage shows her
+        let mut g = arena(3);
+        press(&mut g, 0.0);
+        g.f[0].spawn_prot = 0.0;
+        g.authority_hit(0, Some(1), 10.0, V3::ZERO, 0.0, false, Weapon::Revolver as u8);
+        assert_eq!(g.f[0].invis_t, 0.0, "being hit breaks it");
+    }
+
 
     #[test]
     fn passives() {
@@ -9519,6 +9792,299 @@ mod ability_mode_tests {
             assert!(g.abilities_on(), "{mode:?}: abilities on");
             g.tick(&Input { ability: true, ..Default::default() });
             assert!(g.f[0].invis_t > 0.0, "{mode:?}: Q works (phase {:?})", g.mt.phase);
+        }
+    }
+}
+
+/// A host and a player on this computer, talking over the network like a real match.
+#[cfg(test)]
+mod net_play_tests {
+    use super::*;
+    use crate::net::{apply_remote, Incoming, Net};
+
+    struct Pair {
+        hn: Net,
+        hg: Game,
+        cn: Net,
+        cg: Option<Game>,
+    }
+
+    fn pair(mode: Mode, target: u16) -> Pair {
+        let hn = Net::host(0).expect("host");
+        let port = hn.local_port();
+        let mut hg = Game::new(Kind::Host, 0, mode, target);
+        hg.add_player(0, "Host", true, None, 0);
+        hg.mt.phase = Phase::Fight;
+        hg.mt.timer = 300.0;
+        let cn = Net::join(&format!("127.0.0.1:{port}")).expect("join");
+        let mut p = Pair { hn, hg, cn, cg: None };
+        for _ in 0..300 {
+            pump(&mut p, &Input::default(), &Input::default());
+            if p.cg.as_ref().is_some_and(|g| g.f[0].present) && p.hg.f[1].present {
+                return p;
+            }
+        }
+        panic!("the player never joined");
+    }
+
+    /// One frame on both computers (two game ticks each, one network send).
+    fn pump(p: &mut Pair, host_in: &Input, client_in: &Input) {
+        let dt = TICK * 2.0;
+        for m in p.hn.poll() {
+            match m {
+                Incoming::Join { slot, name } => p.hg.add_player(slot, &name, false, None, 0),
+                Incoming::PeerState { slot, st, events, sent, stale } => {
+                    if p.hg.f[slot].present {
+                        if !stale {
+                            let now = p.hg.time;
+                            apply_remote(&mut p.hg.f[slot], &st, true, sent, now);
+                        }
+                        for ev in events {
+                            p.hg.handle_remote_event(slot, ev);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        p.hg.tick(host_in);
+        p.hg.tick(host_in);
+        for ev in p.hg.out_events.drain(..) {
+            p.hn.queue(ev);
+        }
+        p.hn.send(&p.hg, dt);
+        if p.cg.is_none() {
+            p.cn.send_hello("Cli", dt);
+        }
+        for m in p.cn.poll() {
+            match m {
+                Incoming::Host(msg) => {
+                    let g = p.cg.get_or_insert_with(|| Game::new(Kind::Client, msg.you, msg.mode, msg.target));
+                    crate::apply_host_msg(g, msg);
+                }
+                Incoming::PeerState { slot, st, events, sent, stale } => {
+                    if let Some(g) = p.cg.as_mut() {
+                        if g.f[slot].present {
+                            if !stale {
+                                let now = g.time;
+                                apply_remote(&mut g.f[slot], &st, true, sent, now);
+                            }
+                            for ev in events {
+                                g.handle_remote_event(slot, ev);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(g) = p.cg.as_mut() {
+            g.tick(client_in);
+            g.tick(client_in);
+            for ev in g.out_events.drain(..) {
+                p.cn.queue(ev);
+            }
+            p.cn.send(g, dt);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    /// Five duel rounds, each won by the host: round numbers and wins go up by exactly one each
+    /// time, on both computers (a player still down from the last round used to end the next
+    /// one at once).
+    #[test]
+    fn rounds_count_once_each_over_the_network() {
+        let mut p = pair(Mode::Duel, 50);
+        p.hg.mt.duel = [0, 1];
+        p.hg.queue.clear();
+        p.hg.duel_loser = None;
+        p.hg.start_round();
+        let first = p.hg.mt.round;
+        let (mut h_round, mut h_wins) = (p.hg.mt.round, p.hg.f[0].wins);
+        let mut won_in = std::collections::HashSet::new();
+        let (mut c_round, mut c_wins) = (0u32, 0i32);
+        let mut c_rounds_seen = Vec::new();
+        let mut frames = 0;
+        while p.hg.f[0].wins < 5 {
+            frames += 1;
+            assert!(frames < 6000, "five rounds take too long (round {}, wins {})", p.hg.mt.round, p.hg.f[0].wins);
+            // the host knocks the player out as soon as the round is on and they're back in
+            if p.hg.mt.round_end <= 0.0 && p.hg.f[1].alive && p.hg.f[1].spawn_prot <= 0.0 {
+                p.hg.authority_hit(1, Some(0), LETHAL, V3::ZERO, 0.0, false, Weapon::Revolver as u8);
+            }
+            pump(&mut p, &Input::default(), &Input::default());
+            let hg = &p.hg;
+            if hg.mt.round != h_round {
+                assert_eq!(hg.mt.round, h_round + 1, "host: rounds go up one at a time");
+                h_round = hg.mt.round;
+            }
+            if hg.f[0].wins != h_wins {
+                assert_eq!(hg.f[0].wins, h_wins + 1, "host: one win at a time");
+                assert!(won_in.insert(hg.mt.round), "host: one win per round (round {})", hg.mt.round);
+                h_wins = hg.f[0].wins;
+            }
+            assert_eq!(hg.f[1].wins, 0, "the player never wins a round they lost");
+            if let Some(g) = p.cg.as_ref() {
+                if g.mt.round != c_round {
+                    if c_round != 0 {
+                        assert_eq!(g.mt.round, c_round + 1, "player: rounds go up one at a time");
+                    }
+                    c_round = g.mt.round;
+                    c_rounds_seen.push(c_round);
+                }
+                if g.f[0].wins != c_wins {
+                    assert_eq!(g.f[0].wins, c_wins + 1, "player: the host's wins go up one at a time");
+                    c_wins = g.f[0].wins;
+                }
+            }
+        }
+        assert_eq!(won_in.len(), 5);
+        assert_eq!(p.hg.mt.round, first + 4, "five rounds played, one win each");
+        // the player's screen catches up
+        for _ in 0..60 {
+            pump(&mut p, &Input::default(), &Input::default());
+        }
+        let g = p.cg.as_ref().unwrap();
+        assert_eq!(g.f[0].wins, 5, "the player sees five host wins");
+        assert!(c_rounds_seen.len() >= 5, "the player saw each round: {c_rounds_seen:?}");
+    }
+
+    /// The player lands a revolver headshot on the host: the number on the player's screen is
+    /// the health the host really lost (after armour), and both agree it was a headshot.
+    #[test]
+    fn a_confirmed_headshot_shows_the_same_number_everywhere() {
+        let mut p = pair(Mode::Ffa, 50);
+        let l = p.cg.as_ref().unwrap().local;
+        assert_eq!(l, 1);
+        let place = |p: &mut Pair| {
+            p.hg.world = crate::game::lag_comp_tests::flat_world();
+            p.hg.f[0].pos = V3::ZERO;
+            p.hg.f[0].prev_pos = V3::ZERO;
+            p.hg.f[0].vel = V3::ZERO;
+            p.hg.f[0].spawn_prot = 0.0;
+            p.hg.f[0].hp = MAX_HP;
+            p.hg.f[0].ap = 50.0;
+            p.hg.f[1].loadout.gun1 = Weapon::Revolver;
+            let g = p.cg.as_mut().unwrap();
+            g.world = crate::game::lag_comp_tests::flat_world();
+            g.my_loadout.gun1 = Weapon::Revolver;
+            g.f[l].loadout.gun1 = Weapon::Revolver;
+            g.f[l].pos = v3(0.0, 0.0, 8.0);
+            g.f[l].prev_pos = g.f[l].pos;
+            g.f[l].vel = V3::ZERO;
+            g.f[l].spawn_prot = 0.0;
+            g.f[0].spawn_prot = 0.0;
+        };
+        let face = Input { yaw: std::f32::consts::PI, ..Default::default() };
+        for _ in 0..90 {
+            place(&mut p);
+            pump(&mut p, &Input::default(), &face);
+        }
+        // let the host's history fill with everyone standing still
+        for _ in 0..60 {
+            p.hg.f[0].spawn_prot = 0.0;
+            pump(&mut p, &Input::default(), &face);
+        }
+        let g = p.cg.as_ref().unwrap();
+        assert!((g.f[0].pos - V3::ZERO).len() < 0.1 && g.f[0].alive, "the player sees the host standing there: {:?}", g.f[0].pos);
+        assert!((p.hg.f[1].pos - v3(0.0, 0.0, 8.0)).len() < 0.1, "the host sees the player: {:?}", p.hg.f[1].pos);
+        let (hp0, ap0) = (p.hg.f[0].hp, p.hg.f[0].ap);
+        // the shot: from the player's eye straight at the host's head
+        let g = p.cg.as_mut().unwrap();
+        let pose = g.hit_pose(0);
+        let head = pose.caps.iter().find(|c| c.part == Part::Head).map(|c| (c.a + c.b) * 0.5).expect("a head");
+        let o = g.f[l].eye();
+        let d = (head - o).norm();
+        g.dmg_nums.clear();
+        let gs = Weapon::Revolver.gun();
+        g.fire_ray(l, o, d, gs.dmg, gs.range, Weapon::Revolver);
+        let predicted = g.dmg_nums.last().expect("a predicted number").clone();
+        assert!(!predicted.confirmed && predicted.head, "first a grey predicted headshot");
+        let mut confirmed = None;
+        for _ in 0..200 {
+            p.hg.f[0].spawn_prot = 0.0;
+            pump(&mut p, &Input::default(), &face);
+            if let Some(d) = p.cg.as_ref().unwrap().dmg_nums.iter().find(|d| d.victim == 0 && d.confirmed) {
+                confirmed = Some(d.clone());
+                break;
+            }
+        }
+        let c = confirmed.expect("the host confirmed the hit");
+        let hp_lost = hp0 - p.hg.f[0].hp;
+        let ap_lost = ap0 - p.hg.f[0].ap;
+        assert!(c.head, "the host agrees it was a headshot");
+        assert!(ap_lost > 0.0, "armour soaked some: {ap_lost}");
+        assert_eq!(c.amount, hp_lost.round() as i32, "the number is the health the host lost ({hp_lost})");
+        assert_eq!(c.armour, ap_lost.round() as i32, "and the armour ({ap_lost})");
+        assert!((hp_lost + ap_lost - gs.dmg * gs.head).abs() < 0.01, "the full headshot landed: {} + {}", hp_lost, ap_lost);
+        assert_eq!(p.cg.as_ref().unwrap().dmg_nums.iter().filter(|d| d.victim == 0).count(), 1, "one number, not two");
+    }
+}
+
+#[cfg(test)]
+mod soak_tests {
+    use super::*;
+
+    /// One 30-minute, 8-player match (all bots fighting), run as the main loop runs it (sounds,
+    /// network events and career events taken every frame): no list the game keeps may grow
+    /// over the match. Each list's biggest size in the second quarter-hour must stay within the
+    /// first quarter-hour's (with a little slack for a busier moment).
+    #[test]
+    fn a_30_minute_match_keeps_every_list_bounded() {
+        let mut g = Game::offline("Soak", 7, 0.8, Mode::Ffa, 9999);
+        g.f[0].is_bot = true;
+        g.f[0].ready = true;
+        g.bots[0] = Some(crate::bot::Bot::new(0.8, 5));
+        let calm = Input::default();
+        let frame = |g: &mut Game| {
+            g.mt.target = 9999;
+            if g.mt.phase == Phase::Fight {
+                g.mt.timer = g.mt.timer.max(60.0);
+            }
+            g.tick(&calm);
+            g.sounds.clear();
+            g.out_events.clear();
+            g.career.clear();
+        };
+        for _ in 0..(60.0 / TICK) as usize {
+            if g.mt.phase == Phase::Fight {
+                break;
+            }
+            frame(&mut g);
+        }
+        assert_eq!(g.mt.phase, Phase::Fight, "the match starts");
+        let minute = (60.0 / TICK) as usize;
+        let mut peaks: Vec<Vec<(&'static str, usize)>> = Vec::new();
+        for _ in 0..30 {
+            let mut peak: Vec<(&'static str, usize)> = g.mem_counts();
+            for k in 0..minute {
+                frame(&mut g);
+                // sample a few times a second (the busy moments are short)
+                if k % 30 == 0 {
+                    for (p, (_, n)) in peak.iter_mut().zip(g.mem_counts()) {
+                        p.1 = p.1.max(n);
+                    }
+                }
+            }
+            peaks.push(peak);
+        }
+        assert_eq!(g.mt.phase, Phase::Fight, "still the same match after 30 minutes");
+        let kills: i32 = g.f.iter().map(|f| f.kills).sum();
+        assert!(kills > 100, "they really fought: {kills} kills");
+        let first = &peaks[..15];
+        let second = &peaks[15..];
+        for i in 0..peaks[0].len() {
+            let name = peaks[0][i].0;
+            let a = first.iter().map(|p| p[i].1).max().unwrap();
+            let b = second.iter().map(|p| p[i].1).max().unwrap();
+            println!("{name:24} first 15 min peak {a:6}   last 15 min peak {b:6}");
+            assert!(b <= a + a / 2 + 64, "{name} keeps growing: {a} -> {b}");
+        }
+        // and the last minutes aren't climbing either
+        for i in 0..peaks[0].len() {
+            let tail: Vec<usize> = peaks[25..].iter().map(|p| p[i].1).collect();
+            let early = peaks[5..10].iter().map(|p| p[i].1).max().unwrap();
+            assert!(tail.iter().all(|&n| n <= early + early / 2 + 64), "{}: {tail:?} vs {early}", peaks[0][i].0);
         }
     }
 }

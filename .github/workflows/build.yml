@@ -1,6 +1,10 @@
 # Builds Duel Rush for Windows, Mac and Linux (which is also the native Steam Deck build)
 # every time you push, and puts the downloads on the repo's "Releases" page under
-# "Latest build".
+# "Latest build" (always the release tagged `latest`, so its links never change).
+#
+# The run number is the build number: build.rs reads GITHUB_RUN_NUMBER and the game shows it on
+# the main menu. The release also carries version.json (build number, version, what changed, and
+# each download's SHA-256), which the game's auto-updater reads.
 name: Build game
 
 on:
@@ -48,6 +52,7 @@ jobs:
       - name: Make Duel Rush.app
         run: |
           APP="Duel Rush.app"
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           mkdir -p "$APP/Contents/MacOS"
           lipo -create \
             target/aarch64-apple-darwin/release/duel_arena \
@@ -60,7 +65,7 @@ jobs:
           cp "$DYLIB" "$APP/Contents/MacOS/libsteam_api.dylib"
           install_name_tool -add_rpath @executable_path "$APP/Contents/MacOS/duel_arena" || true
           otool -L "$APP/Contents/MacOS/duel_arena" | grep -i steam
-          cat > "$APP/Contents/Info.plist" <<'EOF'
+          cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -70,7 +75,7 @@ jobs:
             <key>CFBundleIdentifier</key><string>local.duelrush.game</string>
             <key>CFBundleExecutable</key><string>duel_arena</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
             <key>CFBundleVersion</key><string>${{ github.run_number }}</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
             <key>NSHighResolutionCapable</key><true/>
@@ -128,16 +133,38 @@ jobs:
     needs: [windows, mac, linux]
     runs-on: ubuntu-latest
     steps:
+      # (the source, for the version number and the commit message that becomes the notes)
+      - uses: actions/checkout@v4
+        with:
+          path: src
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      - name: Write version.json (for the game's auto-updater)
+        run: |
+          VERSION=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
+          NOTES=$(git -C src log -1 --pretty=%B | head -c 1500)
+          sha() { sha256sum "$1" | cut -d' ' -f1; }
+          jq -n \
+            --argjson build "${{ github.run_number }}" \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg win "$(sha DuelRush-Windows.zip)" \
+            --arg mac "$(sha DuelRush-Mac.zip)" \
+            --arg linux "$(sha DuelRush-Linux.tar.gz)" \
+            '{build: $build, version: $version, notes: $notes,
+              files: {windows: {file: "DuelRush-Windows.zip", sha256: $win},
+                      mac: {file: "DuelRush-Mac.zip", sha256: $mac},
+                      linux: {file: "DuelRush-Linux.tar.gz", sha256: $linux}}}' > version.json
+          cat version.json
       - name: Publish "Latest build"
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest DuelRush-Windows.zip DuelRush-Mac.zip DuelRush-Linux.tar.gz \
+          gh release create latest DuelRush-Windows.zip DuelRush-Mac.zip DuelRush-Linux.tar.gz version.json \
+            --latest \
             --target "${{ github.sha }}" \
             --title "Latest build (#${{ github.run_number }})" \
             --notes "Windows: unzip and run Duel Rush.exe (keep steam_api64.dll next to it) (More info -> Run anyway). Mac: unzip, right-click Duel Rush -> Open (or System Settings -> Privacy & Security -> Open Anyway). Linux / Steam Deck: extract and run duel_rush (keep libsteam_api.so next to it); on a Deck, add it to Steam as a non-Steam game to play from Game Mode. Both players need the same build to connect."
