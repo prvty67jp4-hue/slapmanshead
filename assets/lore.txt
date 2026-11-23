@@ -114,3 +114,22 @@ match_start = The bell rings. Rush!
 round_win = The Court records the round.
 match_win = The ledger is closed. A Writ is awarded.
 writ_claimed = A Writ has been claimed!
+
+[executions]
+# The announcer's line when an execution lands (one per execution; the key is its id in src/exec.rs).
+wardens_verdict = The Warden passes judgement, and the Court has no appeal for it.
+border_ledger = Three cuts, three entries. Corvin Vale closes another page.
+lantern_watch = The lantern never went out. The cut arrived before the light did.
+ridge_fall = Down from the ridge like a hawk. The Wardens ride again.
+the_collection = Another one for the wall. Sable Rook has collected.
+bounty_closed = On their knees and off the books. The bounty is closed.
+frozen_lake = Cold, quiet and certain. Nobody misses on the frozen lake.
+hook_and_line = Reeled in from the sky. The hunter never lets go of the line.
+hammer_falls = The hammer falls and the stones crack! The Foundry Bull strikes!
+quench = Struck, folded and quenched. Anvil is still at work.
+foundry_bell = Ring the foundry bell! Every Lower Ward heard that one!
+anvil_drop = Straight down like a falling anvil. Mind the floor!
+lights_out = Lights out! The Lower Wards are on their feet!
+rooftop_run = Over the rooftops and through the guard. Catch her if you can!
+lower_ward_lightning = Three flashes, one spark. Lightning out of the Lower Wards!
+skylight = She fell out of the sky and took the bout with her.

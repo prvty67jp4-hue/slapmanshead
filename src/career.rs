@@ -3,7 +3,8 @@
 //! outfit colours, finishers, lore pages and a badge); the daily first-win bonus and three
 //! weekly challenges.
 
-use crate::game::{CareerEv, FINISHERS};
+use crate::exec::{COUNT as EXEC_COUNT, EXECUTIONS};
+use crate::game::CareerEv;
 use std::path::PathBuf;
 
 /// XP for each thing you do.
@@ -94,7 +95,7 @@ enum Count {
 const POOL: [Challenge; 8] = [
     Challenge { text: "Get 40 kills", goal: 40, xp: 300, kind: Count::Kills },
     Challenge { text: "Land 15 headshot kills", goal: 15, xp: 300, kind: Count::Headshots },
-    Challenge { text: "Perform 3 finishers", goal: 3, xp: 350, kind: Count::Finishers },
+    Challenge { text: "Perform 3 executions", goal: 3, xp: 350, kind: Count::Finishers },
     Challenge { text: "Claim 2 Writs", goal: 2, xp: 350, kind: Count::Writs },
     Challenge { text: "Win 3 matches", goal: 3, xp: 400, kind: Count::Wins },
     Challenge { text: "Get 5 multi-kills", goal: 5, xp: 300, kind: Count::MultiKills },
@@ -134,8 +135,8 @@ pub struct Career {
     pub deaths: u32,
     pub headshots: u32,
     pub finishers: u32,
-    /// Finishers done with each style (see game::FINISHERS).
-    pub fin_by: [u32; FINISHERS.len()],
+    /// Executions done with each one (see crate::exec::EXECUTIONS).
+    pub fin_by: [u32; EXEC_COUNT],
     pub matches: u32,
     pub waves: u32,
     pub xp: u32,
@@ -214,8 +215,12 @@ impl Career {
                 "last_win_day" => c.last_win_day = n(),
                 "week" => c.week = n(),
                 "fin_by" => {
-                    for (slot, x) in c.fin_by.iter_mut().zip(nums()) {
-                        *slot = x;
+                    // (counts kept by the old finishers, one per blade, don't carry over)
+                    let v = nums();
+                    if v.len() == EXEC_COUNT {
+                        for (slot, x) in c.fin_by.iter_mut().zip(v) {
+                            *slot = x;
+                        }
                     }
                 }
                 "mastery" => {
@@ -399,35 +404,29 @@ impl Career {
         LORE_LEVELS.get(page).is_some_and(|&l| self.mastery_level(body) >= l)
     }
 
-    /// The finisher style is open to this fighter (by their mastery).
+    /// The execution is this fighter's own and their mastery has opened it.
     pub fn finisher_unlocked(&self, body: u8, style: usize) -> bool {
-        style < FINISHERS.len() && self.level() >= FINISHERS[style].unlock_level && self.mastery_level(body) >= finisher_level(style)
+        crate::exec::of_fighter(body).contains(&style) && self.mastery_level(body) >= finisher_level(style)
     }
 
-    /// Finisher styles still locked for this fighter, as a bit mask (for the game).
+    /// Executions still locked for this fighter, as a bit mask over all of them (for the game;
+    /// other fighters' count as locked).
     pub fn finisher_locks(&self, body: u8) -> u32 {
-        (0..FINISHERS.len()).filter(|&k| !self.finisher_unlocked(body, k)).fold(0, |m, k| m | 1 << k)
+        (0..EXEC_COUNT).filter(|&k| !self.finisher_unlocked(body, k)).fold(0, |m, k| m | 1 << k)
     }
 
-    /// The finisher style used most (if any yet).
+    /// The execution used most (if any yet).
     pub fn favourite_finisher(&self) -> Option<usize> {
         let (k, n) = self.fin_by.iter().enumerate().max_by_key(|(_, n)| **n)?;
         (*n > 0).then_some(k)
     }
 
-    pub fn unlocked(&self, style: usize) -> bool {
-        FINISHERS.get(style).is_some_and(|s| self.level() >= s.unlock_level)
-    }
 }
 
-/// The mastery level a finisher style opens at: each blade's first style from the start, its
-/// second at 3, its third at 6; the aerial one at 4.
+/// The fighter's mastery level an execution opens at: their first from the start, the second at
+/// 3, the aerial one at 4, the third at 6 (see crate::exec).
 pub fn finisher_level(style: usize) -> u32 {
-    if FINISHERS.get(style).is_some_and(|s| s.weapon.is_none()) {
-        4
-    } else {
-        [1, 3, 6][style % 3]
-    }
+    EXECUTIONS.get(style).map_or(1, |e| e.mastery)
 }
 
 /// What reaching mastery `level` with a fighter unlocks.
@@ -436,9 +435,9 @@ pub fn unlocks_at(body: u8, level: u32) -> Vec<String> {
     for o in OUTFITS.iter().filter(|o| o.1 == level && level > 1) {
         out.push(format!("{} outfit", o.0));
     }
-    for (k, s) in FINISHERS.iter().enumerate() {
+    for k in crate::exec::of_fighter(body) {
         if finisher_level(k) == level && level > 1 {
-            out.push(format!("{} finisher", s.name));
+            out.push(format!("{} execution", EXECUTIONS[k].name));
         }
     }
     for (p, &l) in LORE_LEVELS.iter().enumerate() {
@@ -471,7 +470,6 @@ mod tests {
         c.xp = XP_PER_LEVEL * 2 + XP_PER_LEVEL / 2;
         assert_eq!(c.level(), 3);
         assert!((c.level_progress() - 0.5).abs() < 1e-6);
-        assert!((0..FINISHERS.len()).all(|k| c.unlocked(k)));
     }
 
     #[test]
@@ -509,13 +507,40 @@ mod tests {
         assert_eq!(c.week, week_of(day + 7));
     }
 
+    /// Each fighter starts with one execution; mastery 3 opens the second, 4 the aerial one, 6
+    /// the third, and the mastery note says so.
+    #[test]
+    fn executions_unlock_through_each_fighters_mastery() {
+        for body in 0..FIGHTERS as u8 {
+            let mine = crate::exec::of_fighter(body);
+            let mut c = Career::default();
+            let open = |c: &Career| mine.iter().map(|&k| c.finisher_unlocked(body, k)).collect::<Vec<_>>();
+            assert_eq!(open(&c), vec![true, false, false, false], "fighter {body}: one at the start");
+            let mut notes = Vec::new();
+            for (level, want) in [(3, [true, true, false, false]), (4, [true, true, false, true]), (6, [true, true, true, true])] {
+                while c.mastery_level(body) < level {
+                    c.apply_as(CareerEv::Kill { head: false, finisher: 0 }, Some(body), 20_000);
+                }
+                assert_eq!(open(&c), want.to_vec(), "fighter {body} at mastery {level}");
+                notes.append(&mut c.notes);
+            }
+            for &k in &mine[1..] {
+                assert!(notes.iter().any(|n| n.contains(EXECUTIONS[k].name)), "fighter {body}: told when {} opens", EXECUTIONS[k].name);
+            }
+        }
+    }
+
     #[test]
     fn mastery_unlocks_outfits_finishers_lore_and_badges() {
         let mut c = Career::default();
         assert_eq!(c.mastery_level(1), 1);
         assert_eq!(c.badge(1).0, "Bronze");
         assert!(c.outfit_unlocked(1, 0) && !c.outfit_unlocked(1, 1));
-        assert!(c.finisher_unlocked(1, 3) && !c.finisher_unlocked(1, 4), "the katana's first finisher only");
+        // one execution of their own from the start (and none of another fighter's)
+        let sable = crate::exec::of_fighter(1);
+        assert!(c.finisher_unlocked(1, sable[0]) && !c.finisher_unlocked(1, sable[1]) && !c.finisher_unlocked(1, sable[3]));
+        assert!(!c.finisher_unlocked(1, crate::exec::of_fighter(0)[0]));
+        assert_eq!((0..EXEC_COUNT).filter(|&k| c.finisher_unlocked(1, k)).count(), 1);
         assert!(!c.lore_unlocked(1, 0));
         // play the Huntress a long time
         for _ in 0..400 {
@@ -523,8 +548,8 @@ mod tests {
         }
         assert!(c.mastery_level(1) >= 20 && c.badge(1).0 == "Champion");
         assert!((0..OUTFITS.len()).all(|k| c.outfit_unlocked(1, k)));
-        assert!((0..FINISHERS.len()).all(|k| c.finisher_unlocked(1, k)));
-        assert_eq!(c.finisher_locks(1), 0);
+        assert!(sable.iter().all(|&k| c.finisher_unlocked(1, k)), "every Sable execution at top mastery");
+        assert_eq!(c.finisher_locks(1), !sable.iter().fold(0u32, |m, &k| m | 1 << k) & ((1 << EXEC_COUNT) - 1));
         assert!(c.finisher_locks(0) != 0, "other fighters keep their own progress");
         assert!(c.notes.iter().any(|n| n.contains("Sable Rook mastery")));
         c.notes.clear();

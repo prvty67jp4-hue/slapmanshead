@@ -104,6 +104,12 @@ fn props(s: Sfx) -> Props {
         Sfx::GrappleFire => pp(clips!["throw.wav", "swing_1.wav"], 0.8, 18.0, 0.68),
         Sfx::ShieldUp => pp(clips!["armor.ogg", "clang_1.ogg"], 0.9, 22.0, 0.7),
         Sfx::Vanish => pp(clips!["dash_2.wav"], 0.85, 16.0, 0.55),
+        // executions (each reshaped by `design_exec` below): a long low whoosh, a heavy blow with
+        // a deep thump under it, a ring-out like struck iron cooling, and a crowd's roar
+        Sfx::ExecWhoosh => pp(clips!["swing_2.wav", "swing_4.wav", "dash_1.wav"], 0.8, 14.0, 0.72),
+        Sfx::ExecImpact => p(clips!["flesh_2.ogg", "boom_crunch.ogg"], 1.0, 30.0),
+        Sfx::ExecRing => p(clips!["clang_3.ogg"], 0.75, 40.0),
+        Sfx::Crowd => p(clips!["wall_1.ogg", "wall_2.ogg"], 0.7, 0.0),
     }
 }
 
@@ -366,12 +372,141 @@ pub fn design_gunshot(rec: &[f32], v: &GunVoice, rate: f32, seed: u32) -> Vec<f3
     out.iter().map(|s| s / peak * 0.92).collect()
 }
 
-/// Final touches on a decoded effect: guns get their designed shot.
+/// Final touches on a decoded effect: guns get their designed shot, executions their own sound.
 fn finish_clip(s: Sfx, k: usize, clip: Vec<f32>, rate: f32) -> Vec<f32> {
     match gun_voice(s) {
         Some(v) if !clip.is_empty() => design_gunshot(&clip, &v, rate, s as u32 * 16 + k as u32 + 1),
+        _ if matches!(s, Sfx::ExecWhoosh | Sfx::ExecImpact | Sfx::ExecRing | Sfx::Crowd) && !clip.is_empty() => design_exec(s, &clip, rate, k as u32 + 1),
         _ => clip,
     }
+}
+
+/// The executions' sounds, built from a recording and designed layers (all made here):
+/// - whoosh: the swing stretched long and low, with a band of rushing air sweeping down;
+/// - impact: the hit with a deep thump dropping in pitch and a short room boom after it;
+/// - ring-out: the clang's strike with long, slightly detuned partials (iron cooling), fading
+///   over about two seconds;
+/// - crowd: many voices (noise shaped by moving vowel bands, each swelling on its own) rising
+///   into a roar and dying away.
+pub fn design_exec(s: Sfx, rec: &[f32], rate: f32, seed: u32) -> Vec<f32> {
+    let mut rng = seed.wrapping_mul(2_654_435_761) | 1;
+    let mut noise = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        (rng >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    };
+    let peak_of = |x: &[f32]| x.iter().fold(0.0f32, |m, s| m.max(s.abs())).max(1e-4);
+    let tau = std::f32::consts::TAU;
+    let mut out: Vec<f32> = match s {
+        Sfx::ExecWhoosh => {
+            // the recording slowed to two thirds, plus air rushing past, its band sweeping down
+            let slow = resample(rec, rate * 0.66, rate);
+            let n = slow.len().max((0.55 * rate) as usize);
+            let mut o = vec![0.0f32; n];
+            let rp = peak_of(&slow);
+            for (i, v) in slow.iter().enumerate() {
+                o[i] += v / rp * 0.7;
+            }
+            let air: Vec<f32> = (0..n).map(|_| noise()).collect();
+            let hi = band_pass(&air, 1200.0, 3200.0, rate);
+            let lo = band_pass(&air, 300.0, 900.0, rate);
+            let (hp, lp) = (peak_of(&hi), peak_of(&lo));
+            for i in 0..n {
+                let x = i as f32 / n as f32;
+                let env = (x * std::f32::consts::PI).sin().powf(1.5);
+                let k = 1.0 - x; // the high band fades into the low one
+                o[i] += (hi[i] / hp * k + lo[i] / lp * (1.0 - k)) * env * 0.55;
+            }
+            o
+        }
+        Sfx::ExecImpact => {
+            let n = rec.len().max((0.9 * rate) as usize);
+            let mut o = vec![0.0f32; n];
+            let rp = peak_of(rec);
+            for (i, v) in rec.iter().enumerate() {
+                o[i] += v / rp * 0.8;
+            }
+            // the thump: 110 Hz falling to 38 Hz, saturated
+            let mut ph = 0.0f32;
+            for i in 0..((0.45 * rate) as usize).min(n) {
+                let x = i as f32 / rate;
+                let f = 38.0 + 72.0 * (-x * 9.0).exp();
+                ph += tau * f / rate;
+                let attack = (x / 0.002).min(1.0);
+                o[i] += ((ph.sin() * 2.5).tanh() / 2.5f32.tanh()) * attack * (-x * 7.0).exp() * 1.1;
+            }
+            // a short boom of the room after it
+            let early: Vec<f32> = o.iter().take((0.08 * rate) as usize).copied().collect();
+            let wet = echo(&early, 0.7, rate);
+            let wp = peak_of(&wet);
+            let mut o2 = vec![0.0f32; o.len().max(wet.len())];
+            for (i, v) in o.iter().enumerate() {
+                o2[i] += v;
+            }
+            for (i, v) in wet.iter().enumerate() {
+                o2[i] += v / wp * 0.25;
+            }
+            o2
+        }
+        Sfx::ExecRing => {
+            let n = (2.2 * rate) as usize;
+            let mut o = vec![0.0f32; n.max(rec.len())];
+            let rp = peak_of(rec);
+            for (i, v) in rec.iter().enumerate() {
+                o[i] += v / rp * 0.55;
+            }
+            // inharmonic partials of a struck bar, each with its own decay and a slow beat
+            let parts = [(392.0f32, 1.0f32, 1.9f32), (1076.0, 0.55, 1.2), (2108.0, 0.32, 0.8), (3487.0, 0.18, 0.5), (396.5, 0.6, 2.1)];
+            for (f, a, d) in parts {
+                for i in 0..n {
+                    let x = i as f32 / rate;
+                    let attack = (x / 0.003).min(1.0);
+                    o[i] += (tau * f * x).sin() * a * attack * (-x * 3.0 / d).exp() * 0.35;
+                }
+            }
+            o
+        }
+        _ => {
+            // the crowd: 24 voices of shaped noise, two moving vowel bands each, swelling at
+            // their own moments into a roar (about 3 s), with the recording's grit under it
+            let n = (3.0 * rate) as usize;
+            let mut o = vec![0.0f32; n];
+            let base: Vec<f32> = (0..n).map(|_| noise()).collect();
+            for v in 0..24 {
+                let f1 = 380.0 + 300.0 * ((v as f32 * 1.7).sin() * 0.5 + 0.5);
+                let f2 = 1100.0 + 900.0 * ((v as f32 * 2.3).cos() * 0.5 + 0.5);
+                let shift = (v * 997) % n.max(1);
+                let src: Vec<f32> = (0..n).map(|i| base[(i + shift) % n] * (0.6 + 0.4 * noise().abs())).collect();
+                let b1 = band_pass(&src, f1 * 0.8, f1 * 1.25, rate);
+                let b2 = band_pass(&src, f2 * 0.8, f2 * 1.25, rate);
+                let start = 0.05 + (v as f32 * 0.37).fract() * 0.5;
+                let len = 1.6 + (v as f32 * 0.61).fract() * 1.0;
+                for i in 0..n {
+                    let x = i as f32 / rate;
+                    let u = ((x - start) / len).clamp(0.0, 1.0);
+                    let env = if x < start { 0.0 } else { (u * std::f32::consts::PI).sin().powf(0.7) };
+                    let wob = 1.0 + 0.25 * (x * (3.0 + v as f32 * 0.4)).sin();
+                    o[i] += (b1[i] + b2[i] * 0.6) * env * wob;
+                }
+            }
+            let rp = peak_of(rec);
+            for (i, v) in rec.iter().enumerate().take(n) {
+                o[i] += v / rp * 0.15;
+            }
+            o
+        }
+    };
+    for v in out.iter_mut() {
+        *v = (*v * 1.3).tanh();
+    }
+    let peak = peak_of(&out);
+    let len = out.len();
+    let fade = (0.05 * rate) as usize;
+    for i in 0..fade.min(len) {
+        out[len - 1 - i] *= i as f32 / fade as f32;
+    }
+    out.iter().map(|v| v / peak * 0.9).collect()
 }
 
 fn resample(s: &[f32], from: f32, to: f32) -> Vec<f32> {
@@ -422,7 +557,7 @@ pub struct Audio {
 }
 
 /// Every sound, in the order of `Sfx`.
-pub const ALL: [Sfx; 54] = [
+pub const ALL: [Sfx; 58] = [
     Sfx::Shotgun,
     Sfx::Revolver,
     Sfx::Smg,
@@ -477,6 +612,10 @@ pub const ALL: [Sfx; 54] = [
     Sfx::GrappleFire,
     Sfx::ShieldUp,
     Sfx::Vanish,
+    Sfx::ExecWhoosh,
+    Sfx::ExecImpact,
+    Sfx::ExecRing,
+    Sfx::Crowd,
 ];
 
 fn mix_into(m: &Arc<Mutex<Mixer>>, frames: usize, channels: usize, rate: f32, mut write: impl FnMut(usize, f32)) {

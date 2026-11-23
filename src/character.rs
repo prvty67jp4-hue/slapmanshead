@@ -2,9 +2,9 @@
 //! then layers aiming, strafing, guard, sword swings and weapon holds on top.
 
 use crate::anim::{Rig, Trs, blend_into, blend_masked};
-use crate::game::{Capsule, FAN_THROW_TIME, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, SLASH_HEAVY, SLASH_SLAM, SLASH_THROUGH, THROW_TIME, Tuning, Weapon, finisher};
+use crate::game::{Capsule, FAN_THROW_TIME, Fighter, HitPose, KICK_TIME, Part, RUN_SPEED, SLASH_HEAVY, SLASH_SLAM, SLASH_THROUGH, THROW_TIME, Tuning, Weapon};
 use crate::math::{M3, V3, look_dir, v3, wrap_angle};
-use crate::render::{finisher_arm, finisher_body, sword_arm};
+use crate::render::sword_arm;
 use glam::{Mat3, Mat4, Quat, Vec3};
 use std::collections::VecDeque;
 use std::f32::consts::PI;
@@ -709,7 +709,9 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     // ---- melee clips (the picture only): swings, finishers, the heavy's wind-up, the block,
     // and each swing's follow-through and recovery after it
     let mut clip_arm = false;
-    if show && f.alive && f.stun_t <= 0.0 && melee && !hero {
+    // (an execution's animation drives the hit shapes too, so what's seen is what can be hit)
+    let exec_on = f.alive && f.fin > 0;
+    if (show || exec_on) && f.alive && f.stun_t <= 0.0 && melee && !hero {
         if let Some((mp, w, full)) = melee_layer(rig, st, f, dt) {
             if full && f.on_ground && speed < 2.5 {
                 blend_into(&mut pose, &mp, w);
@@ -803,7 +805,7 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     let chest = (sh_r + sh_l) * 0.5;
     let mut weapon_dir: Option<Vec3> = None;
     // a clip holds the sword arm: no hand-built swing on top of it
-    let clip_drives = show && clip_arm;
+    let clip_drives = (show || exec_on) && clip_arm;
     if alive_upper && clip_drives {
         // the blade leaves the fist on the index-finger side
         if let (Some(ix), Some(pk)) = (rig.node("index_01_r"), rig.node("pinky_01_r")) {
@@ -815,15 +817,7 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     } else if alive_upper {
         let pole_r = sh_r + Vec3::new(0.5, -0.6, -0.3);
         let pole_l = sh_l + Vec3::new(-0.5, -0.6, -0.3);
-        if melee && f.fin > 0 {
-            // a finisher: its own blade path, reaching in and out
-            let pr = (f.fin_t / finisher(f.fin).dur).clamp(0.0, 1.0);
-            let (arm, rk) = finisher_arm(f.fin as usize - 1, pr);
-            let dir = gv(arm.apply(v3(0.0, -1.0, 0.0))).normalize();
-            let target = sh_r + dir * reach * rk;
-            rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(target), to_model(sh_r + Vec3::new(0.2, -0.8, -0.6)));
-            weapon_dir = Some(dir);
-        } else if melee && f.slash_t > 0.0 {
+        if melee && f.slash_t > 0.0 {
             let p = 1.0 - f.slash_t / f.weapon.slash_dur();
             let arm = sword_arm(&M3::I, f.slash_idx, p);
             let dir = gv(arm.apply(v3(0.0, -1.0, 0.0))).normalize();
@@ -991,6 +985,62 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
         rig.rotate_global(&mut pose, &g, bone, ours(rig, Vec3::Z, side * 0.45 * k));
     }
 
+    // ---- an execution's hand-keyed pose (crate::exec): the free hand placed, the head tipped;
+    // the one being executed beaten to their knees
+    if exec_on {
+        let k = f.fin as usize - 1;
+        let p = (f.fin_t / crate::exec::execution(f.fin).dur).clamp(0.0, 1.0);
+        if let Some((at, w)) = crate::exec::left_hand(k, p) {
+            let now_l = gpos(&pose, b.hand_l);
+            let target = now_l.lerp(gv(at), w);
+            let pole = gpos(&pose, b.up_l) + Vec3::new(-0.45, -0.4, -0.25);
+            rig.two_bone_ik(&mut pose, b.up_l, b.lo_l, b.hand_l, to_model(target), to_model(pole));
+        }
+        // the killing blow: the sword arm and blade guided onto them (crate::exec::strike)
+        let (w, h) = crate::exec::strike(k, p);
+        if w > 0.01 && melee && alive_upper {
+            let sc = scale.clamp(0.2, 4.0);
+            let dist = (crate::exec::stand_off(k, f.loadout.melee) - crate::exec::advance(k, p)).abs().max(0.55);
+            let at = Vec3::new(0.0, h, dist) / sc;
+            let sh = gpos(&pose, b.up_r);
+            let to = (at - sh).normalize_or(Vec3::Z);
+            let hand_now = gpos(&pose, b.hand_r);
+            let target = hand_now.lerp(sh + to * reach * 0.9, w);
+            rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(target), to_model(sh + Vec3::new(0.35, -0.7, -0.35)));
+            let (ka, kh, wrist) = hand_frame(rig, &b, &pose);
+            let (c, s) = (GRIP_ANGLE.cos(), GRIP_ANGLE.sin());
+            let blade_now = (ka * c + kh * s).normalize_or(Vec3::Z);
+            let want = (at - wrist).normalize_or(Vec3::Z);
+            let dir = blade_now.lerp(want, w).normalize_or(want);
+            aim_hand(rig, &b, &mut pose, dir, Vec3::ZERO);
+            if clip_drives {
+                let (ka, kh, _) = hand_frame(rig, &b, &pose);
+                weapon_dir = Some((ka * c + kh * s).normalize_or(Vec3::Z));
+            }
+        }
+        let tilt = crate::exec::head_tilt(k, p);
+        if tilt.abs() > 1e-3 {
+            let g = rig.globals(&pose);
+            rig.rotate_global(&mut pose, &g, b.neck, ours(rig, Vec3::X, -tilt));
+        }
+    }
+    // (killed by the blow, they go down from their knees: the kneel fades as the fall begins)
+    let kneel = match f.exec_pose {
+        Some((kind, p)) if f.alive => crate::exec::kneel(kind as usize - 1, p),
+        Some((kind, _)) => {
+            let e = crate::exec::execution(kind);
+            let at = e.kneel.map_or(0.0, |(_, b)| b);
+            if e.kneel.is_some() && (e.hit - at).abs() < 0.02 { (1.0 - f.death_t / 0.7).clamp(0.0, 1.0) } else { 0.0 }
+        }
+        _ => 0.0,
+    };
+    if kneel > 0.01 {
+        rig.sample("Fixing_Kneeling", 1.6, false, &mut st.scratch2);
+        let tmp = std::mem::take(&mut st.scratch2);
+        blend_into(&mut pose, &tmp, kneel * 0.9);
+        st.scratch2 = tmp;
+    }
+
     // ---- world placement with leans
     let mut lean = Quat::IDENTITY;
     if !f.alive {
@@ -1021,11 +1071,14 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
         Some(m) => (m.retarget(rig, &pose), m.norm),
         None => (pose, 1.0),
     };
-    // a finisher turns, leans and lifts the whole body
-    let (spin, fin_lean, lift) = if f.alive && f.fin > 0 { finisher_body(f.fin as usize - 1, (f.fin_t / finisher(f.fin).dur).clamp(0.0, 1.0)) } else { (0.0, 0.0, 0.0) };
+    // an execution turns, tips (a full turn is a flip, about the hips) and lifts the whole body
+    let (spin, fin_lean, lift) = if exec_on { crate::exec::body(f.fin as usize - 1, (f.fin_t / crate::exec::execution(f.fin).dur).clamp(0.0, 1.0)) } else { (0.0, 0.0, 0.0) };
     let lean = lean * Quat::from_rotation_x(fin_lean);
     let body_rot = Quat::from_rotation_y(f.yaw + spin) * lean;
-    let world = Mat4::from_scale_rotation_translation(Vec3::splat(scale.clamp(0.2, 4.0) * norm), body_rot, gv(pos) + Vec3::Y * lift);
+    let sz = scale.clamp(0.2, 4.0) * norm;
+    let hips = Vec3::Y * (0.95 * scale.clamp(0.2, 4.0));
+    let pivot = if exec_on && fin_lean.abs() > 0.6 { hips - body_rot * hips } else { Vec3::ZERO };
+    let world = Mat4::from_scale_rotation_translation(Vec3::splat(sz), body_rot, gv(pos) + Vec3::Y * lift + pivot);
     let palette = match model {
         Some(m) => rig.palette_with(&pose, world, &m.inv_bind),
         None => rig.palette(&pose, world),
@@ -1201,22 +1254,6 @@ fn slash_move(idx: u8, w: Weapon) -> Mv {
     }
 }
 
-/// Each finisher style's move (and where its wind-up starts).
-fn finisher_move(style: usize) -> (Mv, Option<f32>) {
-    match style {
-        0 => (Mv::Hook, None),         // Throat Cut
-        1 => (Mv::Combo2, None),       // Twin Stab: two stabs, the second kills
-        2 => (Mv::C, Some(0.0)),       // Spinning Edge: the whole spin
-        3 => (Mv::Dash, Some(0.0)),    // Quick Draw
-        4 => (Mv::Combo3, None),       // Cross Cut: three cuts
-        5 => (Mv::A, None),            // Rising Cleave
-        6 => (Mv::Slam, None),         // Overhead Crush
-        7 => (Mv::HeavyFirst, None),   // Impale
-        8 => (Mv::HeavyMid, None),     // Wheel Cleave
-        _ => (Mv::Slam, Some(2.05)),   // Sky Splitter: from high overhead
-    }
-}
-
 /// The clip time for a move, `until` game seconds before its contact (negative after), with
 /// `pre` seconds of wind-up and `post` of follow-through. The wind-up lingers at the start (so it
 /// reads) and accelerates into the blow; the follow-through decelerates.
@@ -1246,13 +1283,17 @@ fn melee_layer(rig: &Rig, st: &mut CharState, f: &Fighter, dt: f32) -> Option<(V
     let mut pose = Vec::new();
     let dur = f.weapon.slash_dur();
     if f.fin > 0 {
-        let style = finisher(f.fin);
-        let (m, start) = finisher_move(f.fin as usize - 1);
-        let pr = (f.fin_t / style.dur).clamp(0.0, 1.0);
-        let until = (style.hit - pr) * style.dur;
-        let t = warp(rig, m, start, until, style.hit * style.dur, (1.0 - style.hit) * style.dur);
-        rig.sample(def(m).clip, t, false, &mut pose);
-        st.tail = Some(Tail { mv: m, t, age: 0.0 });
+        // an execution: its own timeline of clip pieces (crate::exec), blended where they meet
+        let p = (f.fin_t / crate::exec::execution(f.fin).dur).clamp(0.0, 1.0);
+        let ((clip, t, wrap), from) = crate::exec::clip_at(f.fin as usize - 1, p);
+        rig.sample(clip, t, wrap, &mut pose);
+        if let Some(((c0, t0, w0), w)) = from {
+            let mut prev = Vec::new();
+            rig.sample(c0, t0, w0, &mut prev);
+            blend_into(&mut prev, &pose, 1.0 - w);
+            pose = prev;
+        }
+        st.tail = None;
         return Some((pose, 1.0, true));
     }
     if f.slash_t > 0.0 {
@@ -1414,6 +1455,202 @@ mod melee_clip_tests {
 }
 fn yaw_fwd_of(yaw: f32) -> V3 {
     v3(yaw.sin(), 0.0, yaw.cos())
+}
+
+#[cfg(test)]
+mod exec_contact_tests {
+    use super::*;
+    use crate::exec::{self, EXECUTIONS};
+    use crate::math::{ray_capsule, seg_dist};
+
+    /// The attacker and the one being executed, posed as the game poses them (the hit shapes)
+    /// `p` into execution `style`, standing as the game stands them; with `gun`, the attacker as
+    /// the picture shows them with the gun out.
+    fn posed(style: usize, blade: Weapon, p: f32, gun: bool) -> (Posed, Posed) {
+        posed_at(style, blade, p, gun, None)
+    }
+
+    /// The same, with the victim dist metres away instead of where the game stands them.
+    fn posed_at(style: usize, blade: Weapon, p: f32, gun: bool, dist: Option<f32>) -> (Posed, Posed) {
+        let rig = crate::anim::shared().expect("rig");
+        let tn = Tuning::default();
+        let e = &EXECUTIONS[style];
+        let y = if e.aerial { 1.6 } else { 0.0 };
+        let mut a = Fighter::new("a", 0, true);
+        a.present = true;
+        a.alive = true;
+        a.on_ground = !e.aerial;
+        a.loadout.body = e.fighter;
+        a.loadout.melee = blade;
+        a.cur = 0;
+        a.weapon = blade;
+        a.fin = style as u8 + 1;
+        a.fin_t = p * e.dur;
+        a.fin_target = 1;
+        // the game's spot: stand-off back from the victim, moved along the line (past them, the
+        // attacker turns round to face them, as the game turns them)
+        let vz = dist.unwrap_or(exec::stand_off(style, blade) - exec::advance(style, p));
+        a.yaw = if vz >= 0.0 { 0.0 } else { std::f32::consts::PI };
+        let mut v = Fighter::new("v", 1, true);
+        v.present = true;
+        v.alive = true;
+        v.on_ground = !e.aerial;
+        v.loadout.body = (e.fighter + 1) % 4;
+        v.cur = 0;
+        v.weapon = Weapon::Katana;
+        v.stun_t = 1.0;
+        v.held_by = Some(0);
+        v.yaw = std::f32::consts::PI;
+        v.exec_pose = Some((a.fin, p));
+        let mut av = a.clone();
+        if gun {
+            // as the renderer shows Sable's point-blank shot (gpu::exec_view)
+            av.weapon = a.loadout.gun2;
+            av.cur = 2;
+            av.since_shot = 0.0;
+            let d = v3(0.0, y + 0.9, vz) - v3(0.0, y + 1.5, 0.0);
+            av.pitch = d.y.atan2(d.flat().len().max(0.1)).clamp(-1.2, 1.2);
+        }
+        let (mut sa, mut sv) = (CharState::new(), CharState::new());
+        let mut out = None;
+        for k in 0..4 {
+            let t = k as f32 / 60.0;
+            // as the picture shows them (the blade where players see it)
+            let pa = animate_show(rig, &mut sa, if gun { &av } else { &a }, v3(0.0, y, 0.0), t, &tn);
+            let pv = animate_show(rig, &mut sv, &v, v3(0.0, y, vz), t, &tn);
+            out = Some((pa.expect("attacker posed"), pv.expect("victim posed")));
+        }
+        out.unwrap()
+    }
+
+    /// How far a blade from `grip` along `dir`, `len` long, passes from the victim's hit shapes'
+    /// surfaces (negative: into them).
+    fn blade_gap(grip: V3, dir: V3, len: f32, v: &Posed) -> f32 {
+        let mut best = f32::MAX;
+        for k in 0..=24 {
+            let q = grip + dir * (len * k as f32 / 24.0);
+            for c in &v.hit.caps {
+                best = best.min(seg_dist(q, c.a, c.b) - c.r);
+            }
+        }
+        best
+    }
+
+    /// For tuning exec::stand_off: the distance at which each execution's blow meets the victim
+    /// best, per blade. `cargo test probe_stand_off -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_stand_off() {
+        for (style, e) in EXECUTIONS.iter().enumerate() {
+            if exec::gun_out(style, e.hit) {
+                continue;
+            }
+            let mut row = Vec::new();
+            for blade in [Weapon::Dagger, Weapon::Katana, Weapon::Greatsword] {
+                let reach = match blade {
+                    Weapon::Dagger => 0.5,
+                    Weapon::Greatsword => 1.72,
+                    _ => 1.28,
+                };
+                let side = if exec::stand_off(style, blade) - exec::advance(style, e.hit) >= 0.0 { 1.0 } else { -1.0 };
+                let mut best = (0.0f32, f32::MAX);
+                let mut closest = (0.0f32, f32::MAX);
+                for k in 0..=26 {
+                    let d = 0.45 + k as f32 * 0.05;
+                    let mut gap = f32::MAX;
+                    for dp in [-0.01f32, 0.0, 0.01] {
+                        let (a, v) = posed_at(style, blade, e.hit + dp, false, Some(d * side));
+                        gap = gap.min(blade_gap(a.grip, a.weapon.z, reach, &v));
+                    }
+                    // the furthest distance at which the blade still bites in a little
+                    if gap < 0.02 && d > best.0 {
+                        best = (d, gap);
+                    }
+                    if gap < closest.1 {
+                        closest = (d, gap);
+                    }
+                }
+                row.push(format!("{blade:?} {:.2} ({:.2}; closest {:.2} at {:.2})", best.0, best.1, closest.1, closest.0));
+            }
+            println!("STAND {style} {}: {}", e.name, row.join(", "));
+        }
+    }
+    /// Every execution's killing blow meets the one being executed on its contact frame, with
+    /// every blade (Sable's shots: the gun points into them), and the hit shapes come from the
+    /// same animation the picture shows. (The blow is decided by the game, so a blade swinging
+    /// through thin air at the kill would show at once.)
+    #[test]
+    fn every_execution_lands_its_blow_on_the_victim() {
+        let mut fails = Vec::new();
+        for (style, e) in EXECUTIONS.iter().enumerate() {
+            let shot = exec::gun_out(style, e.hit);
+            let blades: &[Weapon] = if shot { &[Weapon::Dagger] } else { &[Weapon::Dagger, Weapon::Katana, Weapon::Greatsword] };
+            for &blade in blades {
+                let (a, v) = posed(style, blade, e.hit, shot);
+                if shot {
+                    // the muzzle's line goes into them
+                    let o = a.grip + a.weapon.z * 0.25;
+                    let hit = v.hit.caps.iter().any(|c| ray_capsule(o, a.weapon.z, 4.0, c.a, c.b, c.r + 0.05).is_some());
+                    if !hit {
+                        fails.push(format!("{} ({:?}): the shot misses (aim {:?})", e.name, blade, a.weapon.z));
+                    }
+                } else {
+                    let reach = match blade {
+                        Weapon::Dagger => 0.5,
+                        Weapon::Greatsword => 1.72,
+                        _ => 1.28,
+                    };
+                    // the blade's sweep round the contact frame (a few hundredths either side)
+                    let mut gap = f32::MAX;
+                    for dp in [-0.02f32, -0.01, 0.0, 0.01, 0.02] {
+                        let (a, v) = posed(style, blade, e.hit + dp, false);
+                        gap = gap.min(blade_gap(a.grip, a.weapon.z, reach, &v));
+                    }
+                    if gap > 0.12 {
+                        fails.push(format!("{} ({:?}): the blade passes {gap:.2} m from them", e.name, blade));
+                    }
+                }
+            }
+        }
+        assert!(fails.is_empty(), "{}", fails.join("\n"));
+    }
+
+    /// While it plays, the attacker's hit shapes follow the execution's animation (a third player
+    /// shooting them hits what they see), and the one being executed is on their knees when the
+    /// execution says so.
+    #[test]
+    fn hit_shapes_follow_the_execution_and_the_victim_kneels() {
+        let rig = crate::anim::shared().expect("rig");
+        let tn = Tuning::default();
+        for (style, e) in EXECUTIONS.iter().enumerate() {
+            if exec::gun_out(style, e.hit) {
+                continue;
+            }
+            let (early, _) = posed(style, Weapon::Katana, 0.05, false);
+            let (blow, v) = posed(style, Weapon::Katana, e.hit, false);
+            let moved = early.hit.caps.iter().zip(blow.hit.caps.iter()).any(|(x, y)| (x.b - y.b).len() > 0.08);
+            assert!(moved, "{}: the hit shapes move with it", e.name);
+            if let Some((k0, k1)) = e.kneel {
+                // kneeling: the head is well down from standing
+                let mid = (k0 + k1) * 0.5;
+                let (_, kneeling) = posed(style, Weapon::Katana, mid, false);
+                let mut st = CharState::new();
+                let mut s = Fighter::new("s", 1, true);
+                s.present = true;
+                s.alive = true;
+                s.on_ground = true;
+                s.stun_t = 1.0;
+                s.loadout.body = (e.fighter + 1) % 4;
+                let _ = &v;
+                let mut standing = None;
+                for k in 0..4 {
+                    standing = animate(rig, &mut st, &s, V3::ZERO, k as f32 / 60.0, &tn);
+                }
+                let sh = standing.unwrap().head.y;
+                assert!(kneeling.head.y - if e.aerial { 1.6 } else { 0.0 } < sh - 0.3, "{}: on their knees ({} vs {sh})", e.name, kneeling.head.y);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -99,3 +99,10 @@ assets/env/props/varrow_*.glb and varrow_props.png (Varrow Bridgeworks: bridge r
   Original work made for this game with tools/blender/build_props.py (no third-party parts).
 Varrow Bridgeworks' dusk sky and its river water are drawn by the game's own code (src/env.rs,
   src/gpu.rs); the map's stone and wood reuse the Poly Haven CC0 textures listed above.
+
+Executions (src/exec.rs): every move, name, camera shot and announcer line is this game's own.
+  The animation uses the Quaternius "Universal Animation Library" clips listed above (sword, hook,
+  throw, jump, chop and kneel clips), cut and retimed, with hand-keyed poses on top. The execution
+  sounds (whoosh, impact, ring-out and crowd) are designed in code (src/audio.rs, design_exec) from
+  the CC0 recordings above (swing, dash, flesh, boom, clang and wall sounds) plus synthesised
+  layers. The announcer lines are in assets/lore.txt, [executions].

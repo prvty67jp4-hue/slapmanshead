@@ -71,6 +71,20 @@ Arena run (graphics share 0.2 ms average and 0.6 ms at the 1% low, times 1.85, t
 (and the Deck starts with dynamic resolution on, which lowers the picture's resolution in the busiest moments).
 It is the tightest of the maps; worth confirming on a real Deck.
 
+## Executions (cinematic finishing moves)
+
+Timed with the Steam Deck preset (1280x800, 8 fighters: an execution after another in front of the camera, all
+sixteen in turn, with six bots fighting round it) by `tools/capture_executions.ps1 -Bench` (40 s):
+
+| Run | Average | 1% low | 3D drawing (processor) | Slower than 60 fps |
+| --- | --- | --- | --- | --- |
+| Executions on repeat, 8 fighters | 544 fps (1.84 ms) | 325 fps (3.08 ms) | 1.33 ms (2.43 ms at the 99th percentile) | 0.00% |
+
+Steam Deck estimate, scaled as above (processor share times 3, graphics share times 8): about 8 ms average and
+12.5 ms in the worst 1% of frames, inside the 16.7 ms of a 60 fps frame. The afterimages, floor stains and cracks,
+embers and the letterbox add little: the effects are particles and a few flat quads, and afterimage copies reuse
+the fighters' drawing (at most the eight spare fighter slots). Estimated, not measured on a Deck.
+
 ## Memory
 
 - The game's own lists (effects, replays, histories, logs) stay flat through a 30-minute match: checked every

@@ -424,6 +424,47 @@ mod rig_tests {
         }
     }
 
+    /// Prints each clip's length and the moments its hands and feet move fastest (contact
+    /// frames), for timing executions. `cargo test probe_clip_contacts -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_clip_contacts() {
+        let rig = Rig::load().expect("rig");
+        let clips = [
+            "Sword_Regular_A", "Sword_Regular_B", "Sword_Regular_C", "Sword_Regular_Combo", "Sword_Heavy_Combo", "Sword_Dash", "Sword_Attack", "Melee_Hook", "Punch_Cross", "Punch_Jab",
+            "Pistol_Shoot", "Shield_Dash", "Shield_OneShot", "TreeChopping_Loop", "OverhandThrow", "Roll", "NinjaJump_Start", "NinjaJump_Land", "Spell_Simple_Shoot", "Idle_FoldArms_Loop", "Hit_Knockback",
+            "Jump_Start", "Jump_Land", "Yes", "Fixing_Kneeling", "Slide_Start",
+        ];
+        for c in clips {
+            let Some(clip) = rig.clips.get(c) else {
+                println!("{c}: missing");
+                continue;
+            };
+            let dur = clip.duration;
+            for bone in ["hand_r", "hand_l", "foot_r"] {
+                let n = rig.node(bone).unwrap();
+                let step = 1.0 / 60.0;
+                let mut prev: Option<Vec3> = None;
+                let mut sp = Vec::new();
+                let mut t = 0.0;
+                let mut pose = Vec::new();
+                while t <= dur {
+                    rig.sample(c, t, false, &mut pose);
+                    let h = rig.globals(&pose)[n].w_axis.truncate();
+                    if let Some(p) = prev {
+                        sp.push((t, (h - p).length() / step));
+                    }
+                    prev = Some(h);
+                    t += step;
+                }
+                // local peaks above half the top speed
+                let top = sp.iter().fold(0.0f32, |m, s| m.max(s.1));
+                let peaks: Vec<String> = (1..sp.len().saturating_sub(1)).filter(|&i| sp[i].1 >= sp[i - 1].1 && sp[i].1 >= sp[i + 1].1 && sp[i].1 > top * 0.5).map(|i| format!("{:.2}s@{:.1}", sp[i].0, sp[i].1)).collect();
+                println!("{c} ({dur:.2}s) {bone}: {}", peaks.join(" "));
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn probe_hands() {

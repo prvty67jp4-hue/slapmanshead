@@ -461,40 +461,13 @@ pub const EXEC_TOOL: u8 = 23;
 pub const FINISH_RANGE: f32 = 2.6;
 pub const FINISH_HP: f32 = 25.0;
 
-/// One finisher animation. `weapon` None is the aerial one (any blade, target in the air).
-/// `unlock_level` is the career level it becomes available at (all 1 for now; they're meant
-/// to become cosmetics).
-pub struct FinisherStyle {
-    pub name: &'static str,
-    pub weapon: Option<Weapon>,
-    /// Seconds it lasts, and when (share of that) the blow lands.
-    pub dur: f32,
-    pub hit: f32,
-    pub unlock_level: u32,
-}
-
-pub const FINISHERS: [FinisherStyle; 10] = [
-    FinisherStyle { name: "Throat Cut", weapon: Some(Weapon::Dagger), dur: 0.7, hit: 0.55, unlock_level: 1 },
-    FinisherStyle { name: "Twin Stab", weapon: Some(Weapon::Dagger), dur: 0.8, hit: 0.72, unlock_level: 1 },
-    FinisherStyle { name: "Spinning Edge", weapon: Some(Weapon::Dagger), dur: 0.75, hit: 0.62, unlock_level: 1 },
-    FinisherStyle { name: "Quick Draw", weapon: Some(Weapon::Katana), dur: 0.8, hit: 0.55, unlock_level: 1 },
-    FinisherStyle { name: "Cross Cut", weapon: Some(Weapon::Katana), dur: 0.85, hit: 0.75, unlock_level: 1 },
-    FinisherStyle { name: "Rising Cleave", weapon: Some(Weapon::Katana), dur: 0.8, hit: 0.6, unlock_level: 1 },
-    FinisherStyle { name: "Overhead Crush", weapon: Some(Weapon::Greatsword), dur: 0.95, hit: 0.65, unlock_level: 1 },
-    FinisherStyle { name: "Impale", weapon: Some(Weapon::Greatsword), dur: 0.9, hit: 0.6, unlock_level: 1 },
-    FinisherStyle { name: "Wheel Cleave", weapon: Some(Weapon::Greatsword), dur: 0.95, hit: 0.7, unlock_level: 1 },
-    FinisherStyle { name: "Sky Splitter", weapon: None, dur: 0.9, hit: 0.7, unlock_level: 1 },
-];
-
-/// A finisher style (by its number + 1, as fighters carry it; 0 = none).
-pub fn finisher(kind: u8) -> &'static FinisherStyle {
-    &FINISHERS[(kind.max(1) as usize - 1).min(FINISHERS.len() - 1)]
-}
+/// Executions (each fighter's finishing moves): see crate::exec.
+pub use crate::exec::execution;
 
 /// Something to count in the career stats (handed to the menu side each frame).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CareerEv {
-    /// You got a kill: a headshot? a finisher (its style number + 1)?
+    /// You got a kill: a headshot? an execution (its number + 1)?
     Kill { head: bool, finisher: u8 },
     Death,
     WaveCleared,
@@ -1348,12 +1321,19 @@ pub struct Fighter {
     through_hit: u32,
     /// Greatsword: plunging down for a ground slam.
     pub slam: bool,
-    /// Doing a finisher: its style (number + 1, 0 = none), how far in, on whom, and whether the
-    /// blow has landed.
+    /// Doing an execution (see crate::exec): its number + 1 (0 = none), how far in, on whom,
+    /// whether the blow has landed, and the line to them when it began (it moves along it).
     pub fin: u8,
     pub fin_t: f32,
     pub fin_target: usize,
     fin_hit: bool,
+    pub fin_dir: V3,
+    /// (the picture only) an afterimage copy, this strong (0 = the fighter themselves); the
+    /// execution cues played so far; the execution being done to this fighter and how far in.
+    pub ghost: f32,
+    exec_seen: f32,
+    exec_seen_kind: u8,
+    pub exec_pose: Option<(u8, f32)>,
     /// Caught in someone's finisher: by whom (and for how much longer at most).
     pub held_by: Option<usize>,
     pub held_t: f32,
@@ -1513,6 +1493,11 @@ impl Fighter {
             fin_t: 0.0,
             fin_target: 0,
             fin_hit: false,
+            fin_dir: V3::ZERO,
+            ghost: 0.0,
+            exec_seen: 0.0,
+            exec_seen_kind: 0,
+            exec_pose: None,
             held_by: None,
             held_t: 0.0,
             held_kind: 0,
@@ -1903,6 +1888,39 @@ pub struct Grenade {
     pub vis: V3,
 }
 
+/// Where an execution preview stands on the Courtyard (the training room's open floor).
+const PREVIEW_Z: f32 = -9.0;
+
+/// An execution being watched on a dummy (see Game::exec_preview).
+#[derive(Clone, Debug)]
+pub struct Preview {
+    pub style: usize,
+    pub t: f32,
+    pub started: bool,
+    pub done_t: f32,
+    pub done: bool,
+    /// Play it again and again (the performance check).
+    pub loops: bool,
+    /// Stop time at this share of the execution (pictures).
+    pub freeze_at: Option<f32>,
+    /// Where the attacker stands, and the way to the dummy (1.6 m on).
+    pub at: V3,
+    pub face: V3,
+}
+
+/// A stain or crack on the floor (the picture only): where, how big, what (0 a stain, 1 a crack,
+/// 2 a scorch), its colour, how long it has left, and a number that shapes it.
+#[derive(Clone, Debug)]
+pub struct Decal {
+    pub pos: V3,
+    pub size: f32,
+    pub kind: u8,
+    pub color: [u8; 3],
+    pub life: f32,
+    pub max_life: f32,
+    pub seed: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Particle {
     pub pos: V3,
@@ -2038,8 +2056,13 @@ pub enum Ev {
     Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3, guard: f32 },
     /// From a player: "my bullet was sent back at me by `by`" (the host trusts self-inflicted hurt).
     Deflect { by: u8, dmg: f32 },
-    /// "I've started a finisher on `target`": their computer holds them for it.
-    Finisher { target: u8, kind: u8 },
+    /// From a player to the host: "may I execute `target`"? `open`: which of their fighter's
+    /// four executions they have unlocked (bits, see crate::exec::of_fighter).
+    ExecAsk { target: u8, open: u8 },
+    /// From the host (or the game on this computer): `who` executes `target` with execution
+    /// `kind` (number + 1). The host decides, so everyone plays the same one; the
+    /// target's computer holds them for it.
+    Exec { who: u8, target: u8, kind: u8 },
     Grenade { p: V3, v: V3, kind: u8 },
     /// Only the host (or the game on this computer) decides deaths.
     Died { victim: u8, killer: u8, w: u8, head: bool },
@@ -2122,6 +2145,20 @@ pub struct Game {
     pub kill_chain: Vec<(u32, f32)>,
     /// Finisher styles the local player hasn't unlocked yet (bit per style; from their mastery).
     pub fin_locks: u32,
+    /// Watching an execution on a training dummy (Fighters & Mastery's Preview), when it is.
+    pub preview: Option<Preview>,
+    /// Settings > Game > Violence: how wounds look (blood, sparks or white flashes).
+    pub violence: crate::exec::Violence,
+    /// Stains and cracks on the floor (the picture only).
+    pub decals: Vec<Decal>,
+    /// (online, a player) waiting for the host's answer to an execution we asked for.
+    pub exec_ask_t: f32,
+    /// (host) a target just given to someone's execution, until their computer reports it.
+    exec_reserved: [f32; MAX_PLAYERS],
+    /// The execution's impact frame (a brief high-contrast flash, seconds left) and the
+    /// announcer's line on screen (which execution, seconds shown).
+    pub impact_t: f32,
+    pub exec_line: Option<(u8, f32)>,
     /// Play of the Match: the last few seconds kept (frames), the best moment so far waiting for
     /// its tail (score, who, what, when), the one picked, and its playback after the match.
     pub rec: VecDeque<RecFrame>,
@@ -2388,6 +2425,11 @@ pub enum Sfx {
     GrappleFire,
     ShieldUp,
     Vanish,
+    /// Executions: the blade's whoosh, the killing blow, the ring-out after it, the crowd.
+    ExecWhoosh,
+    ExecImpact,
+    ExecRing,
+    Crowd,
 }
 
 impl Sfx {
@@ -2436,12 +2478,36 @@ pub enum Act {
     Item { kind: u8 },
     /// A greatsword plunge hit the ground: shockwave.
     Slam,
-    /// A finisher starts (the victim is held for it).
+    /// An execution starts (the victim is held for it).
     FinishStart,
+    /// (online, a player) asking the host to start an execution on 	arget.
+    ExecAsk { target: usize },
     /// The finisher's blow lands.
     Execute,
     /// A throwing star, turned this far (radians) from where you aim.
     Star { off: f32 },
+}
+
+/// Start execution `kind` (number + 1) by `ff` on fighter `t` standing at `tp`.
+pub fn begin_exec(ff: &mut Fighter, t: usize, kind: u8, tp: V3) {
+    ff.fin = kind;
+    ff.fin_t = 0.0;
+    ff.fin_target = t;
+    ff.fin_hit = false;
+    let d = (tp - ff.pos).flat();
+    ff.fin_dir = if d.len() > 0.05 { d.norm() } else { ff.fwd() };
+    ff.cur = 0;
+    ff.weapon = ff.loadout.melee;
+    ff.switch_t = 0.0;
+    ff.reload_t = 0.0;
+    if ff.slash_t > 0.0 {
+        ff.slash_t = 0.0;
+        ff.slash_queued = false;
+        ff.combo_window = 0.45;
+    }
+    ff.guard = false;
+    ff.charge_t = 0.0;
+    ff.charged = false;
 }
 
 pub const BOT_NAMES: [&str; 7] = ["Ash", "Vex", "Kiro", "Nyx", "Rook", "Sable", "Juno"];
@@ -2506,6 +2572,13 @@ impl Game {
             streaks: vec![0; MAX_PLAYERS],
             kill_chain: vec![(0, -10.0); MAX_PLAYERS],
             fin_locks: 0,
+            preview: None,
+            violence: crate::exec::Violence::default(),
+            decals: Vec::new(),
+            exec_ask_t: 0.0,
+            exec_reserved: [-1.0; MAX_PLAYERS],
+            impact_t: 0.0,
+            exec_line: None,
             rec: VecDeque::new(),
             rec_acc: 0.0,
             hl_pending: None,
@@ -2582,6 +2655,121 @@ impl Game {
         for h in self.history.iter_mut() {
             h.clear();
         }
+    }
+
+    /// Watch execution style (crate::exec) done by fighter ody on a training dummy. It starts
+    /// a moment in, plays once (loops: again and again, on fresh dummies) and is then done.
+    pub fn exec_preview(name: &str, body: u8, style: usize, loops: bool) -> Game {
+        let mut g = Game::new(Kind::Offline, 0, Mode::Ffa, 9999);
+        g.set_map(MapId::Courtyard);
+        // each fighter's own blade (and Sable's sidearm for her shots)
+        let melee = match body {
+            1 => Weapon::Dagger,
+            2 => Weapon::Greatsword,
+            _ => Weapon::Katana,
+        };
+        let lo = Loadout { melee, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0, body, outfit: 0 };
+        g.my_loadout = lo;
+        g.add_player(0, name, true, None, 0);
+        g.f[0].loadout = lo;
+        g.f[0].equip();
+        g.add_player(1, "Dummy", true, Some(0.0), 0);
+        g.bots[1] = None; // it just stands there
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0, body: (body + 1) % 4, outfit: 0 };
+        g.f[1].equip();
+        g.f[0].respawn_at(v3(0.0, 0.0, PREVIEW_Z), 0.0);
+        g.f[1].respawn_at(v3(0.0, 0.0, PREVIEW_Z + 1.6), std::f32::consts::PI);
+        let (at, face) = (v3(0.0, 0.0, PREVIEW_Z), v3(0.0, 0.0, 1.0));
+        for f in g.f.iter_mut().take(2) {
+            f.spawn_prot = 0.0;
+            f.ready = true;
+        }
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = 1e9;
+        g.preview = Some(Preview { style: style.min(crate::exec::COUNT - 1), t: 0.0, started: false, done_t: 0.0, done: false, loops, freeze_at: None, at, face });
+        g
+    }
+
+    /// Stage the preview somewhere else: the attacker at `at`, the dummy 1.6 m along `face`.
+    pub fn move_preview(&mut self, at: V3, face: V3) {
+        let face = face.flat().norm();
+        if let Some(pv) = self.preview.as_mut() {
+            pv.at = at;
+            pv.face = face;
+        }
+        self.f[0].respawn_at(at, face.x.atan2(face.z));
+        self.f[1].respawn_at(at + face * 1.6, (-face).x.atan2(-face.z));
+        for f in self.f.iter_mut().take(2) {
+            f.spawn_prot = 0.0;
+        }
+    }
+
+    /// A preview's own clock: the dummy is set up beaten and staggered, the execution starts,
+    /// and once it has played out (and the dummy fallen) the preview is done (or goes again).
+    fn preview_step(&mut self, dt: f32) {
+        let Some(mut pv) = self.preview.clone() else { return };
+        pv.t += dt;
+        let e = &crate::exec::EXECUTIONS[pv.style];
+        if !pv.started && pv.t > 0.5 {
+            pv.started = true;
+            let tp = pv.at + pv.face * 1.6;
+            let d = &mut self.f[1];
+            if !d.alive || !d.present {
+                d.respawn_at(tp, std::f32::consts::PI);
+            }
+            d.pos = tp + if e.aerial { v3(0.0, 1.6, 0.0) } else { V3::ZERO };
+            d.prev_pos = d.pos;
+            d.on_ground = !e.aerial;
+            d.float_t = if e.aerial { 2.5 } else { 0.0 };
+            d.hp = FINISH_HP * 0.5;
+            d.stagger_t = 1.0;
+            d.spawn_prot = 0.0;
+            let kind = pv.style as u8 + 1;
+            let mut ff = self.f[0].clone();
+            ff.pos = v3(pv.at.x, ff.pos.y, pv.at.z);
+            begin_exec(&mut ff, 1, kind, tp);
+            self.f[0] = ff;
+            self.hold(1, 0, kind);
+            self.last_finisher = kind;
+            self.exec_started(0);
+        }
+        if pv.started {
+            if let Some(at) = pv.freeze_at {
+                // a still of one moment (for pictures): time stops there
+                if self.f[0].fin > 0 && self.f[0].fin_t >= at * e.dur {
+                    self.hitstop = 1e6;
+                    self.impact_t = 0.0;
+                }
+            }
+            if self.f[0].fin == 0 {
+                pv.done_t += dt;
+                if pv.done_t > 1.3 {
+                    if pv.loops {
+                        // the next one, by its own fighter with their own blade
+                        pv.style = (pv.style + 1) % crate::exec::COUNT;
+                        let body = crate::exec::EXECUTIONS[pv.style].fighter;
+                        self.f[0].loadout.body = body;
+                        self.f[0].loadout.melee = match body {
+                            1 => Weapon::Dagger,
+                            2 => Weapon::Greatsword,
+                            _ => Weapon::Katana,
+                        };
+                        self.f[0].equip();
+                        pv.started = false;
+                        pv.t = 0.0;
+                        pv.done_t = 0.0;
+                        let back = (-pv.face).x.atan2((-pv.face).z);
+                        self.f[1].respawn_at(pv.at + pv.face * 1.6, back);
+                        self.f[1].spawn_prot = 0.0;
+                        self.f[0].respawn_at(pv.at, pv.face.x.atan2(pv.face.z));
+                        self.f[0].spawn_prot = 0.0;
+                    } else {
+                        pv.done = true;
+                    }
+                }
+            }
+        }
+        self.preview = Some(pv);
     }
 
     /// The training room: you, a katana and a rocket launcher, and three dummies that can't die.
@@ -2984,9 +3172,9 @@ impl Game {
         best.map(|(_, j)| j)
     }
 
-    /// Hold fighter `t` for `attacker`'s finisher (on the computer that runs `t`).
+    /// Hold fighter `t` for `attacker`'s execution (on the computer that runs `t`).
     fn hold(&mut self, t: usize, attacker: usize, kind: u8) {
-        let dur = finisher(kind).dur;
+        let dur = execution(kind).dur;
         let f = &mut self.f[t];
         if !f.alive {
             return;
@@ -3548,6 +3736,11 @@ impl Game {
             ff.guard_t = if ff.guard { ff.guard_t + dt } else { 0.0 };
         }
 
+        self.preview_step(dt);
+        self.exec_cues();
+        if self.hitstop > 1e5 {
+            self.impact_t = 0.0; // a still picture: no flash over it
+        }
         self.footsteps(dt);
         self.update_grenades(dt);
         self.update_fx(dt);
@@ -3796,7 +3989,8 @@ impl Game {
         }
         self.sfx(Sfx::Hurt, self.f[victim].pos);
         let p = self.f[victim].chest();
-        self.burst(p, [200, 30, 40], 26, 6.0);
+        let wcol = crate::exec::wound(self.violence).main;
+        self.burst(p, wcol, 26, 6.0);
         self.last_kill = Some((victim, k, w, head));
         // Writs: a streak of WRIT_STREAK kills marks you; whoever takes you down claims it
         let writ_modes = matches!(self.mt.mode, Mode::Ffa | Mode::Tdm) && self.kind != Kind::Demo && self.train.is_none();
@@ -4909,47 +5103,64 @@ impl Game {
 
         ff.yaw = wrap_angle(inp.yaw);
         ff.pitch = inp.pitch.clamp(-1.45, 1.45);
-        // caught in a finisher: held still, facing whoever is doing it
+        // caught in an execution: held still, facing whoever is doing it (let go if they stop,
+        // leave the game or fall)
         if let Some(a) = ff.held_by {
             ff.held_t -= dt;
-            let attacker_done = a < self.f.len() && self.f[a].fin == 0 && ff.held_t < finisher(ff.held_kind).dur - 0.3;
-            if ff.held_t <= 0.0 || attacker_done || !ff.alive {
+            let style = execution(ff.held_kind);
+            let gone = a >= self.f.len() || !self.f[a].present || !self.f[a].alive;
+            let attacker_done = !gone && self.f[a].fin == 0 && ff.held_t < style.dur - 0.3;
+            if ff.held_t <= 0.0 || gone || attacker_done || !ff.alive {
                 ff.held_by = None;
             } else {
                 ff.stun_t = ff.stun_t.max(0.1);
                 ff.vel.x *= 0.5;
                 ff.vel.z *= 0.5;
-                if a < self.f.len() {
-                    let d = self.f[a].pos - ff.pos;
-                    if d.flat().len() > 0.05 {
-                        ff.yaw = d.x.atan2(d.z);
-                    }
+                let ap = self.f[a].pos;
+                let d = ap - ff.pos;
+                if d.flat().len() > 0.05 {
+                    ff.yaw = d.x.atan2(d.z);
+                }
+                // yanked in on a hunter's line
+                let p = ((style.dur + 0.25 - ff.held_t) / style.dur).clamp(0.0, 1.0);
+                let held_kind = ff.held_kind as usize - 1;
+                if crate::exec::pull(held_kind, p).is_some_and(|k| k < 1.0) && d.flat().len() > 1.3 {
+                    let to = ap + (-d.flat()).norm() * 1.15;
+                    ff.pos = ff.pos.lerp(v3(to.x, ff.pos.y, to.z), (14.0 * dt).min(1.0));
                 }
             }
         }
-        // doing a finisher: it plays out, nothing else until it's done
+        // doing an execution: it plays out, nothing else until it's done
         if ff.fin > 0 {
-            let style = finisher(ff.fin);
+            let kind = ff.fin as usize - 1;
+            let style = execution(ff.fin);
             ff.fin_t += dt;
             let t = ff.fin_target.min(self.f.len() - 1);
+            // the one being executed left the game (or was finished off by someone else first):
+            // it ends here, with nothing for it
+            let lost = !self.f[t].present || (!self.f[t].alive && !ff.fin_hit);
             let tp = self.f[t].pos;
-            let d = (tp - ff.pos).flat();
-            let dir = if d.len() > 0.05 { d.norm() } else { ff.fwd() };
-            // step in close, at their height (an aerial one rises to meet them)
-            let spot = tp - dir * 1.05;
-            ff.pos = ff.pos.lerp(v3(spot.x, if style.weapon.is_none() { tp.y } else { ff.pos.y }, spot.z), 0.3);
+            let p = (ff.fin_t / style.dur).clamp(0.0, 1.0);
+            // along the line from when it began: step in close (an aerial one rises to meet
+            // them), and on through or over them for the moves that pass
+            let dir = if ff.fin_dir.len() > 0.5 { ff.fin_dir } else { ff.fwd() };
+            let stand = crate::exec::stand_off(kind, ff.loadout.melee);
+            let spot = tp - dir * stand + dir * crate::exec::advance(kind, p);
+            ff.pos = ff.pos.lerp(v3(spot.x, if style.aerial { tp.y } else { ff.pos.y }, spot.z), 0.3);
             ff.vel = V3::ZERO;
-            ff.yaw = dir.x.atan2(dir.z);
+            let face = (tp - ff.pos).flat();
+            let face = if face.len() > 0.15 { face.norm() } else { dir };
+            ff.yaw = face.x.atan2(face.z);
             ff.guard = false;
             ff.slash_t = 0.0;
-            if !ff.fin_hit && ff.fin_t >= style.dur * style.hit {
+            if !ff.fin_hit && !lost && ff.fin_t >= style.dur * style.hit {
                 ff.fin_hit = true;
                 acts.push(Act::Execute);
             }
-            if ff.fin_t >= style.dur || !ff.alive {
+            if ff.fin_t >= style.dur || !ff.alive || lost {
                 ff.fin = 0;
             }
-            if style.weapon.is_none() && ff.fin == 0 {
+            if style.aerial && ff.fin == 0 {
                 ff.on_ground = false; // drop back down after an aerial one
             }
             self.f[i] = ff;
@@ -5131,35 +5342,23 @@ impl Game {
             }
         }
 
-        // finisher: on a weakened, staggered enemy in reach
+        // execution: on a weakened, staggered (guard-broken, launched) enemy in reach. Online the
+        // host decides (a player asks; see Ev::ExecAsk), so everyone plays the same one.
         if inp.finish && can_act && ff.fin == 0 && ff.held_by.is_none() {
             self.f[i] = ff.clone();
             if let Some(t) = self.finish_target(i) {
-                let b = &self.f[t];
-                let airborne = !b.on_ground && b.pos.y - self.world.ground_below(b.pos + v3(0.0, 0.2, 0.0)) > 0.8;
-                let blade = ff.loadout.melee;
-                let fits = |k: usize| if airborne { FINISHERS[k].weapon.is_none() } else { FINISHERS[k].weapon == Some(blade) };
-                // your own finishers: the ones your fighter's mastery has opened
-                let open = |k: usize| i != self.local || self.fin_locks & (1 << k) == 0;
-                let mut choices: Vec<usize> = (0..FINISHERS.len()).filter(|&k| fits(k) && open(k)).collect();
-                if choices.is_empty() {
-                    choices = (0..FINISHERS.len()).filter(|&k| fits(k)).collect();
+                if self.kind == Kind::Client && i == self.local {
+                    if self.exec_ask_t <= 0.0 {
+                        self.exec_ask_t = 0.5;
+                        acts.push(Act::ExecAsk { target: t });
+                    }
+                } else {
+                    let open = if i == self.local { self.exec_open() } else { 0b1111 };
+                    let kind = self.pick_execution(i, t, open);
+                    begin_exec(&mut ff, t, kind, self.f[t].pos);
+                    self.last_finisher = ff.fin;
+                    acts.push(Act::FinishStart);
                 }
-                let pick = choices[(self.rng.next_u32() as usize) % choices.len().max(1)];
-                ff.fin = pick as u8 + 1;
-                self.last_finisher = ff.fin;
-                ff.fin_t = 0.0;
-                ff.fin_target = t;
-                ff.fin_hit = false;
-                ff.cur = 0;
-                ff.weapon = blade;
-                ff.switch_t = 0.0;
-                ff.reload_t = 0.0;
-                cancel_slash(&mut ff);
-                ff.guard = false;
-                ff.charge_t = 0.0;
-                ff.charged = false;
-                acts.push(Act::FinishStart);
             }
         }
 
@@ -6167,11 +6366,15 @@ impl Game {
                 if self.f[t].owned {
                     self.hold(t, i, kind);
                 }
-                if self.kind == Kind::Host || self.kind == Kind::Client {
-                    self.out_events.push(Ev::Finisher { target: t as u8, kind });
+                // the host tells everyone which one it is (the target's computer holds them)
+                if self.kind == Kind::Host {
+                    self.out_events.push(Ev::Exec { who: i as u8, target: t as u8, kind });
                 }
-                let p = self.f[i].pos;
-                self.sfx(Sfx::ChargeReady, p);
+                self.exec_started(i);
+            }
+            Act::ExecAsk { target } => {
+                let open = self.exec_open();
+                self.out_events.push(Ev::ExecAsk { target: target as u8, open });
             }
             Act::Execute => self.execute(i),
             Act::Star { off } => self.throw_star(i, off),
@@ -6342,11 +6545,13 @@ impl Game {
     pub fn impact_fx(&mut self, p: V3, spark: u8) {
         match spark {
             1 => {
-                self.burst(p, [200, 25, 35], 14, 3.5);
-                // a puff of red mist
+                // a wound, as the Violence setting shows it (blood, sparks or a white flash)
+                let w = crate::exec::wound(self.violence);
+                self.burst(p, w.main, 14, 3.5);
+                // a puff of mist
                 for _ in 0..2 {
                     let v = v3(self.rng.range(-0.6, 0.6), self.rng.range(0.0, 0.6), self.rng.range(-0.6, 0.6));
-                    self.particles.push(Particle { pos: p, vel: v, life: 0.35, max_life: 0.35, size: 0.22, color: [130, 12, 18], gravity: 0.5 });
+                    self.particles.push(Particle { pos: p, vel: v, life: 0.35, max_life: 0.35, size: 0.22, color: w.second, gravity: 0.5 });
                 }
             }
             2 => {
@@ -6365,9 +6570,10 @@ impl Game {
                 }
             }
             5 => {
-                // a hit on armour: sparks and a little blood
+                // a hit on armour: sparks and a little of the wound
                 self.burst(p, [255, 215, 140], 12, 6.0);
-                self.burst(p, [200, 25, 35], 6, 3.0);
+                let w = crate::exec::wound(self.violence);
+                self.burst(p, w.main, 6, 3.0);
             }
             3 => {
                 self.sfx(Sfx::ImpactStone, p);
@@ -7253,11 +7459,11 @@ impl Game {
         if amount > 0.0 {
             self.f[victim].invis_t = 0.0; // taking damage shows an Afterimage
         }
-        // hit by someone else in the middle of a finisher: it's cut short (fair in team fights)
+        // hit by someone else in the middle of an execution: it's cut short (fair in team fights)
         if amount > 0.0 && self.f[victim].fin > 0 && attacker != Some(self.f[victim].fin_target) {
             self.f[victim].fin = 0;
             if victim == self.local {
-                self.say("Finisher interrupted!".to_string());
+                self.say("Execution interrupted!".to_string());
             }
         }
         if guard > 0.0 {
@@ -7444,38 +7650,324 @@ impl Game {
         }
     }
 
-    /// The finisher's blow: the kill (checked by the host like any hit), a big hit-stop and a
-    /// flash, and the finisher's rewards on our side (guard and item back; the host gives the
-    /// health).
+    /// The execution's killing blow: the kill (checked by the host like any hit) and its rewards
+    /// on our side (guard and item back; the host gives the health), the same as before the
+    /// executions got their show. How it looks and sounds is in `exec_cue` (on every computer).
     fn execute(&mut self, i: usize) {
         let t = self.f[i].fin_target;
-        if t >= self.f.len() || !self.f[t].alive {
+        if t >= self.f.len() || !self.f[t].alive || !self.f[t].present {
             return;
         }
-        let style = finisher(self.f[i].fin);
+        let style = execution(self.f[i].fin);
         let a = self.f[i].chest();
         let at = self.f[t].chest();
         let dir = (at - a).flat().norm();
-        let knock = if style.weapon.is_none() { v3(0.0, -14.0, 0.0) } else { dir * 4.0 + v3(0.0, 2.5, 0.0) };
+        let knock = if style.aerial { v3(0.0, -14.0, 0.0) } else { dir * 4.0 + v3(0.0, 2.5, 0.0) };
         self.damage(i, t, LETHAL, knock, 0.8, false, at, EXEC_TOOL, a, dir);
-        self.burst(at, [200, 25, 35], 34, 6.0);
-        self.burst(at, [255, 235, 200], 14, 8.0);
-        self.sfx(Sfx::Flesh, at);
-        self.sfx(Sfx::GuardBreak, at);
         if i == self.local {
             self.f[i].guard_hp = GUARD_MAX;
             self.f[i].items = self.f[i].items.max(2);
-            self.say(format!("EXECUTED! ({})", style.name));
         }
-        if i == self.local || t == self.local {
-            self.hitstop = self.hitstop.max(0.14);
-            self.shake = self.shake.max(0.5);
-            self.jolt(dir, 1.0);
-            self.parry_flash = 0.22;
-            if self.kind == Kind::Offline {
-                self.slowmo = self.slowmo.max(0.3);
+    }
+
+    /// An execution has begun for fighter `i` (on any computer that starts it).
+    fn exec_started(&mut self, i: usize) {
+        let p = self.f[i].pos;
+        self.sfx(Sfx::ChargeReady, p);
+    }
+
+    /// Which of the local fighter's four executions are unlocked (bits, see exec::of_fighter).
+    pub fn exec_open(&self) -> u8 {
+        let body = self.f.get(self.local).map_or(0, |f| f.loadout.body);
+        crate::exec::of_fighter(body).iter().enumerate().filter(|(_, s)| self.fin_locks & (1 << **s) == 0).fold(0u8, |m, (k, _)| m | 1 << k)
+    }
+
+    /// Which execution fighter `i` does on `t` (number + 1): one of their fighter's unlocked ones
+    /// (`open`), the aerial one on a target in the air.
+    fn pick_execution(&mut self, i: usize, t: usize, open: u8) -> u8 {
+        let b = &self.f[t];
+        let airborne = !b.on_ground && b.pos.y - self.world.ground_below(b.pos + v3(0.0, 0.2, 0.0)) > 0.8;
+        let choices = crate::exec::choices(self.f[i].loadout.body, airborne, open);
+        let pick = choices[(self.rng.next_u32() as usize) % choices.len().max(1)];
+        pick as u8 + 1
+    }
+
+    /// (host) May player `i` execute `t`, as the host sees it? The same rules as on their side
+    /// (close, nearly beaten, not already caught), with room for the time the request took.
+    fn exec_ok(&mut self, i: usize, t: usize) -> bool {
+        let (a, b) = (&self.f[i], &self.f[t]);
+        if i == t || !a.alive || a.fin > 0 || a.held_by.is_some() || !self.is_enemy(i, t) || !b.present || !b.alive || b.spawn_prot > 0.0 || b.held_by.is_some() || b.hp >= FINISH_HP + 10.0 {
+            return false;
+        }
+        // nobody else is already executing them (or about to)
+        if self.exec_reserved[t] > self.time || self.f.iter().enumerate().any(|(k, o)| k != i && o.fin > 0 && o.fin_target == t) {
+            return false;
+        }
+        let d = b.pos - a.pos;
+        if d.flat().len() > FINISH_RANGE + 1.6 || d.y.abs() > 4.0 {
+            return false;
+        }
+        self.exec_reserved[t] = self.time + 0.8;
+        true
+    }
+
+    /// The accent colour of fighter `i` (their coat: the team's colour in team modes).
+    pub fn accent(&self, i: usize) -> [u8; 3] {
+        crate::gpu::PALETTE[(self.f.get(i).map_or(0, |f| f.color_idx) as usize) % crate::gpu::PALETTE.len()]
+    }
+
+    /// A wound at `p`, as the Violence setting shows it: blood (Full), sparks and dark particles
+    /// (Reduced) or a white flash (Off). `big` for a killing blow.
+    pub fn wound_fx(&mut self, p: V3, dir: V3, big: bool) {
+        let w = crate::exec::wound(self.violence);
+        let (n, sp) = if big { (36, 6.5) } else { (12, 3.5) };
+        for k in 0..n {
+            // most of it sprays the way the blow went
+            let r = v3(self.rng.range(-1.0, 1.0), self.rng.range(-0.3, 1.0), self.rng.range(-1.0, 1.0));
+            let v = (r + dir * 1.4).norm() * self.rng.range(0.3, 1.0) * sp;
+            let life = self.rng.range(0.3, 0.7);
+            let color = if k % 3 == 0 { w.second } else { w.main };
+            self.particles.push(Particle { pos: p, vel: v, life, max_life: life, size: self.rng.range(0.05, 0.13), color, gravity: w.gravity });
+        }
+        if self.violence == crate::exec::Violence::Off || big {
+            // a bright core (white where there's no blood)
+            let c = if self.violence == crate::exec::Violence::Off { [255, 255, 255] } else { [255, 236, 210] };
+            self.particles.push(Particle { pos: p, vel: V3::ZERO, life: 0.12, max_life: 0.12, size: if big { 0.9 } else { 0.45 }, color: c, gravity: 0.0 });
+        }
+        if w.stain && big {
+            let ground = self.world.ground_below(p + v3(0.0, 0.1, 0.0));
+            let at = v3(p.x, ground + 0.02, p.z) + dir.flat() * 0.4;
+            let seed = self.rng.next_u32();
+            let size = self.rng.range(0.7, 1.0);
+            self.decals.push(Decal { pos: at, size, kind: 0, color: [96, 8, 14], life: 20.0, max_life: 20.0, seed });
+        }
+    }
+
+    /// Execution cues on every computer: each fighter doing one plays its sounds and effects as
+    /// it reaches them, and the one being executed is posed for it (the picture only).
+    fn exec_cues(&mut self) {
+        for f in self.f.iter_mut() {
+            f.exec_pose = None;
+        }
+        for i in 0..self.f.len() {
+            let fin = self.f[i].fin;
+            if fin == 0 || !self.f[i].present {
+                self.f[i].exec_seen_kind = 0;
+                continue;
+            }
+            if self.f[i].exec_seen_kind != fin {
+                self.f[i].exec_seen_kind = fin;
+                self.f[i].exec_seen = -1.0;
+            }
+            let e = execution(fin);
+            let now = self.f[i].fin_t;
+            let seen = self.f[i].exec_seen;
+            let t = self.f[i].fin_target.min(self.f.len() - 1);
+            if t != i {
+                self.f[t].exec_pose = Some((fin, (now / e.dur).clamp(0.0, 1.0)));
+            }
+            for &(at, cue) in e.cues {
+                let ct = at * e.dur;
+                if ct > seen && ct <= now {
+                    self.exec_cue(i, t, fin, cue);
+                }
+            }
+            self.f[i].exec_seen = now;
+        }
+    }
+
+    fn exec_cue(&mut self, i: usize, t: usize, kind: u8, cue: crate::exec::Cue) {
+        use crate::exec::Cue;
+        let a = self.f[i].pos;
+        let v = self.f[t].pos;
+        let line = (v - a).flat();
+        let dir = if line.len() > 0.05 { line.norm() } else { self.f[i].fwd() };
+        let chest = v + v3(0.0, 1.2, 0.0);
+        let hand = a + v3(0.0, 1.3, 0.0) + dir * 0.6;
+        let accent = self.accent(i);
+        let involved = i == self.local || t == self.local;
+        let fighter = execution(kind).fighter;
+        match cue {
+            Cue::Whoosh => {
+                self.sfx(Sfx::ExecWhoosh, hand);
+                for _ in 0..6 {
+                    let p = hand + v3(self.rng.range(-0.4, 0.4), self.rng.range(-0.3, 0.5), self.rng.range(-0.4, 0.4));
+                    let life = self.rng.range(0.15, 0.3);
+                    self.particles.push(Particle { pos: p, vel: dir * 2.0, life, max_life: life, size: 0.07, color: accent, gravity: 0.0 });
+                }
+            }
+            Cue::Strike => {
+                self.f[t].hurt_t = self.f[t].hurt_t.max(0.25);
+                self.f[t].hit_part = Part::Chest as u8;
+                self.f[t].flash_t = 0.12;
+                self.wound_fx(chest, dir, false);
+                let s = if self.violence == crate::exec::Violence::Full { Sfx::Flesh } else { Sfx::Kick };
+                self.sfx(s, chest);
+                if involved {
+                    self.shake = self.shake.max(0.25);
+                    self.hitstop = self.hitstop.max(0.04);
+                }
+            }
+            Cue::Disarm => {
+                self.burst(chest - dir * 0.3, [255, 225, 160], 22, 7.0);
+                self.burst(chest - dir * 0.3, [255, 255, 255], 8, 4.0);
+                self.sfx(Sfx::Clang, chest);
+                self.f[t].hurt_t = self.f[t].hurt_t.max(0.2);
+            }
+            Cue::Lethal => {
+                self.wound_fx(chest, dir, true);
+                // a ring of the attacker's colour round the blow
+                for k in 0..18 {
+                    let ang = k as f32 / 18.0 * std::f32::consts::TAU;
+                    let rd = v3(ang.sin(), 0.0, ang.cos());
+                    self.particles.push(Particle { pos: chest, vel: rd * 7.0 + v3(0.0, 0.5, 0.0), life: 0.3, max_life: 0.3, size: 0.09, color: accent, gravity: 0.0 });
+                }
+                self.sfx(Sfx::ExecImpact, chest);
+                self.f[t].hurt_t = 0.3;
+                if involved {
+                    // the impact frame: a hit-pause and a brief high-contrast flash
+                    self.hitstop = self.hitstop.max(0.12);
+                    self.impact_t = 0.16;
+                    self.shake = self.shake.max(0.6);
+                    self.jolt(dir, 1.0);
+                    if self.kind == Kind::Offline {
+                        self.slowmo = self.slowmo.max(0.3);
+                    }
+                } else if (chest - self.f[self.local].pos).len() < 10.0 {
+                    self.shake = self.shake.max(0.25);
+                }
+                if i == self.local {
+                    self.say(format!("EXECUTED! ({})", execution(kind).name));
+                }
+            }
+            Cue::Slam => {
+                let ground = self.world.ground_below(v + v3(0.0, 0.3, 0.0));
+                let at = v3(v.x, ground, v.z) - dir * 0.2;
+                self.impact_fx(at + v3(0.0, 0.05, 0.0), 8);
+                // chunks of floor thrown up
+                for _ in 0..16 {
+                    let r = v3(self.rng.range(-1.0, 1.0), self.rng.range(0.8, 2.0), self.rng.range(-1.0, 1.0));
+                    let life = self.rng.range(0.6, 1.1);
+                    let sp = self.rng.range(2.0, 4.5);
+                    let size = self.rng.range(0.07, 0.16);
+                    self.particles.push(Particle { pos: at + v3(0.0, 0.1, 0.0), vel: r * sp, life, max_life: life, size, color: [118, 108, 96], gravity: 14.0 });
+                }
+                let seed = self.rng.next_u32();
+                self.decals.push(Decal { pos: v3(at.x, ground + 0.025, at.z), size: 1.6, kind: 1, color: [22, 18, 16], life: 14.0, max_life: 14.0, seed });
+                if fighter == 2 {
+                    // the smith's blade is hot: a scorch and sparks from the forge
+                    self.decals.push(Decal { pos: v3(at.x, ground + 0.03, at.z), size: 0.9, kind: 2, color: [255, 120, 40], life: 3.5, max_life: 3.5, seed: seed ^ 0x55 });
+                    self.exec_cue(i, t, kind, Cue::Embers);
+                }
+            }
+            Cue::Shot => {
+                let f = &self.f[i];
+                let gun = if f.loadout.gun2.is_melee() || f.loadout.gun2 == Weapon::Shuriken { f.loadout.gun1 } else { f.loadout.gun2 };
+                let muzzle = a + v3(0.0, 1.35, 0.0) + dir * 0.75;
+                self.flashes.push(Flash { pos: muzzle, dir, life: 0.06, size: 1.2 });
+                self.tracers.push(Tracer::shot(muzzle, chest, gun, [255, 230, 150]));
+                self.sfx(Sfx::gun(gun), muzzle);
+                self.f[i].recoil = 1.0;
+                self.wound_fx(chest, (chest - muzzle).norm(), false);
+            }
+            Cue::Yank => {
+                let from = a + v3(0.0, 1.4, 0.0) + dir * 0.3;
+                self.tracers.push(Tracer { a: from, b: chest, life: 0.5, max_life: 0.5, width: 0.035, color: [96, 84, 66] });
+                self.sfx(Sfx::GrappleFire, from);
+            }
+            Cue::Blur => {
+                self.sfx(Sfx::Vanish, a);
+                for _ in 0..24 {
+                    let r = v3(self.rng.range(-1.0, 1.0), self.rng.range(0.0, 1.8), self.rng.range(-1.0, 1.0));
+                    let life = self.rng.range(0.25, 0.5);
+                    self.particles.push(Particle { pos: a + v3(0.0, 0.2, 0.0) + r * 0.5, vel: r * 1.5, life, max_life: life, size: 0.1, color: accent, gravity: -1.0 });
+                }
+            }
+            Cue::Embers => {
+                for k in 0..30 {
+                    let r = v3(self.rng.range(-1.0, 1.0), self.rng.range(0.5, 1.6), self.rng.range(-1.0, 1.0));
+                    let life = self.rng.range(0.7, 1.5);
+                    // forge-orange, some in the fighter's own colour
+                    let color = if k % 5 == 0 { accent } else if k % 2 == 0 { [255, 150, 50] } else { [255, 210, 110] };
+                    let sp = self.rng.range(0.8, 2.2);
+                    let size = self.rng.range(0.03, 0.06);
+                    self.particles.push(Particle { pos: hand + r * 0.25, vel: r * sp, life, max_life: life, size, color, gravity: -1.2 });
+                }
+            }
+            Cue::Glint => {
+                // the warden's badge catching the light (on the coat's left breast)
+                let side = v3(dir.z, 0.0, -dir.x);
+                let badge = a + v3(0.0, 1.32, 0.0) + dir * 0.18 - side * 0.12;
+                self.particles.push(Particle { pos: badge, vel: V3::ZERO, life: 0.3, max_life: 0.3, size: 0.42, color: [255, 246, 214], gravity: 0.0 });
+                self.particles.push(Particle { pos: badge, vel: V3::ZERO, life: 0.2, max_life: 0.2, size: 0.9, color: [255, 210, 140], gravity: 0.0 });
+                self.sfx(Sfx::ParryPerfect, badge);
+            }
+            Cue::Flip => {
+                self.sfx(Sfx::Jump, a);
+                self.burst(a + v3(0.0, 0.1, 0.0), [200, 190, 170], 10, 3.0);
+            }
+            Cue::Ring => self.sfx(Sfx::ExecRing, chest),
+            Cue::Crowd => {
+                if involved || (chest - self.f[self.local].pos).len() < 14.0 {
+                    self.sfx2d(Sfx::Crowd);
+                    self.exec_line = Some((kind, 0.0));
+                }
             }
         }
+    }
+
+    /// Afterimage copies of fighters in the middle of a speedy execution (the picture only).
+    pub fn exec_ghosts(&self) -> Vec<Fighter> {
+        let mut out = Vec::new();
+        for f in self.f.iter().filter(|f| f.present && f.alive && f.fin > 0) {
+            let kind = f.fin as usize - 1;
+            let e = execution(f.fin);
+            let p = (f.fin_t / e.dur).clamp(0.0, 1.0);
+            let t = f.fin_target.min(self.f.len() - 1);
+            let vp = self.f[t].pos;
+            let line = (vp - f.pos).flat();
+            let dir = if f.fin_dir.len() > 0.5 {
+                f.fin_dir
+            } else if line.len() > 0.05 {
+                line.norm()
+            } else {
+                f.fwd()
+            };
+            for (k, g) in crate::exec::ghosts(kind, p).into_iter().enumerate() {
+                let mut c = f.clone();
+                c.ghost = g.strength.clamp(0.05, 1.0);
+                c.invis_t = 0.0;
+                c.held_by = None;
+                c.exec_pose = None;
+                match g.angle {
+                    Some(ang) => {
+                        // striking from round the victim
+                        let (s, co) = ang.sin_cos();
+                        let back = -dir;
+                        let off = v3(back.x * co - back.z * s, 0.0, back.x * s + back.z * co);
+                        c.pos = vp + off * 1.05;
+                        c.prev_pos = c.pos;
+                        let face = -off;
+                        c.yaw = face.x.atan2(face.z);
+                        c.fin = 0;
+                        c.cur = 0;
+                        c.weapon = c.loadout.melee;
+                        c.slash_idx = (k % 2) as u8;
+                        c.slash_t = (c.weapon.slash_dur() * (1.0 - g.strike)).max(0.001);
+                    }
+                    None => {
+                        // where the attacker was a moment ago, as they were then
+                        let earlier = (p - g.delay).max(0.0);
+                        c.fin_t = earlier * e.dur;
+                        let back = crate::exec::advance(kind, p) - crate::exec::advance(kind, earlier);
+                        c.pos = f.pos - dir * back;
+                        c.prev_pos = c.pos;
+                    }
+                }
+                out.push(c);
+            }
+        }
+        out
     }
 
     /// Throw one star from where you aim (turned `off` radians to the side, for the fan).
@@ -7686,6 +8178,22 @@ impl Game {
 
     fn update_fx(&mut self, dt: f32) {
         self.update_casings(dt);
+        for d in self.decals.iter_mut() {
+            d.life -= dt;
+        }
+        self.decals.retain(|d| d.life > 0.0);
+        if self.decals.len() > 48 {
+            let n = self.decals.len() - 48;
+            self.decals.drain(..n);
+        }
+        self.exec_ask_t = (self.exec_ask_t - dt).max(0.0);
+        self.impact_t = (self.impact_t - dt).max(0.0);
+        if let Some((_, t)) = self.exec_line.as_mut() {
+            *t += dt;
+        }
+        if self.exec_line.is_some_and(|(_, t)| t > 3.2) {
+            self.exec_line = None;
+        }
         self.update_abilities(dt);
         for p in self.particles.iter_mut() {
             p.life -= dt;
@@ -7810,10 +8318,44 @@ impl Game {
                     self.show_confirmed(victim as usize, hp.clamp(0.0, 999.0), ap.clamp(0.0, 999.0), head);
                 }
             }
-            Ev::Finisher { target, kind } => {
+            Ev::ExecAsk { target, open } => {
+                // a player asks to execute someone: the host checks it (as it sees the game) and
+                // picks which one, then tells everyone
                 let t = target as usize;
-                if t < self.f.len() && from < self.f.len() && self.f[t].owned && self.f[t].alive {
-                    self.hold(t, from, kind.clamp(1, FINISHERS.len() as u8));
+                if self.kind == Kind::Host && from < self.f.len() && t < self.f.len() && self.exec_ok(from, t) {
+                    let kind = self.pick_execution(from, t, open);
+                    if self.f[t].owned {
+                        self.hold(t, from, kind);
+                    }
+                    self.f[from].fin_target = t;
+                    self.out_events.push(Ev::Exec { who: from as u8, target, kind });
+                }
+            }
+            Ev::Exec { who, target, kind } => {
+                let (w, t) = (who as usize, target as usize);
+                let host = from == 0 || from == self.host_slot;
+                if self.kind != Kind::Client || !host || w >= self.f.len() || t >= self.f.len() || w == t {
+                    return;
+                }
+                let kind = kind.clamp(1, crate::exec::COUNT as u8);
+                if w == self.local {
+                    // ours: it starts now (if we still can)
+                    let tp = self.f[t].pos;
+                    let ff = &self.f[w];
+                    if ff.alive && ff.fin == 0 && ff.held_by.is_none() && self.f[t].alive {
+                        let mut f = ff.clone();
+                        begin_exec(&mut f, t, kind, tp);
+                        self.f[w] = f;
+                        self.last_finisher = kind;
+                        self.exec_ask_t = 0.0;
+                        self.exec_started(w);
+                    }
+                } else {
+                    // someone else's: who it's on (for the picture), and hold them if they're ours
+                    self.f[w].fin_target = t;
+                    if self.f[t].owned && self.f[t].alive {
+                        self.hold(t, w, kind);
+                    }
                 }
             }
             Ev::Deflect { by, dmg } => {
@@ -9843,8 +10385,9 @@ mod gauntlet_tests {
 #[cfg(test)]
 mod finisher_tests {
     use super::*;
+    use crate::exec::{self, Violence, EXECUTIONS};
 
-    /// You (katana) facing a beaten enemy 1.6 m away, plus a third fighter off to the side.
+    /// You (katana, Corvin) facing a beaten enemy 1.6 m away, plus a third fighter off to the side.
     fn setup() -> Game {
         let mut g = Game::offline("A", 2, 0.5, Mode::Ffa, 50);
         g.world = crate::game::lag_comp_tests::flat_world();
@@ -9857,6 +10400,7 @@ mod finisher_tests {
             g.f[i].ap = 0.0;
             g.f[i].loadout.melee = Weapon::Katana;
         }
+        g.f[0].loadout.body = 0;
         g.f[0].pos = V3::ZERO;
         g.f[0].yaw = 0.0;
         g.f[0].hp = 40.0;
@@ -9873,8 +10417,14 @@ mod finisher_tests {
         g
     }
 
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs / TICK) as usize {
+            g.tick(&Input::default());
+        }
+    }
+
     #[test]
-    fn only_beaten_staggered_enemies_in_reach_can_be_finished() {
+    fn only_beaten_staggered_enemies_in_reach_can_be_executed() {
         let g = setup();
         assert_eq!(g.finish_target(0), Some(1));
         let mut h = setup();
@@ -9893,48 +10443,130 @@ mod finisher_tests {
         assert_eq!(h.finish_target(0), None, "out of reach");
     }
 
+    /// The whole show: one of your fighter's own executions starts, holds the victim, plays for
+    /// 1.5 to 2.5 s with its cues (the blow, the ring-out, the crowd and the announcer), kills,
+    /// and gives back exactly what a finisher always did.
     #[test]
-    fn a_finisher_executes_heals_and_is_counted() {
+    fn an_execution_plays_kills_heals_and_is_counted() {
         let mut g = setup();
         g.tick(&Input { finish: true, ..Default::default() });
         let kind = g.f[0].fin;
-        assert!(kind > 0, "the finisher starts");
-        let style = finisher(kind);
-        assert_eq!(style.weapon, Some(Weapon::Katana), "a katana finisher");
-        assert!(style.dur < 1.0, "under a second");
+        assert!(kind > 0, "it starts");
+        let e = execution(kind);
+        assert_eq!(e.fighter, 0, "one of Corvin's own");
+        assert!(!e.aerial);
         assert_eq!(g.f[1].held_by, Some(0), "the victim is held");
         let mut ticks = 0;
-        while g.f[0].fin > 0 && ticks < 200 {
+        let mut kneeled = false;
+        while g.f[0].fin > 0 && ticks < 400 {
             g.tick(&Input::default());
             ticks += 1;
+            kneeled |= g.f[1].exec_pose.is_some_and(|(k, p)| exec::kneel(k as usize - 1, p) > 0.5);
         }
-        assert!((ticks as f32 * TICK) < 1.0);
-        for _ in 0..30 {
-            g.tick(&Input::default());
-        }
+        let secs = ticks as f32 * TICK;
+        assert!((1.5..=2.55).contains(&secs), "it lasts 1.5 to 2.5 s ({secs})");
+        assert_eq!(kneeled, e.kneel.is_some(), "the victim is posed for it");
+        run(&mut g, 0.3);
         assert!(!g.f[1].alive, "executed");
-        assert_eq!(g.tune.finish_heal, 30.0, "a finisher gives 30 back (was 50)");
-        // (30 at once; the kill's own 20 comes back over a few seconds on top)
+        assert_eq!(g.tune.finish_heal, 30.0, "an execution gives 30 back, as finishers did");
         assert!(g.f[0].hp >= 40.0 + g.tune.finish_heal - 1.0 && g.f[0].hp <= 40.0 + g.tune.finish_heal + g.tune.kill_heal + 1.0, "30 health back: {}", g.f[0].hp);
         assert_eq!(g.f[0].guard_hp, GUARD_MAX);
         assert!(g.feed.iter().any(|l| l.tool == "EXECUTED"));
         assert!(g.career.iter().any(|e| matches!(e, CareerEv::Kill { finisher, .. } if *finisher == kind)));
+        // its sound design: the whoosh, the blow, the ring-out and the crowd; and the announcer
+        for s in [Sfx::ExecWhoosh, Sfx::ExecImpact, Sfx::ExecRing, Sfx::Crowd] {
+            assert!(g.sounds.iter().any(|x| x.0 == s), "plays {s:?}");
+        }
+        assert!(g.exec_line.is_some_and(|(k, _)| k == kind), "the announcer's line shows");
     }
 
+    /// Each of the sixteen runs start to finish in the game and kills on its blow (the right
+    /// fighter, the right blade, the aerial ones on a target in the air).
     #[test]
-    fn a_launched_target_gets_the_aerial_finisher() {
+    fn every_execution_runs_and_kills_on_its_blow() {
+        for (k, e) in EXECUTIONS.iter().enumerate() {
+            let mut g = setup();
+            g.violence = Violence::Full;
+            g.f[0].loadout.body = e.fighter;
+            if e.aerial {
+                g.f[1].pos = v3(0.0, 2.0, 1.6);
+                g.f[1].on_ground = false;
+                g.f[1].float_t = 0.8;
+            }
+            let tp = g.f[1].pos;
+            let mut ff = g.f[0].clone();
+            begin_exec(&mut ff, 1, k as u8 + 1, tp);
+            g.f[0] = ff;
+            g.hold(1, 0, k as u8 + 1);
+            let mut alive_until = 0.0;
+            let mut t = 0.0;
+            while g.f[0].fin > 0 && t < 3.0 {
+                g.tick(&Input::default());
+                t += TICK;
+                if g.f[1].alive {
+                    alive_until = t;
+                }
+            }
+            assert!(!g.f[1].alive, "{}: kills", e.name);
+            assert!((alive_until - e.hit * e.dur).abs() < 0.05, "{}: on its blow ({alive_until} vs {})", e.name, e.hit * e.dur);
+            assert!(g.f[0].alive && g.f[0].fin == 0);
+            if e.cues.iter().any(|c| c.1 == exec::Cue::Slam) {
+                assert!(g.decals.iter().any(|d| d.kind == 1), "{}: the floor cracks", e.name);
+            }
+            assert!(g.decals.iter().any(|d| d.kind == 0), "{}: Full violence leaves a stain", e.name);
+        }
+    }
+
+    /// The aerial one on a target in the air; with it still locked, an unlocked one instead.
+    #[test]
+    fn a_launched_target_gets_the_aerial_execution() {
+        let air = |g: &mut Game| {
+            g.f[1].pos = v3(0.0, 2.0, 1.6);
+            g.f[1].prev_pos = g.f[1].pos;
+            g.f[1].on_ground = false;
+            g.f[1].float_t = 0.8;
+        };
         let mut g = setup();
-        g.f[1].pos = v3(0.0, 2.0, 1.6);
-        g.f[1].prev_pos = g.f[1].pos;
-        g.f[1].on_ground = false;
-        g.f[1].float_t = 0.8;
+        air(&mut g);
         g.tick(&Input { finish: true, ..Default::default() });
         assert!(g.f[0].fin > 0);
-        assert!(finisher(g.f[0].fin).weapon.is_none(), "the aerial one");
+        assert!(execution(g.f[0].fin).aerial, "the aerial one");
+        // with only the first open (a new player), the first it is
+        let mut g = setup();
+        g.fin_locks = !(1u32 << exec::of_fighter(0)[0]);
+        air(&mut g);
+        g.tick(&Input { finish: true, ..Default::default() });
+        assert_eq!(g.f[0].fin as usize - 1, exec::of_fighter(0)[0]);
+    }
+
+    /// Locked executions never play: a new player's fighter always does their first one.
+    #[test]
+    fn locked_executions_are_never_chosen() {
+        for body in 0..4u8 {
+            let mine = exec::of_fighter(body);
+            for seed in 0..12u64 {
+                let mut g = setup();
+                g.rng = Rng(seed * 7919 + 1);
+                g.f[0].loadout.body = body;
+                g.fin_locks = !(1u32 << mine[0]);
+                g.tick(&Input { finish: true, ..Default::default() });
+                assert_eq!(g.f[0].fin as usize - 1, mine[0], "fighter {body}: only the first is open");
+            }
+            // all open: any of the three signature ones
+            let mut seen = std::collections::HashSet::new();
+            for seed in 0..40u64 {
+                let mut g = setup();
+                g.rng = Rng(seed * 104_729 + 3);
+                g.f[0].loadout.body = body;
+                g.tick(&Input { finish: true, ..Default::default() });
+                seen.insert(g.f[0].fin as usize - 1);
+            }
+            assert!(seen.iter().all(|s| mine[..3].contains(s)) && seen.len() >= 2, "fighter {body}: {seen:?}");
+        }
     }
 
     #[test]
-    fn being_hit_cuts_a_finisher_short() {
+    fn being_hit_cuts_an_execution_short() {
         let mut g = setup();
         g.tick(&Input { finish: true, ..Default::default() });
         assert!(g.f[0].fin > 0);
@@ -9943,14 +10575,54 @@ mod finisher_tests {
         let o = g.f[2].chest();
         g.damage(2, 0, 8.0, V3::ZERO, 0.0, false, at, Weapon::Revolver as u8, o, v3(-1.0, 0.0, 0.0));
         assert_eq!(g.f[0].fin, 0, "interrupted");
-        for _ in 0..120 {
-            g.tick(&Input::default());
-        }
+        run(&mut g, 1.0);
         assert!(g.f[1].alive, "the target lives");
+        assert!(g.f[1].held_by.is_none(), "and is let go");
+    }
+
+    /// The one doing it leaves the game mid-execution: the victim is let go at once and lives.
+    #[test]
+    fn the_attacker_leaving_lets_the_victim_go() {
+        let mut g = setup();
+        // the third fighter executes the one in the middle (so the one leaving isn't you)
+        g.f[2].pos = v3(0.0, 0.0, 3.0);
+        g.f[2].prev_pos = g.f[2].pos;
+        let tp = g.f[1].pos;
+        let mut ff = g.f[2].clone();
+        begin_exec(&mut ff, 1, 1, tp);
+        g.f[2] = ff;
+        g.hold(1, 2, 1);
+        run(&mut g, 0.3);
+        assert_eq!(g.f[1].held_by, Some(2));
+        g.remove_player(2);
+        run(&mut g, 0.1);
+        assert!(g.f[1].held_by.is_none(), "let go");
+        run(&mut g, 2.5);
+        assert!(g.f[1].alive, "and alive");
+    }
+
+    /// The one being executed leaves mid-execution: it ends there, with no kill and nothing
+    /// for it (no health, no XP), and the attacker can move again.
+    #[test]
+    fn the_victim_leaving_ends_it_with_nothing() {
+        let mut g = setup();
+        g.tick(&Input { finish: true, ..Default::default() });
+        assert!(g.f[0].fin > 0);
+        run(&mut g, 0.3);
+        let hp = g.f[0].hp;
+        g.remove_player(1);
+        run(&mut g, 0.1);
+        assert_eq!(g.f[0].fin, 0, "it ends");
+        run(&mut g, 2.5);
+        assert!(g.f[0].hp <= hp + 0.01, "no health for it");
+        assert!(!g.career.iter().any(|e| matches!(e, CareerEv::Kill { .. })), "no kill");
+        g.tick(&Input { fwd: 1.0, ..Default::default() });
+        run(&mut g, 0.3);
+        assert!(g.f[0].vel.len() > 0.0 || g.f[0].fin == 0, "free to move");
     }
 
     #[test]
-    fn the_host_checks_finisher_kills() {
+    fn the_host_checks_execution_kills() {
         let g = setup();
         let (o, d) = (g.f[0].chest(), v3(0.0, 0.0, 1.0));
         assert!(g.validate_claim(0, 1, EXEC_TOOL, LETHAL, o, d, false).is_some());
@@ -9958,8 +10630,155 @@ mod finisher_tests {
         healthy.f[1].hp = 90.0;
         assert!(healthy.validate_claim(0, 1, EXEC_TOOL, LETHAL, o, d, false).is_none(), "no executing a healthy player");
     }
-}
 
+    /// Online, a player asks and the host decides: it checks the rules as it sees them, picks
+    /// one of the player's unlocked executions, holds the victim and tells everyone; a second ask
+    /// for the same victim (or a bad one) is turned down; and the player's game starts exactly
+    /// the one the host chose.
+    #[test]
+    fn the_host_decides_which_execution_everyone_sees() {
+        let mut host = Game::new(Kind::Host, 0, Mode::Ffa, 15);
+        host.world = crate::game::lag_comp_tests::flat_world();
+        host.add_player(0, "Host", true, None, 0);
+        host.add_player(1, "Guest", false, None, 0);
+        host.add_player(2, "Other", false, None, 0);
+        host.mt.phase = Phase::Fight;
+        for i in 0..3 {
+            host.f[i].alive = true;
+            host.f[i].spawn_prot = 0.0;
+            host.f[i].on_ground = true;
+        }
+        host.f[1].loadout.body = 2;
+        host.f[1].pos = V3::ZERO;
+        host.f[0].pos = v3(0.0, 0.0, 1.6);
+        host.f[0].hp = 15.0;
+        host.f[0].stagger_t = 0.5;
+        host.f[2].pos = v3(1.0, 0.0, 1.0);
+        // a bad ask: the target is healthy
+        host.f[2].hp = 100.0;
+        host.handle_remote_event(1, Ev::ExecAsk { target: 2, open: 0b1111 });
+        assert!(host.out_events.iter().all(|e| !matches!(e, Ev::Exec { .. })), "turned down");
+        // a good one: only Anvil's first and third open
+        host.handle_remote_event(1, Ev::ExecAsk { target: 0, open: 0b0101 });
+        let chosen = host.out_events.iter().find_map(|e| if let Ev::Exec { who: 1, target: 0, kind } = e { Some(*kind) } else { None }).expect("the host says go");
+        let mine = exec::of_fighter(2);
+        assert!([mine[0], mine[2]].contains(&(chosen as usize - 1)), "one of the player's unlocked ones ({chosen})");
+        assert_eq!(host.f[0].held_by, Some(1), "the host's own fighter is held");
+        // a second player asking for the same victim right after: no
+        host.out_events.clear();
+        host.f[2].pos = v3(0.0, 0.0, 3.0);
+        host.handle_remote_event(2, Ev::ExecAsk { target: 0, open: 1 });
+        assert!(host.out_events.is_empty(), "one execution per victim");
+        // the player's game: it asked (and didn't start on its own), then plays the host's choice
+        let mut cli = Game::new(Kind::Client, 1, Mode::Ffa, 15);
+        cli.world = crate::game::lag_comp_tests::flat_world();
+        for (s, n) in [(0, "Host"), (1, "Guest"), (2, "Other")] {
+            cli.add_player(s, n, s == 1, None, 0);
+        }
+        cli.mt.phase = Phase::Fight;
+        cli.f[1].owned = true;
+        for i in 0..3 {
+            cli.f[i].alive = true;
+            cli.f[i].spawn_prot = 0.0;
+            cli.f[i].on_ground = true;
+        }
+        cli.f[1].loadout.body = 2;
+        cli.f[1].pos = V3::ZERO;
+        cli.f[0].pos = v3(0.0, 0.0, 1.6);
+        cli.f[0].hp = 15.0;
+        cli.f[0].stagger_t = 0.5;
+        cli.f[0].stun_t = 0.5;
+        cli.tick(&Input { finish: true, ..Default::default() });
+        assert_eq!(cli.f[1].fin, 0, "a player doesn't start one on their own");
+        assert!(cli.out_events.iter().any(|e| matches!(e, Ev::ExecAsk { target: 0, .. })), "it asks the host");
+        cli.handle_remote_event(0, Ev::Exec { who: 1, target: 0, kind: chosen });
+        assert_eq!(cli.f[1].fin, chosen, "the host's choice plays");
+        // a third player's game sees the same one on the same victim
+        let mut third = Game::new(Kind::Client, 2, Mode::Ffa, 15);
+        for (s, n) in [(0, "Host"), (1, "Guest"), (2, "Other")] {
+            third.add_player(s, n, s == 2, None, 0);
+        }
+        third.handle_remote_event(0, Ev::Exec { who: 1, target: 0, kind: chosen });
+        assert_eq!(third.f[1].fin_target, 0);
+        // and only the host may say so
+        let mut cheat = Game::new(Kind::Client, 1, Mode::Ffa, 15);
+        cheat.add_player(1, "Guest", true, None, 0);
+        cheat.add_player(2, "Other", false, None, 0);
+        cheat.f[1].alive = true;
+        cheat.f[2].alive = true;
+        cheat.handle_remote_event(2, Ev::Exec { who: 1, target: 2, kind: 1 });
+        assert_eq!(cheat.f[1].fin, 0, "not from another player");
+    }
+
+    /// Violence: Full sprays blood and stains the floor; Reduced shows sparks and dark
+    /// particles; Off white flashes. No red in Reduced or Off, from executions or ordinary hits.
+    #[test]
+    fn the_violence_setting_changes_every_wound() {
+        for v in Violence::ALL {
+            let mut g = setup();
+            g.violence = v;
+            g.tick(&Input { finish: true, ..Default::default() });
+            run(&mut g, 2.6);
+            g.impact_fx(v3(0.0, 1.0, 3.0), 1);
+            g.impact_fx(v3(0.0, 1.0, 3.0), 5);
+            let red = g.particles.iter().filter(|p| exec::is_blood(p.color)).count();
+            let stains = g.decals.iter().filter(|d| d.kind == 0).count();
+            match v {
+                Violence::Full => assert!(red > 10 && stains > 0, "Full: blood ({red}) and a stain ({stains})"),
+                _ => assert!(red == 0 && stains == 0, "{v:?}: no blood ({red}, {stains})"),
+            }
+            if v == Violence::Off {
+                assert!(g.particles.iter().any(|p| p.color == [255, 255, 255]), "Off: white flashes");
+            }
+        }
+        assert_eq!(Violence::default(), Violence::Reduced, "Reduced by default");
+    }
+
+    /// Where everyone stands through each execution (for checking the camera's framing).
+    /// `cargo test probe_exec_positions -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_exec_positions() {
+        for style in [4usize, 12, 14] {
+            let e = &EXECUTIONS[style];
+            let mut g = Game::exec_preview("Me", e.fighter, style, false);
+            let mut next = 0.0;
+            for _ in 0..(4.0 / TICK) as usize {
+                g.tick(&Input::default());
+                let f = &g.f[0];
+                if f.fin > 0 {
+                    let p = f.fin_t / e.dur;
+                    if p >= next {
+                        next += 0.1;
+                        let (cam, look, _) = exec::camera(style, p, f.pos, g.f[1].pos, false);
+                        println!("{} p {p:.2}: attacker {:?} yaw {:.2} victim {:?} alive {} | cam {cam:?} look {look:?}", e.name, f.pos, f.yaw, g.f[1].pos, g.f[1].alive);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A preview (Fighters & Mastery) plays the chosen one on a dummy, counts nothing, and ends.
+    #[test]
+    fn a_preview_plays_the_chosen_execution_and_ends() {
+        for style in [0usize, 7, 11, 12] {
+            let mut g = Game::exec_preview("Me", EXECUTIONS[style].fighter, style, false);
+            let mut seen = 0;
+            for _ in 0..(5.0 / TICK) as usize {
+                g.tick(&Input::default());
+                if g.f[0].fin > 0 {
+                    seen = g.f[0].fin;
+                }
+                if g.preview.as_ref().is_some_and(|p| p.done) {
+                    break;
+                }
+            }
+            assert_eq!(seen as usize, style + 1, "plays the one asked for");
+            assert!(g.preview.as_ref().is_some_and(|p| p.done), "and ends");
+            assert!(!g.f[1].alive, "on the dummy");
+        }
+    }
+}
 #[cfg(test)]
 mod body_tests {
     use super::*;
@@ -10474,6 +11293,66 @@ mod net_play_tests {
             p.cn.send(g, dt);
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    /// Over a real connection: the player executes the host's fighter. The player's game asks,
+    /// the host decides and holds its fighter, both computers play the same execution, the blow
+    /// kills on the host, and the player's fighter is free again afterwards.
+    #[test]
+    fn an_execution_over_the_network_is_the_same_on_both_computers() {
+        let mut p = pair(Mode::Ffa, 50);
+        let mut asked = false;
+        let mut client_kind = 0u8;
+        let mut host_kind = 0u8;
+        let mut held = false;
+        for frame in 0..900 {
+            // the host's fighter: beaten and staggered, standing 1.6 m in front of the player
+            if !asked || client_kind == 0 {
+                let hf = &mut p.hg.f[0];
+                hf.pos = v3(0.0, 0.0, 1.6);
+                hf.prev_pos = hf.pos;
+                hf.hp = 15.0;
+                hf.ap = 0.0;
+                hf.stagger_t = 0.5;
+                hf.stun_t = 0.5;
+                hf.spawn_prot = 0.0;
+                hf.alive = true;
+            }
+            let mut ci = Input::default();
+            if let Some(g) = p.cg.as_mut() {
+                let l = g.local;
+                if client_kind == 0 {
+                    g.f[l].pos = V3::ZERO;
+                    g.f[l].prev_pos = V3::ZERO;
+                    g.f[l].spawn_prot = 0.0;
+                }
+                // once the host's fighter shows up hurt and staggered here, press execute
+                if frame > 30 && !asked && g.finish_target(l) == Some(0) {
+                    ci.finish = true;
+                    ci.yaw = 0.0;
+                    asked = true;
+                }
+            }
+            pump(&mut p, &Input::default(), &ci);
+            let g = p.cg.as_ref().unwrap();
+            if g.f[g.local].fin > 0 && client_kind == 0 {
+                client_kind = g.f[g.local].fin;
+            }
+            if p.hg.f[1].fin > 0 && host_kind == 0 {
+                host_kind = p.hg.f[1].fin;
+            }
+            held |= p.hg.f[0].held_by == Some(1);
+            if client_kind > 0 && !p.hg.f[0].alive && g.f[g.local].fin == 0 {
+                break;
+            }
+        }
+        assert!(asked, "the player could execute");
+        assert!(client_kind > 0, "the player's execution started (the host said go)");
+        assert_eq!(host_kind, client_kind, "the host sees the same execution");
+        assert!(held, "the host held its fighter for it");
+        assert!(!p.hg.f[0].alive, "the blow killed on the host");
+        let g = p.cg.as_ref().unwrap();
+        assert_eq!(g.f[g.local].fin, 0, "and the player is free again");
     }
 
     /// Five duel rounds, each won by the host: round numbers and wins go up by exactly one each

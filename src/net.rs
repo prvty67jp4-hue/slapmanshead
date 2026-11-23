@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 const MAGIC: [u8; 4] = *b"DRB2";
 /// The protocol version as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA9";
+pub const PROTOCOL: &str = "DRA10";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
@@ -150,7 +150,7 @@ pub struct FState {
     pub flags4: u8,
     /// Ability charge (hundredths; shown on enemies' nameplates up close).
     pub ab: u8,
-    /// Finisher style being played (number + 1; 0 = none).
+    /// Execution being played (number + 1; 0 = none; see crate::exec).
     pub fin: u8,
     pub slash_t: f32,
     pub slash_idx: u8,
@@ -206,7 +206,7 @@ fn read_fstate(r: &mut R) -> Option<FState> {
         flags3: r.u8()?,
         flags4: r.u8()?,
         ab: r.u8()?,
-        fin: r.u8()?.min(crate::game::FINISHERS.len() as u8),
+        fin: r.u8()?.min(crate::exec::COUNT as u8),
         slash_t: r.f()?,
         slash_idx: r.u8()?,
         hurt_t: r.f()?,
@@ -287,8 +287,14 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.f(*ap);
             w.u8(*head as u8);
         }
-        Ev::Finisher { target, kind } => {
+        Ev::ExecAsk { target, open } => {
             w.u8(10);
+            w.u8(*target);
+            w.u8(*open);
+        }
+        Ev::Exec { who, target, kind } => {
+            w.u8(14);
+            w.u8(*who);
             w.u8(*target);
             w.u8(*kind);
         }
@@ -312,7 +318,8 @@ fn read_ev(r: &mut R) -> Option<Ev> {
         9 => Ev::Deflect { by: r.u8()?, dmg: r.f()?.clamp(0.0, 60.0) },
         11 => Ev::Ability { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.min(3), p: r.v()?, d: clamp_v(r.v()?, 40.0) },
         12 => Ev::Confirm { attacker: r.u8()?.min(MAX_PLAYERS as u8 - 1), victim: r.u8()?.min(MAX_PLAYERS as u8 - 1), hp: r.f()?.clamp(0.0, 999.0), ap: r.f()?.clamp(0.0, 999.0), head: r.u8()? != 0 },
-        10 => Ev::Finisher { target: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.clamp(1, crate::game::FINISHERS.len() as u8) },
+        10 => Ev::ExecAsk { target: r.u8()?.min(MAX_PLAYERS as u8 - 1), open: r.u8()? & 0b1111 },
+        14 => Ev::Exec { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), target: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.clamp(1, crate::exec::COUNT as u8) },
         _ => return None,
     })
 }
@@ -969,7 +976,7 @@ impl Net {
                     if id > self.last_in[slot] {
                         self.last_in[slot] = id;
                         // pass on what others need to see; hit claims stay here until checked
-                        if matches!(ev, Ev::Shot { .. } | Ev::Grenade { .. } | Ev::Chat { .. } | Ev::Finisher { .. }) {
+                        if matches!(ev, Ev::Shot { .. } | Ev::Grenade { .. } | Ev::Chat { .. }) {
                             self.out.push_back((slot as u8, id, Instant::now(), ev.clone()));
                         }
                         fresh_evs.push(ev);
@@ -1776,10 +1783,24 @@ mod finisher_net_tests {
             Some(Ev::Ability { who: 2, kind: 1, p, d }) => assert!(p.z == 3.0 && d.z <= 40.0, "an ability crosses the network (its throw clamped)"),
             other => panic!("{other:?}"),
         }
+        // an execution: asked for by a player, decided by the host
         let mut w = W(Vec::new());
-        write_ev(&mut w, &Ev::Finisher { target: 3, kind: 5 });
+        write_ev(&mut w, &Ev::ExecAsk { target: 3, open: 0b1011 });
         match read_ev(&mut R { b: &w.0, i: 0 }) {
-            Some(Ev::Finisher { target: 3, kind: 5 }) => {}
+            Some(Ev::ExecAsk { target: 3, open: 0b1011 }) => {}
+            e => panic!("{e:?}"),
+        }
+        let mut w = W(Vec::new());
+        write_ev(&mut w, &Ev::Exec { who: 2, target: 3, kind: 14 });
+        match read_ev(&mut R { b: &w.0, i: 0 }) {
+            Some(Ev::Exec { who: 2, target: 3, kind: 14 }) => {}
+            e => panic!("{e:?}"),
+        }
+        // nonsense is clamped: no execution past the last one, no slot past the last
+        let mut w = W(Vec::new());
+        write_ev(&mut w, &Ev::Exec { who: 200, target: 9, kind: 99 });
+        match read_ev(&mut R { b: &w.0, i: 0 }) {
+            Some(Ev::Exec { who, target, kind }) => assert!((who as usize) < MAX_PLAYERS && (target as usize) < MAX_PLAYERS && kind as usize == crate::exec::COUNT),
             e => panic!("{e:?}"),
         }
         let mut f = Fighter::new("x", 1, true);

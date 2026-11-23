@@ -9,6 +9,7 @@ mod chars;
 #[cfg(test)]
 mod duel_bench;
 mod env;
+mod exec;
 mod game;
 mod gpu;
 mod math;
@@ -81,6 +82,8 @@ struct Settings {
     cross_size: f32,
     /// The crosshair's dot turns red over an enemy.
     cross_red: bool,
+    /// Settings > Game > Violence: 0 Full, 1 Reduced (the default), 2 Off (see exec::Violence).
+    violence: u8,
     /// Servers joined before, newest first.
     recent: Vec<RecentServer>,
     /// Network test: pretend the connection has extra lag and loses packets.
@@ -192,7 +195,7 @@ const ACTIONS: [(&str, &str); N_ACTIONS] = [
     ("slide", "Slide (while running)"),
     ("music", "Music on / off"),
     ("kick", "Kick"),
-    ("finish", "Finisher"),
+    ("finish", "Execution"),
     ("ability", "Ability"),
 ];
 
@@ -333,6 +336,7 @@ impl Default for Settings {
             cross_color: [255, 255, 255],
             cross_size: 0.8,
             cross_red: true,
+            violence: 1,
             recent: Vec::new(),
             net_test: false,
             net_lag: 100.0,
@@ -443,6 +447,7 @@ impl Settings {
                             "net_loss" => s.net_loss = v.parse().unwrap_or(5.0f32).clamp(0.0, 30.0),
                             "cross_size" => s.cross_size = v.parse().unwrap_or(0.8f32).clamp(0.5, 2.0),
                             "cross_red" => s.cross_red = v != "0",
+                            "violence" => s.violence = v.parse().unwrap_or(1u8).min(2),
                             "pad_sens" => s.pad_sens = v.parse().unwrap_or(1.0f32).clamp(0.2, 3.0),
                             "pad_invert" => s.pad_invert = v == "1",
                             "aim_assist" => s.aim_assist = v != "0",
@@ -544,8 +549,8 @@ impl Settings {
             );
             let [r, g, b] = self.cross_color;
             text += &format!(
-                "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\naim_v=3\n",
-                self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8
+                "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\nviolence={}\naim_v=3\n",
+                self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8, self.violence
             );
             text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\nabilities={}\nauto_update={}\noutfits={},{},{},{}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8, self.abilities as u8, self.auto_update as u8, self.outfits[0], self.outfits[1], self.outfits[2], self.outfits[3]);
             let f = self.post;
@@ -730,6 +735,10 @@ struct App {
     quick: Option<f32>,
     /// A Quick Play lobby: keep it filled with bots.
     quick_host: bool,
+    /// Where an execution preview goes back to when it ends.
+    preview_back: Option<Page>,
+    /// An execution's camera: which shot (execution, shot, victim's view) and the angle chosen for it.
+    exec_cam: std::cell::Cell<((u8, usize, bool), usize)>,
     /// The News / Patch notes text.
     news: String,
     /// Where the menu fighter stands and which way the camera looks at them from.
@@ -883,6 +892,8 @@ impl App {
             match_xp: 0,
             quick: None,
             quick_host: false,
+            preview_back: None,
+            exec_cam: std::cell::Cell::new(((0, 0, false), 0)),
             news: load_news(),
             show_spot: (V3::ZERO, 0.0),
             menu_fx: 0.64,
@@ -1038,6 +1049,48 @@ impl App {
             app.autoplay = true;
             app.start_game(g, None);
         }
+        // hidden test mode: an execution on a dummy. DUEL_EXEC=<number 0-15>[,<share to stop at>]
+        // (with DUEL_EXEC_LOOP=1 it plays again and again, with DUEL_BOTS bots fighting round it)
+        if let Ok(v) = std::env::var("DUEL_EXEC") {
+            let mut parts = v.split(',');
+            let style = parts.next().and_then(|x| x.trim().parse::<usize>().ok()).unwrap_or(0).min(exec::COUNT - 1);
+            let at = parts.next().and_then(|x| x.trim().parse::<f32>().ok());
+            let looping = std::env::var_os("DUEL_EXEC_LOOP").is_some();
+            let mut g = Game::exec_preview("Tester", exec::EXECUTIONS[style].fighter, style, looping);
+            if let Some(pv) = g.preview.as_mut() {
+                pv.freeze_at = at;
+            }
+            // DUEL_EXEC_SPOT=wall: a wall right behind the attacker; side: a wall at their right
+            match std::env::var("DUEL_EXEC_SPOT").as_deref() {
+                Ok("wall") => {
+                    let o = v3(0.0, 1.0, -9.0);
+                    if let Some((h, _)) = g.world.raycast(o, v3(0.0, 0.0, -1.0), 40.0) {
+                        g.move_preview(v3(0.0, 0.0, -9.0 - h + 0.9), v3(0.0, 0.0, 1.0));
+                    }
+                }
+                Ok("side") => {
+                    let o = v3(0.0, 1.0, -9.0);
+                    if let Some((h, _)) = g.world.raycast(o, v3(1.0, 0.0, 0.0), 40.0) {
+                        g.move_preview(v3(h - 0.9, 0.0, -9.0), v3(0.0, 0.0, 1.0));
+                    }
+                }
+                _ => {}
+            }
+            if looping {
+                // a full lobby round it: bots fighting each other further off
+                let nb: usize = std::env::var("DUEL_BOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(6).min(game::MAX_PLAYERS - 2);
+                for k in 0..nb {
+                    let s = k + 2;
+                    g.add_player(s, &format!("Bot {s}"), true, Some(0.0), 0);
+                    g.bots[s] = Some(bot::Bot::new(0.7, 20 + s as u64));
+                    let a = k as f32 / nb.max(1) as f32 * std::f32::consts::TAU;
+                    g.f[s].respawn_at(v3(a.sin() * 9.0, 0.0, a.cos() * 9.0 + 4.0), a);
+                    g.f[s].ready = true;
+                }
+            }
+            app.autoplay = true;
+            app.start_game(g, None);
+        }
         // hidden test mode: the training room at lesson N (a bot hits the dummies unless DUEL_HUMAN)
         if let Ok(n) = std::env::var("DUEL_TRAIN") {
             let mut g = Game::training("Tester");
@@ -1071,10 +1124,11 @@ impl App {
 
     fn start_game(&mut self, mut game: Game, net: Option<Net>) {
         let l = game.local;
-        if game.train.is_none() {
+        let own = game.train.is_none() && game.preview.is_none();
+        if own {
             game.my_loadout = self.settings.loadout;
         }
-        if game.f[l].present && !game.f[l].is_bot && game.train.is_none() {
+        if game.f[l].present && !game.f[l].is_bot && own {
             game.f[l].loadout = self.settings.loadout;
             game.f[l].equip();
         }
@@ -1132,6 +1186,14 @@ impl App {
         self.ip_announced = false;
         self.start_game(g, Some(n));
         Ok(())
+    }
+
+    /// Watch an execution on a training dummy (Fighters & Mastery), then come back to ack.
+    fn start_exec_preview(&mut self, body: u8, style: usize, back: Page) {
+        let name = clean_name(&self.settings.name, 0);
+        let g = Game::exec_preview(&name, body, style, false);
+        self.preview_back = Some(back);
+        self.start_game(g, None);
     }
 
     fn leave_to_menu(&mut self) {
@@ -1207,7 +1269,9 @@ impl App {
     /// Count what happened for the career stats (and the XP it earns).
     fn career_frame(&mut self) {
         let Screen::Play { game, .. } = &mut self.screen else { return };
-        if game.kind == Kind::Demo {
+        // (a preview of an execution, or a test run with a fixed violence setting, counts nothing)
+        game.violence = exec::Violence::from_u8(self.settings.violence);
+        if game.kind == Kind::Demo || game.preview.is_some() {
             game.career.clear();
             return;
         }
@@ -1215,7 +1279,7 @@ impl App {
             self.match_xp = 0;
         }
         let body = game.f[game.local].loadout.body;
-        // your finishers: the ones this fighter's mastery has opened
+        // your executions: the ones this fighter's mastery has opened
         game.fin_locks = self.career.finisher_locks(body);
         let evs = std::mem::take(&mut game.career);
         if evs.is_empty() {
@@ -1228,7 +1292,7 @@ impl App {
             self.match_xp += xp;
             if let CareerEv::Kill { finisher, .. } = ev {
                 if finisher > 0 {
-                    game.say(format!("+{xp} XP (finisher)"));
+                    game.say(format!("+{xp} XP (execution)"));
                 }
             }
         }
@@ -1826,6 +1890,17 @@ impl App {
                         ui.label(egui::RichText::new("Steam isn't running, so the name above is used as typed (with Steam, your Steam name is used unless you untick it here).").size(12.5).color(Color32::from_gray(175)));
                     }
                 }
+                ui_kit::section(ui, "Gameplay");
+                ui.horizontal(|ui| {
+                    ui.label("Violence");
+                    for v in exec::Violence::ALL {
+                        let sel = self.settings.violence == v as u8;
+                        if ui.selectable_label(sel, v.name()).on_hover_text(v.blurb()).clicked() {
+                            self.settings.violence = v as u8;
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new(exec::Violence::from_u8(self.settings.violence).blurb()).size(12.5).color(Color32::from_gray(175)));
                 ui_kit::section(ui, "Mouse and sound");
                 ui.add(egui::Slider::new(&mut self.settings.sens, 0.2..=3.0).text("mouse sensitivity"));
                 ui.add(egui::Slider::new(&mut self.settings.fov, 60.0..=110.0).text("field of view"));
@@ -2851,7 +2926,9 @@ impl App {
         let shot_frame: u32 = std::env::var("DUEL_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
         let killcam_now = std::env::var_os("DUEL_SHOT_KILLCAM").is_some()
             && matches!(&self.screen, Screen::Play { game, .. } if game.killcam.as_ref().map_or(false, |k| k.t > 1.3));
-        if (self.frames >= shot_frame || killcam_now) && !self.shot_requested {
+        // an execution still (DUEL_EXEC=n,share): as soon as time has stopped at that moment
+        let exec_still = std::env::var_os("DUEL_EXEC").is_some() && matches!(&self.screen, Screen::Play { game, .. } if game.hitstop > 1e5) && self.frames > 20;
+        if (self.frames >= shot_frame || killcam_now || exec_still) && !self.shot_requested {
             self.shot_requested = true;
             let slot = self.shot_slot.clone();
             ctx.request_screenshot(move |img| {
@@ -3150,6 +3227,15 @@ impl App {
         self.gauntlet_frame();
         self.watchdog.stage("career stats (saving)");
         self.career_frame();
+        // a finished execution preview goes back to where it was opened
+        if let Screen::Play { game, .. } = &self.screen {
+            if game.preview.as_ref().is_some_and(|p| p.done) && self.screenshot.is_none() {
+                let back = self.preview_back.take().unwrap_or(Page::Mastery);
+                self.leave_to_menu();
+                self.screen = Screen::Menu(back);
+                return;
+            }
+        }
         self.watchdog.stage("network");
         let Screen::Play { game, net } = &mut self.screen else { return };
         if let Some(n) = net.as_mut() {
@@ -3512,45 +3598,32 @@ impl App {
             let d = (target - pos).norm();
             return (Cam::new(pos, d.x.atan2(d.z), d.y.clamp(-1.0, 1.0).asin(), 62.0, rect), body);
         }
-        // doing a finisher: a short cinematic cut-in from the side, slowly orbiting
-        if f.alive && f.fin > 0 && f.fin_target < game.f.len() {
-            let t = &game.f[f.fin_target];
-            let tp = t.prev_pos.lerp(t.pos, alpha);
-            let mid = (body + tp) * 0.5 + v3(0.0, 1.1, 0.0);
-            let line = (tp - body).flat();
-            let line = if line.len() > 0.05 { line.norm() } else { yaw_fwd(f.yaw) };
-            let side = v3(line.z, 0.0, -line.x);
-            let pr = (f.fin_t / finisher(f.fin).dur).clamp(0.0, 1.0);
-            let o = 0.45 - 0.6 * pr;
-            let out = (side * o.cos() - line * (o.sin() * 0.8) + v3(0.0, 0.28, 0.0)).norm();
-            let mut dist = 3.3;
-            if let Some((hit, _)) = game.world.raycast(mid, out, dist + 0.3) {
-                dist = (hit - 0.3).max(0.9);
-            }
-            let pos = mid + out * dist;
-            let d = (mid - pos).norm();
-            return (Cam::new(pos, d.x.atan2(d.z), d.y.asin(), 56.0, rect), body);
-        }
-        // caught in a finisher: a low angle looking up at whoever is doing it
-        if let (true, Some(a)) = (f.alive, f.held_by) {
-            if a < game.f.len() {
-                let at = game.f[a].prev_pos.lerp(game.f[a].pos, alpha);
-                let line = (at - body).flat();
-                let line = if line.len() > 0.05 { line.norm() } else { yaw_fwd(f.yaw) };
-                let side = v3(line.z, 0.0, -line.x);
-                let look = at + v3(0.0, 1.55, 0.0);
-                let base = body + v3(0.0, 0.35, 0.0);
-                let out = (-line * 1.5 + side * 0.65).norm();
-                let mut dist = 1.7;
-                if let Some((hit, _)) = game.world.raycast(base, out, dist + 0.2) {
-                    dist = (hit - 0.2).max(0.5);
+        // an execution, done or suffered: its cinematic camera (crate::exec::camera): cut-ins, an
+        // orbit, a push-in to the blow; the one being executed sees it from below
+        if f.alive {
+            let doing = (f.fin > 0 && f.fin_target < game.f.len()).then_some((l, f.fin_target, f.fin_t, f.fin, false));
+            let suffering = game.f.iter().enumerate().find(|(k, a)| *k != l && a.present && a.alive && a.fin > 0 && a.fin_target == l).map(|(k, a)| (k, l, a.fin_t, a.fin, true));
+            if let Some((a, v, ft, kind, victim_view)) = doing.or(suffering) {
+                let af = &game.f[a];
+                let vf = &game.f[v];
+                let ap = if a == l { body } else { af.prev_pos.lerp(af.pos, alpha) };
+                let vp = if v == l { body } else { vf.prev_pos.lerp(vf.pos, alpha) };
+                let e = crate::exec::execution(kind);
+                let p = (ft / e.dur).clamp(0.0, 1.0);
+                // the authored shot when it frames both fighters and the weapon with nothing in the
+                // way, else another angle round them, pulled in, or over the shoulder (exec::camera_safe)
+                let shot = crate::exec::shot_index(kind as usize - 1, p, victim_view);
+                let (key, prev) = self.exec_cam.get();
+                let prefer = (key == (kind, shot, victim_view)).then_some(prev);
+                let (pos, look, fov, chosen) = crate::exec::camera_safe(&game.world, kind as usize - 1, p, ap, vp, victim_view, prefer);
+                self.exec_cam.set(((kind, shot, victim_view), chosen));
+                let dir = (look - pos).norm();
+                if std::env::var_os("DUEL_EXEC_DEBUG").is_some() {
+                    eprintln!("EXECCAM p {p:.3} a {ap:?} v {vp:?} cam {pos:?} look {look:?} local {l} kind {kind} victim_view {victim_view}");
                 }
-                let pos = base + out * dist;
-                let d = (look - pos).norm();
-                return (Cam::new(pos, d.x.atan2(d.z), d.y.clamp(-1.0, 1.0).asin(), 62.0, rect), body);
+                return (Cam::new(pos, dir.x.atan2(dir.z), dir.y.clamp(-1.0, 1.0).asin(), fov, rect), body);
             }
-        }
-        // watching: follow someone still fighting
+        }        // watching: follow someone still fighting
         let watching = f.spectate || (!f.alive && game.mt.mode.rounds() && game.mt.phase == Phase::Fight);
         if watching {
             let pick = game.mt.duel.iter().map(|&d| d as usize).chain(0..game.f.len()).find(|&i| i < game.f.len() && i != l && game.f[i].present && game.f[i].alive && !game.f[i].spectate);
@@ -4036,9 +4109,9 @@ fn gallery_pose(g: &mut Game, page: &str) {
                     f.kick_t = (KICK_TIME - hit - if phase >= 0.0 { -hit * phase } else { (KICK_TIME - hit) * -phase * 0.5 }).clamp(0.01, KICK_TIME);
                 }
                 _ => {
-                    // a finisher (Overhead Crush)
-                    let st = finisher(7);
-                    f.fin = 7;
+                    // an execution (Hammer Falls)
+                    let st = crate::exec::execution(9);
+                    f.fin = 9;
                     f.fin_target = 0;
                     f.fin_t = (st.hit - if phase >= 0.0 { st.hit * phase * 0.5 } else { -(1.0 - st.hit) * phase * 0.5 }) * st.dur;
                 }
@@ -4639,6 +4712,86 @@ fn draw_training(p: &egui::Painter, rect: Rect, s: f32, margin: f32, t: &Trainin
 }
 
 impl App {
+    /// An execution you're doing or caught in: letterbox bars sliding in, its name on a title
+    /// card, the impact frame's high-contrast flash at the blow, and the announcer's line after.
+    fn draw_execution(&self, p: &egui::Painter, rect: Rect, g: &Game, s: f32) {
+        let l = g.local;
+        let me = &g.f[l];
+        let doing = (me.alive && me.fin > 0).then_some((l, me.fin, me.fin_t));
+        let suffering = g.f.iter().enumerate().find(|(k, a)| *k != l && a.present && a.alive && a.fin > 0 && a.fin_target == l).map(|(k, a)| (k, a.fin, a.fin_t));
+        let c = rect.center();
+        if let Some((who, kind, ft)) = doing.or(suffering) {
+            let e = exec::execution(kind);
+            let pr = (ft / e.dur).clamp(0.0, 1.0);
+            // bars in over the first tenth, out over the last
+            let k = (pr / 0.1).min(1.0).min((1.0 - pr) / 0.08).clamp(0.0, 1.0);
+            let k = k * k * (3.0 - 2.0 * k);
+            let bar_h = rect.height() * 0.12 * k;
+            p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
+            p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - bar_h), Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
+            // the title card: the execution's name over a slash of the fighter's colour
+            let acc = g.accent(who);
+            let m = acc[0].max(acc[1]).max(acc[2]).max(1) as f32;
+            let bright = |a: u8| Color32::from_rgba_unmultiplied((acc[0] as f32 / m * 255.0) as u8, (acc[1] as f32 / m * 255.0) as u8, (acc[2] as f32 / m * 255.0) as u8, a);
+            let shown = ((pr - 0.04) / 0.08).clamp(0.0, 1.0) * ((1.0 - pr) / 0.1).clamp(0.0, 1.0);
+            if shown > 0.0 {
+                let a = (255.0 * shown) as u8;
+                let slide = (1.0 - shown) * 60.0 * s;
+                let y = rect.top() + bar_h.max(rect.height() * 0.06) + 34.0 * s;
+                let x = rect.left() + 46.0 * s - slide;
+                let slash = [Pos2::new(x - 18.0 * s, y + 26.0 * s), Pos2::new(x + 380.0 * s, y + 26.0 * s), Pos2::new(x + 400.0 * s, y - 30.0 * s), Pos2::new(x + 2.0 * s, y - 30.0 * s)];
+                p.add(egui::Shape::convex_polygon(slash.to_vec(), Color32::from_rgba_unmultiplied(12, 10, 14, (200.0 * shown) as u8), Stroke::NONE));
+                p.rect_filled(Rect::from_min_size(Pos2::new(x - 18.0 * s, y + 24.0 * s), Vec2::new(398.0 * s, 4.0 * s)), 0.0, bright(a));
+                text_display(p, Pos2::new(x, y - 2.0 * s), Align2::LEFT_CENTER, &e.name.to_uppercase(), 34.0 * s, Color32::from_rgba_unmultiplied(250, 244, 236, a));
+                let sub = format!("{}  ·  EXECUTION", chars::name(e.fighter).to_uppercase());
+                text_shadow(p, Pos2::new(x + 2.0 * s, y + 38.0 * s), Align2::LEFT_CENTER, &sub, 13.0 * s, bright(a));
+            }
+        }
+        // the slow motion round the blow: the picture's edges darken and close in
+        if let Some((_, kind, ft)) = doing.or(suffering) {
+            let e = exec::execution(kind);
+            let pr = (ft / e.dur).clamp(0.0, 1.0);
+            let k = ((pr - e.slow.0) / 0.03).clamp(0.0, 1.0) * ((e.slow.1 - pr) / 0.04).clamp(0.0, 1.0);
+            if k > 0.0 {
+                let w = rect.width() * 0.1;
+                for (i, f) in [0.5f32, 0.3, 0.15].iter().enumerate() {
+                    let ww = w * (i as f32 + 1.0) / 3.0;
+                    let col = Color32::from_rgba_unmultiplied(0, 0, 0, (120.0 * k * f) as u8);
+                    p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(ww, rect.height())), 0.0, col);
+                    p.rect_filled(Rect::from_min_size(Pos2::new(rect.right() - ww, rect.top()), Vec2::new(ww, rect.height())), 0.0, col);
+                }
+            }
+        }
+        // the impact frame: a white flash, then a moment of stark contrast (dark edges)
+        if g.impact_t > 0.0 {
+            let k = (g.impact_t / 0.16).clamp(0.0, 1.0);
+            if k > 0.6 {
+                p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, ((k - 0.6) / 0.4 * 210.0) as u8));
+            } else {
+                let a = (k / 0.6 * 170.0) as u8;
+                let w = rect.width() * 0.18;
+                for (i, f) in [1.0f32, 0.6, 0.3].iter().enumerate() {
+                    let ww = w * (i as f32 + 1.0) / 3.0;
+                    let col = Color32::from_rgba_unmultiplied(0, 0, 0, (a as f32 * f) as u8);
+                    p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(ww, rect.height())), 0.0, col);
+                    p.rect_filled(Rect::from_min_size(Pos2::new(rect.right() - ww, rect.top()), Vec2::new(ww, rect.height())), 0.0, col);
+                }
+            }
+        }
+        // the announcer's line (from assets/lore.txt) under the picture
+        if let Some((kind, t)) = g.exec_line {
+            let a = ((t / 0.25).min(1.0) * ((3.2 - t) / 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+            let e = exec::execution(kind);
+            let line = exec::announcer_line(kind as usize - 1);
+            let y = rect.bottom() - rect.height() * 0.06 - 22.0 * s;
+            text_shadow(p, Pos2::new(c.x, y - 22.0 * s), Align2::CENTER_CENTER, "THE ANNOUNCER", 11.5 * s, Color32::from_rgba_unmultiplied(255, 170, 90, a));
+            text_shadow(p, Pos2::new(c.x, y), Align2::CENTER_CENTER, &format!("\u{201c}{line}\u{201d}"), 18.0 * s, Color32::from_rgba_unmultiplied(245, 238, 226, a));
+            let quip = exec::fighter_line(e.fighter);
+            if !quip.is_empty() {
+                text_shadow(p, Pos2::new(c.x, y + 22.0 * s), Align2::CENTER_CENTER, &format!("{}: {quip}", chars::name(e.fighter)), 13.0 * s, Color32::from_rgba_unmultiplied(210, 200, 190, a));
+            }
+        }
+    }
     fn draw_hud(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game) {
         if test_view().is_some() {
             return; // a clean picture of the map
@@ -4655,6 +4808,11 @@ impl App {
         // everything scales with the window so nothing overlaps at small sizes (and grows with
         // the Couch / TV interface size)
         let s = self.hud_scale(rect);
+        // watching an execution on a dummy: only the execution's own titles, no match HUD
+        if g.preview.is_some() {
+            self.draw_execution(p, rect, g, s);
+            return;
+        }
         // quick chat (controller): the lines to pick from
         if let Some(k) = self.quick_chat {
             let x = rect.left() + 18.0 * s;
@@ -4706,6 +4864,9 @@ impl App {
                 return;
             }
         }
+
+        // an execution: letterbox bars, its title card, the impact frame and the announcer
+        self.draw_execution(p, rect, g, s);
 
         // perfect parry: a white flash
         if g.parry_flash > 0.0 {
@@ -4993,13 +5154,13 @@ impl App {
             }
         }
 
-        // ---- finisher prompt over an enemy you can finish
-        if me.alive && me.fin == 0 {
+        // ---- execution prompt over an enemy you can execute
+        if me.alive && me.fin == 0 && g.exec_ask_t <= 0.0 {
             if let Some(t) = g.finish_target(g.local) {
                 if let Some(sp) = cam.project(g.f[t].pos + v3(0.0, 2.3, 0.0)) {
                     let key = if self.pad_active { pad::button_name(pad::btn::R3, self.pads.name.as_deref()).to_string() } else { self.settings.binds[A_FINISH].name() };
                     let pulse = 0.75 + 0.25 * (g.time * 10.0).sin();
-                    let text = format!("{key}  FINISH");
+                    let text = format!("{key}  EXECUTE");
                     let gal = p.layout_no_wrap(text.clone(), FontId::proportional(14.0 * s), Color32::WHITE);
                     let r = Rect::from_center_size(sp, gal.size() + Vec2::new(16.0 * s, 8.0 * s));
                     p.rect_filled(r, 5.0 * s, Color32::from_rgba_unmultiplied(120, 15, 15, (200.0 * pulse) as u8));
@@ -5851,7 +6012,7 @@ impl App {
                     }
                 }                Page::Mastery => {
                     ui.heading("Fighters & Mastery");
-                    ui.label(egui::RichText::new("Play a fighter to level their mastery: outfit colours, finishers, lore pages and badges (Bronze to Champion) unlock as you go.").size(13.0).color(Color32::from_gray(195)));
+                    ui.label(egui::RichText::new("Play a fighter to level their mastery: outfit colours, executions, lore pages and badges (Bronze to Champion) unlock as you go. Preview any execution here, locked or not.").size(13.0).color(Color32::from_gray(195)));
                     let cr = self.career.clone();
                     for b in 0..chars::COUNT.min(career::FIGHTERS) as u8 {
                         let (badge, bc) = cr.badge(b);
@@ -5874,12 +6035,21 @@ impl App {
                                 }
                             }
                         });
-                        let fins: Vec<String> = FINISHERS
-                            .iter()
-                            .enumerate()
-                            .map(|(k, s)| if cr.finisher_unlocked(b, k) { s.name.to_string() } else { format!("{} (mastery {})", s.name, career::finisher_level(k)) })
-                            .collect();
-                        ui.label(egui::RichText::new(format!("Finishers: {}", fins.join(", "))).size(12.5).color(Color32::from_gray(200)));
+                        // the fighter's executions: name, when it unlocks, and a preview
+                        ui.label(egui::RichText::new("Executions").size(13.0).color(Color32::from_rgb(235, 220, 200)));
+                        for k in exec::of_fighter(b) {
+                            let e = &exec::EXECUTIONS[k];
+                            let open = cr.finisher_unlocked(b, k);
+                            ui.horizontal(|ui| {
+                                let kind = if e.aerial { "aerial" } else { "signature" };
+                                let txt = if open { format!("{}  ·  {kind}", e.name) } else { format!("{}  ·  {kind}  ·  locked: mastery {}", e.name, career::finisher_level(k)) };
+                                ui.label(egui::RichText::new(txt).size(12.5).color(if open { Color32::from_gray(225) } else { Color32::from_gray(145) }));
+                                if ui.small_button("Preview").on_hover_text("Watch it on a training dummy").clicked() {
+                                    let (body, style) = (b, k);
+                                    action = Some(Box::new(move |app: &mut App| app.start_exec_preview(body, style, Page::Mastery)));
+                                }
+                            });
+                        }
                         for (pg, (title, text)) in career::LORE[b as usize].iter().enumerate() {
                             if cr.lore_unlocked(b, pg) {
                                 egui::CollapsingHeader::new(egui::RichText::new(*title).color(Color32::from_rgb(235, 220, 200))).id_salt(("lore", b, pg)).show(ui, |ui| {
@@ -5910,22 +6080,22 @@ impl App {
                         ui.label(if done { egui::RichText::new(format!("{}: done (+{} XP)", ch.text, ch.xp)).color(Color32::from_rgb(140, 220, 160)) } else { egui::RichText::new(format!("{}: {n} / {}  (+{} XP)", ch.text, ch.goal, ch.xp)) });
                     }
                     ui.label(if cr.first_win_ready(day) { format!("First win of the day: +{} XP waiting", career::XP_FIRST_WIN) } else { "First win of the day: earned today".to_string() });
-                    ui_kit::section(ui, "Finishers");
+                    ui_kit::section(ui, "Executions");
                     let share = if cr.kills > 0 { cr.finishers as f32 * 100.0 / cr.kills as f32 } else { 0.0 };
                     ui.label(format!("Executions {}  ({share:.0}% of your kills)", cr.finishers));
                     if let Some(k) = cr.favourite_finisher() {
-                        ui.label(format!("Favourite: {}", FINISHERS[k].name));
+                        ui.label(format!("Favourite: {}", exec::EXECUTIONS[k].name));
                     }
                     egui::Grid::new("finisher-stats").num_columns(4).spacing([14.0, 3.0]).show(ui, |ui| {
-                        for (k, st) in FINISHERS.iter().enumerate() {
+                        for (k, st) in exec::EXECUTIONS.iter().enumerate() {
                             ui.label(st.name);
-                            ui.label(egui::RichText::new(st.weapon.map_or("aerial (any blade)", |w| w.name())).color(Color32::from_gray(180)));
+                            ui.label(egui::RichText::new(format!("{}{}", chars::name(st.fighter), if st.aerial { ", aerial" } else { "" })).color(Color32::from_gray(180)));
                             ui.label(format!("{}", cr.fin_by[k]));
-                            ui.label(if cr.unlocked(k) { egui::RichText::new("unlocked").color(Color32::from_rgb(140, 220, 160)) } else { egui::RichText::new(format!("level {}", st.unlock_level)).color(Color32::from_gray(150)) });
+                            ui.label(if cr.finisher_unlocked(st.fighter, k) { egui::RichText::new("unlocked").color(Color32::from_rgb(140, 220, 160)) } else { egui::RichText::new(format!("mastery {}", st.mastery)).color(Color32::from_gray(150)) });
                             ui.end_row();
                         }
                     });
-                    ui.label(egui::RichText::new("Finish a weakened (under 25% health) enemy who is staggered, guard-broken or launched: press E next to them.").size(12.5).color(Color32::from_gray(190)));
+                    ui.label(egui::RichText::new("Execute a weakened (under 25% health) enemy who is staggered, guard-broken or launched: press E next to them.").size(12.5).color(Color32::from_gray(190)));
                     if Self::big_button(ui, "Back") {
                         next = Some(Page::Main);
                     }

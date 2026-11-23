@@ -1941,6 +1941,82 @@ fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, 
 /// swing trail, hair, and the long coat.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+/// How an execution shows fighter `f` right now: (a stand-in to draw instead, e.g. with the gun
+/// out for a point-blank shot; whether they're only a blur and not drawn at all). None when
+/// they aren't doing one.
+fn exec_view(g: &Game, f: &Fighter) -> Option<(Option<Fighter>, bool)> {
+    if f.fin == 0 || !f.alive || f.ghost > 0.0 {
+        return None;
+    }
+    let k = f.fin as usize - 1;
+    let p = (f.fin_t / crate::exec::execution(f.fin).dur).clamp(0.0, 1.0);
+    if crate::exec::hidden(k, p) {
+        return Some((None, true));
+    }
+    if !crate::exec::gun_out(k, p) {
+        return Some((None, false));
+    }
+    let mut v = f.clone();
+    let gun = if f.loadout.gun2.is_melee() || f.loadout.gun2 == Weapon::Shuriken { f.loadout.gun1 } else { f.loadout.gun2 };
+    v.weapon = gun;
+    v.cur = if gun == f.loadout.gun2 { 2 } else { 1 };
+    v.since_shot = 0.0;
+    v.scope_t = 0.0;
+    // aimed at the one being executed (at their chest, kneeling or not)
+    let t = g.f.get(f.fin_target).map_or(f.pos + f.fwd(), |t| t.pos);
+    let d = t + v3(0.0, 0.9, 0.0) - (f.pos + v3(0.0, 1.5, 0.0));
+    v.pitch = d.y.atan2(d.flat().len().max(0.1)).clamp(-1.2, 1.2);
+    Some((Some(v), false))
+}
+
+/// A stain, crack or scorch on the floor: flat on the ground under it.
+fn decal_into(al: &mut MB, ad: &mut MB, d: &crate::game::Decal) {
+    let fade = (d.life / d.max_life.max(0.01)).clamp(0.0, 1.0);
+    let fade = (fade * 4.0).min(1.0);
+    let up = v3(0.0, 1.0, 0.0);
+    let mut rng = Rng((d.seed as u64).wrapping_mul(2_654_435_761) | 1);
+    let flat = |c: V3, r: f32, a: f32| -> [V3; 4] {
+        let (s, co) = a.sin_cos();
+        let x = v3(co, 0.0, s) * r;
+        let z = v3(-s, 0.0, co) * r;
+        [c - x - z, c + x - z, c + x + z, c - x + z]
+    };
+    let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    match d.kind {
+        0 => {
+            // a stain: a few soft overlapping splashes and drops
+            for k in 0..6 {
+                let off = v3(rng.range(-0.5, 0.5), 0.0, rng.range(-0.5, 0.5)) * d.size * if k == 0 { 0.0 } else { 1.0 };
+                let r = d.size * if k == 0 { 0.55 } else { rng.range(0.12, 0.3) };
+                al.quad(flat(d.pos + off + up * (0.001 * k as f32), r, rng.range(0.0, 6.28)), up, uv, lina(d.color, 0.85 * fade), [-1.0, 3.0, 1.0, 0.0]);
+            }
+        }
+        1 => {
+            // a crack: dark jagged lines out from the blow, and a darker crater
+            al.quad(flat(d.pos, d.size * 0.35, 0.0), up, uv, lina(d.color, 0.75 * fade), [-1.0, 3.0, 1.0, 0.0]);
+            for _ in 0..9 {
+                let mut a = rng.range(0.0, std::f32::consts::TAU);
+                let mut p0 = d.pos + up * 0.002;
+                let mut w = 0.06;
+                for _ in 0..4 {
+                    a += rng.range(-0.6, 0.6);
+                    let len = d.size * rng.range(0.12, 0.22);
+                    let dir = v3(a.cos(), 0.0, a.sin());
+                    let side = v3(-dir.z, 0.0, dir.x);
+                    let p1 = p0 + dir * len;
+                    al.quad([p0 - side * w, p1 - side * (w * 0.6), p1 + side * (w * 0.6), p0 + side * w], up, [[0.5, 0.5]; 4], lina(d.color, 0.9 * fade), [-1.0, 2.0, 1.0, 0.0]);
+                    p0 = p1;
+                    w *= 0.6;
+                }
+            }
+        }
+        _ => {
+            // a scorch from the smith's hot blade: glowing, cooling fast
+            let heat = (d.life / d.max_life.max(0.01)).clamp(0.0, 1.0);
+            ad.quad(flat(d.pos, d.size * 0.5, 0.0), up, uv, lina(d.color, 0.7 * heat * heat), [-1.0, 3.0, 1.0, 0.0]);
+        }
+    }
+}
 fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, flash: f32, sc: f32) {
     let tint = |c: [u8; 3]| -> [f32; 4] {
         let l = lin(c);
@@ -2006,7 +2082,7 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     if w.is_melee() && f.alive {
         // seconds to the game's hit (negative after it)
         let until = if f.fin > 0 {
-            let s = finisher(f.fin);
+            let s = crate::exec::execution(f.fin);
             Some((s.hit - f.fin_t / s.dur) * s.dur)
         } else if f.slashing() {
             Some(f.slash_t - w.slash_dur() * w.hit_left())
@@ -2014,7 +2090,15 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
             None
         };
         if let Some(u) = until {
-            let k = if u > 0.0 { 1.0 - (u / 0.07).min(1.0) } else { 1.0 - (-u / 0.3).min(1.0) * 0.85 };
+            let k = if f.fin > 0 {
+                // an execution: the blade trails through every cut, brightest at each blow
+                let e = crate::exec::execution(f.fin);
+                e.cues.iter().filter(|c| matches!(c.1, crate::exec::Cue::Whoosh | crate::exec::Cue::Strike | crate::exec::Cue::Lethal)).map(|c| 1.0 - ((f.fin_t - c.0 * e.dur).abs() / 0.2).min(1.0)).fold(0.0f32, f32::max)
+            } else if u > 0.0 {
+                1.0 - (u / 0.07).min(1.0)
+            } else {
+                1.0 - (-u / 0.3).min(1.0) * 0.85
+            };
             if k > 0.02 {
                 st.trail.push_back((anchor + p.weapon.z * (tip * 0.3), anchor + p.weapon.z * tip, time, k));
             }
@@ -2036,12 +2120,22 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     }
     let n = st.trail.len();
     let heavy = f.slash_idx >= 2 || w == Weapon::Greatsword;
+    // an execution's trail is in the fighter's own colour (their team's in team modes)
+    let accent = (f.fin > 0).then(|| {
+        let c = PALETTE[(f.color_idx as usize) % PALETTE.len()];
+        let m = c[0].max(c[1]).max(c[2]).max(1) as f32;
+        [(c[0] as f32 / m * 255.0) as u8, (c[1] as f32 / m * 255.0) as u8, (c[2] as f32 / m * 255.0) as u8]
+    });
     for k in 1..n {
         let (b0, b1, tb, kb) = st.trail[k - 1];
         let (a0, a1, ta, ka) = st.trail[k];
         let age = |t0: f32| (1.0 - (time - t0) / 0.2).clamp(0.0, 1.0);
         let al = 0.7 * age(ta).min(age(tb)) * (0.3 + 0.7 * k as f32 / n as f32) * ka.min(kb);
-        let c = if heavy { lina([255, 170, 80], al) } else { lina([150, 200, 255], al) };
+        let c = match accent {
+            Some(a) => lina(a, al),
+            None if heavy => lina([255, 170, 80], al),
+            None => lina([150, 200, 255], al),
+        };
         let nrm = (b1 - b0).cross(a0 - b0).norm();
         add_mb.quad([b0, b1, a1, a0], nrm, [[0.5, 0.5]; 4], c, [-1.0, 2.0, 1.0, 0.0]);
         // bright core near the blade's edge
@@ -3126,7 +3220,8 @@ impl Gpu {
         let mut insts: Vec<Vec<f32>> = Vec::new();
         let mut inst_body: Vec<usize> = Vec::new();
         // Afterimage decoys are drawn as their owners (after the real fighters)
-        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).take(MAX_INST - MAX_PLAYERS).collect();
+        // (and an execution's afterimages, after them)
+        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).chain(g.exec_ghosts()).take(MAX_INST - MAX_PLAYERS).collect();
         for (i, f) in g.f.iter().enumerate().chain(decoys.iter().enumerate().map(|(k, f)| (MAX_PLAYERS + k, f))) {
             if !f.present || f.spectate {
                 continue;
@@ -3146,13 +3241,24 @@ impl Gpu {
                 }
                 continue;
             }
+            // an execution: only a blur for a moment (its afterimages strike), and the gun drawn for
+            // a point-blank shot
+            let exec_view = exec_view(g, f);
+            if exec_view.as_ref().is_some_and(|v| v.1) {
+                continue;
+            }
+            let f: &Fighter = match &exec_view {
+                Some((Some(v), _)) => v,
+                _ => f,
+            };
             let mut pos = f.prev_pos.lerp(f.pos, alpha.clamp(0.0, 1.0));
             if let Some((li, p)) = local_override {
                 if li == i {
                     pos = p;
                 }
             }
-            if i == g.local && (cam.pos - (pos + v3(0.0, 1.1, 0.0))).len() < 0.8 {
+            // (the camera inside your own head hides you; not in an execution's cinematic shots)
+            if i == g.local && f.fin == 0 && (cam.pos - (pos + v3(0.0, 1.1, 0.0))).len() < 0.8 {
                 continue;
             }
             let posed = match (&self.skin, insts.len() < MAX_INST) {
@@ -3174,20 +3280,22 @@ impl Gpu {
                     let mut data = Vec::with_capacity(INST_FLOATS);
                     let mut t0 = tint(lk.coat);
                     // (w: a glowing trim brightens while the ability is on: Afterimage's vanish)
-                    t0[3] = if f.invis_t > 0.0 { 1.0 } else { 0.0 };
+                    t0[3] = if f.invis_t > 0.0 || f.ghost > 0.0 { 1.0 } else { 0.0 };
                     data.extend_from_slice(&t0);
                     let pants = tint(lk.pants);
                     // (a textured fighter reads the hurt flash from here)
                     data.extend_from_slice(&[pants[0], pants[1], pants[2], flash * 1.6]);
-                    let m = self.part_masks[(f.hit_part as usize).min(6)];
-                    let strength = (f.flash_t / 0.12).clamp(0.0, 1.0) * 0.85;
+                    // (an execution's afterimage: the whole body white-hot, as energy)
+                    let m = if f.ghost > 0.0 { [u32::MAX; 3] } else { self.part_masks[(f.hit_part as usize).min(6)] };
+                    let strength = if f.ghost > 0.0 { 0.45 + 0.35 * f.ghost } else { (f.flash_t / 0.12).clamp(0.0, 1.0) * 0.85 };
                     data.extend_from_slice(&[f32::from_bits(m[0]), f32::from_bits(m[1]), f32::from_bits(m[2]), strength]);
                     // rim light in the player's colour, brightened to full strength (dimmer on
                     // yourself, so it doesn't distract)
                     let rc = lin(lk.coat);
                     let top = rc[0].max(rc[1]).max(rc[2]).max(0.05);
                     let own = if i == g.local { 0.35 } else { 1.0 };
-                    let rk = g.tune.rim * own * if f.alive { 1.0 } else { 0.3 };
+                    // (an afterimage glows all over in its colour)
+                    let rk = g.tune.rim * own * if f.ghost > 0.0 { 2.5 + 3.0 * f.ghost } else if f.alive { 1.0 } else { 0.3 };
                     data.extend_from_slice(&[rc[0] / top * rk, rc[1] / top * rk, rc[2] / top * rk, g.tune.rim_width.max(0.5)]);
                     // how it moves (for the sway of hair, scarves and aprons), and its own phase
                     data.extend_from_slice(&[f.vel.x, f.vel.y, f.vel.z, i as f32 * 1.7]);
@@ -3328,6 +3436,18 @@ impl Gpu {
         }
         // Warden's Marks: a red spark in flight; landed, a pulsing beacon with a ring showing
         // its reach, so everyone sees where it is
+        // stains and cracks on the floor (executions)
+        for d in &g.decals {
+            decal_into(&mut al, &mut ad, d);
+        }
+        // an execution's afterimages shimmer in their colour
+        for f in decoys.iter().filter(|f| f.ghost > 0.0) {
+            let c = PALETTE[(f.color_idx as usize) % PALETTE.len()];
+            for (n, h) in [0.4f32, 0.95, 1.5].iter().enumerate() {
+                let wob = (g.time * 13.0 + n as f32 * 2.1).sin();
+                ad.billboard(cam, f.pos + v3(wob * 0.1, *h, 0.0), 0.5, lina(c, 0.12 * f.ghost));
+            }
+        }
         for m in &g.marks {
             if !m.landed {
                 ad.billboard(cam, m.pos, 0.3, lina([255, 80, 60], 0.9));
