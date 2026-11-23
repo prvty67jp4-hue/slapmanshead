@@ -1,4 +1,4 @@
-﻿//! Steam: lobbies (host one, find them in a browser, join from the friends list), rich presence
+//! Steam: lobbies (host one, find them in a browser, join from the friends list), rich presence
 //! for "Join game", and relayed messages so nobody has to forward ports. Uses the Steamworks
 //! dev App ID 480 until the game has its own. When Steam isn't running (or its library is
 //! missing) `Steam::start` returns None and the game keeps to direct-IP play.
@@ -42,8 +42,20 @@ pub struct LobbyRow {
     pub ping: Option<u32>,
 }
 
+/// The Gauntlet leaderboard's steps, each reported by Steam's callback and acted on afterwards in
+/// `update` (never from inside a callback: the Steam library holds its callback lock while one
+/// runs, so asking it for another call result there waits forever. That froze the game when a
+/// Gauntlet run ended).
+enum BoardStep {
+    Found(steamworks::Leaderboard, i32),
+    Uploaded(steamworks::Leaderboard, i32),
+    Entries(i32, Vec<(SteamId, i32, i32)>),
+    Failed,
+}
+
 pub struct Steam {
     pub client: Client,
+    board: Arc<Mutex<Vec<BoardStep>>>,
     pub me: u64,
     pub name: String,
     /// The map our hosted lobby plays (shown in the browser).
@@ -112,7 +124,7 @@ impl Steam {
         client.networking_utils().init_relay_network_access();
         let me = client.user().steam_id().raw();
         let name = client.friends().name();
-        Some(Steam { client, me, name, map_name: "Arena".into(), lobby: None, hosting: false, events, _callbacks: callbacks, rows: Vec::new(), refreshing: false, pings_sent: HashMap::new(), pings: HashMap::new() })
+        Some(Steam { client, board: Arc::new(Mutex::new(Vec::new())), me, name, map_name: "Arena".into(), lobby: None, hosting: false, events, _callbacks: callbacks, rows: Vec::new(), refreshing: false, pings_sent: HashMap::new(), pings: HashMap::new() })
     }
 
     /// Run Steam's callbacks, answer ping probes, and hand back what happened.
@@ -142,6 +154,11 @@ impl Steam {
                 r.ping = Some(*p);
             }
         }
+        // the leaderboard's next step, now that no callback is running
+        let steps = std::mem::take(&mut *self.board.lock().unwrap_or_else(|e| e.into_inner()));
+        for step in steps {
+            self.board_step(step);
+        }
         let mut out = std::mem::take(&mut *self.events.lock().unwrap_or_else(|e| e.into_inner()));
         for e in &out {
             if let SteamEvent::LobbyList(ids) = e {
@@ -165,29 +182,56 @@ impl Steam {
     }
 
     /// Put a Gauntlet score on the Steam leaderboard (your best is kept) and fetch the top five.
+    /// Three steps (find the board, upload, download the top), each started from `update` once
+    /// the one before has reported back.
     pub fn submit_gauntlet(&self, score: i32) {
-        use steamworks::{LeaderboardDataRequest, LeaderboardDisplayType, LeaderboardSortMethod, UploadScoreMethod};
-        let ev = self.events.clone();
-        let client = self.client.clone();
+        use steamworks::{LeaderboardDisplayType, LeaderboardSortMethod};
+        let board = self.board.clone();
         self.client.user_stats().find_or_create_leaderboard("Gauntlet", LeaderboardSortMethod::Descending, LeaderboardDisplayType::Numeric, move |r| {
-            let Ok(Some(lb)) = r else {
-                if let Ok(mut e) = ev.lock() {
-                    e.push(SteamEvent::Board { rank: 0, top: Vec::new() });
-                }
-                return;
+            let step = match r {
+                Ok(Some(lb)) => BoardStep::Found(lb, score),
+                _ => BoardStep::Failed,
             };
-            let (c2, ev2, lb2) = (client.clone(), ev.clone(), lb.clone());
-            client.user_stats().upload_leaderboard_score(&lb, UploadScoreMethod::KeepBest, score, &[], move |u| {
-                let rank = u.ok().flatten().map_or(0, |x| x.global_rank_new);
-                let c3 = c2.clone();
-                c2.user_stats().download_leaderboard_entries(&lb2, LeaderboardDataRequest::Global, 1, 5, 0, move |d| {
-                    let top = d.map(|v| v.into_iter().map(|e| (c3.friends().get_friend(e.user).name(), e.score, e.global_rank)).collect()).unwrap_or_default();
-                    if let Ok(mut e) = ev2.lock() {
-                        e.push(SteamEvent::Board { rank, top });
+            if let Ok(mut b) = board.lock() {
+                b.push(step);
+            }
+        });
+    }
+
+    /// Act on one leaderboard step (outside any Steam callback).
+    fn board_step(&mut self, step: BoardStep) {
+        use steamworks::{LeaderboardDataRequest, UploadScoreMethod};
+        let board = self.board.clone();
+        match step {
+            BoardStep::Found(lb, score) => {
+                let next = lb.clone();
+                self.client.user_stats().upload_leaderboard_score(&lb, UploadScoreMethod::KeepBest, score, &[], move |u| {
+                    let rank = u.ok().flatten().map_or(0, |x| x.global_rank_new);
+                    if let Ok(mut b) = board.lock() {
+                        b.push(BoardStep::Uploaded(next, rank));
                     }
                 });
-            });
-        });
+            }
+            BoardStep::Uploaded(lb, rank) => {
+                self.client.user_stats().download_leaderboard_entries(&lb, LeaderboardDataRequest::Global, 1, 5, 0, move |d| {
+                    let top = d.map(|v| v.into_iter().map(|e| (e.user, e.score, e.global_rank)).collect()).unwrap_or_default();
+                    if let Ok(mut b) = board.lock() {
+                        b.push(BoardStep::Entries(rank, top));
+                    }
+                });
+            }
+            BoardStep::Entries(rank, top) => {
+                // names looked up here too, not inside the callback
+                let friends = self.client.friends();
+                let top = top.into_iter().map(|(id, score, r)| (friends.get_friend(id).name(), score, r)).collect();
+                self.push_event(SteamEvent::Board { rank, top });
+            }
+            BoardStep::Failed => self.push_event(SteamEvent::Board { rank: 0, top: Vec::new() }),
+        }
+    }
+
+    fn push_event(&self, e: SteamEvent) {
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).push(e);
     }
 
     /// Our lobby is up: describe it for the browser and let friends join from Steam.

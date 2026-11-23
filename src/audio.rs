@@ -95,6 +95,15 @@ fn props(s: Sfx) -> Props {
         Sfx::Slam => pp(clips!["boom_crunch.ogg", "boom_2.ogg"], 0.95, 28.0, 0.8),
         // a throwing star: a short, high, thin whip through the air
         Sfx::Shuriken => pp(clips!["swing_1.wav", "swing_3.wav"], 0.5, 10.0, 1.75),
+        // the pump racking (a heavy mechanical clack) and a shell thumbed in
+        Sfx::Pump => pp(clips!["switch_gun.ogg", "reload_end.ogg"], 0.8, 10.0, 0.78),
+        Sfx::ShellIn => pp(clips!["reload_end.ogg"], 0.5, 6.0, 1.45),
+        // abilities, loud enough that enemies can react: a bright ping, a whipping line, a heavy
+        // metal shield, a hollow whoosh
+        Sfx::MarkPing => pp(clips!["headshot.ogg"], 0.85, 30.0, 0.62),
+        Sfx::GrappleFire => pp(clips!["throw.wav", "swing_1.wav"], 0.8, 18.0, 0.68),
+        Sfx::ShieldUp => pp(clips!["armor.ogg", "clang_1.ogg"], 0.9, 22.0, 0.7),
+        Sfx::Vanish => pp(clips!["dash_2.wav"], 0.85, 16.0, 0.55),
     }
 }
 
@@ -206,7 +215,8 @@ pub fn gun_voice(s: Sfx) -> Option<GunVoice> {
         Sfx::HandCannon => v(0.45, 4000.0, 0.75, 8.0, 0.75, (500.0, 2000.0), 120.0, 1.0, (120.0, 40.0), 230.0, 0.28, 1.2),
         Sfx::Rifle => v(0.5, 6000.0, 0.9, 4.0, 0.65, (900.0, 3200.0), 70.0, 0.65, (170.0, 62.0), 125.0, 0.2, 0.8),
         Sfx::Smg => v(0.55, 6000.0, 0.65, 3.0, 0.6, (1000.0, 3500.0), 45.0, 0.45, (200.0, 80.0), 70.0, 0.12, 0.45),
-        Sfx::Shotgun => v(0.45, 3800.0, 0.7, 7.0, 0.8, (400.0, 1800.0), 150.0, 1.0, (110.0, 40.0), 240.0, 0.26, 1.1),
+        // the scattergun: a big, low, rolling boom
+        Sfx::Shotgun => v(0.45, 3300.0, 0.65, 8.0, 0.9, (300.0, 1500.0), 170.0, 1.25, (95.0, 32.0), 320.0, 0.32, 1.3),
         Sfx::Sniper => v(0.45, 5000.0, 1.0, 5.0, 0.7, (700.0, 2600.0), 110.0, 0.9, (140.0, 44.0), 210.0, 0.32, 1.8),
         _ => return None,
     })
@@ -412,7 +422,7 @@ pub struct Audio {
 }
 
 /// Every sound, in the order of `Sfx`.
-pub const ALL: [Sfx; 48] = [
+pub const ALL: [Sfx; 54] = [
     Sfx::Shotgun,
     Sfx::Revolver,
     Sfx::Smg,
@@ -461,6 +471,12 @@ pub const ALL: [Sfx; 48] = [
     Sfx::ChargeReady,
     Sfx::Slam,
     Sfx::Shuriken,
+    Sfx::Pump,
+    Sfx::ShellIn,
+    Sfx::MarkPing,
+    Sfx::GrappleFire,
+    Sfx::ShieldUp,
+    Sfx::Vanish,
 ];
 
 fn mix_into(m: &Arc<Mutex<Mixer>>, frames: usize, channels: usize, rate: f32, mut write: impl FnMut(usize, f32)) {

@@ -702,7 +702,9 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
                 }
                 _ => {
                     let hr = chest + side * 0.12 + aim * 0.32 + down * 0.08;
-                    (hr, Some(hr + aim * 0.36 - side * 0.06 + down * 0.02))
+                    // the scattergun's pump: the front hand racks it back and forward after a shot
+                    let pump = f.pump_k() * 0.12;
+                    (hr, Some(hr + aim * (0.36 - pump) - side * 0.06 + down * 0.02))
                 }
             };
             let reload = f.reload_t > 0.0;
@@ -865,7 +867,8 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     let (sh_l, sh_r) = (wp(b.up_l), wp(b.up_r));
     let hit = HitPose {
         caps: [
-            cap(head + hy * (0.04 * sc), head + hy * (0.17 * sc), 0.115, Part::Head),
+            // the head reaches up over the hood and hair, so what looks like a head hit is one
+            cap(head + hy * (0.07 * sc), head + hy * (0.17 * sc), 0.15, Part::Head),
             cap(neck, head, 0.065, Part::Chest),
             cap(wp(b.spine2), wp(b.spine3), 0.16, Part::Chest),
             cap(sh_l, sh_r, 0.085, Part::Chest),

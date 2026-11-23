@@ -16,7 +16,15 @@ pub const TICK: f32 = 1.0 / 120.0;
 pub const MAX_PLAYERS: usize = 8;
 pub const RESPAWN_TIME: f32 = 3.0;
 pub const SPAWN_PROT: f32 = 1.5;
-pub const MATCH_TIME: f32 = 600.0;
+/// A match lasts at most six minutes.
+pub const MATCH_TIME: f32 = 360.0;
+/// Kills in a row (without dying) that earn a Writ (Free-for-All and Team Deathmatch).
+pub const WRIT_STREAK: u32 = 3;
+/// Play of the Match: how much of the moment is kept before and after it, and how often a frame
+/// is kept.
+pub const POTM_BEFORE: f32 = 4.0;
+pub const POTM_AFTER: f32 = 1.5;
+pub const REC_DT: f32 = 1.0 / 30.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Weapon {
@@ -61,6 +69,39 @@ pub const THROW_TIME: f32 = 0.24;
 pub const FAN_THROW_TIME: f32 = 0.28;
 /// A thrown star is drawn leaving the hand, easing onto its true path over this long.
 pub const STAR_VIS_TIME: f32 = 0.12;
+
+/// The scattergun's pellets, always in this pattern (units of its spread; x right, y up): one
+/// in the middle, a tight square of four round it, and a ring of five. The same every shot, so
+/// where you aim decides what it does; the crosshair draws it.
+pub const SHOTGUN_PATTERN: [(f32, f32); 10] = [
+    (0.0, 0.0),
+    (0.23, 0.23),
+    (-0.23, 0.23),
+    (0.23, -0.23),
+    (-0.23, -0.23),
+    (0.0, 1.0),
+    (0.951, 0.309),
+    (0.588, -0.809),
+    (-0.588, -0.809),
+    (-0.951, 0.309),
+];
+/// One shell loaded into the scattergun (it reloads shell by shell; shooting stops it).
+pub const SHELL_TIME: f32 = 0.5;
+/// The pump: how long after a shot it racks (fire_cd left when it does, the slide's travel).
+pub const PUMP_AT: f32 = 0.58;
+/// Single-shot guns: a bullet passing this close to a head counts as a headshot.
+pub const HEAD_ASSIST: f32 = 0.05;
+
+/// The scattergun's damage at distance `t`: full to 5 m, 40% by 18 m, 15% from 30 m on.
+pub fn shotgun_falloff(t: f32) -> f32 {
+    if t <= 5.0 {
+        1.0
+    } else if t <= 18.0 {
+        1.0 - 0.6 * (t - 5.0) / 13.0
+    } else {
+        (0.4 - 0.25 * (t - 18.0) / 12.0).max(0.15)
+    }
+}
 
 /// How a gun shoots. Spread is the tangent of the cone's half-angle: every pellet leaves within
 /// it, and the crosshair is drawn exactly that wide.
@@ -116,7 +157,7 @@ impl Weapon {
             Weapon::Dagger => "fast, short reach, light hits",
             Weapon::Katana => "balanced",
             Weapon::Greatsword => "slow, long reach, every hit breaks guards",
-            Weapon::Shotgun => "9 pellets, deadly up close",
+            Weapon::Shotgun => "pump: 10 pellets in a fixed pattern, aim decides",
             Weapon::Revolver => "a headshot kills; tap it, don't spam it",
             Weapon::Smg => "hold to spray, 30 rounds",
             Weapon::Rifle => "semi-auto marksman, 10 rounds",
@@ -144,7 +185,7 @@ impl Weapon {
     }
     pub fn interval(self) -> f32 {
         match self {
-            Weapon::Shotgun => 0.85,
+            Weapon::Shotgun => 0.9,
             Weapon::Revolver => 0.30,
             Weapon::Smg => 0.075,
             Weapon::Rifle => 0.45,
@@ -158,7 +199,8 @@ impl Weapon {
     }
     pub fn reload_time(self) -> f32 {
         match self {
-            Weapon::Shotgun => 1.9,
+            // per shell: it loads one at a time
+            Weapon::Shotgun => SHELL_TIME,
             Weapon::Revolver => 1.5,
             Weapon::Smg => 1.8,
             Weapon::Rifle => 2.2,
@@ -171,7 +213,7 @@ impl Weapon {
     }
     pub fn gun(self) -> GunStats {
         match self {
-            Weapon::Shotgun => GunStats { pellets: 9, spread_still: 0.075, move_cap: 1.0, bloom: 0.0, dmg: 7.5, range: 40.0, head: 1.5, knock: 1.1 },
+            Weapon::Shotgun => GunStats { pellets: 10, spread_still: 0.07, move_cap: 1.0, bloom: 0.0, dmg: 11.0, range: 40.0, head: 2.0, knock: 1.0 },
             Weapon::Smg => GunStats { pellets: 1, spread_still: 0.012, move_cap: 1.5, bloom: 0.25, dmg: 9.0, range: 80.0, head: 1.4, knock: 0.4 },
             Weapon::Rifle => GunStats { pellets: 1, spread_still: 0.003, move_cap: 2.0, bloom: 0.6, dmg: 34.0, range: 200.0, head: 2.0, knock: 2.0 },
             Weapon::HandCannon => GunStats { pellets: 1, spread_still: 0.012, move_cap: 1.5, bloom: 1.5, dmg: 45.0, range: 160.0, head: 1.0, knock: 2.6 },
@@ -262,22 +304,25 @@ pub struct Loadout {
     pub item: u8,
     /// The fighter (see crate::chars): 0 Ranger, 1 Huntress, 2 Brawler, 3 Striker.
     pub body: u8,
+    /// Their outfit colour (see career::OUTFITS), unlocked through mastery.
+    pub outfit: u8,
 }
 
 impl Default for Loadout {
     fn default() -> Self {
-        Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 2, body: 0 }
+        Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 2, body: 0, outfit: 0 }
     }
 }
 
 impl Loadout {
     pub fn to_bytes(self) -> [u8; 4] {
         // the fighter rides in the item byte's top half
-        [self.melee as u8, self.gun1 as u8, self.gun2 as u8, (self.item & 0x0f) | (self.body.min(15) << 4)]
+        // the outfit rides in the blade byte's top half
+        [(self.melee as u8) | (self.outfit.min(15) << 4), self.gun1 as u8, self.gun2 as u8, (self.item & 0x0f) | (self.body.min(15) << 4)]
     }
     /// Read and repair (a melee in the melee slot, guns in the gun slots).
     pub fn from_bytes(b: [u8; 4]) -> Loadout {
-        let mut l = Loadout { melee: Weapon::from_u8(b[0]), gun1: Weapon::from_u8(b[1]), gun2: Weapon::from_u8(b[2]), item: (b[3] & 0x0f).min(2), body: (b[3] >> 4).min(crate::chars::COUNT as u8 - 1) };
+        let mut l = Loadout { outfit: (b[0] >> 4).min(3), melee: Weapon::from_u8(b[0] & 0x0f), gun1: Weapon::from_u8(b[1]), gun2: Weapon::from_u8(b[2]), item: (b[3] & 0x0f).min(2), body: (b[3] >> 4).min(crate::chars::COUNT as u8 - 1) };
         if !l.melee.is_melee() {
             l.melee = Weapon::Katana;
         }
@@ -297,7 +342,7 @@ impl Loadout {
         let n = Weapon::GUNS.len();
         let a = rng.next_u32() as usize % n;
         let b = (a + 1 + rng.next_u32() as usize % (n - 1)) % n;
-        Loadout { melee: m, gun1: Weapon::GUNS[a], gun2: Weapon::GUNS[b], item: (rng.next_u32() % 3) as u8, body: (rng.next_u32() % crate::chars::COUNT as u32) as u8 }
+        Loadout { melee: m, gun1: Weapon::GUNS[a], gun2: Weapon::GUNS[b], item: (rng.next_u32() % 3) as u8, body: (rng.next_u32() % crate::chars::COUNT as u32) as u8, outfit: 0 }
     }
 }
 
@@ -367,6 +412,12 @@ pub enum CareerEv {
     Death,
     WaveCleared,
     MatchEnd,
+    /// You won the match (the first win of the day pays a bonus).
+    MatchWon,
+    /// You took down someone holding a Writ (their streak).
+    WritClaim { streak: u32 },
+    /// Two kills in quick succession (or more).
+    MultiKill,
 }
 /// A combo finished: the elimination hit's "weapon" (kill feed).
 pub const COMBO_TOOL: u8 = 22;
@@ -445,6 +496,8 @@ pub struct Input {
     pub kick: bool,
     /// Pressed: finisher (on a weakened, staggered enemy in reach).
     pub finish: bool,
+    /// Pressed: the fighter's ability.
+    pub ability: bool,
     pub yaw: f32,
     pub pitch: f32,
 }
@@ -462,6 +515,87 @@ pub struct WallRun {
 /// Each chained move adds this much speed...
 /// Speed added per chained move (5 in a chain: +20%).
 pub const FLOW_STEP: f32 = 0.04;
+
+/// Each fighter's active ability (key Q / controller LB), and a passive that comes with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ability {
+    /// Corvin Vale: a thrown marker that shows enemies near it through walls.
+    Mark = 0,
+    /// Sable Rook: a line to a wall, ledge or pillar that pulls you to it.
+    Grapple = 1,
+    /// Bram "Anvil" Kask: a frontal shield that stops bullets and throws back blades.
+    Wall = 2,
+    /// Ilya Fen: vanish for a moment while a decoy runs on and fakes an attack.
+    Afterimage = 3,
+}
+
+impl Ability {
+    pub const ALL: [Ability; 4] = [Ability::Mark, Ability::Grapple, Ability::Wall, Ability::Afterimage];
+    /// The fighter's own ability.
+    pub fn of(body: u8) -> Ability {
+        Ability::ALL[(body as usize).min(3)]
+    }
+    pub fn from_u8(k: u8) -> Ability {
+        Ability::ALL[(k as usize).min(3)]
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Ability::Mark => "Warden's Mark",
+            Ability::Grapple => "Grapple Line",
+            Ability::Wall => "Iron Wall",
+            Ability::Afterimage => "Afterimage",
+        }
+    }
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Ability::Mark => "throw a marker: enemies within 12 m show through walls for 4 s",
+            Ability::Grapple => "pull yourself to a wall, ledge or pillar within 20 m (2 charges; jump lets go)",
+            Ability::Wall => "a 2.5 s frontal shield: stops bullets, throws back blades",
+            Ability::Afterimage => "vanish for 0.6 s while a decoy runs on and fakes an attack",
+        }
+    }
+    pub fn passive(self) -> &'static str {
+        match self {
+            Ability::Mark => "instant reload after a kill",
+            Ability::Grapple => "your sniper glint stays hidden for the first second scoped",
+            Ability::Wall => "+30% guard meter",
+            Ability::Afterimage => "flow chains fade 50% slower",
+        }
+    }
+    /// Seconds for a spent charge to come back, and how many charges it holds.
+    pub fn cooldown(self, tn: &Tuning) -> f32 {
+        match self {
+            Ability::Mark => tn.mark_cd,
+            Ability::Grapple => tn.grapple_cd,
+            Ability::Wall => tn.shield_cd,
+            Ability::Afterimage => tn.after_cd,
+        }
+    }
+    pub fn charges(self, tn: &Tuning) -> f32 {
+        if self == Ability::Grapple { tn.grapple_charges.round().max(1.0) } else { 1.0 }
+    }
+}
+
+/// A Warden's Mark: flying, then stuck where it landed, showing enemies near it.
+#[derive(Clone, Debug)]
+pub struct Mark {
+    pub pos: V3,
+    pub vel: V3,
+    pub owner: usize,
+    pub landed: bool,
+    /// Seconds flying, or seconds left once landed.
+    pub t: f32,
+}
+
+/// An Afterimage decoy: a copy of its owner running on, faking an attack.
+#[derive(Clone, Debug)]
+pub struct Decoy {
+    pub pos: V3,
+    pub vel: V3,
+    pub yaw: f32,
+    pub owner: usize,
+    pub t: f32,
+}
 
 /// Feel settings the developer tuning panel (F4) changes live. The defaults are the game's own.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -520,6 +654,22 @@ pub struct Tuning {
     /// Team-coloured rim light on players, and how thin it is.
     pub rim: f32,
     pub rim_width: f32,
+    // ---- abilities
+    pub mark_cd: f32,
+    pub mark_radius: f32,
+    pub mark_time: f32,
+    pub grapple_cd: f32,
+    pub grapple_charges: f32,
+    pub grapple_range: f32,
+    pub grapple_pull: f32,
+    pub shield_cd: f32,
+    pub shield_time: f32,
+    pub after_cd: f32,
+    pub invis_time: f32,
+    pub decoy_time: f32,
+    pub glint_hide: f32,
+    pub guard_bonus: f32,
+    pub flow_slow: f32,
 }
 
 impl Default for Tuning {
@@ -557,6 +707,21 @@ impl Default for Tuning {
             // a thin outline: the fighters wear their own colours now
             rim: 0.5,
             rim_width: 4.0,
+            mark_cd: 20.0,
+            mark_radius: 12.0,
+            mark_time: 4.0,
+            grapple_cd: 12.0,
+            grapple_charges: 2.0,
+            grapple_range: 20.0,
+            grapple_pull: 24.0,
+            shield_cd: 22.0,
+            shield_time: 2.5,
+            after_cd: 18.0,
+            invis_time: 0.6,
+            decoy_time: 1.6,
+            glint_hide: 1.0,
+            guard_bonus: 0.3,
+            flow_slow: 0.5,
         }
     }
 }
@@ -604,7 +769,7 @@ pub struct TuneField {
     pub set: fn(&mut Tuning, f32),
 }
 
-pub const TUNE_FIELDS: [TuneField; 30] = [
+pub const TUNE_FIELDS: [TuneField; 45] = [
     TuneField { key: "run_speed", label: "Run speed", min: 4.0, max: 16.0, unit: "m/s", group: "Movement", get: |t| t.run_speed, set: |t, v| t.run_speed = v },
     TuneField { key: "accel_time", label: "Ground acceleration time", min: 0.01, max: 0.6, unit: "s", group: "Movement", get: |t| t.accel_time, set: |t, v| t.accel_time = v },
     TuneField { key: "stop_time", label: "Stopping time", min: 0.01, max: 0.8, unit: "s", group: "Movement", get: |t| t.stop_time, set: |t, v| t.stop_time = v },
@@ -635,6 +800,21 @@ pub const TUNE_FIELDS: [TuneField; 30] = [
     TuneField { key: "fov_speed", label: "FOV widening with speed", min: 0.0, max: 20.0, unit: "°", group: "Camera feel", get: |t| t.fov_speed, set: |t, v| t.fov_speed = v },
     TuneField { key: "rim", label: "Player rim light", min: 0.0, max: 2.0, unit: "×", group: "Players", get: |t| t.rim, set: |t, v| t.rim = v },
     TuneField { key: "rim_width", label: "Rim thinness", min: 1.0, max: 6.0, unit: "", group: "Players", get: |t| t.rim_width, set: |t, v| t.rim_width = v },
+    TuneField { key: "mark_cd", label: "Warden's Mark cooldown", min: 2.0, max: 60.0, unit: "s", group: "Abilities", get: |t| t.mark_cd, set: |t, v| t.mark_cd = v },
+    TuneField { key: "mark_radius", label: "Warden's Mark reveal radius", min: 3.0, max: 30.0, unit: "m", group: "Abilities", get: |t| t.mark_radius, set: |t, v| t.mark_radius = v },
+    TuneField { key: "mark_time", label: "Warden's Mark reveal time", min: 0.5, max: 10.0, unit: "s", group: "Abilities", get: |t| t.mark_time, set: |t, v| t.mark_time = v },
+    TuneField { key: "grapple_cd", label: "Grapple Line recharge (each)", min: 1.0, max: 40.0, unit: "s", group: "Abilities", get: |t| t.grapple_cd, set: |t, v| t.grapple_cd = v },
+    TuneField { key: "grapple_charges", label: "Grapple Line charges", min: 1.0, max: 4.0, unit: "", group: "Abilities", get: |t| t.grapple_charges, set: |t, v| t.grapple_charges = v.round() },
+    TuneField { key: "grapple_range", label: "Grapple Line range", min: 5.0, max: 40.0, unit: "m", group: "Abilities", get: |t| t.grapple_range, set: |t, v| t.grapple_range = v },
+    TuneField { key: "grapple_pull", label: "Grapple Line pull speed", min: 8.0, max: 45.0, unit: "m/s", group: "Abilities", get: |t| t.grapple_pull, set: |t, v| t.grapple_pull = v },
+    TuneField { key: "shield_cd", label: "Iron Wall cooldown", min: 2.0, max: 60.0, unit: "s", group: "Abilities", get: |t| t.shield_cd, set: |t, v| t.shield_cd = v },
+    TuneField { key: "shield_time", label: "Iron Wall duration", min: 0.5, max: 8.0, unit: "s", group: "Abilities", get: |t| t.shield_time, set: |t, v| t.shield_time = v },
+    TuneField { key: "after_cd", label: "Afterimage cooldown", min: 2.0, max: 60.0, unit: "s", group: "Abilities", get: |t| t.after_cd, set: |t, v| t.after_cd = v },
+    TuneField { key: "invis_time", label: "Afterimage invisibility", min: 0.1, max: 3.0, unit: "s", group: "Abilities", get: |t| t.invis_time, set: |t, v| t.invis_time = v },
+    TuneField { key: "decoy_time", label: "Afterimage decoy life", min: 0.3, max: 4.0, unit: "s", group: "Abilities", get: |t| t.decoy_time, set: |t, v| t.decoy_time = v },
+    TuneField { key: "glint_hide", label: "Sable: hidden sniper glint", min: 0.0, max: 3.0, unit: "s", group: "Passives", get: |t| t.glint_hide, set: |t, v| t.glint_hide = v },
+    TuneField { key: "guard_bonus", label: "Bram: extra guard meter", min: 0.0, max: 1.0, unit: "×", group: "Passives", get: |t| t.guard_bonus, set: |t, v| t.guard_bonus = v },
+    TuneField { key: "flow_slow", label: "Ilya: slower flow fade", min: 0.0, max: 0.9, unit: "×", group: "Passives", get: |t| t.flow_slow, set: |t, v| t.flow_slow = v },
 ];
 /// ...up to this many steps (+20%).
 pub const FLOW_MAX: u32 = 5;
@@ -781,7 +961,7 @@ impl HitPose {
         let c = |a: V3, b: V3, r: f32, part: Part| Capsule { a, b, r, part };
         HitPose {
             caps: [
-                c(at(0.0, 1.6), at(0.0, 1.72), 0.115, Part::Head),
+                c(at(0.0, 1.63), at(0.0, 1.73), 0.15, Part::Head),
                 c(at(0.0, 1.45), at(0.0, 1.56), 0.065, Part::Chest),
                 c(at(0.0, 1.12), at(0.0, 1.36), 0.16, Part::Chest),
                 c(at(-0.19, 1.42), at(0.19, 1.42), 0.085, Part::Chest),
@@ -888,6 +1068,13 @@ pub struct Fighter {
     /// Moves chained (each +4% speed), its little pop on screen, and the slow fade on foot.
     pub flow: u32,
     pub flow_pop: f32,
+    /// The ability: charges ready (fractions recharging), a grapple's anchor and how long it's
+    /// pulled, the Iron Wall's time left, invisibility left (Afterimage).
+    pub ab_charge: f32,
+    pub grapple: Option<V3>,
+    pub grapple_t: f32,
+    pub shield_t: f32,
+    pub invis_t: f32,
     flow_fade: f32,
     still_t: f32,
     /// Sliding time left (0 = not sliding).
@@ -1107,6 +1294,11 @@ impl Fighter {
             air_slashes: 0,
             float_t: 0.0,
             walljumps: 2,
+            ab_charge: 8.0,
+            grapple: None,
+            grapple_t: 0.0,
+            shield_t: 0.0,
+            invis_t: 0.0,
         }
     }
 
@@ -1181,7 +1373,7 @@ impl Fighter {
         }
         let gs = self.weapon.gun();
         if gs.pellets > 1 {
-            return gs.spread_still * self.move_spread; // the shotgun's cone is the cone
+            return gs.spread_still; // the scattergun's pattern never changes
         }
         if self.weapon == Weapon::Sniper {
             // wild from the hip, dead-on the moment the scope is up (quickscopes welcome)
@@ -1195,6 +1387,15 @@ impl Fighter {
     }
     pub fn chest(&self) -> V3 {
         self.pos + v3(0.0, 1.2, 0.0)
+    }
+    /// The scattergun's pump racking back and forward after a shot (0 at rest, 1 fully back).
+    pub fn pump_k(&self) -> f32 {
+        if self.weapon != Weapon::Shotgun || self.fire_cd <= 0.0 {
+            return 0.0;
+        }
+        let e = Weapon::Shotgun.interval() - self.fire_cd;
+        let p = ((e - 0.26) / 0.36).clamp(0.0, 1.0);
+        (p * std::f32::consts::PI).sin()
     }
     pub fn fwd(&self) -> V3 {
         yaw_fwd(self.yaw)
@@ -1377,6 +1578,8 @@ impl Phase {
 #[derive(Clone, Debug)]
 pub struct MatchState {
     pub mode: Mode,
+    /// Classic: no abilities or passives (a lobby setting).
+    pub classic: bool,
     pub phase: Phase,
     pub timer: f32,
     /// Kills to win (a player's in Free-for-All, a team's in Team Deathmatch).
@@ -1453,6 +1656,35 @@ pub struct Flash {
     pub size: f32,
 }
 
+/// One kept moment of the match: everyone as they were, with the shots and sparks in the air.
+#[derive(Clone, Debug)]
+pub struct RecFrame {
+    pub t: f32,
+    pub f: Vec<Fighter>,
+    pub tracers: Vec<Tracer>,
+    pub particles: Vec<Particle>,
+}
+
+/// The Play of the Match: whose, what it was, how good, and the frames to replay.
+#[derive(Clone, Debug)]
+pub struct Highlight {
+    pub player: usize,
+    pub name: String,
+    pub color: u8,
+    pub what: String,
+    pub score: f32,
+    pub frames: Vec<RecFrame>,
+}
+
+impl Highlight {
+    pub fn duration(&self) -> f32 {
+        match (self.frames.first(), self.frames.last()) {
+            (Some(a), Some(b)) => (b.t - a.t).max(0.0),
+            _ => 0.0,
+        }
+    }
+}
+
 /// The slow-motion look at the kill that ended the match.
 #[derive(Clone, Debug)]
 pub struct KillCam {
@@ -1471,6 +1703,8 @@ pub struct DmgNum {
     pub amount: i32,
     pub life: f32,
     pub head: bool,
+    /// Who was hit (255: nobody in particular); a volley's pellets add up into one number.
+    pub victim: u8,
 }
 
 /// A kill feed line.
@@ -1489,6 +1723,9 @@ pub struct FeedLine {
 #[derive(Clone, Debug)]
 pub enum Ev {
     Shot { o: V3, e: V3, w: u8, spark: u8 },
+    /// Someone used their ability: what (Ability), where from / to, which way. From a player
+    /// about themselves; from the host, passed on once it checked out.
+    Ability { who: u8, kind: u8, p: V3, d: V3 },
     /// From a player: "I hit them" (the host checks it). From the host: "you were hit".
     /// `guard` drains the victim's guard meter (a blocked hit).
     Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3, guard: f32 },
@@ -1563,7 +1800,31 @@ pub struct Game {
     /// The menu's showcased fighter: posed in front of the camera, outside the match (nobody
     /// targets, hits or bumps into it).
     pub showcase: Option<usize>,
-    pub hitmarker: f32,
+    /// Warden's Marks and Afterimage decoys in the arena.
+    pub marks: Vec<Mark>,
+    pub decoys: Vec<Decoy>,
+    /// (host) when each player last used their ability (to throw out uses still on cooldown).
+    ab_uses: Vec<Vec<f32>>,
+    /// When each fighter's scope came up (-1: not scoped), for the sniper glint.
+    pub scoped_since: Vec<f32>,
+    /// Kills since their last death, for everyone (a Writ at WRIT_STREAK).
+    pub streaks: Vec<u32>,
+    /// Quick kills in a row for everyone (count, time of the last), for multi-kills.
+    pub kill_chain: Vec<(u32, f32)>,
+    /// Finisher styles the local player hasn't unlocked yet (bit per style; from their mastery).
+    pub fin_locks: u32,
+    /// Play of the Match: the last few seconds kept (frames), the best moment so far waiting for
+    /// its tail (score, who, what, when), the one picked, and its playback after the match.
+    pub rec: VecDeque<RecFrame>,
+    rec_acc: f32,
+    hl_pending: Option<(f32, usize, String, f32)>,
+    pub potm: Option<Highlight>,
+    pub potm_t: Option<f32>,
+    pub potm_done: bool,
+    potm_stash: Option<(Vec<Fighter>, Vec<Tracer>, Vec<Particle>, f32)>,
+    flow_noted: Vec<bool>,
+    /// The phase last tick (to notice a match ending on every computer).
+    seen_phase: Phase,    pub hitmarker: f32,
     /// Where recent hits on you came from (world point, time left).
     pub hurt_dirs: Vec<(V3, f32)>,
     /// Kill confirmation: time left, who, kills in a row.
@@ -1656,6 +1917,10 @@ pub struct TrainStats {
     pub slams: u32,
     pub combo_kos: u32,
     pub star_hits: u32,
+    pub marks: u32,
+    pub grapples: u32,
+    pub wall_blocks: u32,
+    pub afterimages: u32,
 }
 
 pub struct Lesson {
@@ -1670,36 +1935,42 @@ pub struct Lesson {
     /// What the dummies do: 0 stand facing you, 1 hold their guard up, 2 shoot at you now and
     /// then, 3 stand with their backs turned.
     pub dummy: u8,
+    /// The fighter to play for this lesson (their ability).
+    pub body: Option<u8>,
 }
 
-pub const LESSONS: [Lesson; 27] = [
-    Lesson { title: "Move and jump", how: "Move with W A S D and look with the mouse. Press SPACE to jump.", count: |s| s.jumps, need: 3, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Dash", how: "Press SHIFT (or double-tap a direction key) to dash. Dash in different directions.", count: |s| s.dashes, need: 3, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Air dash", how: "Jump with SPACE, then press SHIFT in the air for a second burst of speed.", count: |s| s.air_dashes, need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Wall-run", how: "Run along a wall, jump, then press SPACE again next to the wall while moving along it.", count: |s| s.wallruns, need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Wall climb", how: "Face a wall, jump, then press SPACE again while looking straight at it to run up.", count: |s| s.wallclimbs, need: 1, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Wall-jump", how: "While on a wall, press SPACE again to kick off it. Chain wall to wall!", count: |s| s.walljumps, need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Slide", how: "Run, then hold C to slide along the ground. Press SPACE mid-slide to jump out of it with your speed.", count: |s| s.slides.min(1) + s.slide_jumps.min(1), need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Momentum", how: "Land from a dash, air dash or wall-jump: you keep your speed for a moment instead of slowing to a run.", count: |s| s.momentum, need: 3, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Perfect timing", how: "Jump or dash the instant you land (within a tenth of a second) for an extra boost and a whoosh.", count: |s| s.perfects, need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Flow chain", how: "Chain moves without staying on the ground: dash, wall-run, wall-jump, air dash. Each adds +4% speed. Reach x4!", count: |s| (s.best_flow >= 4) as u32, need: 1, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Sword slash", how: "Press 1 for your katana and click to slash a dummy. Click again to chain swings.", count: |s| s.slash_hits, need: 4, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Slash cancel", how: "Right after a slash hits, press SHIFT, SPACE or hold right-click to cut its recovery short.", count: |s| s.cancels, need: 3, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Butterfly", how: "Slash, hold right-click to guard, release and slash again. Keep the rhythm going!", count: |s| s.butterflies, need: 4, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Launcher", how: "Dash at a dummy and slash during the dash (or land the 3rd hit of a ground combo) to launch it.", count: |s| s.launches, need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Air combo", how: "Launch a dummy, jump after it and slash it in mid-air before it lands.", count: |s| s.air_hits, need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Combo KO", how: "Land 5 blade hits in a row, each while the dummy is still reeling (mashing won't do: mix slashes, cancels, a launcher, air hits, kicks). The fifth knocks it out.", count: |s| s.combo_kos, need: 1, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Charged heavy", how: "Hold the attack button: after half a second your blade flashes. Let go for a heavy slash that smashes through guards and launches. (SHIFT cancels it.)", count: |s| s.heavies, need: 2, gun: None, melee: None, dummy: 1 },
-    Lesson { title: "Kick", how: "Press F to kick. It's quick and can't be blocked: kick a guarding dummy to stagger it. (A slash beats a kick, a kick beats a guard, a guard beats a slash.)", count: |s| s.guard_kicks, need: 3, gun: None, melee: None, dummy: 1 },
-    Lesson { title: "Guard break", how: "Blocking drains the guard meter under the crosshair. Keep slashing a guarding dummy until its guard shatters.", count: |s| s.guard_breaks, need: 1, gun: None, melee: None, dummy: 1 },
-    Lesson { title: "Bullet deflect", how: "Hold your blade. A dummy shoots at you now and then: raise your guard (right-click) just as it fires to send the bullet back.", count: |s| s.deflects, need: 2, gun: None, melee: None, dummy: 2 },
-    Lesson { title: "Dagger backstab", how: "You have a dagger now. Its hits do double damage from behind: get around a dummy and stab it in the back.", count: |s| s.backstabs, need: 3, gun: None, melee: Some(Weapon::Dagger), dummy: 3 },
-    Lesson { title: "Katana dash-through", how: "Dash at a dummy and slash during the dash: you cut straight through it and come out the other side.", count: |s| s.dash_throughs, need: 2, gun: None, melee: None, dummy: 0 },
-    Lesson { title: "Greatsword slam", how: "You have a greatsword now. Jump high (or off a ledge) and slash in the air to plunge down with a shockwave.", count: |s| s.slams, need: 2, gun: None, melee: Some(Weapon::Greatsword), dummy: 0 },
-    Lesson { title: "Hand cannon", how: "Press 3 for the hand cannon. A headshot always kills, even through armour. Land 2 headshots on a dummy (wait a beat between shots: the first is dead-on).", count: |s| s.cannon_heads, need: 2, gun: Some(Weapon::HandCannon), melee: None, dummy: 0 },
-    Lesson { title: "Sniper", how: "Press 3 for the sniper and hold right click to scope: it's dead-on once the scope is up. Hit a dummy twice (one body hit kills a real player).", count: |s| s.sniper_hits, need: 2, gun: Some(Weapon::Sniper), melee: None, dummy: 0 },
-    Lesson { title: "Shuriken", how: "Press 3 for the throwing stars. Click throws three in a quick burst, right-click fans three at once. They fly fast but not instantly: lead a moving target. Hit a dummy 6 times.", count: |s| s.star_hits, need: 6, gun: Some(Weapon::Shuriken), melee: None, dummy: 0 },
-    Lesson { title: "Rocket jump", how: "Press 2 for the rocket launcher. Look down at your feet, jump and fire at the same moment.", count: |s| s.rocket_jumps, need: 1, gun: None, melee: None, dummy: 0 },
+pub const LESSONS: [Lesson; 31] = [
+    Lesson { title: "Move and jump", how: "Move with W A S D and look with the mouse. Press SPACE to jump.", count: |s| s.jumps, need: 3, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Dash", how: "Press SHIFT (or double-tap a direction key) to dash. Dash in different directions.", count: |s| s.dashes, need: 3, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Air dash", how: "Jump with SPACE, then press SHIFT in the air for a second burst of speed.", count: |s| s.air_dashes, need: 2, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Wall-run", how: "Run along a wall, jump, then press SPACE again next to the wall while moving along it.", count: |s| s.wallruns, need: 2, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Wall climb", how: "Face a wall, jump, then press SPACE again while looking straight at it to run up.", count: |s| s.wallclimbs, need: 1, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Wall-jump", how: "While on a wall, press SPACE again to kick off it. Chain wall to wall!", count: |s| s.walljumps, need: 2, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Slide", how: "Run, then hold C to slide along the ground. Press SPACE mid-slide to jump out of it with your speed.", count: |s| s.slides.min(1) + s.slide_jumps.min(1), need: 2, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Momentum", how: "Land from a dash, air dash or wall-jump: you keep your speed for a moment instead of slowing to a run.", count: |s| s.momentum, need: 3, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Perfect timing", how: "Jump or dash the instant you land (within a tenth of a second) for an extra boost and a whoosh.", count: |s| s.perfects, need: 2, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Flow chain", how: "Chain moves without staying on the ground: dash, wall-run, wall-jump, air dash. Each adds +4% speed. Reach x4!", count: |s| (s.best_flow >= 4) as u32, need: 1, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Sword slash", how: "Press 1 for your katana and click to slash a dummy. Click again to chain swings.", count: |s| s.slash_hits, need: 4, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Slash cancel", how: "Right after a slash hits, press SHIFT, SPACE or hold right-click to cut its recovery short.", count: |s| s.cancels, need: 3, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Butterfly", how: "Slash, hold right-click to guard, release and slash again. Keep the rhythm going!", count: |s| s.butterflies, need: 4, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Launcher", how: "Dash at a dummy and slash during the dash (or land the 3rd hit of a ground combo) to launch it.", count: |s| s.launches, need: 2, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Air combo", how: "Launch a dummy, jump after it and slash it in mid-air before it lands.", count: |s| s.air_hits, need: 2, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Combo KO", how: "Land 5 blade hits in a row, each while the dummy is still reeling (mashing won't do: mix slashes, cancels, a launcher, air hits, kicks). The fifth knocks it out.", count: |s| s.combo_kos, need: 1, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Charged heavy", how: "Hold the attack button: after half a second your blade flashes. Let go for a heavy slash that smashes through guards and launches. (SHIFT cancels it.)", count: |s| s.heavies, need: 2, gun: None, melee: None, dummy: 1, body: None },
+    Lesson { title: "Kick", how: "Press F to kick. It's quick and can't be blocked: kick a guarding dummy to stagger it. (A slash beats a kick, a kick beats a guard, a guard beats a slash.)", count: |s| s.guard_kicks, need: 3, gun: None, melee: None, dummy: 1, body: None },
+    Lesson { title: "Guard break", how: "Blocking drains the guard meter under the crosshair. Keep slashing a guarding dummy until its guard shatters.", count: |s| s.guard_breaks, need: 1, gun: None, melee: None, dummy: 1, body: None },
+    Lesson { title: "Bullet deflect", how: "Hold your blade. A dummy shoots at you now and then: raise your guard (right-click) just as it fires to send the bullet back.", count: |s| s.deflects, need: 2, gun: None, melee: None, dummy: 2, body: None },
+    Lesson { title: "Dagger backstab", how: "You have a dagger now. Its hits do double damage from behind: get around a dummy and stab it in the back.", count: |s| s.backstabs, need: 3, gun: None, melee: Some(Weapon::Dagger), dummy: 3, body: None },
+    Lesson { title: "Katana dash-through", how: "Dash at a dummy and slash during the dash: you cut straight through it and come out the other side.", count: |s| s.dash_throughs, need: 2, gun: None, melee: None, dummy: 0, body: None },
+    Lesson { title: "Greatsword slam", how: "You have a greatsword now. Jump high (or off a ledge) and slash in the air to plunge down with a shockwave.", count: |s| s.slams, need: 2, gun: None, melee: Some(Weapon::Greatsword), dummy: 0, body: None },
+    Lesson { title: "Hand cannon", how: "Press 3 for the hand cannon. A headshot always kills, even through armour. Land 2 headshots on a dummy (wait a beat between shots: the first is dead-on).", count: |s| s.cannon_heads, need: 2, gun: Some(Weapon::HandCannon), melee: None, dummy: 0, body: None },
+    Lesson { title: "Sniper", how: "Press 3 for the sniper and hold right click to scope: it's dead-on once the scope is up. Hit a dummy twice (one body hit kills a real player).", count: |s| s.sniper_hits, need: 2, gun: Some(Weapon::Sniper), melee: None, dummy: 0, body: None },
+    Lesson { title: "Shuriken", how: "Press 3 for the throwing stars. Click throws three in a quick burst, right-click fans three at once. They fly fast but not instantly: lead a moving target. Hit a dummy 6 times.", count: |s| s.star_hits, need: 6, gun: Some(Weapon::Shuriken), melee: None, dummy: 0, body: None },
+    Lesson { title: "Warden's Mark (Corvin Vale)", how: "You're Corvin Vale. Press Q (controller LB) to throw a marker near the dummies: enemies within 12 m of it show through walls for 4 s. Passive: a kill reloads every gun.", count: |s| s.marks, need: 2, gun: None, melee: None, dummy: 0, body: Some(0) },
+    Lesson { title: "Grapple Line (Sable Rook)", how: "You're Sable Rook. Aim at a wall, ledge or pillar within 20 m and press Q to be pulled there (2 charges). Press SPACE to let go early and keep your speed. Passive: your sniper glint stays hidden for the first second scoped.", count: |s| s.grapples, need: 3, gun: None, melee: None, dummy: 0, body: Some(1) },
+    Lesson { title: "Iron Wall (Bram Kask)", how: "You're Bram \"Anvil\" Kask. The dummies shoot at you: face them and press Q to raise a shield that stops bullets (and throws back blades). Block 3 shots. Passive: a 30% bigger guard meter.", count: |s| s.wall_blocks, need: 3, gun: None, melee: None, dummy: 2, body: Some(2) },
+    Lesson { title: "Afterimage (Ilya Fen)", how: "You're Ilya Fen. Press Q to vanish for a moment while a decoy of you runs on and fakes an attack. Passive: your flow chain fades half as fast.", count: |s| s.afterimages, need: 2, gun: None, melee: None, dummy: 0, body: Some(3) },
+    Lesson { title: "Rocket jump", how: "Press 2 for the rocket launcher. Look down at your feet, jump and fire at the same moment.", count: |s| s.rocket_jumps, need: 1, gun: None, melee: None, dummy: 0, body: None },
 ];
 
 pub struct Training {
@@ -1785,6 +2056,14 @@ pub enum Sfx {
     ChargeReady,
     Slam,
     Shuriken,
+    /// The scattergun racking its pump, and a shell pushed into it.
+    Pump,
+    ShellIn,
+    /// Abilities: a mark pinging, a grapple firing, a shield going up, vanishing.
+    MarkPing,
+    GrappleFire,
+    ShieldUp,
+    Vanish,
 }
 
 impl Sfx {
@@ -1824,6 +2103,10 @@ pub struct ClaimCheck {
 pub enum Act {
     /// A gunshot with the spread it had the moment it was fired.
     Gun { w: Weapon, spread: f32 },
+    /// The scattergun's pump racks: out flies the spent shell.
+    Pump,
+    /// The fighter's ability: where from / to, which way.
+    Ability { kind: Ability, p: V3, d: V3 },
     Slash,
     Throw,
     Item { kind: u8 },
@@ -1857,6 +2140,7 @@ impl Game {
             kind,
             mt: MatchState {
                 mode,
+                classic: false,
                 phase,
                 timer,
                 target: target.max(1),
@@ -1891,6 +2175,22 @@ impl Game {
             history: (0..MAX_PLAYERS).map(|_| VecDeque::new()).collect(),
             my_loadout: Loadout::default(),
             showcase: None,
+            marks: Vec::new(),
+            decoys: Vec::new(),
+            ab_uses: vec![Vec::new(); MAX_PLAYERS],
+            scoped_since: vec![-1.0; MAX_PLAYERS],
+            streaks: vec![0; MAX_PLAYERS],
+            kill_chain: vec![(0, -10.0); MAX_PLAYERS],
+            fin_locks: 0,
+            rec: VecDeque::new(),
+            rec_acc: 0.0,
+            hl_pending: None,
+            potm: None,
+            potm_t: None,
+            potm_done: false,
+            potm_stash: None,
+            flow_noted: vec![false; MAX_PLAYERS],
+            seen_phase: Phase::Warmup,
             hitmarker: 0.0,
             hurt_dirs: Vec::new(),
             kill_t: 0.0,
@@ -1957,14 +2257,14 @@ impl Game {
     pub fn training(name: &str) -> Game {
         let mut g = Game::new(Kind::Offline, 0, Mode::Ffa, 9999);
         g.set_map(MapId::Courtyard);
-        g.my_loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rocket, gun2: Weapon::Revolver, item: 2, body: 0 };
+        g.my_loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rocket, gun2: Weapon::Revolver, item: 2, body: 0, outfit: 0 };
         g.add_player(0, name, true, None, 0);
         let homes = [v3(-3.5, 0.0, -6.0), v3(0.0, 0.0, -6.2), v3(3.5, 0.0, -6.0)];
         for (k, &h) in homes.iter().enumerate() {
             let s = k + 1;
             g.add_player(s, &format!("Dummy {}", s), true, Some(0.0), 0);
             g.bots[s] = None; // stands still
-            g.f[s].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0, body: 0 };
+            g.f[s].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0, body: 0, outfit: 0 };
             g.f[s].equip();
             g.f[s].respawn_at(h, 0.0);
             g.f[s].spawn_prot = 0.0;
@@ -2084,6 +2384,14 @@ impl Game {
         // refill ammo and grenades so practice never runs dry; hand over this lesson's gun
         if let Some(f) = self.f.get_mut(me) {
             f.items = f.items.max(1);
+            // an ability lesson: play its fighter
+            if let Some(b) = LESSONS.get(t.lesson).and_then(|l| l.body) {
+                if f.loadout.body != b {
+                    f.loadout.body = b;
+                    f.ab_charge = 9.0;
+                    self.my_loadout.body = b;
+                }
+            }
             let blade = LESSONS.get(t.lesson).and_then(|l| l.melee).unwrap_or(Weapon::Katana);
             if f.loadout.melee != blade {
                 f.loadout.melee = blade;
@@ -2481,7 +2789,7 @@ impl Game {
         let me = self.f[i].eye();
         let mut best: Option<(f32, usize)> = None;
         for j in 0..self.f.len() {
-            if !self.is_enemy(i, j) || !self.f[j].alive {
+            if !self.is_enemy(i, j) || !self.f[j].alive || self.f[j].invis_t > 0.0 {
                 continue;
             }
             let mut d = (self.f[j].pos - self.f[i].pos).len();
@@ -2854,6 +3162,19 @@ impl Game {
         } else {
             self.mt.timer = (self.mt.timer - dt).max(0.0);
         }
+        self.record(dt);
+        if self.mt.phase == Phase::MatchOver && self.seen_phase != Phase::MatchOver {
+            self.on_match_over();
+        }
+        if self.mt.phase != Phase::MatchOver && self.seen_phase == Phase::MatchOver {
+            // a new match: a new Play of the Match
+            self.potm = None;
+            self.potm_t = None;
+            self.potm_done = false;
+            self.hl_pending = None;
+            self.rec.clear();
+        }
+        self.seen_phase = self.mt.phase;
         if let Some((_, t)) = &mut self.banner {
             *t -= dt;
             if *t <= 0.0 {
@@ -2874,6 +3195,20 @@ impl Game {
         if let Some(kc) = self.killcam.as_mut() {
             kc.t += dt;
         }
+        // the Play of the Match plays once the final kill cam is over
+        if self.mt.phase == Phase::MatchOver && !self.potm_done {
+            let cam_over = self.killcam.as_ref().map_or(true, |k| k.t >= KILLCAM_TIME);
+            if let Some(h) = self.potm.as_ref().filter(|_| cam_over) {
+                let len = h.duration();
+                let t = self.potm_t.map_or(0.0, |t| t + dt);
+                if t >= len {
+                    self.potm_t = None;
+                    self.potm_done = true;
+                } else {
+                    self.potm_t = Some(t);
+                }
+            }
+        }
         let mut scale = 1.0;
         if self.slowmo > 0.0 {
             self.slowmo -= dt;
@@ -2891,6 +3226,7 @@ impl Game {
             // presses count once
             inp.jump = false;
             inp.dash = false;
+            inp.ability = false;
             inp.fire_pressed = false;
             inp.reload = false;
             inp.item = false;
@@ -3052,6 +3388,71 @@ impl Game {
         let p = self.f[victim].chest();
         self.burst(p, [200, 30, 40], 26, 6.0);
         self.last_kill = Some((victim, k, w, head));
+        // Writs: a streak of WRIT_STREAK kills marks you; whoever takes you down claims it
+        let writ_modes = matches!(self.mt.mode, Mode::Ffa | Mode::Tdm) && self.kind != Kind::Demo && self.train.is_none();
+        let held = self.streaks.get(victim).copied().unwrap_or(0);
+        let claimed = writ_modes && held >= WRIT_STREAK;
+        if let Some(s) = self.streaks.get_mut(victim) {
+            *s = 0;
+        }
+        if let Some(s) = self.kill_chain.get_mut(victim) {
+            *s = (0, -10.0);
+        }
+        if let Some(kk) = k.filter(|&kk| kk != victim && self.is_enemy(kk, victim)) {
+            // Corvin Vale's passive: a kill reloads every gun at once
+            if self.abilities_on() && self.f[kk].owned && Ability::of(self.f[kk].loadout.body) == Ability::Mark {
+                let f = &mut self.f[kk];
+                for s in 1..3 {
+                    f.mag[s] = f.slot_weapon(s).mag();
+                }
+                f.reload_t = 0.0;
+                if kk == self.local {
+                    self.sfx2d(Sfx::ReloadEnd);
+                }
+            }
+            let now = self.time;
+            let n = {
+                let s = &mut self.streaks[kk];
+                *s += 1;
+                *s
+            };
+            let chain = {
+                let c = &mut self.kill_chain[kk];
+                *c = if now - c.1 < 4.0 { (c.0 + 1, now) } else { (1, now) };
+                c.0
+            };
+            let kn = self.f[kk].name.clone();
+            let vn = self.f[victim].name.clone();
+            if claimed {
+                self.feed.push(FeedLine { killer: None, victim: (String::new(), 0), tool: "", head: false, text: Some(format!("WRIT CLAIMED  {kn} took {vn}'s Writ ({held} kills)")), life: 6.0 });
+                if kk == self.local {
+                    self.career.push(CareerEv::WritClaim { streak: held });
+                    self.banner = Some(("WRIT CLAIMED".into(), 1.6));
+                }
+                self.highlight(kk, 180.0 + 30.0 * held as f32, "WRIT CLAIMED".into());
+            }
+            if writ_modes && n == WRIT_STREAK {
+                self.feed.push(FeedLine { killer: None, victim: (String::new(), 0), tool: "", head: false, text: Some(format!("WRIT  {kn} is on a {n}-kill streak: take them down for XP")), life: 6.0 });
+                if kk == self.local {
+                    self.banner = Some(("YOU HOLD A WRIT".into(), 2.0));
+                }
+            }
+            // the Play of the Match: multi-kills, finishers, or at least a good kill
+            let what = match chain {
+                2 => "DOUBLE KILL",
+                3 => "TRIPLE KILL",
+                4 => "QUAD KILL",
+                c if c >= 5 => "RAMPAGE",
+                _ if w == EXEC_TOOL => "EXECUTION",
+                _ if head => "HEADSHOT",
+                _ => "ELIMINATION",
+            };
+            let score = if chain >= 2 { 100.0 * chain as f32 } else if w == EXEC_TOOL { 220.0 } else if head { 70.0 } else { 50.0 };
+            self.highlight(kk, score + if w == EXEC_TOOL && chain >= 2 { 60.0 } else { 0.0 }, what.into());
+            if kk == self.local && chain == 2 {
+                self.career.push(CareerEv::MultiKill);
+            }
+        }
         if k == Some(self.local) && victim != self.local && self.is_enemy(self.local, victim) {
             self.streak = if self.time - self.last_kill_time < 4.0 { self.streak + 1 } else { 1 };
             self.last_kill_time = self.time;
@@ -3136,6 +3537,307 @@ impl Game {
         }
     }
 
+    /// Abilities and passives are in play (any mode, Duels too, unless the lobby is Classic).
+    pub fn abilities_on(&self) -> bool {
+        !self.mt.classic
+    }
+
+    /// The guard meter's top for this fighter (Bram's passive raises it).
+    pub fn guard_max_of(&self, f: &Fighter) -> f32 {
+        if self.abilities_on() && Ability::of(f.loadout.body) == Ability::Wall { GUARD_MAX * (1.0 + self.tune.guard_bonus) } else { GUARD_MAX }
+    }
+
+    /// (host) a player's ability use holds up: their fighter's own, abilities on, alive, a
+    /// charge free (with a little slack for lag), and where it happened in reach.
+    pub fn ability_ok(&self, w: usize, kind: Ability, p: V3) -> bool {
+        let f = &self.f[w];
+        if !self.abilities_on() || !f.alive || Ability::of(f.loadout.body) != kind {
+            return false;
+        }
+        let cd = kind.cooldown(&self.tune) * 0.85;
+        let recent = self.ab_uses[w].iter().filter(|&&t| self.time - t < cd).count();
+        if recent as f32 >= kind.charges(&self.tune) {
+            return false;
+        }
+        let reach = if kind == Ability::Grapple { self.tune.grapple_range + 4.0 } else { 4.0 };
+        (p - f.pos).len() <= reach
+    }
+
+    /// What an ability use looks and sounds like (and leaves in the arena), on every computer.
+    fn ability_fx(&mut self, i: usize, kind: Ability, p: V3, d: V3) {
+        let owned = self.f[i].owned;
+        let at = self.f[i].chest();
+        match kind {
+            Ability::Mark => {
+                self.marks.push(Mark { pos: p, vel: clamp_len(d, 40.0), owner: i, landed: false, t: 0.0 });
+                self.sfx(Sfx::Throw, p);
+            }
+            Ability::Grapple => {
+                if !owned {
+                    self.f[i].grapple = Some(p);
+                    self.f[i].grapple_t = 0.0;
+                }
+                self.sfx(Sfx::GrappleFire, at);
+                self.burst(p, [230, 220, 200], 8, 3.0);
+                self.note(i, |s| s.grapples += 1);
+            }
+            Ability::Wall => {
+                if !owned {
+                    self.f[i].shield_t = self.tune.shield_time;
+                }
+                self.sfx(Sfx::ShieldUp, at);
+                self.burst(at + self.f[i].fwd() * 0.6, [120, 190, 255], 18, 4.0);
+            }
+            Ability::Afterimage => {
+                if !owned {
+                    self.f[i].invis_t = self.tune.invis_time;
+                }
+                let dd = clamp_len(d, 15.0);
+                self.decoys.push(Decoy { pos: p, vel: v3(dd.x, 0.0, dd.z), yaw: dd.x.atan2(dd.z), owner: i, t: 0.0 });
+                self.sfx(Sfx::Vanish, at);
+                for _ in 0..14 {
+                    let v = v3(self.rng.range(-1.2, 1.2), self.rng.range(0.2, 1.4), self.rng.range(-1.2, 1.2));
+                    self.particles.push(Particle { pos: at, vel: v, life: 0.6, max_life: 0.6, size: 0.35, color: [150, 140, 170], gravity: -0.4 });
+                }
+                self.note(i, |s| s.afterimages += 1);
+            }
+        }
+    }
+
+    /// Marks fly and stick, decoys run and fade, scopes are timed (for the sniper glint).
+    fn update_abilities(&mut self, dt: f32) {
+        let gravity = self.tune.gravity;
+        let mut landed = Vec::new();
+        for (k, m) in self.marks.iter_mut().enumerate() {
+            if m.landed {
+                m.t -= dt;
+                continue;
+            }
+            m.t += dt;
+            let step = m.vel * dt;
+            let len = step.len();
+            let hit = if len > 1e-5 { self.world.raycast(m.pos, step * (1.0 / len), len + 0.05) } else { None };
+            match hit {
+                Some((ht, _)) => {
+                    m.pos = m.pos + step * ((ht - 0.05).max(0.0) / len);
+                    m.landed = true;
+                    m.t = self.tune.mark_time;
+                    landed.push(k);
+                }
+                None => {
+                    m.pos = m.pos + step;
+                    m.vel.y -= gravity * dt;
+                    if m.t > 2.0 {
+                        m.landed = true;
+                        m.t = self.tune.mark_time;
+                        landed.push(k);
+                    }
+                }
+            }
+        }
+        for k in landed {
+            let (p, owner) = (self.marks[k].pos, self.marks[k].owner);
+            self.sfx(Sfx::MarkPing, p);
+            self.burst(p, [255, 90, 70], 16, 5.0);
+            let r = self.tune.mark_radius;
+            if (0..self.f.len()).any(|j| self.f[j].alive && self.is_enemy(owner, j) && (self.f[j].pos - p).len() <= r) {
+                self.note(owner, |s| s.marks += 1);
+            }
+        }
+        self.marks.retain(|m| !m.landed || m.t > 0.0);
+        let life = self.tune.decoy_time;
+        for d in self.decoys.iter_mut() {
+            d.t += dt;
+            let step = d.vel * dt;
+            let len = step.len();
+            if len > 1e-5 && self.world.raycast(d.pos + v3(0.0, 1.0, 0.0), step * (1.0 / len), len + 0.4).is_some() {
+                d.vel = V3::ZERO; // ran into a wall: stops there
+            } else {
+                d.pos = d.pos + step;
+            }
+            let ground = self.world.ground_below(d.pos + v3(0.0, 0.8, 0.0));
+            if (d.pos.y - ground).abs() < 1.5 {
+                d.pos.y = ground;
+            }
+        }
+        self.decoys.retain(|d| d.t < life);
+        let now = self.time;
+        for (i, f) in self.f.iter().enumerate() {
+            if let Some(s) = self.scoped_since.get_mut(i) {
+                *s = if f.scope_t > 0.0 && f.alive { if *s < 0.0 { now } else { *s } } else { -1.0 };
+            }
+        }
+        for u in self.ab_uses.iter_mut() {
+            u.retain(|&t| now - t < 120.0);
+        }
+    }
+
+    /// Does `viewer` see fighter `j` through walls (a Warden's Mark of theirs or a teammate's)?
+    pub fn revealed_to(&self, viewer: usize, j: usize) -> bool {
+        let r = self.tune.mark_radius;
+        self.f.get(j).is_some_and(|f| f.alive) && self.marks.iter().any(|m| m.landed && m.owner < self.f.len() && !self.is_enemy(viewer, m.owner) && self.is_enemy(m.owner, j) && (self.f[j].pos - m.pos).len() <= r)
+    }
+
+    /// A decoy drawn as its owner: running, then faking a swing.
+    pub fn decoy_fighter(&self, d: &Decoy) -> Option<Fighter> {
+        let mut f = self.f.get(d.owner)?.clone();
+        f.pos = d.pos;
+        f.prev_pos = d.pos;
+        f.vel = d.vel;
+        f.yaw = d.yaw;
+        f.alive = true;
+        f.on_ground = true;
+        f.invis_t = 0.0;
+        f.shield_t = 0.0;
+        f.grapple = None;
+        f.guard = false;
+        f.fin = 0;
+        f.cur = 0;
+        f.weapon = f.loadout.melee;
+        let fake = d.t - 0.55;
+        f.slash_t = if (0.0..f.weapon.slash_dur()).contains(&fake) { f.weapon.slash_dur() - fake } else { 0.0 };
+        f.slash_idx = 0;
+        Some(f)
+    }
+
+    /// Someone holds a Writ right now.
+    pub fn has_writ(&self, j: usize) -> bool {
+        matches!(self.mt.mode, Mode::Ffa | Mode::Tdm) && self.kind != Kind::Demo && self.train.is_none() && self.f.get(j).is_some_and(|f| f.present && f.alive) && self.streaks.get(j).is_some_and(|&s| s >= WRIT_STREAK)
+    }
+
+    /// A moment worth replaying: kept if it beats the best so far (it's saved once its tail
+    /// has been recorded).
+    fn highlight(&mut self, player: usize, score: f32, what: String) {
+        if self.kind == Kind::Demo || self.train.is_some() || self.mt.phase != Phase::Fight {
+            return;
+        }
+        let best = self.potm.as_ref().map_or(0.0, |h| h.score).max(self.hl_pending.as_ref().map_or(0.0, |p| p.0));
+        if score > best {
+            self.hl_pending = Some((score, player, what, self.time));
+        }
+    }
+
+    /// Keep the last few seconds (during a fight), and seal a waiting highlight once its tail
+    /// is in.
+    fn record(&mut self, dt: f32) {
+        if self.kind == Kind::Demo || self.train.is_some() || self.mt.phase != Phase::Fight {
+            return;
+        }
+        // a long flow chain is a moment too
+        for i in 0..self.f.len().min(self.flow_noted.len()) {
+            let f = &self.f[i];
+            if f.present && f.alive && f.flow >= FLOW_MAX && !self.flow_noted[i] {
+                self.flow_noted[i] = true;
+                self.highlight(i, 90.0 + 10.0 * f.flow as f32, "FLOW CHAIN".into());
+            } else if self.f[i].flow == 0 {
+                self.flow_noted[i] = false;
+            }
+        }
+        self.rec_acc += dt;
+        if self.rec_acc >= REC_DT {
+            self.rec_acc -= REC_DT;
+            self.rec.push_back(RecFrame { t: self.time, f: self.f.clone(), tracers: self.tracers.clone(), particles: self.particles.clone() });
+            let keep = POTM_BEFORE + POTM_AFTER + 0.5;
+            while self.rec.front().is_some_and(|fr| fr.t < self.time - keep) {
+                self.rec.pop_front();
+            }
+        }
+        if self.hl_pending.as_ref().is_some_and(|p| self.time >= p.3 + POTM_AFTER) {
+            self.seal_highlight();
+        }
+    }
+
+    fn seal_highlight(&mut self) {
+        let Some((score, player, what, at)) = self.hl_pending.take() else { return };
+        let frames: Vec<RecFrame> = self.rec.iter().filter(|fr| fr.t >= at - POTM_BEFORE && fr.t <= at + POTM_AFTER).cloned().collect();
+        if frames.len() < 4 || player >= self.f.len() {
+            return;
+        }
+        let (name, color) = (self.f[player].name.clone(), self.f[player].color_idx);
+        self.potm = Some(Highlight { player, name, color, what, score, frames });
+    }
+
+    /// The match just ended (here, or the host said so): count it, and pick the Play of the Match.
+    fn on_match_over(&mut self) {
+        if self.kind == Kind::Demo {
+            return;
+        }
+        self.seal_highlight();
+        self.potm_t = None;
+        self.potm_done = self.potm.is_none();
+        if self.train.is_none() {
+            self.career.push(CareerEv::MatchEnd);
+            if self.local_won() {
+                self.career.push(CareerEv::MatchWon);
+            }
+        }
+    }
+
+    /// Did the local player (or their team) win the match that just ended?
+    pub fn local_won(&self) -> bool {
+        let me = &self.f[self.local];
+        if !me.present {
+            return false;
+        }
+        match self.mt.mode {
+            Mode::Tdm | Mode::Ctf => {
+                let t = (me.team as usize).min(1);
+                self.mt.team_score[t] > self.mt.team_score[1 - t]
+            }
+            Mode::Duel | Mode::Lms => self.f.iter().filter(|f| f.present && f.slot != self.local).all(|f| me.wins > f.wins),
+            Mode::Gauntlet => false,
+            _ => self.f.iter().filter(|f| f.present && f.slot != self.local).all(|f| me.kills > f.kills),
+        }
+    }
+
+    /// While the Play of the Match plays: put its moment in place of the live one (fighters
+    /// between two kept frames, the shots and sparks of the nearest) so it can be drawn; true
+    /// if it did. Undo with `potm_view_end`.
+    pub fn potm_view_begin(&mut self) -> bool {
+        let (Some(t), Some(h)) = (self.potm_t, self.potm.as_ref()) else { return false };
+        if self.potm_stash.is_some() || h.frames.is_empty() {
+            return false;
+        }
+        let t0 = h.frames[0].t + t;
+        let k = h.frames.iter().position(|fr| fr.t > t0).unwrap_or(h.frames.len() - 1).max(1).min(h.frames.len() - 1);
+        let (a, b) = (&h.frames[k - 1], &h.frames[k]);
+        let w = ((t0 - a.t) / (b.t - a.t).max(1e-4)).clamp(0.0, 1.0);
+        let mut f = a.f.clone();
+        for (x, y) in f.iter_mut().zip(b.f.iter()) {
+            if (y.pos - x.pos).len() < 3.0 {
+                x.pos = x.pos.lerp(y.pos, w);
+                x.yaw += crate::math::wrap_angle(y.yaw - x.yaw) * w;
+                x.pitch += (y.pitch - x.pitch) * w;
+                x.vel = x.vel.lerp(y.vel, w);
+            }
+            x.prev_pos = x.pos;
+        }
+        let fr = if w < 0.5 { a } else { b };
+        let (tracers, particles) = (fr.tracers.clone(), fr.particles.clone());
+        let time = a.t + (b.t - a.t) * w;
+        let live_f = std::mem::replace(&mut self.f, f);
+        let live_tr = std::mem::replace(&mut self.tracers, tracers);
+        let live_pa = std::mem::replace(&mut self.particles, particles);
+        let live_time = std::mem::replace(&mut self.time, time);
+        self.potm_stash = Some((live_f, live_tr, live_pa, live_time));
+        true
+    }
+
+    pub fn potm_view_end(&mut self) {
+        if let Some((f, tr, pa, time)) = self.potm_stash.take() {
+            self.f = f;
+            self.tracers = tr;
+            self.particles = pa;
+            self.time = time;
+        }
+    }
+
+    /// Skip the Play of the Match.
+    pub fn skip_potm(&mut self) {
+        self.potm_t = None;
+        self.potm_done = true;
+    }
+
     /// Start the slow-motion final kill cam (when the match ends with a kill).
     pub fn start_killcam(&mut self) {
         if self.kind == Kind::Demo {
@@ -3148,7 +3850,6 @@ impl Game {
     }
 
     fn end_match(&mut self) {
-        self.career.push(CareerEv::MatchEnd);
         self.start_killcam();
         self.mt.phase = Phase::MatchOver;
         self.mt.timer = if self.kind == Kind::Demo { 5.0 } else { 9999.0 };
@@ -3406,6 +4107,8 @@ impl Game {
             self.gauntlet = Some(Gauntlet { best, ..Default::default() });
         }
         self.mt.number += 1;
+        self.streaks = vec![0; MAX_PLAYERS];
+        self.kill_chain = vec![(0, -10.0); MAX_PLAYERS];
         self.killcam = None;
         self.slowmo = 0.0;
         self.last_kill = None;
@@ -3604,7 +4307,11 @@ impl Game {
         let tn = self.tune;
         let run = tn.run_speed;
 
+        let cd_before = ff.fire_cd;
         ff.fire_cd = (ff.fire_cd - dt).max(0.0);
+        if ff.weapon == Weapon::Shotgun && cd_before > PUMP_AT && ff.fire_cd <= PUMP_AT && ff.alive {
+            acts.push(Act::Pump);
+        }
         ff.switch_t = (ff.switch_t - dt).max(0.0);
         ff.dash_cd = (ff.dash_cd - dt).max(0.0);
         // spent dashes come back one at a time
@@ -3657,7 +4364,7 @@ impl Game {
         if !ff.guard {
             ff.guard_rest += dt;
             if ff.guard_rest > GUARD_REGEN_DELAY {
-                ff.guard_hp = (ff.guard_hp + GUARD_REGEN * dt).min(GUARD_MAX);
+                ff.guard_hp = (ff.guard_hp + GUARD_REGEN * dt).min(self.guard_max_of(&ff));
             }
         }
         // carried speed: held for a moment after landing, then eased off
@@ -3778,8 +4485,19 @@ impl Game {
             ff.reload_t -= dt;
             if ff.reload_t <= 0.0 {
                 ff.reload_t = 0.0;
-                ff.mag[wi] = ff.weapon.mag();
-                sounds.push(Sfx::ReloadEnd);
+                if ff.weapon == Weapon::Shotgun {
+                    // one shell at a time, until it's full (or you shoot)
+                    ff.mag[wi] = (ff.mag[wi] + 1).min(ff.weapon.mag());
+                    sounds.push(Sfx::ShellIn);
+                    if ff.mag[wi] < ff.weapon.mag() {
+                        ff.reload_t = SHELL_TIME;
+                    } else {
+                        sounds.push(Sfx::Pump);
+                    }
+                } else {
+                    ff.mag[wi] = ff.weapon.mag();
+                    sounds.push(Sfx::ReloadEnd);
+                }
             }
         } else if inp.reload && !melee && ff.mag[wi] < ff.weapon.mag() && can_act {
             ff.reload_t = ff.weapon.reload_time();
@@ -3812,6 +4530,77 @@ impl Game {
         }
         ff.scope_t = if scoping { ff.scope_t + dt } else { 0.0 };
 
+        // ---- the ability (Q / LB): charges come back one at a time
+        let ab = Ability::of(ff.loadout.body);
+        let ab_on = self.abilities_on();
+        let most = ab.charges(&tn);
+        ff.ab_charge = if ab_on { (ff.ab_charge + dt / ab.cooldown(&tn).max(0.5)).min(most) } else { most };
+        ff.shield_t = (ff.shield_t - dt).max(0.0);
+        ff.invis_t = (ff.invis_t - dt).max(0.0);
+        if inp.ability && ab_on && can_act && ff.alive && ff.ab_charge >= 1.0 && ff.fin == 0 && ff.held_by.is_none() {
+            let eye = ff.eye();
+            match ab {
+                Ability::Mark => {
+                    let (_, dir) = self.shot_ray(i);
+                    acts.push(Act::Ability { kind: ab, p: eye + ff.fwd() * 0.4, d: dir * 22.0 + v3(0.0, 4.0, 0.0) });
+                    ff.ab_charge -= 1.0;
+                }
+                Ability::Grapple => {
+                    // the line goes where the crosshair is, if there's something to hook within range
+                    let (o, dir) = self.shot_ray(i);
+                    let reach = tn.grapple_range + (o - eye).len();
+                    if let Some((t, _)) = self.world.raycast(o, dir, reach) {
+                        let anchor = o + dir * (t - 0.05);
+                        let d = (anchor - eye).len();
+                        if d <= tn.grapple_range + 0.5 && d > 2.0 {
+                            acts.push(Act::Ability { kind: ab, p: anchor, d: dir });
+                            ff.ab_charge -= 1.0;
+                            ff.grapple = Some(anchor);
+                            ff.grapple_t = 0.0;
+                            // off the ground and on the way, keeping the speed you had
+                            let to = (anchor - ff.chest()).norm();
+                            ff.vel = ff.vel * 0.7 + to * (tn.grapple_pull * 0.55) + v3(0.0, 2.5, 0.0);
+                            ff.on_ground = false;
+                            ff.wall = None;
+                            ff.sliding = 0.0;
+                        }
+                    }
+                }
+                Ability::Wall => {
+                    ff.shield_t = tn.shield_time;
+                    ff.guard = false;
+                    acts.push(Act::Ability { kind: ab, p: ff.pos, d: ff.fwd() });
+                    ff.ab_charge -= 1.0;
+                }
+                Ability::Afterimage => {
+                    ff.invis_t = tn.invis_time;
+                    let run = ff.fwd() * (tn.run_speed.max(6.0) * 1.1);
+                    acts.push(Act::Ability { kind: ab, p: ff.pos, d: run });
+                    ff.ab_charge -= 1.0;
+                }
+            }
+        }
+        // the grapple pulls (on top of what you were doing); jump lets go, keeping the speed
+        if let Some(a) = ff.grapple {
+            ff.grapple_t += dt;
+            let to = a - ff.chest();
+            let dist = to.len();
+            if !ff.alive || inp.jump || dist < 1.4 || ff.grapple_t > 1.5 || ff.stun_t > 0.0 {
+                if inp.jump && ff.alive {
+                    ff.vel.y = ff.vel.y.max(5.5);
+                }
+                ff.grapple = None;
+            } else {
+                let dir = to * (1.0 / dist);
+                let along = ff.vel.dot(dir);
+                if along < tn.grapple_pull {
+                    ff.vel = ff.vel + dir * (tn.grapple_pull - along).min(70.0 * dt);
+                }
+                ff.vel.y += tn.gravity * 0.85 * dt; // the line carries your weight
+                ff.on_ground = false;
+            }
+        }
+
         // finisher: on a weakened, staggered enemy in reach
         if inp.finish && can_act && ff.fin == 0 && ff.held_by.is_none() {
             self.f[i] = ff.clone();
@@ -3819,7 +4608,13 @@ impl Game {
                 let b = &self.f[t];
                 let airborne = !b.on_ground && b.pos.y - self.world.ground_below(b.pos + v3(0.0, 0.2, 0.0)) > 0.8;
                 let blade = ff.loadout.melee;
-                let choices: Vec<usize> = (0..FINISHERS.len()).filter(|&k| if airborne { FINISHERS[k].weapon.is_none() } else { FINISHERS[k].weapon == Some(blade) }).collect();
+                let fits = |k: usize| if airborne { FINISHERS[k].weapon.is_none() } else { FINISHERS[k].weapon == Some(blade) };
+                // your own finishers: the ones your fighter's mastery has opened
+                let open = |k: usize| i != self.local || self.fin_locks & (1 << k) == 0;
+                let mut choices: Vec<usize> = (0..FINISHERS.len()).filter(|&k| fits(k) && open(k)).collect();
+                if choices.is_empty() {
+                    choices = (0..FINISHERS.len()).filter(|&k| fits(k)).collect();
+                }
                 let pick = choices[(self.rng.next_u32() as usize) % choices.len().max(1)];
                 ff.fin = pick as u8 + 1;
                 self.last_finisher = ff.fin;
@@ -4180,9 +4975,11 @@ impl Game {
             ff.sliding = 0.0;
         }
         // the chain fades if you stand still, or slowly after a while on foot
+        // Ilya Fen's passive: the chain fades slower
+        let flow_keep = if self.abilities_on() && Ability::of(ff.loadout.body) == Ability::Afterimage { 1.0 / (1.0 - tn.flow_slow.clamp(0.0, 0.9)) } else { 1.0 };
         if ff.on_ground && ff.vel.flat().len() < 1.0 && wish.len() < 0.1 {
             ff.still_t += dt;
-            if ff.still_t > 0.2 {
+            if ff.still_t > 0.2 * flow_keep {
                 ff.flow = 0;
             }
         } else {
@@ -4190,7 +4987,7 @@ impl Game {
         }
         if ff.ground_t > 1.0 && ff.flow > 0 && ff.sliding <= 0.0 {
             ff.flow_fade += dt;
-            if ff.flow_fade > 0.6 {
+            if ff.flow_fade > 0.6 * flow_keep {
                 ff.flow_fade = 0.0;
                 ff.flow -= 1;
             }
@@ -4406,8 +5203,11 @@ impl Game {
                     }
                 }
                 w => {
-                    if inp.fire && ff.fire_cd <= 0.0 && ff.reload_t <= 0.0 {
+                    // the scattergun can cut its shell-by-shell reload short with a shot
+                    let shell_cancel = w == Weapon::Shotgun && ff.mag[wi] > 0;
+                    if inp.fire && ff.fire_cd <= 0.0 && (ff.reload_t <= 0.0 || shell_cancel) {
                         if ff.mag[wi] > 0 {
+                            ff.reload_t = 0.0;
                             ff.mag[wi] -= 1;
                             ff.fire_cd = w.interval();
                             let spread = ff.spread(); // what the crosshair showed
@@ -4670,9 +5470,13 @@ impl Game {
                 if !ff.is_bot {
                     self.tracer_from = Some(muzzle);
                 }
-                for _ in 0..pellets {
-                    let d = pellet_dir(dir, right, spread, &mut self.rng);
-                    self.fire_ray(i, o, d, dmg, range, w);
+                if w == Weapon::Shotgun {
+                    self.fire_pattern(i, o, dir, spread);
+                } else {
+                    for _ in 0..pellets {
+                        let d = pellet_dir(dir, right, spread, &mut self.rng);
+                        self.fire_ray(i, o, d, dmg, range, w);
+                    }
                 }
                 self.tracer_from = None;
                 let o = if self.f[i].is_bot { o } else { muzzle };
@@ -4694,8 +5498,8 @@ impl Game {
                     let v = dir * self.rng.range(0.5, 1.5) + v3(0.0, self.rng.range(0.2, 0.6), 0.0);
                     self.particles.push(Particle { pos: o + dir * 0.1, vel: v, life: 0.5, max_life: 0.5, size: 0.16, color: [150, 150, 150], gravity: -0.5 });
                 }
-                // spent shells fly out to the right
-                if w != Weapon::Revolver {
+                // spent shells fly out to the right (the scattergun's when its pump racks)
+                if w != Weapon::Revolver && w != Weapon::Shotgun {
                     let color = if w == Weapon::Shotgun { [170, 30, 30] } else { [214, 172, 70] };
                     let v = right * self.rng.range(2.0, 3.2) + v3(0.0, self.rng.range(2.0, 3.0), 0.0) - dir * 0.5;
                     self.casings.push(Casing { pos: o - dir * 0.35 + right * 0.05, vel: v, life: 2.0, spin: self.rng.range(0.0, 6.0), color });
@@ -4704,8 +5508,9 @@ impl Game {
                     }
                 }
                 if i == self.local && !self.f[i].is_bot {
-                    // recoil: the hand cannon and sniper kick the aim up (it settles back)
+                    // recoil: the hand cannon, scattergun and sniper kick the aim up (it settles back)
                     self.aim_kick += match w {
+                        Weapon::Shotgun => 0.07,
                         Weapon::HandCannon => 0.075,
                         Weapon::Sniper => 0.05,
                         Weapon::Rifle => 0.018,
@@ -4716,10 +5521,29 @@ impl Game {
                 if i == self.local {
                     // only a nudge: a shaking view would throw off the aim
                     self.shake = self.shake.max(match w {
-                        Weapon::Shotgun | Weapon::Rifle => 0.2,
+                        // the scattergun's boom punches the camera
+                        Weapon::Shotgun => 0.4,
+                        Weapon::Rifle => 0.2,
                         Weapon::Smg => 0.05,
                         _ => 0.12,
                     });
+                }
+            }
+            Act::Ability { kind, p, d } => {
+                self.ability_fx(i, kind, p, d);
+                if self.kind == Kind::Host || self.kind == Kind::Client {
+                    self.out_events.push(Ev::Ability { who: i as u8, kind: kind as u8, p, d });
+                }
+            }
+            Act::Pump => {
+                let ff = &self.f[i];
+                let right = yaw_right(ff.yaw);
+                let at = ff.pos + v3(0.0, 1.3, 0.0) + right * 0.3 + ff.fwd() * 0.3;
+                let v = right * self.rng.range(2.2, 3.4) + v3(0.0, self.rng.range(2.2, 3.2), 0.0) - ff.fwd() * 0.6;
+                self.sfx(Sfx::Pump, at);
+                self.casings.push(Casing { pos: at, vel: v, life: 2.0, spin: self.rng.range(0.0, 6.0), color: [170, 30, 30] });
+                if self.casings.len() > 80 {
+                    self.casings.remove(0);
                 }
             }
             Act::Slash => {
@@ -4755,6 +5579,29 @@ impl Game {
         }
     }
 
+    /// The scattergun's shot: its ten pellets in their fixed pattern around `dir`.
+    pub fn fire_pattern(&mut self, i: usize, o: V3, dir: V3, spread: f32) {
+        let w = Weapon::Shotgun;
+        let gs = w.gun();
+        let mut right = yaw_right(self.f[i].yaw);
+        right = right - dir * right.dot(dir);
+        if right.len() < 1e-3 {
+            right = v3(dir.z, 0.0, -dir.x);
+        }
+        let right = right.norm();
+        let up = dir.cross(right).norm();
+        for (x, y) in SHOTGUN_PATTERN {
+            let d = (dir + right * (x * spread) + up * (y * spread)).norm();
+            self.fire_ray(i, o, d, gs.dmg, gs.range, w);
+        }
+    }
+
+    /// Where a ray meets fighter `j`'s head grown by `pad`, if it does.
+    pub fn ray_head(&self, j: usize, o: V3, d: V3, max_t: f32, pad: f32) -> Option<f32> {
+        let pose = self.hit_pose(j);
+        pose.caps.iter().filter(|c| c.part == Part::Head).filter_map(|c| ray_capsule(o, d, max_t, c.a, c.b, c.r + pad)).reduce(f32::min)
+    }
+
     fn fire_ray(&mut self, shooter: usize, o: V3, d: V3, dmg: f32, range: f32, w: Weapon) {
         let mut t = range;
         let mut hit_world = false;
@@ -4762,6 +5609,7 @@ impl Game {
             t = wt;
             hit_world = true;
         }
+        let t_world = t;
         let mut victim: Option<(usize, Part, bool)> = None;
         for j in 0..self.f.len() {
             if !self.f[j].alive || !self.is_enemy(shooter, j) {
@@ -4772,13 +5620,42 @@ impl Game {
                 victim = Some((j, part, far));
             }
         }
+        // single-shot guns: a bullet that just grazes a head (within HEAD_ASSIST) is a headshot
+        if matches!(w, Weapon::Revolver | Weapon::HandCannon | Weapon::Rifle | Weapon::Sniper) && !matches!(victim, Some((_, Part::Head, _))) {
+            for j in 0..self.f.len() {
+                if !self.f[j].alive || !self.is_enemy(shooter, j) {
+                    continue;
+                }
+                let Some(ht) = self.ray_head(j, o, d, t_world, HEAD_ASSIST) else { continue };
+                // in front of whatever else it met, or the same fighter's head just behind the part it hit
+                let ok = match victim {
+                    None => true,
+                    Some((vj, _, _)) if vj == j => ht <= t + 0.3,
+                    Some(_) => ht < t,
+                };
+                if ok {
+                    t = ht.min(t_world);
+                    victim = Some((j, Part::Head, false));
+                }
+            }
+        }
+        // the Iron Wall stops bullets coming at its front
+        let mut shielded = false;
+        if let Some((j, _, _)) = victim {
+            if self.f[j].shield_t > 0.0 && self.f[j].fwd().dot(-d) > 0.25 {
+                shielded = true;
+                t = (t - 0.55).max(0.05);
+                victim = None;
+                self.note(j, |s| s.wall_blocks += 1);
+            }
+        }
         let end = o + d * t;
         let mut spark = 0u8;
         if let Some((j, part, far)) = victim {
             let head = part == Part::Head;
             let gs = w.gun();
             let falloff = match w {
-                Weapon::Shotgun => (1.0 - (t - 8.0).max(0.0) / 22.0).max(0.25),
+                Weapon::Shotgun => shotgun_falloff(t),
                 Weapon::Smg => (1.0 - (t - 20.0).max(0.0) / 60.0).max(0.5),
                 _ => 1.0,
             };
@@ -4831,6 +5708,9 @@ impl Game {
             }
         } else if hit_world {
             spark = 3;
+        }
+        if shielded {
+            spark = 2;
         }
         let color = if shooter == self.local { [255, 230, 150] } else { [255, 170, 120] };
         let vis = self.tracer_from.unwrap_or(o);
@@ -4958,6 +5838,23 @@ impl Game {
                 None => (to, Part::Chest),
             };
             let counter = b.stagger_t > 0.0;
+            if b.shield_t > 0.0 && facing {
+                // the Iron Wall throws the attacker back
+                let at = &mut self.f[i];
+                at.vel = -d.flat().norm() * 9.0 + v3(0.0, 3.5, 0.0);
+                at.stun_t = at.stun_t.max(0.45);
+                at.stagger_t = at.stagger_t.max(0.45);
+                at.slash_t = 0.0;
+                at.slash_queued = false;
+                self.impact_fx(hit_at, 2);
+                if i == self.local || j == self.local {
+                    self.shake = self.shake.max(0.3);
+                }
+                if self.kind == Kind::Host || self.kind == Kind::Client {
+                    self.out_events.push(Ev::Shot { o: hit_at, e: hit_at, w: 0, spark: 2 });
+                }
+                continue;
+            }
             if b.guard && facing && b.guard_t <= PERFECT_PARRY && !counter {
                 // perfect parry: the attacker reels, open to a counter
                 let at = &mut self.f[i];
@@ -5311,10 +6208,20 @@ impl Game {
             self.hitmarker = if head { 0.35 } else { 0.25 };
             self.hit_head = head || (self.hit_head && self.time - self.hit_chain_t < 0.02);
             let shown = if amount >= LETHAL { (self.f[victim].hp + self.f[victim].ap).max(1.0) } else { amount };
-            self.dmg_nums.push(DmgNum { pos: at + v3(0.0, 0.3, 0.0), amount: shown.round() as i32, life: 0.9, head: head || amount >= LETHAL });
             // one crisp tick per shot (a shotgun's pellets count once), climbing in pitch while
             // the hits keep coming
             let volley = self.time - self.hit_chain_t < 0.02;
+            // and one number per shot: a volley's pellets on the same target add up (gold if any
+            // of them was a headshot)
+            let gold = head || amount >= LETHAL;
+            match self.dmg_nums.last_mut().filter(|d| volley && d.victim == victim as u8 && d.life > 0.85) {
+                Some(d) => {
+                    d.amount += shown.round() as i32;
+                    d.head |= gold;
+                    d.life = 0.9;
+                }
+                None => self.dmg_nums.push(DmgNum { pos: at + v3(0.0, 0.3, 0.0), amount: shown.round() as i32, life: 0.9, head: gold, victim: victim as u8 }),
+            }
             if !volley {
                 self.hit_chain = if self.time - self.hit_chain_t < 1.5 { (self.hit_chain + 1).min(14) } else { 0 };
                 let pitch = 2f32.powf(self.hit_chain as f32 * 1.5 / 12.0);
@@ -5495,6 +6402,14 @@ impl Game {
         let wpn = Weapon::from_u8(w);
         if w >= N_WEAPONS || !s.loadout.has(wpn) || wpn == Weapon::Rocket {
             return None; // explosions are worked out by the host itself
+        }
+        // an Iron Wall facing the attacker stops it
+        let vf = &self.f[victim];
+        if vf.shield_t > 0.0 {
+            let toward = if wpn.is_melee() { (s.pos - vf.pos).flat().norm() } else { -dir.norm() };
+            if vf.fwd().dot(toward) > 0.25 {
+                return None;
+            }
         }
         if !(dmg >= 0.0) || dmg > wpn.max_hit() * 1.5 * 1.05 {
             return None; // (a counter-slash does 1.5x)
@@ -6008,7 +6923,7 @@ impl Game {
                 if owner == self.local && j != self.local {
                     self.combo_hit(dmg);
                     self.hitmarker = 0.25;
-                    self.dmg_nums.push(DmgNum { pos: c + v3(0.0, 0.5, 0.0), amount: dmg.round() as i32, life: 0.9, head: false });
+                    self.dmg_nums.push(DmgNum { pos: c + v3(0.0, 0.5, 0.0), amount: dmg.round() as i32, life: 0.9, head: false, victim: 255 });
                 }
                 self.authority_hit(j, Some(owner), dmg, knock, 0.3, false, w);
             }
@@ -6044,6 +6959,7 @@ impl Game {
 
     fn update_fx(&mut self, dt: f32) {
         self.update_casings(dt);
+        self.update_abilities(dt);
         for p in self.particles.iter_mut() {
             p.life -= dt;
             p.vel.y -= p.gravity * dt;
@@ -6137,6 +7053,24 @@ impl Game {
                 } else if from == 0 && v == self.local && self.f[v].owned {
                     // the host confirmed we were hit
                     self.apply_hit_g(v, None, dmg, knock, stun, head, w, Some(o), guard.clamp(0.0, GUARD_MAX));
+                }
+            }
+            Ev::Ability { who, kind, p, d } => {
+                let w = who as usize;
+                if w >= self.f.len() || !self.f[w].present || !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) {
+                    return;
+                }
+                let kind = Ability::from_u8(kind);
+                if self.kind == Kind::Host {
+                    // a player used their ability: only their own, the right one, off cooldown, in reach
+                    if from != w || !self.ability_ok(w, kind, p) {
+                        return;
+                    }
+                    self.ab_uses[w].push(self.time);
+                    self.ability_fx(w, kind, p, d);
+                    self.out_events.push(Ev::Ability { who, kind: kind as u8, p, d }); // passed on
+                } else if from == 0 && w != self.local {
+                    self.ability_fx(w, kind, p, d);
                 }
             }
             Ev::Finisher { target, kind } => {
@@ -6307,7 +7241,7 @@ mod lag_comp_tests {
         g.world = flat_world();
         g.bots[1] = None;
         g.mt.phase = Phase::Fight;
-        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0, body: 0 };
+        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0, body: 0, outfit: 0 };
         g.f[0].pos = v3(0.0, 0.0, -10.0);
         g.f[1].pos = v3(0.0, 0.0, 0.0);
         g.f[0].spawn_prot = 0.0;
@@ -6569,6 +7503,11 @@ mod net_smooth_tests {
 }
 /// One pellet's direction: inside the cone of half-angle atan(spread) around `dir`, spread evenly
 /// over its area. The sideways axes are made exactly square to `dir`, so no pellet strays wider.
+fn clamp_len(v: V3, max: f32) -> V3 {
+    let l = v.len();
+    if l > max && l.is_finite() { v * (max / l) } else if l.is_finite() { v } else { V3::ZERO }
+}
+
 pub fn pellet_dir(dir: V3, right_hint: V3, spread: f32, rng: &mut Rng) -> V3 {
     if spread <= 0.0 {
         return dir;
@@ -6608,7 +7547,7 @@ mod hitbox_tests {
         g.f[1].yaw = std::f32::consts::PI; // facing the shooter
         g.f[0].spawn_prot = 0.0;
         g.f[1].spawn_prot = 0.0;
-        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
         g.f[1].equip();
         for _ in 0..30 {
             g.f[1].pos = v3(0.0, 0.0, 0.0);
@@ -6647,7 +7586,7 @@ mod hitbox_tests {
         g.mt.phase = Phase::Fight;
         for i in 0..2 {
             g.f[i].ap = 0.0; // no armour soaking up the counter
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = Weapon::Katana;
@@ -6755,7 +7694,7 @@ mod movement_tests {
     fn speed(g: &Game) -> f32 {
         g.f[0].vel.flat().len()
     }
-    const FWD: Input = Input { fwd: 1.0, right: 0.0, jump: false, dash: false, fire: false, fire_pressed: false, guard: false, select: None, reload: false, item: false, crouch: false, kick: false, finish: false, yaw: 0.0, pitch: 0.0 };
+    const FWD: Input = Input { fwd: 1.0, right: 0.0, jump: false, dash: false, fire: false, fire_pressed: false, guard: false, select: None, reload: false, item: false, crouch: false, kick: false, finish: false, ability: false, yaw: 0.0, pitch: 0.0 };
 
     #[test]
     fn landing_from_a_dash_keeps_speed_then_eases() {
@@ -6968,10 +7907,10 @@ mod weapon_tests {
         g.world = crate::game::lag_comp_tests::flat_world();
         g.bots[1] = None;
         g.mt.phase = Phase::Fight;
-        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: gun, gun2: Weapon::Revolver, item: 0, body: 0 };
+        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: gun, gun2: Weapon::Revolver, item: 0, body: 0, outfit: 0 };
         g.f[0].equip();
         g.f[0].pos = v3(0.0, 0.0, -10.0);
-        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Smg, item: 0, body: 0 };
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Smg, item: 0, body: 0, outfit: 0 };
         g.f[1].equip();
         for i in 0..2 {
             g.f[i].spawn_prot = 0.0;
@@ -7009,6 +7948,82 @@ mod weapon_tests {
         let (o, d) = shot_at(g, cap);
         g.fire_ray(0, o, d, w.gun().dmg, w.gun().range, w);
         g.tick(&Input::default()); // deaths are settled in the tick
+    }
+
+    /// Fire the scattergun's whole pattern from `dist` metres straight at capsule `cap`'s middle.
+    fn pump_at(g: &mut Game, cap: usize, dist: f32) {
+        let c = g.hit_pose(1).caps[cap];
+        let d = v3(0.0, 0.0, 1.0);
+        let o = (c.a + c.b) * 0.5 - d * dist;
+        g.f[0].yaw = 0.0;
+        g.fire_pattern(0, o, d, Weapon::Shotgun.gun().spread_still);
+        g.tick(&Input::default()); // deaths are settled in the tick
+    }
+
+    #[test]
+    fn point_blank_shotgun_body_does_100() {
+        let mut g = range(Weapon::Shotgun);
+        pump_at(&mut g, 2, 1.5);
+        let lost = (MAX_HP - g.f[1].hp) + (MAX_AP - g.f[1].ap);
+        println!("point-blank body: {lost}");
+        assert!(lost >= 100.0, "a point-blank body shot does 100+ (did {lost})");
+        // shown as one number for the whole shot
+        let nums: Vec<&DmgNum> = g.dmg_nums.iter().filter(|n| n.victim == 1).collect();
+        assert_eq!(nums.len(), 1, "one damage number per shot");
+        assert!((nums[0].amount as f32 - lost).abs() <= 2.0, "the number is the shot's total: {} vs {lost}", nums[0].amount);
+        assert!(!nums[0].head);
+    }
+
+    #[test]
+    fn point_blank_shotgun_headshot_kills_through_full_armour() {
+        let mut g = range(Weapon::Shotgun);
+        assert!(g.f[1].hp >= MAX_HP && g.f[1].ap >= MAX_AP);
+        pump_at(&mut g, 0, 1.5);
+        assert!(!g.f[1].alive, "a point-blank headshot kills through full armour");
+        let n = g.dmg_nums.iter().find(|n| n.victim == 1).expect("a number");
+        println!("point-blank head: {}", n.amount);
+        assert!(n.head && n.amount >= 160, "a gold 160+: {} (head {})", n.amount, n.head);
+    }
+
+    #[test]
+    fn shotgun_pattern_is_fixed_and_falls_off() {
+        assert_eq!(SHOTGUN_PATTERN.len(), Weapon::Shotgun.gun().pellets);
+        assert!((shotgun_falloff(4.0) - 1.0).abs() < 1e-6);
+        assert!((shotgun_falloff(18.0) - 0.4).abs() < 1e-4);
+        assert!((shotgun_falloff(60.0) - 0.15).abs() < 1e-6);
+        // the same shot from the same place does exactly the same every time
+        let mut a = range(Weapon::Shotgun);
+        pump_at(&mut a, 2, 6.0);
+        let mut b = range(Weapon::Shotgun);
+        pump_at(&mut b, 2, 6.0);
+        assert_eq!((a.f[1].hp, a.f[1].ap), (b.f[1].hp, b.f[1].ap));
+        assert!(a.f[1].hp < MAX_HP || a.f[1].ap < MAX_AP);
+    }
+
+    #[test]
+    fn a_shot_clipping_the_hood_is_a_headshot() {
+        // a level shot just over the top of the head: `above` metres from its axis's top end
+        let shot = |w: Weapon, above: f32| -> (bool, f32) {
+            let mut g = range(w);
+            let c = g.hit_pose(1).caps[0];
+            let top = c.b + v3(0.0, above, 0.0);
+            let d = v3(0.0, 0.0, 1.0);
+            g.fire_ray(0, top - d * 5.0, d, w.gun().dmg, w.gun().range, w);
+            g.tick(&Input::default());
+            let lost = (MAX_HP - g.f[1].hp) + (MAX_AP - g.f[1].ap);
+            (g.dmg_nums.iter().any(|n| n.victim == 1 && n.head), lost)
+        };
+        // over the hood: inside the bigger head (0.15) though outside the old one (0.115)
+        let (head, lost) = shot(Weapon::Smg, 0.13);
+        assert!(head && lost > 0.0, "the hood is the head");
+        // a single-shot gun grazing past within 5 cm of it
+        for w in [Weapon::Revolver, Weapon::HandCannon, Weapon::Rifle] {
+            let (head, lost) = shot(w, 0.15 + 0.035);
+            assert!(head && lost > 0.0, "{w:?}: a graze counts as a headshot");
+        }
+        // but not further out, and not for a spray gun
+        assert!(shot(Weapon::Revolver, 0.15 + 0.08).1 == 0.0, "a clean miss");
+        assert!(shot(Weapon::Smg, 0.15 + 0.035).1 == 0.0, "no assist for the SMG");
     }
 
     #[test]
@@ -7092,7 +8107,7 @@ mod weapon_tests {
         assert!(r.dmg * r.head >= MAX_HP, "revolver headshot one-taps");
         // tapping (half a second apart): every shot dead-on
         let mut f = Fighter::new("x", 0, true);
-        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
+        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
         f.equip();
         f.cur = 1;
         f.weapon = Weapon::Revolver;
@@ -7231,7 +8246,7 @@ mod melee_depth_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: blade, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
+            g.f[i].loadout = Loadout { melee: blade, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = blade;
@@ -7471,7 +8486,7 @@ mod fairness_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = Weapon::Katana;
@@ -7612,7 +8627,7 @@ mod shuriken_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shuriken, gun2: Weapon::Rifle, item: 0, body: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shuriken, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
             g.f[i].equip();
             g.f[i].ap = 0.0;
             g.f[i].spawn_prot = 0.0;
@@ -8153,5 +9168,357 @@ mod body_tests {
         assert!(gap >= RADIUS * 2.0 - 0.05, "enemies stop body to body (gap {gap})");
         let gap = run_at_each_other(Mode::Tdm, true);
         assert!(gap < 0.0, "teammates walk through each other (gap {gap})");
+    }
+}
+
+#[cfg(test)]
+mod engagement_tests {
+    use super::*;
+
+    fn fight(bots: usize) -> Game {
+        let mut g = Game::offline("A", bots, 0.5, Mode::Ffa, 50);
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = MATCH_TIME;
+        for i in 1..=bots {
+            g.bots[i] = None; // they stand still: the test decides who dies
+        }
+        for _ in 0..10 {
+            g.tick(&Input::default());
+        }
+        g
+    }
+
+    #[test]
+    fn matches_last_six_minutes() {
+        assert!((300.0..=420.0).contains(&MATCH_TIME));
+    }
+
+    #[test]
+    fn a_three_kill_streak_earns_a_writ_and_claiming_it_pays() {
+        let mut g = fight(2);
+        for _ in 0..WRIT_STREAK {
+            g.on_death(2, Some(1), Weapon::Revolver as u8, false);
+        }
+        assert!(g.has_writ(1), "three kills in a row: a Writ");
+        assert!(g.feed.iter().any(|l| l.text.as_deref().is_some_and(|t| t.starts_with("WRIT"))));
+        g.career.clear();
+        g.on_death(1, Some(0), Weapon::Revolver as u8, false);
+        assert!(!g.has_writ(1), "claimed");
+        assert!(g.career.contains(&CareerEv::WritClaim { streak: WRIT_STREAK }), "the claim pays XP: {:?}", g.career);
+        assert!(g.feed.iter().any(|l| l.text.as_deref().is_some_and(|t| t.starts_with("WRIT CLAIMED"))));
+        // dying ends a streak
+        assert_eq!(g.streaks[1], 0);
+    }
+
+    #[test]
+    fn play_of_the_match_replays_the_best_moment() {
+        let mut g = fight(2);
+        for _ in 0..240 {
+            g.tick(&Input::default());
+        }
+        // a lone kill, then a double kill: the double is the better moment
+        g.on_death(2, Some(1), Weapon::Revolver as u8, false);
+        for _ in 0..240 {
+            g.tick(&Input::default());
+        }
+        g.on_death(1, Some(0), Weapon::Shotgun as u8, true);
+        g.on_death(2, Some(0), Weapon::Shotgun as u8, false);
+        for _ in 0..(POTM_AFTER / TICK) as usize + 20 {
+            g.tick(&Input::default());
+        }
+        g.mt.timer = 0.0;
+        for _ in 0..4 {
+            g.tick(&Input::default());
+        }
+        assert_eq!(g.mt.phase, Phase::MatchOver);
+        let h = g.potm.clone().expect("a Play of the Match");
+        assert_eq!(h.player, 0);
+        assert_eq!(h.what, "DOUBLE KILL");
+        assert!(h.duration() > POTM_BEFORE, "the moment and what led up to it: {}", h.duration());
+        assert!(g.career.contains(&CareerEv::MatchEnd));
+        // it plays after the kill cam, then it's done
+        let live = g.f[1].pos;
+        let mut acc = 0.0;
+        let mut seen = false;
+        for _ in 0..600 {
+            let mut inp = Input::default();
+            g.advance(&mut acc, 1.0 / 60.0, &mut inp);
+            if g.potm_t.is_some() {
+                seen = true;
+                assert!(g.potm_view_begin());
+                g.potm_view_end();
+                assert_eq!(g.f[1].pos, live, "the live match comes back after drawing");
+            }
+            if g.potm_done {
+                break;
+            }
+        }
+        assert!(seen && g.potm_done, "played through");
+    }
+}
+
+#[cfg(test)]
+mod ability_tests {
+    use super::*;
+    use crate::world::{Block, Mat};
+
+    /// You (slot 0, playing `body`) at the origin facing +z on open ground, still targets at
+    /// 10 m and 30 m ahead.
+    fn arena(body: u8) -> Game {
+        let mut g = Game::offline("A", 2, 0.5, Mode::Ffa, 50);
+        g.world = crate::game::lag_comp_tests::flat_world();
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = MATCH_TIME;
+        for i in 1..=2 {
+            g.bots[i] = None;
+        }
+        g.f[0].loadout.body = body;
+        for (i, z) in [(0usize, 0.0f32), (1, 10.0), (2, 30.0)] {
+            g.f[i].pos = v3(0.0, 0.0, z);
+            g.f[i].prev_pos = g.f[i].pos;
+            g.f[i].vel = V3::ZERO;
+            g.f[i].yaw = if i == 0 { 0.0 } else { std::f32::consts::PI };
+            g.f[i].spawn_prot = 0.0;
+        }
+        g.tick(&Input::default());
+        g
+    }
+
+    fn run(g: &mut Game, secs: f32, inp: Input) {
+        for _ in 0..(secs / TICK) as usize {
+            g.tick(&inp);
+        }
+    }
+
+    fn press(g: &mut Game, pitch: f32) {
+        g.tick(&Input { ability: true, pitch, ..Default::default() });
+    }
+
+    #[test]
+    fn wardens_mark_shows_enemies_near_it_then_fades() {
+        let mut g = arena(0);
+        press(&mut g, 0.0);
+        assert_eq!(g.marks.len(), 1, "thrown");
+        assert!(g.f[0].ab_charge < 1.0, "on cooldown");
+        press(&mut g, 0.0);
+        assert_eq!(g.marks.len(), 1, "one at a time");
+        run(&mut g, 1.5, Input::default());
+        assert!(g.marks[0].landed);
+        assert!(g.revealed_to(0, 1), "the near enemy shows");
+        assert!(!g.revealed_to(0, 2), "the far one doesn't");
+        assert!(!g.revealed_to(1, 2), "only for the one who threw it (and their team)");
+        let fade = g.tune.mark_time + 0.5;
+        run(&mut g, fade, Input::default());
+        assert!(g.marks.is_empty() && !g.revealed_to(0, 1), "it fades");
+    }
+
+    #[test]
+    fn grapple_pulls_you_to_a_wall_and_jump_lets_go() {
+        let mut g = arena(1);
+        g.world.blocks.push(Block { b: Aabb::new(v3(-6.0, 0.0, 15.0), v3(6.0, 8.0, 16.0)), mat: Mat::Wall });
+        for i in 1..=2 {
+            g.f[i].pos = v3(20.0, 0.0, 0.0);
+        }
+        assert!(g.f[0].ab_charge >= 2.0, "two charges");
+        press(&mut g, 0.08);
+        assert!(g.f[0].grapple.is_some(), "hooked the wall");
+        run(&mut g, 0.45, Input { pitch: 0.08, ..Default::default() });
+        assert!(g.f[0].pos.z > 4.0, "pulled towards it: z {}", g.f[0].pos.z);
+        let speed = g.f[0].vel.flat().len();
+        g.tick(&Input { jump: true, pitch: 0.08, ..Default::default() });
+        assert!(g.f[0].grapple.is_none(), "jump lets go");
+        assert!(g.f[0].vel.flat().len() > speed * 0.6, "keeping the momentum");
+        // the second charge (from back in range), then none left
+        run(&mut g, 1.0, Input::default());
+        g.f[0].pos = V3::ZERO;
+        g.f[0].prev_pos = V3::ZERO;
+        g.f[0].vel = V3::ZERO;
+        run(&mut g, 0.3, Input { pitch: 0.08, ..Default::default() });
+        press(&mut g, 0.08);
+        assert!(g.f[0].ab_charge < 1.0);
+        let before = g.f[0].ab_charge;
+        press(&mut g, 0.08);
+        assert!(g.f[0].ab_charge >= before, "no third pull");
+        // nothing to hook in range: nothing happens and no charge is spent
+        let mut g = arena(1);
+        press(&mut g, 0.5);
+        assert!(g.f[0].grapple.is_none() && g.f[0].ab_charge >= 2.0, "open sky: no pull, no charge spent");
+    }
+
+    #[test]
+    fn iron_wall_stops_bullets_from_the_front_and_throws_back_blades() {
+        let mut g = arena(2);
+        // the wall is up on fighter 0, who faces +z; fighter 1 shoots from the front
+        press(&mut g, 0.0);
+        assert!(g.f[0].shield_t > 0.0);
+        let chest = g.f[0].chest();
+        let front = v3(0.0, 0.0, -1.0);
+        g.fire_ray(1, chest - front * 6.0, front, 28.0, 150.0, Weapon::Revolver);
+        g.tick(&Input::default());
+        assert_eq!((g.f[0].hp, g.f[0].ap), (MAX_HP, MAX_AP), "stopped by the shield");
+        assert!(g.validate_claim(1, 0, Weapon::Revolver as u8, 28.0, chest - front * 6.0, front, false).is_none(), "the host agrees");
+        // from behind it's no help
+        let back = v3(0.0, 0.0, 1.0);
+        g.fire_ray(1, chest - back * 6.0, back, 28.0, 150.0, Weapon::Revolver);
+        g.tick(&Input::default());
+        assert!(g.f[0].hp < MAX_HP || g.f[0].ap < MAX_AP, "a shot in the back lands");
+        // a blade from the front: the attacker is thrown back and staggered, no damage
+        let (hp, ap) = (g.f[0].hp, g.f[0].ap);
+        g.f[1].pos = v3(0.0, 0.0, 1.5);
+        g.f[1].yaw = std::f32::consts::PI;
+        g.f[1].cur = 0;
+        g.f[1].weapon = g.f[1].loadout.melee;
+        g.f[1].slash_idx = 0;
+        g.resolve_slash(1);
+        assert_eq!((g.f[0].hp, g.f[0].ap), (hp, ap));
+        assert!(g.f[1].stun_t > 0.0 && g.f[1].vel.z > 3.0, "thrown back: {:?}", g.f[1].vel);
+    }
+
+    #[test]
+    fn afterimage_vanishes_and_sends_a_decoy() {
+        let mut g = arena(3);
+        press(&mut g, 0.0);
+        assert!(g.f[0].invis_t > 0.0, "vanished");
+        assert_eq!(g.decoys.len(), 1, "a decoy runs on");
+        assert_ne!(g.nearest_enemy(1), Some(0), "bots lose sight of you");
+        let start = g.decoys[0].pos;
+        run(&mut g, 0.4, Input::default());
+        assert!((g.decoys[0].pos - start).len() > 2.0, "the decoy runs");
+        let fake = g.decoy_fighter(&g.decoys[0]).expect("drawn as you");
+        assert_eq!(fake.loadout.body, 3);
+        run(&mut g, 0.4, Input::default());
+        assert_eq!(g.f[0].invis_t, 0.0, "back in sight");
+        let life = g.tune.decoy_time;
+        run(&mut g, life, Input::default());
+        assert!(g.decoys.is_empty(), "the decoy fades");
+    }
+
+    #[test]
+    fn passives() {
+        // Corvin Vale: a kill reloads every gun
+        let mut g = arena(0);
+        g.f[0].mag = [0, 0, 0];
+        g.on_death(1, Some(0), Weapon::Revolver as u8, false);
+        assert_eq!(g.f[0].mag[1], g.f[0].slot_weapon(1).mag());
+        assert_eq!(g.f[0].mag[2], g.f[0].slot_weapon(2).mag());
+        // Bram Kask: a bigger guard meter
+        let g = arena(2);
+        assert!((g.guard_max_of(&g.f[0]) - GUARD_MAX * 1.3).abs() < 1e-3);
+        assert_eq!(g.guard_max_of(&g.f[1]), GUARD_MAX);
+        // Ilya Fen: the flow chain fades slower when you stop
+        let mut a = arena(3);
+        let mut b = arena(0);
+        for g in [&mut a, &mut b] {
+            g.f[0].flow = 3;
+            run(g, 0.3, Input::default());
+        }
+        assert!(a.f[0].flow > 0 && b.f[0].flow == 0, "Ilya keeps it a little longer ({} vs {})", a.f[0].flow, b.f[0].flow);
+        // Sable Rook: her scope is timed (her glint hides for its first moment)
+        let mut g = arena(1);
+        g.f[0].loadout.gun1 = Weapon::Sniper;
+        g.f[0].cur = 1;
+        g.f[0].weapon = Weapon::Sniper;
+        g.f[0].switch_t = 0.0;
+        g.f[0].reload_t = 0.0;
+        run(&mut g, 0.3, Input { guard: true, ..Default::default() });
+        assert!(g.f[0].scope_t > 0.0 && g.scoped_since[0] >= 0.0, "scoped, and timed");
+    }
+
+    #[test]
+    fn classic_lobbies_have_no_abilities_and_duels_do() {
+        let mut g = arena(3);
+        g.mt.classic = true;
+        press(&mut g, 0.0);
+        assert!(g.decoys.is_empty() && g.f[0].invis_t == 0.0);
+        assert_eq!(g.guard_max_of(&g.f[0]), GUARD_MAX);
+        // a Duel follows the setting like every other mode
+        let mut d = arena(3);
+        d.mt.mode = Mode::Duel;
+        assert!(d.abilities_on());
+        press(&mut d, 0.0);
+        assert_eq!(d.decoys.len(), 1, "abilities work in a Duel");
+    }
+
+    #[test]
+    fn the_host_checks_ability_uses() {
+        let mut g = Game::new(Kind::Host, 0, Mode::Ffa, 15);
+        g.world = crate::game::lag_comp_tests::flat_world();
+        g.add_player(0, "Host", true, None, 0);
+        g.add_player(1, "Guest", false, None, 0);
+        g.mt.phase = Phase::Fight;
+        g.f[1].alive = true;
+        g.f[1].loadout.body = 3;
+        g.f[1].pos = v3(0.0, 0.0, 5.0);
+        let p = g.f[1].pos;
+        let ev = |kind: Ability, p: V3| Ev::Ability { who: 1, kind: kind as u8, p, d: v3(0.0, 0.0, 7.0) };
+        // the wrong ability for their fighter, or someone else's: thrown out
+        g.handle_remote_event(1, ev(Ability::Wall, p));
+        assert_eq!(g.f[1].shield_t, 0.0);
+        g.handle_remote_event(2, ev(Ability::Afterimage, p));
+        assert!(g.decoys.is_empty());
+        // their own: it happens and is passed on
+        g.out_events.clear();
+        g.handle_remote_event(1, ev(Ability::Afterimage, p));
+        assert_eq!(g.decoys.len(), 1);
+        assert!(g.out_events.iter().any(|e| matches!(e, Ev::Ability { who: 1, .. })), "passed on to the others");
+        // again right away: still on cooldown
+        g.handle_remote_event(1, ev(Ability::Afterimage, p));
+        assert_eq!(g.decoys.len(), 1, "on cooldown: thrown out");
+        // far from where they stand: thrown out
+        assert!(!g.ability_ok(1, Ability::Afterimage, p + v3(30.0, 0.0, 0.0)));
+        // grapples reach 20 m, not 40
+        g.f[1].loadout.body = 1;
+        assert!(g.ability_ok(1, Ability::Grapple, p + v3(0.0, 2.0, 15.0)));
+        assert!(!g.ability_ok(1, Ability::Grapple, p + v3(0.0, 0.0, 40.0)));
+        // a Classic lobby: none at all
+        g.mt.classic = true;
+        assert!(!g.ability_ok(1, Ability::Grapple, p + v3(0.0, 2.0, 15.0)));
+    }
+
+    #[test]
+    fn bots_use_their_abilities() {
+        let mut g = Game::offline("A", 3, 0.9, Mode::Ffa, 50);
+        g.mt.phase = Phase::Fight;
+        g.mt.timer = MATCH_TIME;
+        g.f[0].is_bot = true;
+        g.bots[0] = Some(crate::bot::Bot::new(0.9, 5));
+        for i in 0..4 {
+            g.f[i].loadout.body = i as u8;
+        }
+        let mut used = [false; 4];
+        for _ in 0..(40.0 / TICK) as usize {
+            g.tick(&Input::default());
+            for i in 0..4 {
+                if g.f[i].ab_charge < Ability::of(i as u8).charges(&g.tune) - 0.01 {
+                    used[i] = true;
+                }
+            }
+        }
+        assert!(used.iter().filter(|&&u| u).count() >= 2, "bots use abilities: {used:?}");
+    }
+}
+
+#[cfg(test)]
+mod ability_mode_tests {
+    use super::*;
+
+    #[test]
+    fn every_practice_mode_has_abilities() {
+        for mode in Mode::ALL.into_iter().chain([Mode::Gauntlet]) {
+            let mut g = if mode == Mode::Gauntlet { Game::gauntlet("A", 0) } else { Game::offline("A", 1, 0.5, mode, 5) };
+            g.mt.classic = false; // the menu's "Abilities" setting, on (the default)
+            g.f[0].ready = true;
+            g.f[0].loadout.body = 3;
+            g.my_loadout.body = 3;
+            // play until the fight starts and you're in it
+            let mut n = 0;
+            while !(g.mt.phase == Phase::Fight && g.f[0].alive && !g.f[0].spectate) && n < 60 * 120 {
+                g.tick(&Input::default());
+                n += 1;
+            }
+            assert!(g.abilities_on(), "{mode:?}: abilities on");
+            g.tick(&Input { ability: true, ..Default::default() });
+            assert!(g.f[0].invis_t > 0.0, "{mode:?}: Q works (phase {:?})", g.mt.phase);
+        }
     }
 }

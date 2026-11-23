@@ -1544,15 +1544,20 @@ const CLOTH_ROWS: usize = 7;
 /// length, its colour, its hem colour). The Ranger's long coat is in the team colour; the
 /// Huntress wears a shorter cape of her own brown leather with only a team-coloured hem, so the
 /// two read apart from behind.
-fn coat_style(body: u8, lk: &Look) -> (f32, f32, [f32; 4], [f32; 4]) {
-    match body {
+fn coat_style(body: u8, lk: &Look, outfit: u8) -> (f32, f32, [f32; 4], [f32; 4]) {
+    let (span, length, base, trim) = match body {
         1 => (3.0, 0.5, lin([112, 84, 56]), lin(lk.coat)),
         _ => (4.4, 0.68, lin(lk.coat_dark), lin(lk.coat)),
+    };
+    // a mastery outfit colours the coat or cape (the hem keeps the player's colour)
+    match crate::career::OUTFITS.get(outfit as usize).and_then(|o| o.2) {
+        Some(c) => (span, length, lin(c), trim),
+        None => (span, length, base, trim),
     }
 }
 
-fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, sc: f32, body: u8) {
-    let (span, length, base, trim) = coat_style(body, lk);
+fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, sc: f32, body: u8, outfit: u8) {
+    let (span, length, base, trim) = coat_style(body, lk, outfit);
     let caps = &p.hit.caps;
     let (hips, legs) = (caps[4], [caps[9], caps[10], caps[11], caps[12]]);
     // the belt mostly stays level (it leans a little with the hips, not with the whole spine)
@@ -1723,7 +1728,7 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     if dressed {
         // the fighters have real hair; the long coat is cloth that swings and drapes
         if f.alive || f.death_t < 3.0 {
-            coat_cloth(mb, p, st, time, lk, sc, f.loadout.body);
+            coat_cloth(mb, p, st, time, lk, sc, f.loadout.body, f.loadout.outfit);
         }
     } else {
         // hair cap
@@ -1845,7 +1850,10 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
         Weapon::Shotgun => {
             mb.obox(hand + wf.apply(v3(0.0, 0.0, 0.05)), wf, v3(0.04, 0.06, 0.25), wood, 4.0, 0.3);
             mb.tube(hand + wf.apply(v3(0.0, 0.05, 0.0)), hand + wf.apply(v3(0.0, 0.05, 0.7)), 0.03, 0.03, wf.x, 1.0, gunmetal, -1.0, 1.5);
-            mb.tube(hand + wf.apply(v3(0.0, 0.0, 0.25)), hand + wf.apply(v3(0.0, 0.0, 0.55)), 0.035, 0.035, wf.x, 1.0, lin([80, 56, 36]), 4.0, 0.3);
+            // the pump slides back and forward after each shot
+            let slide = f.pump_k() * 0.12;
+            mb.tube(hand + wf.apply(v3(0.0, 0.0, 0.25 - slide)), hand + wf.apply(v3(0.0, 0.0, 0.55 - slide)), 0.038, 0.038, wf.x, 1.0, lin([80, 56, 36]), 4.0, 0.3);
+            mb.tube(hand + wf.apply(v3(0.0, 0.0, 0.0)), hand + wf.apply(v3(0.0, 0.0, 0.25 - slide)), 0.02, 0.02, wf.x, 1.0, gunmetal, -1.0, 1.5);
         }
         Weapon::Revolver => {
             mb.obox(hand + wf.apply(v3(0.0, -0.04, 0.0)), wf, v3(0.022, 0.06, 0.04), lin([60, 40, 28]), 4.0, 0.3);
@@ -2838,8 +2846,14 @@ impl Gpu {
         let mut ad = MB::default();
         let mut insts: Vec<Vec<f32>> = Vec::new();
         let mut inst_body: Vec<usize> = Vec::new();
-        for (i, f) in g.f.iter().enumerate() {
+        // Afterimage decoys are drawn as their owners (after the real fighters)
+        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).take(MAX_INST - MAX_PLAYERS).collect();
+        for (i, f) in g.f.iter().enumerate().chain(decoys.iter().enumerate().map(|(k, f)| (MAX_PLAYERS + k, f))) {
             if !f.present || f.spectate {
+                continue;
+            }
+            // vanished (Afterimage): nobody else sees them
+            if f.invis_t > 0.0 && i != g.local {
                 continue;
             }
             let mut pos = f.prev_pos.lerp(f.pos, alpha.clamp(0.0, 1.0));
@@ -2897,8 +2911,31 @@ impl Gpu {
                 let a = 0.18 + 0.08 * (g.time * 12.0).sin();
                 ad.billboard(cam, pos + v3(0.0, 1.0, 0.0), 1.15, lina([140, 200, 255], a));
             }
-            // a scoped sniper's lens glints at whoever it's pointed at
-            if i != g.local && f.alive && f.weapon == Weapon::Sniper && f.scope_t > 0.0 {
+            // abilities: the grapple line, the Iron Wall's glowing panel
+            if let Some(a) = f.grapple.filter(|_| f.alive) {
+                let p0 = pos + v3(0.0, 1.35, 0.0);
+                let side = (a - p0).cross(v3(0.0, 1.0, 0.0));
+                let side = if side.len() > 1e-3 { side.norm() } else { v3(1.0, 0.0, 0.0) };
+                op.tube(p0, a, 0.02, 0.02, side, 1.0, lin([70, 60, 48]), -1.0, 0.6);
+                ad.billboard(cam, a, 0.4, lina([255, 230, 190], 0.6));
+            }
+            if f.shield_t > 0.0 && f.alive {
+                let fw = yaw_fwd(f.yaw);
+                let rt = yaw_right(f.yaw);
+                let up = v3(0.0, 1.0, 0.0);
+                let c = pos + fw * 0.75 + v3(0.0, 1.05, 0.0);
+                let flick = 0.8 + 0.2 * (g.time * 30.0).sin().abs();
+                ad.obox(c, &M3 { x: rt, y: up, z: fw }, v3(0.62, 0.95, 0.02), lina([50, 110, 255], 0.35 * flick), -1.0, 1.0);
+                for k in 0..10 {
+                    let u = k as f32 / 9.0 * 2.0 - 1.0;
+                    ad.billboard(cam, c + rt * (u * 0.62) + up * 0.95, 0.16, lina([160, 210, 255], 0.5));
+                    ad.billboard(cam, c + rt * (u * 0.62) - up * 0.95, 0.16, lina([160, 210, 255], 0.5));
+                }
+            }
+            // a scoped sniper's lens glints at whoever it's pointed at (Sable Rook's stays hidden
+            // for the first moment scoped)
+            let glint_hidden = g.abilities_on() && Ability::of(f.loadout.body) == Ability::Grapple && g.scoped_since.get(i).is_some_and(|&s| s >= 0.0 && g.time - s < g.tune.glint_hide);
+            if i != g.local && f.alive && f.weapon == Weapon::Sniper && f.scope_t > 0.0 && !glint_hidden {
                 let eye = pos + v3(0.0, 1.62, 0.0);
                 let aim = look_dir(f.yaw, f.pitch);
                 let to_cam = (cam.pos - eye).norm();
@@ -2989,6 +3026,25 @@ impl Gpu {
                 ad.billboard(cam, p.pos, size, lina(p.color, t));
             } else {
                 al.billboard(cam, p.pos, size, lina(p.color, t * 0.9));
+            }
+        }
+        // Warden's Marks: a red spark in flight; landed, a pulsing beacon with a ring showing
+        // its reach, so everyone sees where it is
+        for m in &g.marks {
+            if !m.landed {
+                ad.billboard(cam, m.pos, 0.3, lina([255, 80, 60], 0.9));
+                continue;
+            }
+            let pulse = 0.5 + 0.5 * (g.time * 6.0).sin();
+            ad.billboard(cam, m.pos, 0.5 + 0.2 * pulse, lina([255, 70, 50], 0.9));
+            for k in 0..6 {
+                ad.billboard(cam, m.pos + v3(0.0, 0.4 + k as f32 * 0.5, 0.0), 0.35 - k as f32 * 0.04, lina([255, 90, 60], 0.35 - k as f32 * 0.05));
+            }
+            let r = g.tune.mark_radius;
+            let n = 40;
+            for k in 0..n {
+                let a = k as f32 / n as f32 * std::f32::consts::TAU + g.time * 0.3;
+                ad.billboard(cam, m.pos + v3(a.sin() * r, 0.15, a.cos() * r), 0.3, lina([255, 80, 60], 0.25 + 0.15 * pulse));
             }
         }
         for fl in &g.flashes {
@@ -3189,7 +3245,7 @@ mod cloth_tests {
             }
             let p = character::animate(rig, &mut st, &f, pos, t, &Tuning::default()).expect("posed");
             mb.v.clear();
-            coat_cloth(&mut mb, &p, &mut st, t, &lk, 1.0, 0);
+            coat_cloth(&mut mb, &p, &mut st, t, &lk, 1.0, 0, 0);
             let waist = p.hit.caps[4].b.y + 0.1;
             let _ = waist;
             let belt = st.cloth[..CLOTH_COLS].iter().fold(f32::MIN, |m, q| m.max(q.y));
@@ -3309,7 +3365,7 @@ mod final_kill_tests {
                 let pos = f.prev_pos.lerp(f.pos, alpha);
                 if let Some(p) = character::animate_show(rig, &mut self.chars[i], f, pos, g.time, &g.tune) {
                     mb.v.clear();
-                    coat_cloth(&mut mb, &p, &mut self.chars[i], g.time, &lk, g.tune.char_scale, f.loadout.body);
+                    coat_cloth(&mut mb, &p, &mut self.chars[i], g.time, &lk, g.tune.char_scale, f.loadout.body, f.loadout.outfit);
                 }
             }
         }

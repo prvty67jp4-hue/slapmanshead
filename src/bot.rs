@@ -1,4 +1,4 @@
-﻿use crate::game::{CHARGE_TIME, GUARD_MAX, Game, Input, KICK_RANGE, SCOPE_IN, STAR_SPEED, Weapon};
+use crate::game::{Ability, CHARGE_TIME, GUARD_MAX, Game, Input, KICK_RANGE, SCOPE_IN, STAR_SPEED, Weapon};
 use crate::math::*;
 
 /// A simple practice opponent.
@@ -27,6 +27,8 @@ pub struct Bot {
     slash_next: bool,
     /// Re-raising the guard against gunfire, to catch bullets in the deflect window.
     guard_tap: f32,
+    /// Until the next think about the ability.
+    ab_wait: f32,
 }
 
 impl Bot {
@@ -55,6 +57,7 @@ impl Bot {
             charge_hold: 0.0,
             slash_next: false,
             guard_tap: 0.0,
+            ab_wait: 2.0,
         }
     }
 
@@ -113,6 +116,22 @@ impl Bot {
 
         let dist = (en.pos - me.pos).len();
         let visible = en.alive && g.world.line_clear(eye, en.chest());
+
+        // the ability, when it fits the moment (thought over every couple of seconds)
+        self.ab_wait -= dt;
+        if self.ab_wait <= 0.0 && g.abilities_on() && me.ab_charge >= 1.0 {
+            self.ab_wait = 1.2 + self.rng.f() * 2.5;
+            inp.ability = match Ability::of(me.loadout.body) {
+                // find them behind cover
+                Ability::Mark => !visible && dist < 28.0,
+                // close the distance
+                Ability::Grapple => dist > 14.0 && aim_off < 0.35,
+                // under fire, or a blade coming in
+                Ability::Wall => (me.hurt_t > 0.0 && !en.weapon.is_melee() && visible) || (en.slashing() && dist < 3.5),
+                // slip away when hurt, or feint going in
+                Ability::Afterimage => (me.hp < 45.0 && dist < 12.0) || (dist < 9.0 && self.rng.f() < 0.35),
+            };
+        }
 
         // weapon choice (with a little hesitation)
         self.choose_t -= dt;

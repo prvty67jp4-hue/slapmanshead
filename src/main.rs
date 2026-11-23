@@ -89,6 +89,10 @@ struct Settings {
     post: gpu::Fx,
     /// Use the Steam name when Steam is running (otherwise the name as typed).
     steam_name: bool,
+    /// Each fighter's chosen outfit colour (career::OUTFITS; only unlocked ones are used).
+    outfits: [u8; 4],
+    /// Lobbies and practice with abilities (off: Classic).
+    abilities: bool,
 }
 
 /// Interface sizes: (name, zoom).
@@ -132,7 +136,7 @@ enum Bind {
     Unbound,
 }
 
-const N_ACTIONS: usize = 20;
+const N_ACTIONS: usize = 21;
 const A_FWD: usize = 0;
 const A_BACK: usize = 1;
 const A_LEFT: usize = 2;
@@ -153,6 +157,7 @@ const A_SLIDE: usize = 16;
 const A_MUSIC: usize = 17;
 const A_KICK: usize = 18;
 const A_FINISH: usize = 19;
+const A_ABILITY: usize = 20;
 
 /// (saved id, what it does)
 const ACTIONS: [(&str, &str); N_ACTIONS] = [
@@ -176,6 +181,7 @@ const ACTIONS: [(&str, &str); N_ACTIONS] = [
     ("music", "Music on / off"),
     ("kick", "Kick"),
     ("finish", "Finisher"),
+    ("ability", "Ability"),
 ];
 
 fn default_binds() -> [Bind; N_ACTIONS] {
@@ -187,7 +193,8 @@ fn default_binds() -> [Bind; N_ACTIONS] {
         Key(egui::Key::D),
         Key(egui::Key::Space),
         Shift,
-        Key(egui::Key::Q),
+        // (Q is the ability now)
+        Unbound,
         Mouse(0),
         Mouse(1),
         Key(egui::Key::R),
@@ -201,6 +208,7 @@ fn default_binds() -> [Bind; N_ACTIONS] {
         Key(egui::Key::M),
         Key(egui::Key::F),
         Key(egui::Key::E),
+        Key(egui::Key::Q),
     ]
 }
 
@@ -324,6 +332,8 @@ impl Default for Settings {
             dyn_res: false,
             post: gpu::Quality::PRESETS[2].1.post,
             steam_name: true,
+            outfits: [0; 4],
+            abilities: true,
         }
     }
 }
@@ -426,6 +436,12 @@ impl Settings {
                             "ui_scale" => s.ui_scale = v.parse().unwrap_or(0usize).min(UI_SCALES.len() - 1),
                             "dyn_res" => s.dyn_res = v == "1",
                             "steam_name" => s.steam_name = v != "0",
+                            "abilities" => s.abilities = v != "0",
+                            "outfits" => {
+                                for (slot, x) in s.outfits.iter_mut().zip(v.split(',')) {
+                                    *slot = x.trim().parse::<u8>().unwrap_or(0).min(3);
+                                }
+                            }
                             k if k.starts_with("fx_") => fx_keys.push((k.to_string(), v != "0")),
                             "aim_v" => aim_v = v.parse().unwrap_or(0),
                             "cross_color" => {
@@ -451,6 +467,10 @@ impl Settings {
                     }
                 }
             }
+        }
+        // settings saved before abilities: Q moves from the second dash key to the ability
+        if s.binds[A_DASH2] == Bind::Key(Key::Q) && s.binds[A_ABILITY] == Bind::Key(Key::Q) {
+            s.binds[A_DASH2] = Bind::Unbound;
         }
         // settings saved before the aiming update: closer default view, smaller crosshair
         if saved && aim_v < 2 {
@@ -513,7 +533,7 @@ impl Settings {
                 "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\naim_v=3\n",
                 self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8
             );
-            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8);
+            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\nabilities={}\noutfits={},{},{},{}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8, self.abilities as u8, self.outfits[0], self.outfits[1], self.outfits[2], self.outfits[3]);
             let f = self.post;
             text += &format!(
                 "fx_soft_shadows={}\nfx_ssao={}\nfx_bloom={}\nfx_rays={}\nfx_grading={}\nfx_vignette={}\n",
@@ -547,6 +567,8 @@ enum Page {
     Browse,
     /// Career stats, finishers included.
     Stats,
+    /// Each fighter's mastery: badge, outfits, finishers, lore.
+    Mastery,
 }
 
 enum Screen {
@@ -564,6 +586,7 @@ struct Latch {
     item: bool,
     kick: bool,
     finish: bool,
+    ability: bool,
     select: Option<u8>,
 }
 
@@ -621,6 +644,8 @@ struct App {
     lan_ip: Option<String>,
     /// The main menu's loadout screen is open.
     menu_loadout: bool,
+    /// XP earned in the match being played (shown when it ends).
+    match_xp: u32,
     /// Quick Play: seconds spent looking for an open game (Steam).
     quick: Option<f32>,
     /// A Quick Play lobby: keep it filled with bots.
@@ -663,6 +688,8 @@ struct App {
     /// Developer tuning panel (F4): the live values, whether it's open, preset name, last message.
     tune: Tuning,
     show_tuning: bool,
+    /// F4: draw everyone's hit shapes (the head in yellow).
+    show_hitboxes: bool,
     preset_name: String,
     tune_msg: Option<String>,
     /// Where the smoothed camera is (camera smoothing).
@@ -764,6 +791,7 @@ impl App {
             audio,
             lan_ip: net::local_ip(),
             menu_loadout: false,
+            match_xp: 0,
             quick: None,
             quick_host: false,
             news: load_news(),
@@ -792,6 +820,7 @@ impl App {
             selftest_t: 0.0,
             tune: load_tuning_defaults(),
             show_tuning: false,
+            show_hitboxes: std::env::var_os("DUEL_HITBOXES").is_some(),
             preset_name: "my preset".into(),
             tune_msg: None,
             cam_smooth_pos: std::cell::Cell::new(None),
@@ -868,6 +897,8 @@ impl App {
                 app.screen = Screen::Menu(Page::Join);
             } else if pg == "host" {
                 app.screen = Screen::Menu(Page::Host);
+            } else if pg == "mastery" {
+                app.screen = Screen::Menu(Page::Mastery);
             } else if pg == "play" {
                 app.screen = Screen::Menu(Page::Play);
             } else if pg == "loadout" {
@@ -939,8 +970,14 @@ impl App {
             game.f[l].loadout = self.settings.loadout;
             game.f[l].equip();
         }
+        // abilities on or Classic, as set (a joined game takes the host's; Training needs them)
+        if game.kind != Kind::Client {
+            game.mt.classic = !self.settings.abilities && game.train.is_none();
+        }
         self.aim_yaw = game.f[l].yaw;
         self.aim_pitch = 0.0;
+        self.match_xp = 0;
+        game.fin_locks = self.career.finisher_locks(self.settings.loadout.body);
         self.local_alive = game.f[l].alive;
         self.acc = 0.0;
         self.latch = Latch::default();
@@ -1066,18 +1103,29 @@ impl App {
             game.career.clear();
             return;
         }
+        if game.mt.phase == Phase::Loadout {
+            self.match_xp = 0;
+        }
+        let body = game.f[game.local].loadout.body;
+        // your finishers: the ones this fighter's mastery has opened
+        game.fin_locks = self.career.finisher_locks(body);
         let evs = std::mem::take(&mut game.career);
         if evs.is_empty() {
             return;
         }
         let level = self.career.level();
+        let day = career::today();
         for ev in evs {
-            let xp = self.career.apply(ev);
+            let xp = self.career.apply_as(ev, Some(body), day);
+            self.match_xp += xp;
             if let CareerEv::Kill { finisher, .. } = ev {
                 if finisher > 0 {
                     game.say(format!("+{xp} XP (finisher)"));
                 }
             }
+        }
+        for note in std::mem::take(&mut self.career.notes) {
+            game.say(note);
         }
         if self.career.level() > level {
             game.say(format!("Level up! You are level {}", self.career.level()));
@@ -1255,6 +1303,7 @@ impl App {
                     }
                 });
                 ui.separator();
+                ui.checkbox(&mut self.show_hitboxes, "Show hitboxes on dummies and players (head in yellow)");
                 ui.horizontal(|ui| {
                     ui.label("Spawn dummy at");
                     for d in [5.0f32, 15.0, 30.0] {
@@ -1878,6 +1927,17 @@ fn draw_crosshair(p: &egui::Painter, c: Pos2, style: u8, col: Color32, dot_col: 
             arm(dx, dy);
         }
     };
+    if circle {
+        // the scattergun: its ten pellets, exactly where they'll go
+        let pr = (1.6 * size).max(1.4);
+        for (x, y) in SHOTGUN_PATTERN {
+            let at = c + Vec2::new(x * gap, -y * gap);
+            p.circle_filled(at, pr + 1.0, outline);
+            p.circle_filled(at, pr, if x == 0.0 && y == 0.0 { dot_col } else { col });
+        }
+        p.circle_stroke(c, gap, Stroke::new(1.0, col.gamma_multiply(0.35)));
+        return;
+    }
     match style {
         2 => dot(),
         3 => {
@@ -2088,6 +2148,12 @@ impl eframe::App for App {
         self.watchdog.beat();
         self.watchdog.hold(ctx.input(|i| i.viewport().minimized.unwrap_or(false)));
         self.watchdog.stage("frame start");
+        // the chosen fighter wears their chosen outfit (once mastery has unlocked it)
+        {
+            let b = self.settings.loadout.body.min(3);
+            let o = self.settings.outfits[b as usize];
+            self.settings.loadout.outfit = if self.career.outfit_unlocked(b, o as usize) { o } else { 0 };
+        }
         // frame-rate limit: wait out the rest of this frame's time
         if self.settings.fps_cap > 0 && self.screenshot.is_none() {
             if let Some(t0) = self.frame_start {
@@ -2258,6 +2324,11 @@ impl eframe::App for App {
         let alpha = (self.acc / TICK).clamp(0.0, 1.0);
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         let mut ears = None;
+        // the Play of the Match: its moment stands in for the live one while it's drawn
+        let potm_view = match &mut self.screen {
+            Screen::Play { game, .. } => game.potm_view_begin(),
+            _ => false,
+        };
         match &self.screen {
             Screen::Play { game, .. } => {
                 let (cam, lp) = self.play_camera(game, rect);
@@ -2313,6 +2384,11 @@ impl eframe::App for App {
         }
 
         self.gpu = gpu;
+        if potm_view {
+            if let Screen::Play { game, .. } = &mut self.screen {
+                game.potm_view_end();
+            }
+        }
 
         // ---- UI overlays
         self.watchdog.stage("menus and panels");
@@ -2562,6 +2638,9 @@ impl App {
             if b[A_FINISH].tapped(i, prev) {
                 self.latch.finish = true;
             }
+            if b[A_ABILITY].tapped(i, prev) {
+                self.latch.ability = true;
+            }
             if b[A_ITEM].tapped(i, prev) {
                 self.latch.item = true;
             }
@@ -2649,7 +2728,9 @@ impl App {
         let cur = me.cur;
         let l = &mut self.latch;
         l.jump |= st.tapped(btn::A);
-        l.dash |= st.tapped(btn::LB) || st.tapped(btn::L3);
+        // LB is the ability; L3 dashes
+        l.dash |= st.tapped(btn::L3);
+        l.ability |= st.tapped(btn::LB);
         l.fire_pressed |= st.tapped(btn::RT);
         l.reload |= st.tapped(btn::X);
         l.kick |= st.tapped(btn::RB);
@@ -2698,6 +2779,7 @@ impl App {
         inp.reload = self.latch.reload;
         inp.kick = self.latch.kick;
         inp.finish = self.latch.finish;
+        inp.ability = self.latch.ability;
         inp.item = self.latch.item;
         inp.select = self.latch.select;
         inp
@@ -2855,9 +2937,11 @@ impl App {
             let l = game.local;
             let me = game.f[l].pos;
             let right = yaw_right(game.f[l].yaw);
-            game.f[l].cur = 2;
+            // DUEL_HUD_SHOTGUN: the scattergun instead (its pattern crosshair, one gold number)
+            let pump = std::env::var_os("DUEL_HUD_SHOTGUN").is_some();
+            game.f[l].cur = if pump { 1 } else { 2 };
             game.f[l].loadout.gun2 = Weapon::Revolver;
-            game.f[l].reload_t = 0.7;
+            game.f[l].reload_t = if pump { 0.0 } else { 0.7 };
             game.kill_t = 1.2;
             game.kill_name = "Vex".into();
             game.streak = 2;
@@ -2866,7 +2950,7 @@ impl App {
             game.hurt_dirs = vec![(me + right * 6.0, 1.0), (me - yaw_fwd(game.f[l].yaw) * 6.0, 0.6)];
             if game.dmg_nums.is_empty() {
                 let p = me + yaw_fwd(game.f[l].yaw) * 6.0 + v3(0.0, 1.8, 0.0);
-                game.dmg_nums.push(DmgNum { pos: p, amount: 42, life: 0.8, head: true });
+                game.dmg_nums.push(DmgNum { pos: p, amount: if pump { 168 } else { 42 }, life: 0.8, head: true, victim: 255 });
             }
             if game.chat.is_empty() {
                 game.add_chat(1, "that was a clean launch, rematch after this?");
@@ -3014,6 +3098,7 @@ impl App {
         if let Some(h) = first {
             let Screen::Lobby { net, .. } = std::mem::replace(&mut self.screen, Screen::Menu(Page::Main)) else { return };
             let mut g = Game::new(Kind::Client, h.you, h.mode, h.target);
+            g.mt.classic = h.classic;
             g.mt.number = h.number;
             let you = h.you;
             apply_host_msg(&mut g, h);
@@ -3049,6 +3134,12 @@ impl App {
         // test switch: DUEL_VIEW=x,y,z,yaw,pitch[,fov] puts the camera there (before / after pictures)
         if let Some(v) = test_view() {
             return (Cam::new(v3(v[0], v[1], v[2]), v[3], v[4], v[5], rect), body);
+        }
+        // the Play of the Match: behind its player, as they played it
+        if let (Some(_), Some(h)) = (game.potm_t, game.potm.as_ref()) {
+            let tf = &game.f[h.player.min(game.f.len() - 1)];
+            let (pivot, dir, md) = game.camera_rig(tf.pos, tf.yaw, tf.pitch * 0.6);
+            return (Cam::new(pivot - dir * md, tf.yaw, tf.pitch * 0.6, self.settings.fov, rect), body);
         }
         // choosing a loadout: a showcase shot of your fighter on the right of the screen
         if self.loadout_open(game) && !f.is_bot && !f.spectate {
@@ -3312,7 +3403,7 @@ fn gallery_pose(g: &mut Game, page: &str) {
         f.stun_t = 0.0;
         f.reload_t = 0.0;
         f.spawn_prot = 0.0;
-        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0, body: (i % chars::COUNT) as u8 };
+        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0, body: (i % chars::COUNT) as u8, outfit: 0 };
         f.cur = 2;
         f.weapon = Weapon::Revolver;
         let fwd = f.fwd();
@@ -3757,6 +3848,31 @@ impl App {
         p.circle_filled(c, 1.6, Color32::from_rgb(230, 40, 40));
     }
 
+    /// The Play of the Match's frame: letterbox bars, its title, whose and what it was.
+    fn draw_potm(&self, p: &egui::Painter, rect: Rect, h: &Highlight, t: f32) {
+        let s = self.hud_scale(rect);
+        let bar_h = rect.height() * 0.12;
+        let a = ((t / 0.35).min(1.0) * 255.0) as u8;
+        p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
+        p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - bar_h), Vec2::new(rect.width(), bar_h)), 0.0, Color32::BLACK);
+        let c = rect.center();
+        text_display(p, Pos2::new(c.x, rect.top() + bar_h * 0.5), Align2::CENTER_CENTER, "PLAY OF THE MATCH", 40.0 * s, Color32::from_rgba_unmultiplied(255, 150, 70, a));
+        // how far through
+        let k = (t / h.duration().max(0.1)).clamp(0.0, 1.0);
+        let pr = Rect::from_min_size(Pos2::new(rect.left(), rect.top() + bar_h - 3.0 * s), Vec2::new(rect.width() * k, 3.0 * s));
+        p.rect_filled(pr, 0.0, ACCENT);
+        let y = rect.bottom() - bar_h * 0.5;
+        let pc = player_color(h.color);
+        let name = h.name.to_uppercase();
+        let nw = ui_kit::text_width(p, &name, ui_kit::display(36.0 * s));
+        let ww = ui_kit::text_width(p, &h.what, ui_kit::display(26.0 * s));
+        let x0 = c.x - (nw + 20.0 * s + ww) * 0.5;
+        text_display(p, Pos2::new(x0, y), Align2::LEFT_CENTER, &name, 36.0 * s, Color32::from_rgba_unmultiplied(pc.r(), pc.g(), pc.b(), a));
+        text_display(p, Pos2::new(x0 + nw + 20.0 * s, y + 2.0 * s), Align2::LEFT_CENTER, &h.what, 26.0 * s, Color32::from_rgba_unmultiplied(255, 230, 200, a));
+        let hint = if self.pad_active { format!("{}: skip", pad::button_name(pad::btn::A, self.pads.name.as_deref())) } else { "Space: skip".to_string() };
+        p.text(Pos2::new(rect.right() - 16.0, rect.bottom() - 10.0), Align2::RIGHT_BOTTOM, hint, ui_kit::body(13.0 * s), Color32::from_gray(190));
+    }
+
     /// The pre-match loadout screen is up.
     fn loadout_open(&self, g: &Game) -> bool {
         g.mt.phase == Phase::Loadout && !g.f[g.local].ready && self.disconnected.is_none() && !self.paused
@@ -3936,6 +4052,10 @@ impl App {
         if (self.loadout_open(g) && !g.f[g.local].is_bot) || (self.paused && self.loadout_edit) {
             return; // the loadout screen covers it
         }
+        if let (Some(t), Some(h)) = (g.potm_t, g.potm.as_ref()) {
+            self.draw_potm(p, rect, h, t);
+            return;
+        }
         let me = &g.f[g.local];
         let c = rect.center();
         // everything scales with the window so nothing overlaps at small sizes (and grows with
@@ -4014,7 +4134,7 @@ impl App {
         }
 
         // name tags over everyone you can see
-        for other in g.f.iter().filter(|o| o.present && !o.spectate && o.slot != g.local) {
+        for other in g.f.iter().filter(|o| o.present && !o.spectate && o.slot != g.local && o.invis_t <= 0.0) {
             if !(other.alive || other.death_t < 2.0) {
                 continue;
             }
@@ -4029,6 +4149,94 @@ impl App {
             text_shadow(p, sp + Vec2::new(0.0, -12.0 * s), Align2::CENTER_BOTTOM, &label, 15.0 * s, col);
             let r = Rect::from_center_size(sp, Vec2::new(70.0 * s, 8.0 * s));
             bar(p, r, other.hp / MAX_HP, if enemy { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(80, 200, 110) });
+        }
+
+        // Writs: a crown over each holder (seen through walls), and on the screen's edge when
+        // they're off it
+        let gold = Color32::from_rgb(255, 200, 60);
+        for j in 0..g.f.len() {
+            if j == g.local || !g.has_writ(j) {
+                continue;
+            }
+            let n = g.streaks[j];
+            let at = g.f[j].pos + v3(0.0, 2.55, 0.0);
+            let v = cam.to_view(at);
+            let inner = rect.shrink(40.0 * s);
+            let sp = (v.z > cam.near).then(|| cam.proj_view(v)).filter(|sp| inner.contains(*sp));
+            match sp {
+                Some(sp) => {
+                    let pulse = 1.0 + 0.08 * (g.time * 5.0).sin();
+                    ui_kit::crown(p, sp, 11.0 * s * pulse, gold);
+                    text_display(p, sp - Vec2::new(0.0, 17.0 * s), Align2::CENTER_BOTTOM, &format!("WRIT x{n}"), 15.0 * s, gold);
+                }
+                None => {
+                    let mut d = Vec2::new(v.x, -v.y);
+                    if d.length() < 1e-3 {
+                        d = Vec2::new(0.0, 1.0);
+                    }
+                    let d = d.normalized();
+                    let (hw, hh) = (inner.width() * 0.5, inner.height() * 0.5);
+                    let k = (hw / d.x.abs().max(1e-4)).min(hh / d.y.abs().max(1e-4));
+                    let at = inner.center() + d * k;
+                    p.circle_filled(at, 18.0 * s, Color32::from_black_alpha(150));
+                    ui_kit::crown(p, at - Vec2::new(0.0, 2.0 * s), 9.0 * s, gold);
+                    let dist = (g.f[j].pos - me.pos).len();
+                    text_display(p, at + Vec2::new(0.0, 22.0 * s), Align2::CENTER_TOP, &format!("{} {:.0} m", g.f[j].name, dist), 13.0 * s, gold);
+                }
+            }
+        }
+        if g.has_writ(g.local) {
+            let y = rect.top() + margin + 64.0 * s;
+            let txt = format!("YOU HOLD A WRIT  x{}  ·  everyone is hunting you", g.streaks[g.local]);
+            let w = ui_kit::text_width(p, &txt, ui_kit::display(17.0 * s)) + 44.0 * s;
+            let r = Rect::from_center_size(Pos2::new(c.x, y + 13.0 * s), Vec2::new(w, 28.0 * s));
+            p.rect_filled(r, 5.0 * s, Color32::from_rgba_unmultiplied(60, 40, 10, 190));
+            ui_kit::crown(p, Pos2::new(r.left() + 16.0 * s, r.center().y), 8.0 * s, gold);
+            text_display(p, Pos2::new(r.left() + 30.0 * s, r.center().y + 1.0 * s), Align2::LEFT_CENTER, &txt, 17.0 * s, gold);
+        }
+
+        // Warden's Mark: enemies near your (or a teammate's) mark, outlined through walls
+        for j in 0..g.f.len() {
+            if j == g.local || !g.revealed_to(g.local, j) {
+                continue;
+            }
+            for c in g.hit_pose(j).caps.iter() {
+                let (va, vb) = (cam.to_view(c.a), cam.to_view(c.b));
+                if va.z < cam.near || vb.z < cam.near {
+                    continue;
+                }
+                let (pa, pb) = (cam.proj_view(va), cam.proj_view(vb));
+                let w = 2.0 * c.r * cam.focal / ((va.z + vb.z) * 0.5);
+                p.line_segment([pa, pb], Stroke::new(w + 3.0, Color32::from_rgba_unmultiplied(255, 60, 50, 170)));
+                p.line_segment([pa, pb], Stroke::new(w, Color32::from_rgba_unmultiplied(120, 10, 10, 120)));
+            }
+        }
+
+        // F4: everyone's hit shapes, as the game checks them (the head in yellow)
+        if self.show_hitboxes {
+            for j in 0..g.f.len() {
+                let o = &g.f[j];
+                if j == g.local || !o.present || !o.alive || o.spectate {
+                    continue;
+                }
+                for c in g.hit_pose(j).caps.iter() {
+                    let (va, vb) = (cam.to_view(c.a), cam.to_view(c.b));
+                    if va.z < cam.near || vb.z < cam.near {
+                        continue;
+                    }
+                    let (pa, pb) = (cam.proj_view(va), cam.proj_view(vb));
+                    let w = 2.0 * c.r * cam.focal / ((va.z + vb.z) * 0.5);
+                    let head = c.part == Part::Head;
+                    let fill = if head { Color32::from_rgba_unmultiplied(255, 215, 50, 95) } else { Color32::from_rgba_unmultiplied(70, 200, 255, 55) };
+                    p.line_segment([pa, pb], Stroke::new(w, fill));
+                    p.circle_filled(pa, w * 0.5, fill);
+                    p.circle_filled(pb, w * 0.5, fill);
+                    if head {
+                        p.circle_stroke(pb, w * 0.5, Stroke::new(1.5, Color32::from_rgb(255, 225, 90)));
+                        p.circle_stroke(pa, w * 0.5, Stroke::new(1.5, Color32::from_rgb(255, 225, 90)));
+                    }
+                }
+            }
         }
 
         // damage numbers: pop in, drift up, bigger for bigger hits, gold for headshots
@@ -4456,6 +4664,52 @@ impl App {
             let kw = (ui_kit::text_width(p, &keys[k], ui_kit::display(13.0 * s * 0.85)) + 10.0 * s * 0.85).max(18.0 * s * 0.85);
             ui_kit::keycap(p, Pos2::new(r.left() + 3.0 * s + kw * 0.5, r.top() + 1.0 * s), &keys[k], s * 0.85);
         }
+        // ---- the ability: icon, cooldown, charges and key, left of the weapons (or a note
+        // that this lobby plays Classic)
+        if !g.abilities_on() && g.train.is_none() {
+            text_display(p, Pos2::new(right.left() - 12.0 * s, right.bottom() - 4.0 * s), Align2::RIGHT_BOTTOM, "CLASSIC: NO ABILITIES", 13.0 * s, Color32::from_gray(160));
+        }
+        if g.abilities_on() {
+            let ab = Ability::of(me.loadout.body);
+            let sz = 64.0 * s;
+            let r = Rect::from_min_size(Pos2::new(right.left() - 10.0 * s - sz, right.bottom() - sz), Vec2::splat(sz));
+            let ready = me.ab_charge >= 1.0;
+            let active = me.shield_t > 0.0 || me.invis_t > 0.0 || me.grapple.is_some();
+            p.rect_filled(r, 8.0 * s, hud_fill);
+            let edge = if active {
+                Stroke::new(2.5 * s, Color32::from_rgb(140, 200, 255).gamma_multiply(0.6 + 0.4 * (g.time * 10.0).sin().abs()))
+            } else if ready {
+                Stroke::new(2.0 * s, ACCENT)
+            } else {
+                Stroke::new(1.0, Color32::from_white_alpha(40))
+            };
+            p.rect_stroke(r, 8.0 * s, edge, egui::StrokeKind::Inside);
+            ui_kit::ability_icon(p, r.shrink(15.0 * s), ab, if ready { Color32::WHITE } else { Color32::from_gray(120) });
+            if !ready {
+                // the charge filling back up, and the seconds left
+                let k = 1.0 - me.ab_charge.clamp(0.0, 1.0);
+                let cover = Rect::from_min_size(r.min, Vec2::new(r.width(), r.height() * k));
+                p.rect_filled(cover, 8.0 * s, Color32::from_black_alpha(120));
+                let secs = (k * ab.cooldown(&g.tune)).ceil() as i32;
+                text_display(p, r.center() + Vec2::new(0.0, 2.0 * s), Align2::CENTER_CENTER, &format!("{secs}"), 26.0 * s, Color32::WHITE);
+            }
+            let most = ab.charges(&g.tune) as usize;
+            if most > 1 {
+                for c in 0..most {
+                    let at = Pos2::new(r.center().x + (c as f32 - (most as f32 - 1.0) * 0.5) * 12.0 * s, r.bottom() - 7.0 * s);
+                    let full = me.ab_charge >= c as f32 + 1.0;
+                    p.circle_filled(at, 3.5 * s, if full { ACCENT } else { Color32::from_white_alpha(50) });
+                }
+            }
+            let key = if self.pad_active { "LB".to_string() } else { self.settings.binds[A_ABILITY].name() };
+            let kw = (ui_kit::text_width(p, &key, ui_kit::display(13.0 * s * 0.85)) + 10.0 * s * 0.85).max(18.0 * s * 0.85);
+            ui_kit::keycap(p, Pos2::new(r.left() + 3.0 * s + kw * 0.5, r.top() + 1.0 * s), &key, s * 0.85);
+            text_display(p, Pos2::new(r.center().x, r.top() - 6.0 * s), Align2::CENTER_BOTTOM, &ab.name().to_uppercase(), 13.0 * s, if ready { ACCENT } else { Color32::from_gray(170) });
+            if me.invis_t > 0.0 {
+                text_display(p, c + Vec2::new(0.0, 60.0 * s), Align2::CENTER_CENTER, "UNSEEN", 20.0 * s, Color32::from_rgb(190, 180, 230));
+            }
+        }
+
         // ---- chat, above the health panel, wrapped to its own column
         let chat_w = (rect.width() * 0.42).max(pw);
         let mut cy = left.top() - 8.0 * s;
@@ -4636,7 +4890,8 @@ impl App {
             let fade = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
             let mut parts: Vec<(String, Color32)> = Vec::new();
             if let Some(t) = &line.text {
-                parts.push((t.clone(), Color32::from_rgb(255, 240, 220)));
+                let col = if t.starts_with("WRIT") { Color32::from_rgb(255, 205, 80) } else { Color32::from_rgb(255, 240, 220) };
+                parts.push((t.clone(), col));
             } else {
                 if let Some((k, kc)) = &line.killer {
                     parts.push((k.clone(), player_color(*kc)));
@@ -4827,7 +5082,7 @@ impl App {
             next = Some(Page::Main);
         }
         let width = match page {
-            Page::Settings => 600.0,
+            Page::Settings | Page::Mastery => 600.0,
             Page::Play => 520.0,
             _ => 380.0,
         };
@@ -4901,7 +5156,52 @@ impl App {
                         self.quick = None;
                         next = Some(Page::Main);
                     }
-                }                Page::Stats => {
+                }                Page::Mastery => {
+                    ui.heading("Fighters & Mastery");
+                    ui.label(egui::RichText::new("Play a fighter to level their mastery: outfit colours, finishers, lore pages and badges (Bronze to Champion) unlock as you go.").size(13.0).color(Color32::from_gray(195)));
+                    let cr = self.career.clone();
+                    for b in 0..chars::COUNT.min(career::FIGHTERS) as u8 {
+                        let (badge, bc) = cr.badge(b);
+                        let lv = cr.mastery_level(b);
+                        ui_kit::section(ui, chars::name(b));
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!(" {} ", badge.to_uppercase())).font(ui_kit::display(16.0)).color(Color32::from_rgb(20, 14, 10)).background_color(Color32::from_rgb(bc[0], bc[1], bc[2])));
+                            ui.label(egui::RichText::new(format!("Mastery {lv} / {}", career::MASTERY_MAX)).font(ui_kit::display(18.0)));
+                        });
+                        ui.add(egui::ProgressBar::new(cr.mastery_progress(b)).desired_height(8.0));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Outfit");
+                            for (k, o) in career::OUTFITS.iter().enumerate() {
+                                let open = cr.outfit_unlocked(b, k);
+                                let sel = self.settings.outfits[b as usize] as usize == k;
+                                let txt = if open { o.0.to_string() } else { format!("{} (mastery {})", o.0, o.1) };
+                                if ui.add_enabled_ui(open, |ui| ui.selectable_label(sel, txt)).inner.clicked() {
+                                    self.settings.outfits[b as usize] = k as u8;
+                                    self.settings.save();
+                                }
+                            }
+                        });
+                        let fins: Vec<String> = FINISHERS
+                            .iter()
+                            .enumerate()
+                            .map(|(k, s)| if cr.finisher_unlocked(b, k) { s.name.to_string() } else { format!("{} (mastery {})", s.name, career::finisher_level(k)) })
+                            .collect();
+                        ui.label(egui::RichText::new(format!("Finishers: {}", fins.join(", "))).size(12.5).color(Color32::from_gray(200)));
+                        for (pg, (title, text)) in career::LORE[b as usize].iter().enumerate() {
+                            if cr.lore_unlocked(b, pg) {
+                                egui::CollapsingHeader::new(egui::RichText::new(*title).color(Color32::from_rgb(235, 220, 200))).id_salt(("lore", b, pg)).show(ui, |ui| {
+                                    ui.label(egui::RichText::new(*text).size(13.5).italics());
+                                });
+                            } else {
+                                ui.label(egui::RichText::new(format!("Locked lore page: \"{title}\" (mastery {})", career::LORE_LEVELS[pg])).size(12.5).color(Color32::from_gray(140)));
+                            }
+                        }
+                    }
+                    if Self::big_button(ui, "Back") {
+                        next = Some(Page::Main);
+                    }
+                }
+                Page::Stats => {
                     let cr = self.career.clone();
                     ui.heading(format!("Level {}", cr.level()));
                     ui.add(egui::ProgressBar::new(cr.level_progress()).text(format!("{} XP  ·  {} to the next level", cr.xp, career::XP_PER_LEVEL - cr.xp % career::XP_PER_LEVEL)));
@@ -4910,6 +5210,13 @@ impl App {
                     let kd = if cr.deaths == 0 { cr.kills as f32 } else { cr.kills as f32 / cr.deaths as f32 };
                     ui.label(format!("Kills {}  ·  Deaths {}  ·  K/D {:.2}  ·  Headshots {}  ·  Matches {}  ·  Gauntlet waves {}", cr.kills, cr.deaths, kd, cr.headshots, cr.matches, cr.waves));
                     ui.add_space(6.0);
+                    ui.label(format!("Wins {}  ·  Writs claimed {}", cr.wins, cr.writs));
+                    ui_kit::section(ui, "This week");
+                    let day = career::today();
+                    for (ch, n, done) in cr.challenges(day) {
+                        ui.label(if done { egui::RichText::new(format!("{}: done (+{} XP)", ch.text, ch.xp)).color(Color32::from_rgb(140, 220, 160)) } else { egui::RichText::new(format!("{}: {n} / {}  (+{} XP)", ch.text, ch.goal, ch.xp)) });
+                    }
+                    ui.label(if cr.first_win_ready(day) { format!("First win of the day: +{} XP waiting", career::XP_FIRST_WIN) } else { "First win of the day: earned today".to_string() });
                     ui_kit::section(ui, "Finishers");
                     let share = if cr.kills > 0 { cr.finishers as f32 * 100.0 / cr.kills as f32 } else { 0.0 };
                     ui.label(format!("Executions {}  ({share:.0}% of your kills)", cr.finishers));
@@ -4934,6 +5241,7 @@ impl App {
                     ui.heading("Practice vs Bots");
                     mode_picker(ui, &mut self.settings.mode);
                     map_picker(ui, &mut self.settings.map);
+                    ui.checkbox(&mut self.settings.abilities, "Abilities (off: Classic)").on_hover_text("Each fighter's ability (Q / LB) and passive.");
                     ui.add(egui::Slider::new(&mut self.settings.bots, 1..=7).text("bots"));
                     ui.label("Bot difficulty");
                     ui.horizontal(|ui| {
@@ -5000,6 +5308,7 @@ impl App {
                     mode_picker(ui, &mut self.settings.mode);
                     map_picker(ui, &mut self.settings.map);
                     ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
+                    ui.checkbox(&mut self.settings.abilities, "Abilities: On / Off (Classic)").on_hover_text("Each fighter's ability (Q / LB) and passive.");
                     ui.add(egui::Slider::new(&mut self.settings.fill_bots, 0..=MAX_PLAYERS).text("fill with bots up to this many fighters (0 = none)"))
                         .on_hover_text("Bots keep the lobby busy; each one leaves when a real player joins.");
                     ui.horizontal(|ui| {
@@ -5077,8 +5386,9 @@ impl App {
                             ("Space", "jump"),
                             ("Space at a wall", "while in the air: run along it, or up it if you face it"),
                             ("Space on a wall", "kick off the wall"),
-                            ("Shift / Q", "dash (once more in the air)"),
+                            ("Shift", "dash (once more in the air)"),
                             ("C while running", "slide, keeping your speed; Space jumps out of it"),
+                            ("Q", "your fighter's ability (Corvin: Warden's Mark, Sable: Grapple Line, Bram: Iron Wall, Ilya: Afterimage); each also has a passive"),
                             ("Flow", "chain moves without stopping on the ground: each adds +4% speed (up to +20%)"),
                             ("Perfect timing", "jump or dash the instant you land for an extra boost"),
                             ("Double-tap W A S D", "dodge in that direction"),
@@ -5229,6 +5539,26 @@ impl App {
         if phase == Phase::MatchOver && killcam_running {
             return leave;
         }
+        // the Play of the Match plays before the results (Space, Enter or a click skips it)
+        let potm_waiting = match &self.screen {
+            Screen::Play { game, .. } => game.potm.is_some() && !game.potm_done,
+            _ => false,
+        };
+        if phase == Phase::MatchOver && potm_waiting {
+            let mut skip = ctx.input(|i| i.key_pressed(Key::Space) || i.key_pressed(Key::Enter));
+            egui::Area::new(egui::Id::unique("potm-skip")).fixed_pos(Pos2::new(rect.right() - 150.0, rect.bottom() - rect.height() * 0.12 - 54.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+                ui.set_width(130.0);
+                if ui_kit::menu_button(ui, "Skip", 40.0).clicked() {
+                    skip = true;
+                }
+            });
+            if skip {
+                if let Screen::Play { game, .. } = &mut self.screen {
+                    game.skip_potm();
+                }
+            }
+            return leave;
+        }
         if phase == Phase::MatchOver {
             let mut rematch = false;
             let mut vote = false;
@@ -5237,7 +5567,24 @@ impl App {
                 _ => None,
             };
             let has_steam = self.steam.is_some();
+            let (potm_line, won) = match &self.screen {
+                Screen::Play { game, .. } => (game.potm.as_ref().map(|h| format!("Play of the Match: {}  ·  {}", h.name, h.what.to_lowercase())), game.local_won()),
+                _ => (None, false),
+            };
+            let match_xp = self.match_xp;
+            let first_win_ready = self.career.first_win_ready(career::today());
             panel(ctx, "over", Pos2::new(center.x, center.y + 60.0), 360.0, |ui| {
+                if run.is_none() {
+                    ui.heading(if won { "Victory" } else { "Match over" });
+                    ui.label(egui::RichText::new(format!("+{match_xp} XP this match")).font(ui_kit::display(22.0)).color(ACCENT));
+                    if first_win_ready {
+                        ui.label(egui::RichText::new(format!("Win a match today for a +{} XP first-win bonus", career::XP_FIRST_WIN)).size(12.5).color(Color32::from_gray(190)));
+                    }
+                    if let Some(l) = &potm_line {
+                        ui.label(egui::RichText::new(l).size(13.0).color(Color32::from_gray(215)));
+                    }
+                    ui.add_space(4.0);
+                }
                 if let Some(gt) = &run {
                     ui.heading(format!("Score {}", gt.score));
                     ui.label(format!("Wave {}  ·  {} kills", gt.wave, gt.kills));
@@ -5266,7 +5613,7 @@ impl App {
                     }
                 } else {
                     ui.label(format!("Rematch votes: {votes} / {humans} (more than half starts it)"));
-                    if !voted && App::big_button(ui, "Vote for a rematch") {
+                    if !voted && App::big_button(ui, "Rematch") {
                         vote = true;
                     }
                     if voted {
@@ -5684,6 +6031,9 @@ impl App {
             if Self::big_button_h(ui, "Loadout", 42.0) {
                 self.menu_loadout = true;
             }
+            if Self::big_button_h(ui, "Fighters & Mastery", 42.0) {
+                *next = Some(Page::Mastery);
+            }
             if Self::big_button_h(ui, "Stats", 42.0) {
                 *next = Some(Page::Stats);
             }
@@ -5715,6 +6065,15 @@ impl App {
         }
         p.rect_filled(r, 6.0, Color32::from_rgba_unmultiplied(10, 9, 18, 175));
         ui_kit::edge_marks(&p, r, 1.0, false);
+        // the fighter's mastery badge, on a tab above
+        let body = self.settings.loadout.body;
+        let (badge, bc) = self.career.badge(body);
+        let tab_txt = format!("{}  ·  {} MASTERY {}", chars::name(body).to_uppercase(), badge.to_uppercase(), self.career.mastery_level(body));
+        let tw = ui_kit::text_width(&p, &tab_txt, ui_kit::display(14.0)) + 22.0;
+        let tab = Rect::from_min_size(Pos2::new(r.left(), r.top() - 22.0), Vec2::new(tw, 20.0));
+        p.rect_filled(tab, 4.0, Color32::from_rgba_unmultiplied(10, 9, 18, 200));
+        p.circle_filled(Pos2::new(tab.left() + 10.0, tab.center().y), 4.5, Color32::from_rgb(bc[0], bc[1], bc[2]));
+        p.text(Pos2::new(tab.left() + 18.0, tab.center().y + 1.0), Align2::LEFT_CENTER, &tab_txt, ui_kit::display(14.0), Color32::from_rgb(bc[0], bc[1], bc[2]));
         let name = self.settings.name.trim().to_uppercase();
         let name = if name.is_empty() { "PLAYER".to_string() } else { name };
         let nf = ui_kit::fitted(&p, &name, ui_kit::display(40.0), r.width() - 36.0);
@@ -5749,7 +6108,22 @@ impl App {
                     ui.label(egui::RichText::new("NEWS").font(ui_kit::display(22.0)).color(ACCENT));
                     ui.label(egui::RichText::new("patch notes").size(12.0).color(Color32::from_gray(160)));
                 });
-                egui::ScrollArea::vertical().id_salt("news-scroll").max_height(max_h).show(ui, |ui| {
+                // this week's challenges and the first-win bonus
+                let day = career::today();
+                ui.label(egui::RichText::new("THIS WEEK").font(ui_kit::display(17.0)).color(ACCENT));
+                for (ch, n, done) in self.career.challenges(day) {
+                    let txt = if done { format!("{}  ·  done", ch.text) } else { format!("{}  ·  {n}/{}  (+{} XP)", ch.text, ch.goal, ch.xp) };
+                    ui.label(egui::RichText::new(txt).size(12.5).color(if done { Color32::from_rgb(140, 220, 160) } else { Color32::from_gray(215) }));
+                    let bar = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), egui::Sense::hover()).0;
+                    ui.painter().rect_filled(bar, 2.0, Color32::from_white_alpha(28));
+                    let mut fill = bar;
+                    fill.set_width(bar.width() * (n as f32 / ch.goal.max(1) as f32).min(1.0));
+                    ui.painter().rect_filled(fill, 2.0, if done { Color32::from_rgb(140, 220, 160) } else { ACCENT });
+                }
+                let fw = if self.career.first_win_ready(day) { format!("First win of the day: +{} XP waiting", career::XP_FIRST_WIN) } else { "First win of the day: earned".to_string() };
+                ui.label(egui::RichText::new(fw).size(12.5).color(Color32::from_rgb(255, 205, 120)));
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical().id_salt("news-scroll").max_height(max_h * 0.6).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     for line in self.news.lines() {
                         let l = line.trim();

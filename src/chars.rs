@@ -107,16 +107,16 @@ fn hair_long() -> File {
 
 const SPECS: [Spec; 4] = [
     Spec {
-        name: "Ranger",
-        blurb: "hooded scout in leather, bracers and a shoulder guard",
+        name: "Corvin Vale",
+        blurb: "Ranger: hooded scout in leather, bracers and a shoulder guard",
         skeleton: male_ranger,
         parts: &[Part { file: male_ranger, head_only: false }, Part { file: hero_male, head_only: true }, Part { file: hair_beard, head_only: false }],
         accent: &["Male_Ranger_Head_Hood", "Male_Ranger_Acc_Pauldron"],
         swaps: &[],
     },
     Spec {
-        name: "Huntress",
-        blurb: "light hooded hunter with pauldrons, in forest colours",
+        name: "Sable Rook",
+        blurb: "Huntress: light hooded hunter with pauldrons, in forest colours",
         skeleton: female_ranger,
         parts: &[Part { file: female_ranger, head_only: false }, Part { file: hero_female, head_only: true }],
         // only the pauldrons take the team colour: her hood keeps its own brown, so from behind she
@@ -125,16 +125,16 @@ const SPECS: [Spec; 4] = [
         swaps: &[("MI_Ranger", "ranger_alt")],
     },
     Spec {
-        name: "Brawler",
-        blurb: "bearded street fighter in a rough tunic and boots",
+        name: "Bram \"Anvil\" Kask",
+        blurb: "Brawler: bearded street fighter in a rough tunic and boots",
         skeleton: male_peasant,
         parts: &[Part { file: male_peasant, head_only: false }, Part { file: hero_male, head_only: true }, Part { file: hair_buzzed, head_only: false }, Part { file: hair_beard, head_only: false }],
         accent: &["Male_Peasant_Body"],
         swaps: &[],
     },
     Spec {
-        name: "Striker",
-        blurb: "quick duelist with long hair and a fitted tunic",
+        name: "Ilya Fen",
+        blurb: "Striker: quick duelist with long hair and a fitted tunic",
         skeleton: female_peasant,
         parts: &[Part { file: female_peasant, head_only: false }, Part { file: hero_female, head_only: true }, Part { file: hair_long, head_only: false }],
         accent: &["Female_Peasant_Body"],

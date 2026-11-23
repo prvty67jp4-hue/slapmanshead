@@ -467,6 +467,65 @@ pub fn item_icon(p: &Painter, r: Rect, item: u8, col: Color32) {
     }
 }
 
+/// A crown (a Writ's mark), centred at `c`, `r` half its width.
+pub fn crown(p: &Painter, c: Pos2, r: f32, col: Color32) {
+    let outline = Color32::from_black_alpha((180.0 * col.a() as f32 / 255.0) as u8);
+    let base = Rect::from_min_max(c + Vec2::new(-r, r * 0.25), c + Vec2::new(r, r * 0.65));
+    let spikes = [(-r, -0.15 * r, -0.62 * r, -0.95 * r, -0.2 * r), (-0.45 * r, 0.0, 0.0, -1.15 * r, 0.45 * r), (0.2 * r, -0.15 * r, 0.62 * r, -0.95 * r, r)];
+    for pass in 0..2 {
+        let (fill, grow) = if pass == 0 { (outline, 1.5) } else { (col, 0.0) };
+        p.rect_filled(base.expand(grow), 1.0, fill);
+        for (x0, y0, xt, yt, x1) in spikes {
+            p.add(Shape::convex_polygon(vec![c + Vec2::new(x0 - grow, r * 0.3), c + Vec2::new(x0, y0), c + Vec2::new(xt, yt - grow), c + Vec2::new(x1, y0), c + Vec2::new(x1 + grow, r * 0.3)], fill, Stroke::NONE));
+        }
+    }
+    for (x, y) in [(-0.62, -0.95), (0.0, -1.15), (0.62, -0.95)] {
+        p.circle_filled(c + Vec2::new(x * r, y * r), r * 0.16, Color32::from_rgb(255, 245, 210).gamma_multiply(col.a() as f32 / 255.0));
+    }
+}
+
+/// An ability's icon, centred in `r`: a marker with its rings, a hook on a line, a shield,
+/// two figures (one fading).
+pub fn ability_icon(p: &Painter, r: Rect, a: crate::game::Ability, col: Color32) {
+    use crate::game::Ability;
+    let c = r.center();
+    let s = r.width().min(r.height()) * 0.5;
+    let st = Stroke::new((s * 0.12).max(1.5), col);
+    match a {
+        Ability::Mark => {
+            p.circle_stroke(c, s * 0.85, Stroke::new((s * 0.08).max(1.2), col.gamma_multiply(0.6)));
+            p.circle_stroke(c, s * 0.5, st);
+            p.circle_filled(c, s * 0.2, col);
+            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                let d = Vec2::new(dx, dy);
+                p.line_segment([c + d * s * 0.6, c + d * s * 1.0], st);
+            }
+        }
+        Ability::Grapple => {
+            let a0 = c + Vec2::new(-s * 0.8, s * 0.8);
+            let a1 = c + Vec2::new(s * 0.45, -s * 0.45);
+            p.line_segment([a0, a1], st);
+            // the hook: three prongs
+            for ang in [-0.9f32, 0.0, 0.9] {
+                let base = std::f32::consts::FRAC_PI_4 * -1.0 + ang;
+                let d = Vec2::new(base.cos(), base.sin());
+                p.line_segment([a1, a1 + d * s * 0.5], st);
+            }
+            p.circle_filled(a0, s * 0.14, col);
+        }
+        Ability::Wall => shield_icon(p, c, s * 0.85, col),
+        Ability::Afterimage => {
+            let fig = |at: Pos2, k: f32| {
+                let cl = col.gamma_multiply(k);
+                p.circle_filled(at + Vec2::new(0.0, -s * 0.55), s * 0.22, cl);
+                p.add(Shape::convex_polygon(vec![at + Vec2::new(-s * 0.3, -s * 0.25), at + Vec2::new(s * 0.3, -s * 0.25), at + Vec2::new(s * 0.22, s * 0.8), at + Vec2::new(-s * 0.22, s * 0.8)], cl, Stroke::NONE));
+            };
+            fig(c + Vec2::new(-s * 0.35, 0.0), 0.35);
+            fig(c + Vec2::new(s * 0.3, 0.0), 1.0);
+        }
+    }
+}
+
 /// A health cross for the HUD.
 pub fn cross_icon(p: &Painter, c: Pos2, r: f32, col: Color32) {
     p.rect_filled(Rect::from_center_size(c, Vec2::new(r * 2.0, r * 0.75)), r * 0.15, col);
@@ -872,6 +931,17 @@ pub fn loadout_screen(ctx: &egui::Context, rect: Rect, lo: &mut Loadout, st: &mu
         label(&p, Pos2::new(br.right(), br.top() - 34.0 * k), Align2::RIGHT_BOTTOM, &fname, display(40.0 * k), Color32::WHITE);
         let bl = chars::blurb(lo.body);
         p.text(Pos2::new(br.right(), br.top() - 30.0 * k), Align2::RIGHT_TOP, bl, fitted(&p, bl, body(13.5 * k), right_w - m * 1.5), Color32::from_gray(215));
+        // their ability and passive, over the name
+        let ab = crate::game::Ability::of(lo.body);
+        let at = format!("{}  ·  passive: {}", ab.name().to_uppercase(), ab.passive());
+        let ay = br.top() - 128.0 * k;
+        let aw = fitted(&p, &at, display(15.0 * k), right_w - m * 1.5 - 30.0 * k);
+        let tw = text_width(&p, &at, aw.clone());
+        let back = Rect::from_min_max(Pos2::new(br.right() - tw - 34.0 * k, ay - 22.0 * k), Pos2::new(br.right() + 6.0 * k, ay + 3.0 * k));
+        p.rect_filled(back, 4.0 * k, Color32::from_rgba_unmultiplied(10, 9, 18, 215));
+        p.rect_filled(Rect::from_min_size(back.min, Vec2::new(3.0 * k, back.height())), 1.0, ACCENT);
+        ability_icon(&p, Rect::from_center_size(Pos2::new(br.right() - tw - 16.0 * k, ay - 9.0 * k), Vec2::splat(20.0 * k)), ab, ACCENT);
+        label(&p, Pos2::new(br.right(), ay), Align2::RIGHT_BOTTOM, &at, aw, Color32::from_rgb(255, 210, 170));
         let held = match st.slot {
             1 => lo.gun1,
             2 => lo.gun2,

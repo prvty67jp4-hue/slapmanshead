@@ -264,7 +264,7 @@ pub fn button_name(bit: u32, pad_name: Option<&str>) -> &'static str {
 }
 
 /// Every gameplay action and the controller button for it (shown in Settings and How to Play).
-pub const LAYOUT: [(&str, &str); 18] = [
+pub const LAYOUT: [(&str, &str); 19] = [
     ("Move", "Left stick"),
     ("Look", "Right stick"),
     ("Shoot / slash", "RT"),
@@ -273,7 +273,8 @@ pub const LAYOUT: [(&str, &str); 18] = [
     ("Slide (hold, while running)", "B"),
     ("Reload", "X"),
     ("Next weapon", "Y"),
-    ("Dash", "LB  or  L3"),
+    ("Dash", "L3"),
+    ("Ability", "LB"),
     ("Kick", "RB"),
     ("Finisher", "R3"),
     ("Use item", "D-pad up"),

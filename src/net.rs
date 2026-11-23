@@ -1,4 +1,4 @@
-﻿//! UDP lobby for up to 8 players. The host is the hub: every player sends its own fighter and
+//! UDP lobby for up to 8 players. The host is the hub: every player sends its own fighter and
 //! events to the host, and the host sends everyone the whole match (players, scores, fighters and
 //! everybody else's events). Each player simulates its own fighter; hits are applied by the victim;
 //! the host keeps the scores.
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 const MAGIC: [u8; 4] = *b"DRB1";
 /// The protocol version as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA7";
+pub const PROTOCOL: &str = "DRA8";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
@@ -143,6 +143,8 @@ pub struct FState {
     pub flags2: u8,
     /// 1 kicking, 2 heavy charged, 4 charging, 8 dash-through, 16 greatsword plunge.
     pub flags3: u8,
+    /// 1 Iron Wall up, 2 invisible (Afterimage), 4 on a grapple line.
+    pub flags4: u8,
     /// Finisher style being played (number + 1; 0 = none).
     pub fin: u8,
     pub slash_t: f32,
@@ -157,7 +159,7 @@ pub struct FState {
 impl FState {
     /// A living, running fighter at `pos` (for tests).
     pub fn test_state(pos: V3, vel: V3) -> FState {
-        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
+        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, flags4: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
     }
 }
 
@@ -172,6 +174,7 @@ fn write_fstate(w: &mut W, f: &Fighter) {
     w.u8(f.flags());
     w.u8(if f.spawn_prot > 0.0 { 1 } else { 0 } | if f.stagger_t > 0.0 { 2 } else { 0 } | if f.sliding > 0.0 { 4 } else { 0 } | if f.scope_t > 0.0 { 8 } else { 0 });
     w.u8(if f.kick_t > 0.0 { 1 } else { 0 } | if f.charged { 2 } else { 0 } | if f.charge_t > 0.2 { 4 } else { 0 } | if f.through_t > 0.0 { 8 } else { 0 } | if f.slam { 16 } else { 0 } | if f.throw_t > 0.0 { 32 } else { 0 } | if f.throw_fan { 64 } else { 0 });
+    w.u8(if f.shield_t > 0.0 { 1 } else { 0 } | if f.invis_t > 0.0 { 2 } else { 0 } | if f.grapple.is_some() { 4 } else { 0 });
     w.u8(f.fin);
     w.f(f.slash_t);
     w.u8(f.slash_idx);
@@ -195,6 +198,7 @@ fn read_fstate(r: &mut R) -> Option<FState> {
         flags: r.u8()?,
         flags2: r.u8()?,
         flags3: r.u8()?,
+        flags4: r.u8()?,
         fin: r.u8()?.min(crate::game::FINISHERS.len() as u8),
         slash_t: r.f()?,
         slash_idx: r.u8()?,
@@ -257,6 +261,13 @@ fn write_ev(w: &mut W, ev: &Ev) {
         }
         Ev::Ready => w.u8(7),
         Ev::Vote => w.u8(8),
+        Ev::Ability { who, kind, p, d } => {
+            w.u8(11);
+            w.u8(*who);
+            w.u8(*kind);
+            w.v(*p);
+            w.v(*d);
+        }
         Ev::Finisher { target, kind } => {
             w.u8(10);
             w.u8(*target);
@@ -279,6 +290,7 @@ fn read_ev(r: &mut R) -> Option<Ev> {
         7 => Ev::Ready,
         8 => Ev::Vote,
         9 => Ev::Deflect { by: r.u8()?, dmg: r.f()?.clamp(0.0, 60.0) },
+        11 => Ev::Ability { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.min(3), p: r.v()?, d: clamp_v(r.v()?, 40.0) },
         10 => Ev::Finisher { target: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.clamp(1, crate::game::FINISHERS.len() as u8) },
         _ => return None,
     })
@@ -308,6 +320,8 @@ pub struct RosterEntry {
 pub struct HostMsg {
     pub you: usize,
     pub mode: Mode,
+    /// A Classic lobby (no abilities).
+    pub classic: bool,
     /// Which map (crate::world::MapId as a number).
     pub map: u8,
     pub phase: Phase,
@@ -957,7 +971,9 @@ impl Net {
         let you_hp = r.f()?;
         let you_ap = r.f()?;
         let you_alive = r.u8()? == 1;
-        let mode = Mode::from_u8(r.u8()?);
+        let mode_byte = r.u8()?;
+        let classic = mode_byte & 0x80 != 0;
+        let mode = Mode::from_u8(mode_byte & 0x7f);
         let map = r.u8()?.min(2);
         let phase = Phase::from_u8(r.u8()?);
         let timer = r.f()?;
@@ -1026,7 +1042,7 @@ impl Net {
                 events.push((origin, ev));
             }
         }
-        Some(HostMsg { you, mode, map, phase, timer, target, team_score, number, round, round_end, duel, flags, you_hp, you_ap, you_alive, roster, fighters, events, sent, stale })
+        Some(HostMsg { you, mode, classic, map, phase, timer, target, team_score, number, round, round_end, duel, flags, you_hp, you_ap, you_alive, roster, fighters, events, sent, stale })
     }
 
     pub fn send_hello(&mut self, name: &str, dt: f32) {
@@ -1119,7 +1135,7 @@ impl Net {
                 w.f(you.hp);
                 w.f(you.ap);
                 w.u8(you.alive as u8);
-                w.u8(g.mt.mode as u8);
+                w.u8(g.mt.mode as u8 | if g.mt.classic { 0x80 } else { 0 });
                 w.u8(g.world.map as u8);
                 w.u8(g.mt.phase as u8);
                 w.f(g.mt.timer);
@@ -1335,6 +1351,12 @@ pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool, sent: f32, now
     f.charge_t = if s.flags3 & 4 != 0 { f.charge_t.max(0.25) } else { 0.0 };
     f.through_t = if s.flags3 & 8 != 0 { 0.1 } else { 0.0 };
     f.slam = s.flags3 & 16 != 0;
+    // abilities: the shield and invisibility as reported, the grapple line until it lets go
+    f.shield_t = if s.flags4 & 1 != 0 { f.shield_t.max(0.15) } else { 0.0 };
+    f.invis_t = if s.flags4 & 2 != 0 { f.invis_t.max(0.15) } else { 0.0 };
+    if s.flags4 & 4 == 0 {
+        f.grapple = None;
+    }
     // a finisher plays out here from its start
     if s.fin != f.fin {
         f.fin = s.fin;
@@ -1658,6 +1680,12 @@ mod finisher_net_tests {
 
     #[test]
     fn finishers_cross_the_network() {
+        let mut w = W(Vec::new());
+        write_ev(&mut w, &Ev::Ability { who: 2, kind: 1, p: crate::math::v3(1.0, 2.0, 3.0), d: crate::math::v3(0.0, 0.0, 99.0) });
+        match read_ev(&mut R { b: &w.0, i: 0 }) {
+            Some(Ev::Ability { who: 2, kind: 1, p, d }) => assert!(p.z == 3.0 && d.z <= 40.0, "an ability crosses the network (its throw clamped)"),
+            other => panic!("{other:?}"),
+        }
         let mut w = W(Vec::new());
         write_ev(&mut w, &Ev::Finisher { target: 3, kind: 5 });
         match read_ev(&mut R { b: &w.0, i: 0 }) {
