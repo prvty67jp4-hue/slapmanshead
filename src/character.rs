@@ -838,6 +838,16 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
         } else if !melee {
             let side = Vec3::X;
             let down = Vec3::NEG_Y;
+            // long guns at rest are carried at low ready (muzzle down and a little out to the
+            // right, the camera's side) and come up to the shoulder to shoot: from the over-the-shoulder camera a gun
+            // pointing straight away shows only its end and reads like a pistol; angled, its
+            // length and stock show
+            let low_k = if matches!(f.weapon, Weapon::Shotgun | Weapon::Rifle | Weapon::Sniper) && f.scope_t <= 0.0 {
+                ((f.since_shot - 0.7) / 0.25).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let aim = if low_k > 0.0 { aim.lerp((aim + down * 0.3 + side * 0.2).normalize(), low_k).normalize() } else { aim };
             let (hr, hl) = match f.weapon {
                 Weapon::Revolver => (sh_r + aim * reach * 0.9 - side * 0.06, None),
                 // throwing stars: one hand, drawn back a little, ready to flick
@@ -848,7 +858,10 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
                     (hr, Some(hr - side * 0.07 + down * 0.04 - aim * 0.04))
                 }
                 Weapon::Rocket => {
-                    let hr = sh_r + aim * 0.22 + down * 0.12;
+                    // carried low; locking in, it comes up onto the shoulder (a tell you can read)
+                    let lift = if f.lock_t > 0.0 { 1.0 - (f.lock_t / tn.rocket_lock.max(0.01)).clamp(0.0, 1.0) } else if f.since_shot < 0.6 { 1.0 } else { 0.0 };
+                    let low = sh_r + aim * 0.26 + down * 0.3 + side * 0.03;
+                    let hr = low.lerp(sh_r + aim * 0.22 + down * 0.12, lift);
                     (hr, Some(hr + aim * 0.3 - side * 0.04 + down * 0.04))
                 }
                 Weapon::Smg => {
@@ -948,6 +961,14 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     }
     // the dagger on the move: held reversed
     let reverse = show && melee && f.alive && f.weapon == Weapon::Dagger && st.carry.is_some_and(|c| c.reverse > 0.5);
+
+    // ---- a grenade being wound up: the throwing arm pulls back behind the shoulder
+    if f.alive && f.stun_t <= 0.0 && f.nade_wind > 0.0 {
+        let k = (1.0 - f.nade_wind / tn.grenade_windup.max(0.01)).clamp(0.0, 1.0);
+        let sh = gpos(&pose, b.up_r);
+        let back = sh + Vec3::new(0.12, 0.05 + 0.12 * k, -0.18 - 0.16 * k);
+        rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(back), to_model(sh + Vec3::new(0.45, -0.35, -0.1)));
+    }
 
     // ---- kick: the right leg snaps forward and back
     if show && f.alive && f.kick_t > 0.0 {
@@ -1077,8 +1098,6 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
 }
 // ---------------------------------------------------------------------------------- melee clips
 
-/// The game's swing: the blow lands when this share of the swing time is left.
-const HIT_LEFT: f32 = 0.72;
 /// How long a finished swing's follow-through and recovery keep showing.
 const TAIL: f32 = 0.36;
 
@@ -1238,10 +1257,12 @@ fn melee_layer(rig: &Rig, st: &mut CharState, f: &Fighter, dt: f32) -> Option<(V
     }
     if f.slash_t > 0.0 {
         let m = slash_move(f.slash_idx, f.weapon);
-        let until = f.slash_t - dur * HIT_LEFT;
-        let pre = if f.slash_idx == SLASH_HEAVY { dur * (1.25 - HIT_LEFT) } else { dur * (1.0 - HIT_LEFT) };
+        // the clip's contact frame lands exactly when the game's blow does (after the wind-up)
+        let hit_left = f.weapon.hit_left();
+        let until = f.slash_t - dur * hit_left;
+        let pre = if f.slash_idx == SLASH_HEAVY { dur * (1.25 - hit_left) } else { dur * (1.0 - hit_left) };
         let start = if f.slash_idx == SLASH_HEAVY { Some(cocked_of(rig, m)) } else { None };
-        let t = warp(rig, m, start, until, pre, dur * HIT_LEFT);
+        let t = warp(rig, m, start, until, pre, dur * hit_left);
         rig.sample(def(m).clip, t, false, &mut pose);
         st.tail = Some(Tail { mv: m, t, age: 0.0 });
         let full = matches!(f.slash_idx, SLASH_HEAVY | SLASH_THROUGH) || (f.slash_idx <= 1 && f.on_ground);
@@ -1634,6 +1655,8 @@ mod pose_tests {
                 f.loadout.gun1 = w;
                 f.cur = 1;
                 f.weapon = w;
+                // (as it's fired: the rocket comes up onto the shoulder for its shot)
+                f.since_shot = 0.1;
                 let mut st = CharState::new();
                 let mut p = None;
                 for k in 0..30 {

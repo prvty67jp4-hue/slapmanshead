@@ -102,8 +102,9 @@ impl Bot {
         let eye = me.eye();
         let to = target + self.err - eye;
         let flat = v3(to.x, 0.0, to.z).len().max(0.01);
-        let want_yaw = to.x.atan2(to.z);
-        let want_pitch = to.y.atan2(flat);
+        // recoil (the SMG's pattern, the rifle's kick) moves the aim: better bots pull it back down
+        let want_yaw = to.x.atan2(to.z) - me.kick[0] * s;
+        let want_pitch = to.y.atan2(flat) - me.kick[1] * s;
         let turn = (3.0 + 9.0 * s) * dt;
         let dy = wrap_angle(want_yaw - me.yaw);
         inp.yaw = me.yaw + dy.clamp(-turn, turn);
@@ -340,7 +341,7 @@ impl Bot {
                 _ => {
                     let thresh = 0.05 + 0.08 * (1.0 - s);
                     // pistols: tap, wait for the aim to settle (better bots wait longer)
-                    let settled = me.weapon.spam().0 <= 0.0 || me.spread() < 0.02 + 0.05 * (1.0 - s);
+                    let settled = me.weapon.spam().0 <= 0.0 || me.spread(&g.tune) < 0.02 + 0.05 * (1.0 - s);
                     if aim_off < thresh && settled && self.rng.chance(dt * (3.0 + 6.0 * s)) {
                         inp.fire = true;
                     }

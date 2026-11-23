@@ -1789,7 +1789,7 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
             let s = finisher(f.fin);
             Some((s.hit - f.fin_t / s.dur) * s.dur)
         } else if f.slashing() {
-            Some(f.slash_t - w.slash_dur() * 0.72)
+            Some(f.slash_t - w.slash_dur() * w.hit_left())
         } else {
             None
         };
@@ -1799,11 +1799,14 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
                 st.trail.push_back((anchor + p.weapon.z * (tip * 0.3), anchor + p.weapon.z * tip, time, k));
             }
             // the tell: a glint runs up the blade through a heavy's or a launcher's wind-up
+            // (every swing's wind-up shows it, so a reacting player can guard or parry; the big
+            // ones brighter)
             let big = f.slash_idx == SLASH_HEAVY || f.slash_idx == 3 || w == Weapon::Greatsword || f.fin > 0;
-            if big && u > 0.02 {
-                let g = (u / 0.2).min(1.0);
+            if u > 0.0 {
+                let g = (u / w.windup().max(0.05)).min(1.0);
                 let at = anchor + p.weapon.z * (tip * (0.35 + 0.65 * (1.0 - g)));
-                add_mb.billboard(cam, at, 0.22 * sc, lina([255, 245, 215], 0.9 * g.sqrt()));
+                let size = if big { 0.26 } else { 0.18 };
+                add_mb.billboard(cam, at, size * sc, lina([255, 245, 215], 0.95 * g.max(0.35).sqrt()));
             }
         }
     }
@@ -3063,8 +3066,11 @@ impl Gpu {
                 continue;
             }
             op.ellipsoid(gr.pos, &M3::rot_y(gr.fuse * 9.0), v3(0.1, 0.11, 0.1), lin([45, 52, 45]), -1.0, 1.0, 0.0);
-            if (gr.fuse * 10.0).sin() > 0.0 {
-                ad.billboard(cam, gr.pos + v3(0.0, 0.13, 0.0), 0.15, lina([255, 40, 30], 1.0));
+            // the fuse light: blinks faster and brighter as it runs out
+            let urgency = (1.0 - gr.fuse / 1.7).clamp(0.0, 1.0);
+            if ((1.7 - gr.fuse) * (3.0 + 10.0 * urgency)).fract() < 0.45 {
+                ad.billboard(cam, gr.pos + v3(0.0, 0.13, 0.0), 0.16 + 0.12 * urgency, lina([255, 40, 30], 1.0));
+                ad.billboard(cam, gr.pos, 0.5 + 0.3 * urgency, lina([255, 60, 40], 0.25));
             }
         }
         let fx_every = (1.0 / self.quality.fx.clamp(0.1, 1.0)).round().max(1.0) as usize;

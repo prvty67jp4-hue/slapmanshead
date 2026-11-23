@@ -6,6 +6,8 @@ mod bot;
 mod career;
 mod character;
 mod chars;
+#[cfg(test)]
+mod duel_bench;
 mod env;
 mod game;
 mod gpu;
@@ -3441,6 +3443,8 @@ impl App {
         }
         // the camera follows the mouse right away, not at the next game tick
         let (yaw, pitch) = if f.is_bot { (f.yaw, f.pitch) } else { (self.aim_yaw, self.aim_pitch) };
+        // the camera shows the recoil in the aim (the SMG's pattern, the rifle's kick): pull against it
+        let (yaw, pitch) = (yaw + f.kick[0], (pitch + f.kick[1]).clamp(-1.5, 1.5));
         // final kill cam: circle the fallen player in slow motion
         if let Some((pos, target)) = game.killcam_view(alpha) {
             let d = (target - pos).norm();
@@ -3873,6 +3877,39 @@ fn gallery_pose(g: &mut Game, page: &str) {
             }
             continue;
         }
+        // held pages (DUEL_GALLERY=held:<weapon number>[:run]): you (so the HUD names your weapon)
+        // in profile and another fighter three-quarters on, both holding that weapon ready to fire
+        // (or running with it), to check the model in hand is the one the HUD shows
+        if let Some(rest) = page.strip_prefix("held:") {
+            let mut parts = rest.split(':');
+            let w = Weapon::from_u8(parts.next().and_then(|x| x.parse::<u8>().ok()).unwrap_or(3));
+            let run = parts.next() == Some("run");
+            let (p, yaw) = match i {
+                0 => (v3(-1.1, 0.0, 8.6), std::f32::consts::FRAC_PI_2 * 3.0),
+                1 => (v3(1.5, 0.0, 9.4), std::f32::consts::PI - 0.7),
+                _ => (v3(0.0, 0.0, -30.0), 0.0),
+            };
+            f.pos = p;
+            f.prev_pos = p;
+            f.yaw = yaw;
+            f.loadout.body = (i % chars::COUNT) as u8;
+            if w.is_melee() {
+                f.loadout.melee = w;
+                f.cur = 0;
+            } else {
+                f.loadout.gun1 = w;
+                f.cur = 1;
+            }
+            f.weapon = w;
+            f.switch_t = 0.0;
+            if run {
+                f.since_shot = 5.0;
+                f.vel = f.fwd() * RUN_SPEED;
+            } else {
+                f.since_shot = 0.1;
+            }
+            continue;
+        }
         if let Some(phase) = melee_at {
             // phase: 0 = the blow lands now, + = that share of the wind-up still to go, - = that
             // share of the follow-through done
@@ -3884,7 +3921,8 @@ fn gallery_pose(g: &mut Game, page: &str) {
             f.kick_t = 0.0;
             f.fin = 0;
             let dur = f.weapon.slash_dur();
-            let at = |pre: f32| dur * 0.72 + if phase >= 0.0 { pre * phase } else { dur * 0.72 * phase };
+            let hl = f.weapon.hit_left();
+            let at = |pre: f32| dur * hl + if phase >= 0.0 { pre * phase } else { dur * hl * phase };
             match i {
                 0..=2 => {
                     f.slash_idx = [0u8, 1, 3][i];
@@ -4614,6 +4652,38 @@ impl App {
             text_shadow(p, sp + Vec2::new(0.0, -12.0 * s), Align2::CENTER_BOTTOM, &label, 15.0 * s, col);
             let r = Rect::from_center_size(sp, Vec2::new(70.0 * s, 8.0 * s));
             bar(p, r, other.hp / MAX_HP, if enemy { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(80, 200, 110) });
+            // an enemy's ability within 15 m: ready, or how long until it is (plan around it)
+            if enemy && g.abilities_on() && other.alive && (other.pos - me.pos).len() <= 15.0 {
+                let ab = Ability::of(other.loadout.body);
+                let ready = other.ab_charge >= 1.0;
+                let c = sp + Vec2::new(48.0 * s, 0.0);
+                p.circle_filled(c, 10.5 * s, Color32::from_black_alpha(170));
+                let col = if ready { Color32::from_rgb(255, 120, 90) } else { Color32::from_gray(150) };
+                ui_kit::ability_icon(p, Rect::from_center_size(c, Vec2::splat(15.0 * s)), ab, col);
+                if !ready {
+                    // the cooldown as a ring filling up, and the seconds left
+                    let k = other.ab_charge.fract();
+                    let n = 24;
+                    let pts: Vec<Pos2> = (0..=((n as f32 * k) as usize)).map(|i| {
+                        let a = -std::f32::consts::FRAC_PI_2 + i as f32 / n as f32 * std::f32::consts::TAU;
+                        c + Vec2::new(a.cos(), a.sin()) * 10.5 * s
+                    }).collect();
+                    if pts.len() > 1 {
+                        p.add(egui::Shape::line(pts, Stroke::new(2.0 * s, Color32::from_rgb(140, 200, 255))));
+                    }
+                    let left = (1.0 - k) * ab.cooldown(&g.tune);
+                    text_shadow(p, c + Vec2::new(14.0 * s, 0.0), Align2::LEFT_CENTER, &format!("{left:.0}s"), 12.0 * s, Color32::from_gray(200));
+                }
+            }
+        }
+        // marked by a Warden's Mark: you're seen through walls for a moment
+        let marked = me.alive && (0..g.f.len()).any(|e| e != g.local && g.f[e].present && g.is_enemy(e, g.local) && g.revealed_to(e, g.local));
+        if marked {
+            let at = Pos2::new(c.x, rect.top() + 96.0 * s);
+            let pulse = 0.6 + 0.4 * (g.time * 6.0).sin().abs();
+            let red = Color32::from_rgb(255, (90.0 * pulse) as u8 + 40, 70);
+            ui_kit::ability_icon(p, Rect::from_center_size(at - Vec2::new(98.0 * s, 0.0), Vec2::splat(20.0 * s)), Ability::Mark, red);
+            text_display(p, at, Align2::CENTER_CENTER, "MARKED - THEY CAN SEE YOU", 17.0 * s, red);
         }
 
         // Writs: a crown over each holder (seen through walls), and on the screen's edge when
@@ -4771,7 +4841,7 @@ impl App {
                 g.aim_enemy(g.local, yaw, pitch).is_some()
             };
             let dot_col = if on_enemy { Color32::from_rgb(255, 45, 45) } else { col };
-            let target = spread_px(me.spread(), cam.focal);
+            let target = spread_px(me.spread(&g.tune), cam.focal);
             // open fast (fully within 50 ms, before any gun can fire again), close smoothly
             let mut gap = self.cross_gap.get();
             let dt = self.frame_dt.max(0.0);
@@ -5014,7 +5084,7 @@ impl App {
             let a = ((g.heal_pop / 0.5).min(1.0) * 255.0) as u8;
             let rise = (1.6 - g.heal_pop) * 14.0 * s;
             let at = Pos2::new(rect.left() + margin + 150.0 * s, rect.bottom() - margin - 104.0 * s - rise);
-            text_shadow(p, at, Align2::CENTER_CENTER, &format!("+{} HP", KILL_HEAL as i32), 17.0 * s, Color32::from_rgba_unmultiplied(110, 235, 120, a));
+            text_shadow(p, at, Align2::CENTER_CENTER, &format!("+{} HP", g.tune.kill_heal as i32), 17.0 * s, Color32::from_rgba_unmultiplied(110, 235, 120, a));
         }
 
         // kill confirmation icon
@@ -5359,6 +5429,29 @@ impl App {
         } else if !me.alive && g.mt.phase != Phase::MatchOver {
             let secs = me.respawn_t.max(0.0).ceil() as i32;
             text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.62), Align2::CENTER_CENTER, &format!("You're down - back in {secs}"), 20.0 * s, Color32::from_rgb(255, 200, 200));
+        }
+        // the death recap: who killed you, with what, and how that life went
+        if let Some(r) = &g.recap {
+            if !me.alive {
+                let a = (r.t / 0.4).min(1.0);
+                let w = 380.0 * s;
+                let top = rect.top() + rect.height() * 0.66;
+                let box_r = Rect::from_min_size(Pos2::new(c.x - w * 0.5, top), Vec2::new(w, 86.0 * s));
+                p.rect_filled(box_r, 6.0 * s, Color32::from_rgba_unmultiplied(14, 12, 22, (215.0 * a) as u8));
+                p.rect_filled(Rect::from_min_size(box_r.min, Vec2::new(4.0 * s, box_r.height())), 2.0, Color32::from_rgba_unmultiplied(230, 70, 60, (255.0 * a) as u8));
+                let st = &r.stats;
+                let head = if r.head { "  (headshot)" } else { "" };
+                let lines = [
+                    (format!("Killed by {} - {}{head}", r.killer, r.weapon), 16.0, Color32::from_rgb(255, 210, 200)),
+                    (format!("Damage dealt {:.0}   taken {:.0}", st.dealt, st.taken), 13.5, Color32::from_gray(220)),
+                    (format!("Accuracy {:.0}%  ({} of {} shots)   headshots {:.0}%", st.accuracy() * 100.0, st.hits, st.shots, st.headshot_rate() * 100.0), 13.5, Color32::from_gray(220)),
+                ];
+                let mut y = top + 10.0 * s;
+                for (text, size, col) in lines {
+                    text_shadow(p, Pos2::new(box_r.left() + 16.0 * s, y), Align2::LEFT_TOP, &text, size * s, col.gamma_multiply(a));
+                    y += (size + 9.0) * s;
+                }
+            }
         }
 
         // ---- kill feed (top right; drops below the score bar when the window is narrow)
@@ -6073,6 +6166,11 @@ impl App {
                 _ => (None, false),
             };
             let match_xp = self.match_xp;
+            // how you played: what to work on
+            let ms = match &self.screen {
+                Screen::Play { game, .. } => game.match_stats.get(game.local).copied().unwrap_or_default(),
+                _ => CombatStats::default(),
+            };
             let first_win_ready = self.career.first_win_ready(career::today());
             panel(ctx, "over", Pos2::new(center.x, center.y + 60.0), 360.0, |ui| {
                 if run.is_none() {
@@ -6084,6 +6182,9 @@ impl App {
                     if let Some(l) = &potm_line {
                         ui.label(egui::RichText::new(l).size(13.0).color(Color32::from_gray(215)));
                     }
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(format!("Accuracy {:.0}%   Headshots {:.0}%   ({} of {} shots hit)", ms.accuracy() * 100.0, ms.headshot_rate() * 100.0, ms.hits, ms.shots)).size(13.0).color(Color32::from_gray(225)));
+                    ui.label(egui::RichText::new(format!("Parries {}   Whiffs {}   Counter-strafe stops {}", ms.parries, ms.whiffs, ms.cs_stops)).size(13.0).color(Color32::from_gray(225)));
                     ui.add_space(4.0);
                 }
                 if let Some(gt) = &run {
@@ -6801,7 +6902,7 @@ mod aim_tests {
                             _ => (0.075, 1.0, 0.4),
                         };
                     }
-                    let spread = g.f[0].spread();
+                    let spread = g.f[0].spread(&g.tune);
                     if state == 0 && w != Weapon::Shotgun {
                         assert_eq!(spread, 0.0, "a rested first shot is dead on");
                     }
@@ -6834,10 +6935,15 @@ mod aim_tests {
             f.since_shot = 0.1;
             f.recoil = 0.0;
             f.move_spread = 1.0;
-            let still = f.spread();
+            let still = f.spread(&Tuning::default());
             f.move_spread = w.gun().move_cap;
-            let moving = f.spread();
-            let cap = if w == Weapon::Rifle { 2.0 } else { 1.5 };
+            let moving = f.spread(&Tuning::default());
+            // (the SMG pays more for moving: spraying on the run should lose)
+            let cap = match w {
+                Weapon::Rifle => 2.0,
+                Weapon::Smg => 2.5,
+                _ => 1.5,
+            };
             assert!(moving <= still * cap + 1e-6, "{w:?}: moving {moving} vs still {still}");
         }
     }

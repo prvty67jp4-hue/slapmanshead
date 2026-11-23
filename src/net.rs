@@ -145,8 +145,11 @@ pub struct FState {
     pub flags2: u8,
     /// 1 kicking, 2 heavy charged, 4 charging, 8 dash-through, 16 greatsword plunge.
     pub flags3: u8,
-    /// 1 Iron Wall up, 2 invisible (Afterimage), 4 on a grapple line.
+    /// 1 Iron Wall up, 2 invisible (Afterimage), 4 on a grapple line, 8 a rocket locking in,
+    /// 16 a grenade winding up.
     pub flags4: u8,
+    /// Ability charge (hundredths; shown on enemies' nameplates up close).
+    pub ab: u8,
     /// Finisher style being played (number + 1; 0 = none).
     pub fin: u8,
     pub slash_t: f32,
@@ -161,7 +164,7 @@ pub struct FState {
 impl FState {
     /// A living, running fighter at `pos` (for tests).
     pub fn test_state(pos: V3, vel: V3) -> FState {
-        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, flags4: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
+        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, flags4: 0, ab: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
     }
 }
 
@@ -176,7 +179,8 @@ fn write_fstate(w: &mut W, f: &Fighter) {
     w.u8(f.flags());
     w.u8(if f.spawn_prot > 0.0 { 1 } else { 0 } | if f.stagger_t > 0.0 { 2 } else { 0 } | if f.sliding > 0.0 { 4 } else { 0 } | if f.scope_t > 0.0 { 8 } else { 0 });
     w.u8(if f.kick_t > 0.0 { 1 } else { 0 } | if f.charged { 2 } else { 0 } | if f.charge_t > 0.2 { 4 } else { 0 } | if f.through_t > 0.0 { 8 } else { 0 } | if f.slam { 16 } else { 0 } | if f.throw_t > 0.0 { 32 } else { 0 } | if f.throw_fan { 64 } else { 0 });
-    w.u8(if f.shield_t > 0.0 { 1 } else { 0 } | if f.invis_t > 0.0 { 2 } else { 0 } | if f.grapple.is_some() { 4 } else { 0 });
+    w.u8(if f.shield_t > 0.0 { 1 } else { 0 } | if f.invis_t > 0.0 { 2 } else { 0 } | if f.grapple.is_some() { 4 } else { 0 } | if f.lock_t > 0.0 { 8 } else { 0 } | if f.nade_wind > 0.0 { 16 } else { 0 });
+    w.u8((f.ab_charge * 100.0).round().clamp(0.0, 255.0) as u8);
     w.u8(f.fin);
     w.f(f.slash_t);
     w.u8(f.slash_idx);
@@ -201,6 +205,7 @@ fn read_fstate(r: &mut R) -> Option<FState> {
         flags2: r.u8()?,
         flags3: r.u8()?,
         flags4: r.u8()?,
+        ab: r.u8()?,
         fin: r.u8()?.min(crate::game::FINISHERS.len() as u8),
         slash_t: r.f()?,
         slash_idx: r.u8()?,
@@ -1385,6 +1390,9 @@ pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool, sent: f32, now
     // abilities: the shield and invisibility as reported, the grapple line until it lets go
     f.shield_t = if s.flags4 & 1 != 0 { f.shield_t.max(0.15) } else { 0.0 };
     f.invis_t = if s.flags4 & 2 != 0 { f.invis_t.max(0.15) } else { 0.0 };
+    f.lock_t = if s.flags4 & 8 != 0 { f.lock_t.max(0.05) } else { 0.0 };
+    f.nade_wind = if s.flags4 & 16 != 0 { f.nade_wind.max(0.05) } else { 0.0 };
+    f.ab_charge = s.ab as f32 / 100.0;
     if s.flags4 & 4 == 0 {
         f.grapple = None;
     }

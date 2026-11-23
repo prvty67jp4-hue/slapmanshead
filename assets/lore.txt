@@ -1,0 +1,116 @@
+# DUEL RUSH - lore and voice lines
+# Edit freely. Format: [section] headers, then key = value lines.
+# Lines starting with # are comments. "line" keys can repeat (one is picked at random).
+
+[world]
+title = Varrow and the Rush
+intro = Varrow is a walled city of black stone and lantern light, built on the ruins of an older one. Its courts were burned in the Ash Riots a generation ago, and nothing replaced them but the Rush: sanctioned duels fought in the old fortress courtyards, steel in one hand and powder in the other. Debts, land, pardons, inheritances, grudges - in Varrow they are all settled the same way.
+court = The Rush is run by the Ashen Court, five masked judges no one has seen unmasked. They set the bouts, keep the ledgers and pay the winners in Writs.
+writs = A Writ is a sealed parchment stamped in grey wax. One Writ can wipe a debt, free a prisoner or hand over a house. Ten can buy a pardon for murder. Everyone in the Rush is fighting for Writs, and everyone is fighting for something different.
+rush = Fighters call it "rushing": the moment the bell rings and two people who have nothing left to lose run straight at each other across the stones.
+
+[fighter.corvin]
+name = Corvin Vale
+title = The Last Warden
+body = Ranger
+bio = Corvin rode the border for twelve years as a Warden of Varrow, until the Wardens were disbanded and his younger brother Aled was branded a traitor and executed in the Rush. Corvin never believed the charge. Calm, patient and dry as old leather, he fights with a lowered blade and a steady hand.
+why = To clear his brother's name, Writ by Writ, until the Ashen Court has to open Aled's ledger.
+rival = sable
+lore1 = The Warden's coat Corvin wears was Aled's. It still has the scorch mark from the night of the trial.
+lore2 = Wardens were trained to read tracks, not people. Corvin learned the second the hard way, in the Undercroft.
+lore3 = He has never lost a duel in the rain. He says it's because nobody else wants to be there.
+lore4 = Corvin keeps a ledger of his own. Every Writ he wins, he writes the name of who it might free.
+lore5 = The Ashen Court offered him a seat among the judges once. He sent the mask back in pieces.
+ability = Warden's Mark - an old border trick: a marker that shows where the hunted are hiding.
+start = Let's keep this clean.
+start = You know why I'm here.
+kill = Rest easy.
+kill = That's one more page closed.
+finisher = For Aled.
+death = Not... yet.
+vs_sable = You still owe me a name.
+
+[fighter.sable]
+name = Sable Rook
+title = The Collector
+body = Huntress
+bio = Silver-haired, precise and utterly unbothered, Sable Rook is the most successful bounty hunter in Varrow. She doesn't hate anyone she fights; she simply collects them. It was Sable who brought in Aled Vale - and she knows something about that night she has never told anyone.
+why = Writs are trophies. She wants the full set - and the Ashen Court's secrets with them.
+rival = corvin
+lore1 = Sable keeps every Writ she has ever won, pinned in rows on the wall of a room no one else has seen.
+lore2 = She learned to shoot on the frozen lakes north of Varrow, where a missed shot means you don't eat.
+lore3 = She took the bounty on Aled Vale. She also refused to collect it. Nobody knows why.
+lore4 = The scarf she wears belonged to her first mark. She says it's a reminder. She won't say of what.
+lore5 = Sable has turned down three invitations to join the Ashen Court. Each time, she asked for something they wouldn't give.
+ability = Grapple Line - a hunter's line, fired into stone, that pulls her wherever the shot is better.
+start = Smile. You're about to be collected.
+start = Nothing personal.
+kill = Collected.
+kill = Into the ledger.
+finisher = Hold still. This is the good part.
+death = ...Interesting.
+vs_corvin = I don't owe. I collect.
+
+[fighter.anvil]
+name = Bram "Anvil" Kask
+title = The Foundry Bull
+body = Brawler
+bio = Bram Kask was a blacksmith before the Ashen Court seized his family's foundry over a debt his father ran up. Now he swings a greatsword he forged himself and fights to buy the furnace back. Loud, warm, funny and enormous, Anvil is the crowd's favourite - and the most dangerous man in the Rush when he stops laughing.
+why = To win back the Kask Foundry, fire by fire, before the Court sells it.
+rival = ilya
+lore1 = Anvil forged his greatsword from the foundry's old gate. He calls her "Mam".
+lore2 = Children from the Lower Wards follow him to every bout. He pays for their seats with his winnings.
+lore3 = He has never once used his guard first. He says a smith should take the hit and keep working.
+lore4 = The scar across his chest is from Sable Rook. He tells everyone it was a bear.
+lore5 = He's the only fighter the Ashen Court has ever fined for laughing during a judgement.
+ability = Iron Wall - he plants his feet like an anvil and nothing gets through.
+start = Right then. Let's make some noise!
+start = Come on, I've had a long day.
+kill = Forged, folded, FINISHED!
+kill = Hah! Next!
+finisher = Hammer falls!
+death = Oof... good hit, that.
+vs_ilya = Keep your guard up, little spark.
+
+[fighter.ilya]
+name = Ilya Fen
+title = The Lower Ward Spark
+body = Striker
+bio = The youngest fighter in the Rush, Ilya Fen grew up running rooftops in the Lower Wards, stealing bread and outrunning the watch. She's cocky, quick and obsessed with speed and flow. She idolises Anvil, who taught her to hold a blade, and she wants to be the first champion the Lower Wards have ever had.
+why = Fame - and the chance to buy the Lower Wards a voice in the Ashen Court.
+rival = anvil
+lore1 = Ilya has never paid to enter a duel. She climbs in over the walls.
+lore2 = Her hood's glowing trim is lantern-oil and soot. It's not supposed to glow. It just does.
+lore3 = She once ran from the Old Marble Court to the harbour across the rooftops without touching the ground. Nobody believes her. She did it twice.
+lore4 = Anvil gave her her first sword. She has broken six since. He keeps making new ones.
+lore5 = The Lower Wards paint her name on the walls after every win. The watch paints over it. They're losing.
+ability = Afterimage - she's gone before you see her go.
+start = Try and keep up!
+start = Blink and you'll miss it.
+kill = Too slow!
+kill = Lower Wards, baby!
+finisher = Lights out!
+death = Ugh, lucky!
+vs_anvil = Watch this, big man!
+
+[map.sunfall_keep]
+name = Sunfall Keep
+lore = The Ashen Court's official duelling ground, a sandstone keep where the bell rings at sunset. Bouts fought here are recorded in the great ledger, and the stands are always full.
+
+[map.undercroft]
+name = The Undercroft
+lore = The cellars and cisterns beneath Varrow, where the illegal fights happen. No judges, no ledgers, no Writs - just the money in the room and whoever is still standing.
+
+[map.old_marble_court]
+name = Old Marble Court
+lore = The white courtyard where the very first Rush was fought after the Ash Riots. The marble is cracked and the banners are faded, but every fighter wants to win here at least once.
+
+[map.bridgeworks]
+name = Varrow Bridgeworks
+lore = The old workshops and stone bridges over the river Varr, where the Foundry Guild once moved iron across the city. Now crews fight over it, team against team, for the right to the river toll.
+
+[announcer]
+match_start = The bell rings. Rush!
+round_win = The Court records the round.
+match_win = The ledger is closed. A Writ is awarded.
+writ_claimed = A Writ has been claimed!
