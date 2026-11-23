@@ -1973,7 +1973,10 @@ impl App {
                 });
                 ui.add_space(6.0);
                 ui_kit::section(ui, "Updates");
-                ui.label(egui::RichText::new(format!("This is {VERSION}.")).size(13.0).color(Color32::from_gray(200)));
+                ui.label(egui::RichText::new(format!("This is {VERSION}, network version {}. Players can play together when their network versions match, even on different builds.", update::local_proto())).size(13.0).color(Color32::from_gray(200)));
+                if let Some(note) = self.updater.behind_note() {
+                    ui.label(egui::RichText::new(note).size(13.0).color(Color32::from_rgb(255, 190, 110)));
+                }
                 ui.checkbox(&mut self.settings.auto_update, "Auto-update on start (look for a new build and offer it; never during a match)");
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.updater.busy(), egui::Button::new("Check for updates")).clicked() {
@@ -1987,7 +1990,7 @@ impl App {
                         update::Phase::Checking { .. } => "Checking...".into(),
                         update::Phase::UpToDate => "You have the newest build.".into(),
                         update::Phase::Dev => "This is a development build: it doesn't update itself.".into(),
-                        update::Phase::Available(m) => format!("Build {} is out (see the top of the menu).", m.build),
+                        update::Phase::Available(m) => format!("Build {} is out (see the top of the menu).", m.build_for(update::platform())),
                         update::Phase::Downloading { build, .. } => format!("Downloading build {build}..."),
                         update::Phase::Installing { build } | update::Phase::Restart { build } => format!("Build {build} is ready: it starts from the menu."),
                         update::Phase::Failed(e) => format!("Update failed: {e}"),
@@ -2790,9 +2793,13 @@ impl App {
     /// the download's progress, or what went wrong (with the page to download it by hand).
     fn update_banner(&mut self, ctx: &egui::Context, rect: Rect) {
         let phase = self.updater.phase();
+        // a download that's behind (the Mac one when GitHub had no Mac machine free): said once a
+        // release, also when you're up to date
+        let behind = self.updater.latest().and_then(|m| m.behind_note(update::platform()).map(|n| (m.build, n)));
         let show = match &phase {
             update::Phase::Available(m) => self.updater.dismissed() != Some(m.build),
             update::Phase::Downloading { .. } | update::Phase::Installing { .. } | update::Phase::Restart { .. } | update::Phase::Failed(_) => true,
+            update::Phase::UpToDate => behind.as_ref().is_some_and(|(b, _)| self.updater.dismissed() != Some(*b)),
             _ => false,
         };
         if !show {
@@ -2807,11 +2814,23 @@ impl App {
             egui::Frame::new().fill(Color32::from_rgba_unmultiplied(18, 16, 28, 240)).stroke(Stroke::new(1.5, ACCENT)).corner_radius(6.0).inner_margin(10.0).show(ui, |ui| {
                 ui.set_width(w);
                 match &phase {
+                    update::Phase::UpToDate => {
+                        ui.label(egui::RichText::new("A download is behind").size(17.0).strong().color(ACCENT));
+                        if let Some((_, note)) = &behind {
+                            ui.label(egui::RichText::new(note.as_str()).size(12.5).color(Color32::from_rgb(255, 210, 160)));
+                        }
+                        if ui.button("OK").clicked() {
+                            action = Some(2);
+                        }
+                    }
                     update::Phase::Available(m) => {
-                        ui.label(egui::RichText::new(format!("Update available (build {})", m.build)).size(17.0).strong().color(ACCENT));
+                        ui.label(egui::RichText::new(format!("Update available (build {})", m.build_for(update::platform()))).size(17.0).strong().color(ACCENT));
                         if !m.notes.trim().is_empty() {
                             let notes: String = m.notes.lines().take(6).collect::<Vec<_>>().join("\n");
                             ui.label(egui::RichText::new(notes).size(12.5).color(Color32::from_gray(210)));
+                        }
+                        if let Some(note) = m.behind_note(update::platform()) {
+                            ui.label(egui::RichText::new(note).size(12.5).color(Color32::from_rgb(255, 210, 160)));
                         }
                         ui.horizontal(|ui| {
                             if update::platform() == "linux" {
@@ -2868,6 +2887,8 @@ impl App {
             Some(2) => {
                 if let update::Phase::Available(m) = &phase {
                     self.updater.dismiss(m.build);
+                } else if let Some((b, _)) = &behind {
+                    self.updater.dismiss(*b);
                 }
             }
             Some(3) => ctx.open_url(egui::OpenUrl::new_tab(update::releases_page())),
@@ -3629,10 +3650,8 @@ impl App {
                     self.screen = Screen::Menu(Page::Join);
                     return;
                 }
-                Incoming::WrongBuild { host } => {
-                    let mine = update::local_build();
-                    let what = if host > mine { "update first (Settings > Updates, or the downloads page)" } else { "the host needs to update first" };
-                    self.menu_msg = Some(format!("Your build ({mine}) doesn't match the host's ({host}) - {what}."));
+                Incoming::WrongBuild { host, proto } => {
+                    self.menu_msg = Some(update::mismatch_text(update::local_build(), update::local_proto(), host, proto));
                     self.screen = Screen::Menu(Page::Join);
                     return;
                 }

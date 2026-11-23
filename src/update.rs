@@ -61,10 +61,40 @@ pub fn releases_page() -> String {
     format!("https://github.com/{REPO}/releases/latest")
 }
 
-/// Can two builds play together? The same build number, or a development build on either side
-/// (a developer testing).
+/// Can two builds play together by build number alone? The same build, or a development build on
+/// either side (a developer testing). Only used for copies from before the network protocol
+/// number (see can_play_together).
 pub fn builds_compatible(a: u32, b: u32) -> bool {
     a == 0 || b == 0 || a == b
+}
+
+/// The network protocol this copy speaks, or a pretend one for testing (DUEL_FAKE_PROTO).
+pub fn local_proto() -> u32 {
+    std::env::var("DUEL_FAKE_PROTO").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(crate::net::NET_PROTOCOL)
+}
+
+/// Can this copy (`my_build`, `my_proto`) play with another? When the other says its network
+/// protocol, that decides: the same protocol plays together whatever the build numbers (a Mac
+/// download a few builds behind still joins). A copy from before the protocol number (`their_proto`
+/// None) has to be the same build.
+pub fn can_play_together(my_build: u32, my_proto: u32, their_build: u32, their_proto: Option<u32>) -> bool {
+    match their_proto {
+        Some(p) => p == my_proto,
+        None => builds_compatible(my_build, their_build),
+    }
+}
+
+/// What to tell a player who can't join (`host`'s build and protocol, as it said).
+pub fn mismatch_text(my_build: u32, my_proto: u32, host_build: u32, host_proto: Option<u32>) -> String {
+    let newer = match host_proto {
+        Some(p) if p != my_proto => p > my_proto,
+        _ => host_build > my_build,
+    };
+    let what = if newer { "update first (Settings > Updates, or the downloads page)" } else { "the host needs to update first" };
+    match host_proto {
+        Some(p) => format!("Your game (build {my_build}, network version {my_proto}) can't play with the host's (build {host_build}, network version {p}): the network version has to match - {what}."),
+        None => format!("Your build ({my_build}) doesn't match the host's ({host_build}) - {what}."),
+    }
 }
 
 /// Is `remote` an update for `local`? Only a newer build, and never for a development build.
@@ -91,6 +121,8 @@ pub struct Download {
     /// The build this file is, when it isn't the release's own (a Mac zip kept from an earlier
     /// build because that run's Mac build didn't finish).
     pub build: Option<u32>,
+    /// The network protocol that file speaks (None: not said, or not known for an old zip).
+    pub protocol: Option<u32>,
 }
 
 /// What version.json says.
@@ -100,6 +132,18 @@ pub struct Manifest {
     pub version: String,
     pub notes: String,
     pub files: Vec<(String, Download)>,
+    /// The network protocol the release's own build speaks (None in releases from before it).
+    pub protocol: Option<u32>,
+}
+
+/// A platform's name as players know it.
+pub fn platform_name(p: &str) -> &str {
+    match p {
+        "windows" => "Windows",
+        "mac" => "Mac",
+        "linux" => "Linux / Steam Deck",
+        other => other,
+    }
 }
 
 impl Manifest {
@@ -109,6 +153,57 @@ impl Manifest {
     /// The build platform would get (its own file's build when the release kept an older one).
     pub fn build_for(&self, platform: &str) -> u32 {
         self.download(platform).and_then(|d| d.build).unwrap_or(self.build)
+    }
+
+    /// The network protocol platform's download speaks: its own when it says, the release's when
+    /// it's the release's own build, otherwise unknown.
+    pub fn protocol_for(&self, platform: &str) -> Option<u32> {
+        let d = self.download(platform)?;
+        d.protocol.or(if self.build_for(platform) == self.build { self.protocol } else { None })
+    }
+
+    /// The downloads that are older than the release (a build that couldn't be made in this run
+    /// keeps the last one): (platform, its build).
+    pub fn behind(&self) -> Vec<(&str, u32)> {
+        self.files.iter().map(|(p, _)| (p.as_str(), self.build_for(p))).filter(|&(_, b)| b < self.build).collect()
+    }
+
+    /// Can a download that's behind still play with the release's build? Only when both say the
+    /// same network protocol (an old download that doesn't say can't: it needs the same build).
+    pub fn plays_with_release(&self, platform: &str) -> bool {
+        match (self.protocol_for(platform), self.protocol) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.build_for(platform) == self.build,
+        }
+    }
+
+    /// What to tell a player about downloads that are behind, from where they stand (`me`, their
+    /// platform): None when every download is the release's build.
+    pub fn behind_note(&self, me: &str) -> Option<String> {
+        let notes: Vec<String> = self
+            .behind()
+            .into_iter()
+            .map(|(p, b)| {
+                let name = platform_name(p);
+                let plays = self.plays_with_release(p);
+                if p == me {
+                    let tail = if plays {
+                        "It still plays with them: the network version is the same.".to_string()
+                    } else {
+                        format!("Until it's rebuilt it can't play with build {} (a different network version).", self.build)
+                    };
+                    format!("The newest {name} download is build {b}; the other platforms are on build {} (GitHub couldn't make the {name} build yet). {tail}", self.build)
+                } else {
+                    let tail = if plays {
+                        format!("{name} players can still play with you: the network version is the same.")
+                    } else {
+                        format!("{name} players can't join build {} until the {name} download is rebuilt.", self.build)
+                    };
+                    format!("The {name} download is behind: it's still build {b} (this release is build {}). {tail}", self.build)
+                }
+            })
+            .collect();
+        (!notes.is_empty()).then(|| notes.join(" "))
     }
 }
 
@@ -128,10 +223,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 continue;
             }
             let fb = d.get("build").and_then(|b| b.as_u64()).filter(|&b| b > 0 && b <= u32::MAX as u64).map(|b| b as u32);
-            files.push((platform.clone(), Download { file: file.to_string(), sha256: sha, build: fb }));
+            let fp = d.get("protocol").and_then(|b| b.as_u64()).filter(|&b| b <= u32::MAX as u64).map(|b| b as u32);
+            files.push((platform.clone(), Download { file: file.to_string(), sha256: sha, build: fb, protocol: fp }));
         }
     }
-    Ok(Manifest { build, version, notes, files })
+    let protocol = v.get("protocol").and_then(|b| b.as_u64()).filter(|&b| b <= u32::MAX as u64).map(|b| b as u32);
+    Ok(Manifest { build, version, notes, files, protocol })
 }
 
 /// The SHA-256 of some bytes, as lower-case hex.
@@ -332,11 +429,23 @@ pub struct UpdaterState {
     pub phase: Phase,
     /// "Later" was pressed for this build.
     pub dismissed: Option<u32>,
+    /// The last version.json read (to say when a platform's download is behind).
+    pub latest: Option<Manifest>,
 }
 
 impl Updater {
     pub fn new() -> Updater {
-        Updater { state: Arc::new(Mutex::new(UpdaterState { phase: Phase::Idle, dismissed: None })) }
+        Updater { state: Arc::new(Mutex::new(UpdaterState { phase: Phase::Idle, dismissed: None, latest: None })) }
+    }
+
+    /// The last version.json read, if any.
+    pub fn latest(&self) -> Option<Manifest> {
+        self.state.lock().ok().and_then(|s| s.latest.clone())
+    }
+
+    /// What the last check found about downloads that are behind, for this platform's player.
+    pub fn behind_note(&self) -> Option<String> {
+        self.latest().and_then(|m| m.behind_note(platform()))
     }
 
     pub fn phase(&self) -> Phase {
@@ -375,7 +484,11 @@ impl Updater {
         self.set(Phase::Checking { manual });
         let me = self.clone();
         let _ = std::thread::Builder::new().name("update check".into()).spawn(move || {
-            let p = match fetch(&manifest_url(), None).and_then(|b| parse_manifest(&String::from_utf8_lossy(&b))) {
+            let got = fetch(&manifest_url(), None).and_then(|b| parse_manifest(&String::from_utf8_lossy(&b)));
+            if let (Ok(m), Ok(mut s)) = (&got, me.state.lock()) {
+                s.latest = Some(m.clone());
+            }
+            let p = match got {
                 Ok(m) if is_newer(m.build_for(platform()), local_build()) => Phase::Available(m),
                 Ok(_) => Phase::UpToDate,
                 Err(e) => Phase::CheckFailed(e),
@@ -509,6 +622,76 @@ mod tests {
         assert_eq!(m.build_for("mac"), 18);
         assert_eq!(m.build_for("linux"), 20, "no file of its own: the release's build");
         assert!(!is_newer(m.build_for("mac"), 18), "a Mac on build 18 is up to date");
+    }
+
+    /// Who can play together: the network protocol decides, not the build number. A Mac zip a few
+    /// builds behind plays with Windows if the protocol is unchanged; a different protocol never
+    /// does; a copy from before the protocol number has to be the same build.
+    #[test]
+    fn the_network_protocol_decides_who_plays_together() {
+        // same protocol, different builds (Mac #21 behind Windows #23): they play
+        assert!(can_play_together(23, 11, 21, Some(11)));
+        assert!(can_play_together(21, 11, 23, Some(11)));
+        // same build number but a different protocol (can't really happen, but the protocol wins)
+        assert!(!can_play_together(23, 11, 23, Some(12)));
+        // different protocols: no, whichever side is newer
+        assert!(!can_play_together(23, 12, 21, Some(11)));
+        assert!(!can_play_together(21, 11, 23, Some(12)));
+        // a copy from before the protocol number (it doesn't say): the same build only
+        assert!(can_play_together(23, 11, 23, None));
+        assert!(!can_play_together(23, 11, 18, None), "the old Mac build #18 can't join #23");
+        assert!(can_play_together(0, 11, 18, None), "a developer's build still joins anyone old");
+        // a developer's build with the same protocol joins a release, and the other way round
+        assert!(can_play_together(0, 11, 23, Some(11)) && can_play_together(23, 11, 0, Some(11)));
+        // what the player is told
+        let t = mismatch_text(21, 11, 23, Some(12));
+        assert!(t.contains("network version 12") && t.contains("update first"), "{t}");
+        let t = mismatch_text(23, 12, 21, Some(11));
+        assert!(t.contains("the host needs to update first"), "{t}");
+        let t = mismatch_text(18, 11, 23, None);
+        assert!(t.contains("Your build (18)") && t.contains("update first"), "{t}");
+        assert_eq!(local_proto(), crate::net::NET_PROTOCOL);
+    }
+
+    fn release(mac: &str, top_protocol: &str) -> Manifest {
+        let sha = "c".repeat(64);
+        parse_manifest(&format!(
+            r#"{{"build": 23, {top_protocol} "files": {{
+                "windows": {{"file": "DuelRush-Windows.zip", "sha256": "{sha}"}},
+                "linux": {{"file": "DuelRush-Linux.tar.gz", "sha256": "{sha}"}},
+                "mac": {{"file": "DuelRush-Mac.zip", "sha256": "{sha}" {mac}}} }} }}"#
+        ))
+        .unwrap()
+    }
+
+    /// version.json says when the Mac download is behind and whether it still plays with the
+    /// release; the game says so to Mac and Windows players alike.
+    #[test]
+    fn a_mac_download_behind_is_said_clearly() {
+        // all on the release's build: nothing to say
+        let m = release("", r#""protocol": 11,"#);
+        assert!(m.behind().is_empty() && m.behind_note("windows").is_none() && m.behind_note("mac").is_none());
+        assert_eq!(m.protocol_for("mac"), Some(11));
+        // the Mac zip kept from build 21, same protocol: behind, but it plays
+        let m = release(r#", "build": 21, "protocol": 11"#, r#""protocol": 11,"#);
+        assert_eq!(m.behind(), vec![("mac", 21)]);
+        assert!(m.plays_with_release("mac"));
+        let w = m.behind_note("windows").unwrap();
+        assert!(w.contains("Mac download is behind") && w.contains("build 21") && w.contains("can still play"), "{w}");
+        let mac = m.behind_note("mac").unwrap();
+        assert!(mac.contains("newest Mac download is build 21") && mac.contains("still plays"), "{mac}");
+        // a different protocol: it can't
+        let m = release(r#", "build": 21, "protocol": 10"#, r#""protocol": 11,"#);
+        assert!(!m.plays_with_release("mac"));
+        assert!(m.behind_note("windows").unwrap().contains("can't join build 23"));
+        assert!(m.behind_note("mac").unwrap().contains("can't play with build 23"));
+        // today's case: the Mac zip is build 18, from before the protocol number: it can't
+        let m = release(r#", "build": 18"#, "");
+        assert_eq!(m.protocol_for("mac"), None);
+        assert!(!m.plays_with_release("mac"));
+        assert!(m.behind_note("linux").unwrap().contains("still build 18"));
+        // and a Mac on 18 isn't offered 18 again
+        assert!(!is_newer(m.build_for("mac"), 18));
     }
 
     #[test]

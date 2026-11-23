@@ -3,20 +3,47 @@
 # "Latest build" (always the release tagged `latest`, so its links never change).
 #
 # The run number is the build number: build.rs reads GITHUB_RUN_NUMBER and the game shows it on
-# the main menu. The release also carries version.json (build number, version, what changed, and
-# each download's SHA-256), which the game's auto-updater reads.
+# the main menu. The release also carries version.json (build number, version, network protocol,
+# what changed, and each download's SHA-256 and protocol), which the game's auto-updater reads.
+#
+# Mac: GitHub's Apple Silicon Mac machines are often all taken ("The job was not acquired by
+# Runner of type hosted" / "capacity constraints for macOS arm64 runners"), so the Mac download
+# is built on two kinds of Mac at once and whichever finishes is used:
+#   - macos-15        Apple Silicon (arm64)
+#   - macos-15-intel  Intel (x64), which also cross-compiles the Apple Silicon half
+# Both make the same universal app (arm64 + x64 joined with lipo). These are GitHub's standard
+# (free for public repos) Mac labels as listed in github.com/actions/runner-images in November
+# 2026: arm64 macos-latest / macos-26 / macos-15, Intel macos-26-intel / macos-15-intel
+# (macos-13 and macos-14 are retired; -large / -xlarge are paid larger runners).
+#
+# If neither Mac could build, the release keeps the last Mac download and says plainly that it's
+# behind (and whether it can still play with this build). To rebuild only the Mac download later:
+# Actions -> Build game -> Run workflow -> tick "Mac only". That builds the latest release's own
+# code with that release's build number, so the Mac matches Windows and Linux exactly, and puts it
+# in the latest release (version.json and the notes too).
 name: Build game
 
 on:
   push:
     branches: [master, main]
   workflow_dispatch:
+    inputs:
+      mac_only:
+        description: "Mac only: rebuild just the Mac download of the latest release (same code and build number) and put it in that release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+# one run at a time touches the release (a Mac-only run waits for a running build, and the other way round)
+concurrency:
+  group: build-game
+  cancel-in-progress: false
+
 jobs:
   windows:
+    if: ${{ !inputs.mac_only }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -39,18 +66,50 @@ jobs:
           path: DuelRush-Windows.zip
 
   mac:
-    # GitHub's Mac machines are sometimes all busy: a Mac build that can't get one, fails or runs
-    # past its time limit no longer holds the release back (see the release job).
-    runs-on: macos-latest
+    # Two Macs at once (see the top): a leg that can't get a machine, fails or runs past its time
+    # limit doesn't stop the other, and doesn't hold the release back.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            kind: arm64
+          - runner: macos-15-intel
+            kind: intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
+      - name: Which code and build number
+        id: what
+        run: |
+          if [ "${{ inputs.mac_only }}" = "true" ]; then
+            # the latest release's own code and number, so this Mac build matches it exactly
+            gh release download latest --repo "${{ github.repository }}" --pattern version.json --dir prev
+            echo "build=$(jq -r '.build' prev/version.json)" >> "$GITHUB_OUTPUT"
+            echo "ref=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.what.outputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.kind }}
       - name: Build (Apple Silicon + Intel)
         run: |
+          # the build number the game shows and joins with (build.rs reads these; a release made
+          # before DUEL_RELEASE_BUILD existed only reads GITHUB_RUN_NUMBER, so both are set)
+          export DUEL_RELEASE_BUILD="${{ steps.what.outputs.build }}"
+          export GITHUB_RUN_NUMBER="${{ steps.what.outputs.build }}"
+          echo "Building build $GITHUB_RUN_NUMBER on ${{ matrix.runner }} ($(uname -m))"
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin
       - name: Make Duel Rush.app
@@ -62,6 +121,11 @@ jobs:
             target/aarch64-apple-darwin/release/duel_arena \
             target/x86_64-apple-darwin/release/duel_arena \
             -output "$APP/Contents/MacOS/duel_arena"
+          # both halves must be there, whichever Mac built it
+          ARCHS=$(lipo -archs "$APP/Contents/MacOS/duel_arena")
+          echo "Architectures: $ARCHS"
+          case "$ARCHS" in *arm64*) ;; *) echo "::error::no Apple Silicon half"; exit 1 ;; esac
+          case "$ARCHS" in *x86_64*) ;; *) echo "::error::no Intel half"; exit 1 ;; esac
           chmod +x "$APP/Contents/MacOS/duel_arena"
           # Steam library: the game won't start on a Mac without it next to the program
           DYLIB=$(find ~/.cargo/registry/src -path '*steamworks-sys*' -name libsteam_api.dylib | head -1)
@@ -80,7 +144,7 @@ jobs:
             <key>CFBundleExecutable</key><string>duel_arena</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>$VERSION</string>
-            <key>CFBundleVersion</key><string>${{ github.run_number }}</string>
+            <key>CFBundleVersion</key><string>${{ steps.what.outputs.build }}</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict>
@@ -90,10 +154,11 @@ jobs:
           ditto -c -k --keepParent "$APP" DuelRush-Mac.zip
       - uses: actions/upload-artifact@v6
         with:
-          name: mac
+          name: mac-${{ matrix.kind }}
           path: DuelRush-Mac.zip
 
   linux:
+    if: ${{ !inputs.mac_only }}
     # Built inside Valve's Steam Runtime 3 ("sniper") SDK, the system Steam runs Linux games in,
     # so the same build runs natively on the Steam Deck (SteamOS) and on any Linux PC with Steam.
     runs-on: ubuntu-latest
@@ -136,85 +201,177 @@ jobs:
 
   release:
     needs: [windows, mac, linux]
-    # Publish when Windows and Linux built, whatever happened to the Mac build (no Mac machine,
-    # a failed build, or past its time limit): the last Mac download is kept instead.
-    if: ${{ !cancelled() && needs.windows.result == 'success' && needs.linux.result == 'success' }}
+    # Publish when Windows and Linux built, whatever happened to the Mac builds (no Mac machine,
+    # a failed build, or past its time limit): the last Mac download is kept instead, and the
+    # notes and version.json say it's behind.
+    if: ${{ !cancelled() && !inputs.mac_only && needs.windows.result == 'success' && needs.linux.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      # (the source, for the version number and the commit message that becomes the notes)
+      # (the source, for the version and protocol numbers and the commit message that becomes the notes)
       - uses: actions/checkout@v6
         with:
           path: src
       - uses: actions/download-artifact@v7
         with:
-          merge-multiple: true
-      - name: Keep the previous Mac build if this run has none
+          path: art
+      - name: Gather the downloads (the Apple Silicon Mac's build first, else the Intel Mac's)
         id: mac
         run: |
-          if [ -f DuelRush-Mac.zip ]; then
-            echo "Mac: built in this run"
+          cp art/windows/DuelRush-Windows.zip art/linux/DuelRush-Linux.tar.gz .
+          PROTO=$(grep -m1 'pub const NET_PROTOCOL' src/src/net.rs | grep -oE '[0-9]+' | head -1)
+          echo "protocol=$PROTO" >> "$GITHUB_OUTPUT"
+          FROM=""
+          for k in arm64 intel; do
+            if [ -f "art/mac-$k/DuelRush-Mac.zip" ]; then cp "art/mac-$k/DuelRush-Mac.zip" .; FROM=$k; break; fi
+          done
+          if [ -n "$FROM" ]; then
+            echo "Mac: built in this run (on the $FROM Mac)"
             echo "build=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+            echo "mac_protocol=$PROTO" >> "$GITHUB_OUTPUT"
             echo "kept=false" >> "$GITHUB_OUTPUT"
+            echo "from=$FROM" >> "$GITHUB_OUTPUT"
           elif gh release download latest --pattern DuelRush-Mac.zip --dir previous; then
             mv previous/DuelRush-Mac.zip .
-            # the build that zip is: what the last version.json said about it
+            # the build that zip is, and the network protocol it speaks: what the last
+            # version.json said (none for zips from before the protocol number: unknown)
             OLD=0
+            OLD_PROTO=""
             if gh release download latest --pattern version.json --dir previous; then
               OLD=$(jq -r '.files.mac.build // .build // 0' previous/version.json)
+              OLD_PROTO=$(jq -r '.files.mac.protocol // (if (.files.mac.build // null) == null then .protocol else null end) // empty' previous/version.json)
             fi
-            echo "Mac: no new build in this run, keeping the previous one (build $OLD)"
+            echo "::warning::No Mac machine built this run: keeping the previous Mac download (build $OLD, network version ${OLD_PROTO:-unknown})"
             echo "build=$OLD" >> "$GITHUB_OUTPUT"
+            echo "mac_protocol=$OLD_PROTO" >> "$GITHUB_OUTPUT"
             echo "kept=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Mac: no new build and no previous one to keep"
+            echo "::warning::No Mac build in this run and no previous one to keep"
             echo "build=0" >> "$GITHUB_OUTPUT"
             echo "kept=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Write version.json (for the game's auto-updater)
         run: |
           VERSION=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
+          PROTO=${{ steps.mac.outputs.protocol }}
           NOTES=$(git -C src log -1 --pretty=%B | head -c 1500)
           sha() { sha256sum "$1" | cut -d' ' -f1; }
           FILES=$(jq -n \
             --arg win "$(sha DuelRush-Windows.zip)" \
             --arg linux "$(sha DuelRush-Linux.tar.gz)" \
-            '{windows: {file: "DuelRush-Windows.zip", sha256: $win},
-              linux: {file: "DuelRush-Linux.tar.gz", sha256: $linux}}')
+            --argjson proto "$PROTO" \
+            '{windows: {file: "DuelRush-Windows.zip", sha256: $win, protocol: $proto},
+              linux: {file: "DuelRush-Linux.tar.gz", sha256: $linux, protocol: $proto}}')
           if [ -f DuelRush-Mac.zip ]; then
-            # a kept Mac zip says which build it is, so Macs aren't offered it again as new
+            # a kept Mac zip says which build it is (so Macs aren't offered it again as new) and,
+            # when known, which network protocol it speaks (so the game can say if it still plays)
             FILES=$(echo "$FILES" | jq \
               --arg mac "$(sha DuelRush-Mac.zip)" \
               --argjson macbuild "${{ steps.mac.outputs.build }}" \
               --argjson kept "${{ steps.mac.outputs.kept }}" \
+              --arg macproto "${{ steps.mac.outputs.mac_protocol }}" \
               '. + {mac: ({file: "DuelRush-Mac.zip", sha256: $mac}
-                          + (if $kept and $macbuild > 0 then {build: $macbuild} else {} end))}')
+                          + (if $kept and $macbuild > 0 then {build: $macbuild} else {} end)
+                          + (if $macproto != "" then {protocol: ($macproto | tonumber)} else {} end))}')
           fi
           jq -n \
             --argjson build "${{ github.run_number }}" \
             --arg version "$VERSION" \
+            --argjson protocol "$PROTO" \
             --arg notes "$NOTES" \
             --argjson files "$FILES" \
-            '{build: $build, version: $version, notes: $notes, files: $files}' > version.json
+            '{build: $build, version: $version, protocol: $protocol, notes: $notes, files: $files}' > version.json
           cat version.json
       - name: Publish "Latest build"
         run: |
+          N=${{ github.run_number }}
+          PROTO=${{ steps.mac.outputs.protocol }}
+          MB=${{ steps.mac.outputs.build }}
+          MP="${{ steps.mac.outputs.mac_protocol }}"
           FILES="DuelRush-Windows.zip DuelRush-Linux.tar.gz version.json"
-          MAC_NOTE=""
+          TITLE="Latest build (#$N)"
           if [ -f DuelRush-Mac.zip ]; then
             FILES="$FILES DuelRush-Mac.zip"
             if [ "${{ steps.mac.outputs.kept }}" = "true" ]; then
-              MAC_NOTE=" (The Mac download is still build #${{ steps.mac.outputs.build }}: this run's Mac build didn't finish.)"
+              TITLE="Latest build (#$N) - Mac download behind (#$MB)"
+              if [ "$MP" = "$PROTO" ]; then
+                MAC_LINE="**Mac download: behind.** It's still build #$MB (GitHub had no Mac machine free for this run). It speaks the same network version ($PROTO) as build #$N, so Mac players can still play with Windows and Linux players."
+              else
+                MAC_LINE="**Mac download: behind.** It's still build #$MB (GitHub had no Mac machine free for this run), and it **can't play with build #$N** (a different network version). Rebuild it: Actions -> Build game -> Run workflow -> tick \"Mac only\"."
+              fi
+            else
+              MAC_LINE="**Mac download:** build #$N, up to date (built on the ${{ steps.mac.outputs.from }} Mac)."
             fi
           else
-            MAC_NOTE=" (No Mac download in this build: its Mac build didn't finish.)"
+            TITLE="Latest build (#$N) - no Mac download"
+            MAC_LINE="**Mac download: none yet.** No Mac build has finished. Rebuild it: Actions -> Build game -> Run workflow -> tick \"Mac only\"."
           fi
+          { cat src/.github/release_intro.md; echo; echo "This release speaks network version $PROTO."; echo; echo "$MAC_LINE"; } > notes.md
+          cat notes.md
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest $FILES \
             --latest \
             --target "${{ github.sha }}" \
-            --title "Latest build (#${{ github.run_number }})" \
-            --notes "Windows: unzip and run Duel Rush.exe (keep steam_api64.dll next to it) (More info -> Run anyway). Mac: unzip, right-click Duel Rush -> Open (or System Settings -> Privacy & Security -> Open Anyway). Linux / Steam Deck: extract and run duel_rush (keep libsteam_api.so next to it); on a Deck, add it to Steam as a non-Steam game to play from Game Mode. Both players need the same build to connect.$MAC_NOTE"
+            --title "$TITLE" \
+            --notes-file notes.md
+
+  mac_update:
+    # "Mac only": put the new Mac download in the latest release, and say it's up to date.
+    needs: [mac]
+    if: ${{ !cancelled() && inputs.mac_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # (the latest release's code, for its protocol number; and this branch, for the notes' text)
+      - uses: actions/checkout@v6
+        with:
+          ref: latest
+          path: src
+      - uses: actions/checkout@v6
+        with:
+          path: cur
+      - uses: actions/download-artifact@v7
+        with:
+          path: art
+      - name: Pick the Mac build (the Apple Silicon Mac's first, else the Intel Mac's)
+        id: pick
+        run: |
+          FROM=""
+          for k in arm64 intel; do
+            if [ -f "art/mac-$k/DuelRush-Mac.zip" ]; then cp "art/mac-$k/DuelRush-Mac.zip" .; FROM=$k; break; fi
+          done
+          if [ -z "$FROM" ]; then
+            echo "::error::Neither Mac machine could build it this time either (GitHub's Macs are busy). The release is unchanged: run it again later."
+            exit 1
+          fi
+          echo "from=$FROM" >> "$GITHUB_OUTPUT"
+      - name: Update version.json and the release
+        run: |
+          gh release download latest --pattern version.json --dir prev
+          B=$(jq -r '.build' prev/version.json)
+          # (a release from before the protocol number has none: null, "not said")
+          PROTO=$(grep -m1 'pub const NET_PROTOCOL' src/src/net.rs | grep -oE '[0-9]+' | head -1)
+          PROTO=${PROTO:-null}
+          SHA=$(sha256sum DuelRush-Mac.zip | cut -d' ' -f1)
+          # the Mac is now the release's own build: no build of its own, and every file speaks
+          # the release's protocol (they're all built from the same code)
+          jq --arg sha "$SHA" --argjson proto "$PROTO" \
+            '.protocol = $proto
+             | .files.mac = {file: "DuelRush-Mac.zip", sha256: $sha}
+             | .files |= with_entries(.value.protocol = $proto)' prev/version.json > version.json
+          cat version.json
+          {
+            cat cur/.github/release_intro.md
+            echo
+            if [ "$PROTO" != "null" ]; then echo "This release speaks network version $PROTO."; echo; fi
+            echo "**Mac download:** build #$B, up to date (rebuilt on its own on the ${{ steps.pick.outputs.from }} Mac)."
+          } > notes.md
+          cat notes.md
+          gh release upload latest DuelRush-Mac.zip version.json --clobber
+          gh release edit latest --title "Latest build (#$B)" --notes-file notes.md

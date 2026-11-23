@@ -13,9 +13,11 @@ fn main() {
     println!("cargo:rerun-if-changed=assets");
     println!("cargo:rustc-env=DUEL_BUILD={}", build_stamp());
     // the release build number: GitHub Actions' run number (0 for a build made anywhere else, a
-    // development build, which never updates itself)
+    // development build, which never updates itself). DUEL_RELEASE_BUILD overrides it: a "Mac
+    // only" rebuild of an existing release takes that release's number, so it matches the others.
     println!("cargo:rerun-if-env-changed=GITHUB_RUN_NUMBER");
-    let run: u32 = std::env::var("GITHUB_RUN_NUMBER").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    println!("cargo:rerun-if-env-changed=DUEL_RELEASE_BUILD");
+    let run: u32 = ["DUEL_RELEASE_BUILD", "GITHUB_RUN_NUMBER"].iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u32| n > 0)).unwrap_or(0);
     println!("cargo:rustc-env=DUEL_BUILD_NUMBER={run}");
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let text = if run > 0 { format!("v{version} build {run}") } else { format!("v{version} dev build ({})", build_stamp()) };

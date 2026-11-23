@@ -10,7 +10,16 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 const MAGIC: [u8; 4] = *b"DRB2";
-/// The protocol version as text (Steam lobbies only list games that speak the same one).
+/// The network protocol number: two copies of the game can play together when theirs match,
+/// whatever their build numbers (so a Mac download that's a few builds behind still plays with
+/// Windows and Linux as long as nothing both sides must agree on has changed since).
+///
+/// Bump it (and PROTOCOL below with it) whenever the netcode changes (packets, events, what a
+/// fighter's state carries) or anything both sides must agree on does: map layouts, the hit
+/// rules and the game's tuning. The `match_fingerprint` test notices most such changes and fails
+/// until it's bumped.
+pub const NET_PROTOCOL: u32 = 11;
+/// The same as text (Steam lobbies only list games that speak the same one).
 pub const PROTOCOL: &str = "DRA11";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
@@ -399,8 +408,9 @@ pub enum Incoming {
     Full,
     /// (player) the host runs a different version of the game
     WrongVersion,
-    /// (player) the host runs a different build (its number)
-    WrongBuild { host: u32 },
+    /// (player) the host can't play with this copy: its build number, and its network protocol
+    /// (None from hosts made before the protocol number existed)
+    WrongBuild { host: u32, proto: Option<u32> },
 }
 
 /// Network test: pretend the connection is slow and drops packets.
@@ -527,6 +537,8 @@ pub struct Net {
     pub is_host: bool,
     /// The build number this side says it is (this build's; tests set others).
     pub build: u32,
+    /// The network protocol this side speaks (NET_PROTOCOL; tests set others).
+    pub proto: u32,
     host_addr: Option<SocketAddr>,
     peers: Vec<Peer>,
     out: VecDeque<(u8, u32, Instant, Ev)>,
@@ -610,6 +622,7 @@ impl Net {
             sock,
             is_host,
             build: crate::update::local_build(),
+            proto: crate::update::local_proto(),
             host_addr,
             peers: Vec::new(),
             out: VecDeque::new(),
@@ -922,7 +935,7 @@ impl Net {
                 K_FULL => out.push(Incoming::Full),
                 K_BUILD => {
                     if let Some(host) = r.u32() {
-                        out.push(Incoming::WrongBuild { host });
+                        out.push(Incoming::WrongBuild { host, proto: r.u32() });
                     }
                 }
                 K_PEERS => {
@@ -940,11 +953,14 @@ impl Net {
         match kind {
             K_HELLO => {
                 let name = r.s().unwrap_or_default();
-                // different builds can't play together: say which build we are instead
+                // copies that speak different network protocols can't play together (players from
+                // before the protocol number: different builds can't): say which we are instead
                 let build = r.u32().unwrap_or(0);
-                if !crate::update::builds_compatible(build, self.build) {
+                let proto = r.u32();
+                if !crate::update::can_play_together(self.build, self.proto, build, proto) {
                     let mut w = self.head(K_BUILD, from);
                     w.u32(self.build);
+                    w.u32(self.proto);
                     self.send_to(w.0, from);
                     return;
                 }
@@ -1119,6 +1135,7 @@ impl Net {
             let mut w = self.head(K_HELLO, h);
             w.s(name);
             w.u32(self.build);
+            w.u32(self.proto);
             self.send_to(w.0, h);
         }
     }
@@ -1613,7 +1630,8 @@ mod migration_tests {
         assert_eq!(parse_peers(&mut R { b: &w.0, i: 0 }), Some(s));
     }
 
-    /// A player on another build is told the host's build instead of joining; the same build joins.
+    /// A player whose game speaks another network protocol is told the host's build instead of
+    /// joining; the same build joins.
     #[test]
     fn different_builds_are_told_instead_of_joining() {
         let mut h = Net::host(0).expect("host");
@@ -1621,6 +1639,7 @@ mod migration_tests {
         let port = h.sock.local_addr().unwrap().port();
         let mut c = Net::join(&format!("127.0.0.1:{port}")).unwrap();
         c.build = 58;
+        c.proto = h.proto + 1;
         let (mut joined, mut told) = (false, None);
         for _ in 0..200 {
             c.send_hello("Bo", 0.3);
@@ -1628,7 +1647,7 @@ mod migration_tests {
                 joined |= matches!(m, Incoming::Join { .. });
             }
             for m in c.poll() {
-                if let Incoming::WrongBuild { host } = m {
+                if let Incoming::WrongBuild { host, .. } = m {
                     told = Some(host);
                 }
             }
@@ -1653,6 +1672,112 @@ mod migration_tests {
             std::thread::sleep(std::time::Duration::from_millis(3));
         }
         assert!(joined, "the same build joins");
+    }
+
+    /// The join check goes by the network protocol: a player a few builds behind (the Mac zip
+    /// that GitHub couldn't rebuild) joins when the protocol is the same; a different protocol is
+    /// told the host's build and protocol instead; a player from before the protocol number (its
+    /// hello has no protocol) must be the same build.
+    #[test]
+    fn the_protocol_not_the_build_decides_who_joins() {
+        let mut h = Net::host(0).expect("host");
+        h.build = 23;
+        h.proto = 11;
+        let port = h.sock.local_addr().unwrap().port();
+        let try_join = |h: &mut Net, c: &mut Net| -> (bool, Option<(u32, Option<u32>)>) {
+            let (mut joined, mut told) = (false, None);
+            for _ in 0..200 {
+                c.send_hello("Mac", 0.3);
+                for m in h.poll() {
+                    joined |= matches!(m, Incoming::Join { .. });
+                }
+                for m in c.poll() {
+                    if let Incoming::WrongBuild { host, proto } = m {
+                        told = Some((host, proto));
+                    }
+                }
+                if joined || told.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(3));
+            }
+            (joined, told)
+        };
+        // an older build that speaks the same protocol joins
+        let mut mac = Net::join(&format!("127.0.0.1:{port}")).unwrap();
+        mac.build = 21;
+        mac.proto = 11;
+        let (joined, told) = try_join(&mut h, &mut mac);
+        assert!(joined && told.is_none(), "same protocol, older build: joins");
+        // a different protocol is told the host's build and protocol
+        let mut old = Net::join(&format!("127.0.0.1:{port}")).unwrap();
+        old.build = 22;
+        old.proto = 10;
+        let (joined, told) = try_join(&mut h, &mut old);
+        assert!(!joined, "a different protocol doesn't join");
+        assert_eq!(told, Some((23, Some(11))));
+        // a hello from before the protocol number (name and build only), on another build
+        let pre = Net::join(&format!("127.0.0.1:{port}")).unwrap();
+        let mut told_old = false;
+        let mut joined_old = false;
+        for _ in 0..200 {
+            let mut w = W(Vec::new());
+            w.0.extend_from_slice(&MAGIC);
+            w.u8(K_HELLO);
+            w.u32(1);
+            w.f(0.0);
+            w.s("Old");
+            w.u32(18);
+            pre.sock.send_to(&w.0, format!("127.0.0.1:{port}")).unwrap();
+            for m in h.poll() {
+                joined_old |= matches!(m, Incoming::Join { .. });
+            }
+            let mut buf = [0u8; 64];
+            pre.sock.set_nonblocking(true).ok();
+            while let Ok((n, _)) = pre.sock.recv_from(&mut buf) {
+                told_old |= n > 4 && buf[4] == K_BUILD;
+            }
+            if told_old {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        assert!(told_old && !joined_old, "an old build #18 without a protocol is turned away");
+    }
+
+    /// The protocol's text (Steam lobbies) and number agree.
+    #[test]
+    fn the_protocol_text_and_number_agree() {
+        assert_eq!(PROTOCOL, format!("DRA{NET_PROTOCOL}"));
+    }
+
+    /// A fingerprint of what both sides of a match must agree on: how a fighter's state and an
+    /// event are written, every map's layout and the game's tuning. When it changes, builds with
+    /// the same NET_PROTOCOL would no longer agree: bump NET_PROTOCOL (and PROTOCOL), then
+    /// record the new fingerprint here, for that protocol.
+    #[test]
+    fn match_fingerprint() {
+        let mut bytes = Vec::new();
+        let mut w = W(Vec::new());
+        write_fstate(&mut w, &Fighter::new("x", 0, true));
+        write_ev(&mut w, &Ev::Ping { who: 1, kind: 2, p: v3(1.0, 2.0, 3.0) });
+        bytes.extend_from_slice(&w.0);
+        // (to the millimetre, so the maths library of each system can't change it)
+        let mm = |x: f32| (x * 1000.0).round() as i64;
+        for m in crate::world::MapId::ALL {
+            for b in crate::world::World::build(m).blocks {
+                let (a, c) = (b.b.min, b.b.max);
+                bytes.extend_from_slice(format!("{} {} {} {} {} {} {:?};", mm(a.x), mm(a.y), mm(a.z), mm(c.x), mm(c.y), mm(c.z), b.mat).as_bytes());
+            }
+        }
+        bytes.extend_from_slice(format!("{:?}", Tuning::default()).as_bytes());
+        // FNV-1a
+        let mut hsh: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            hsh = (hsh ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+        let recorded: (u32, u64) = (11, 7365232207368127387);
+        assert_eq!((NET_PROTOCOL, hsh), recorded, "what both sides of a match must agree on changed: bump NET_PROTOCOL and PROTOCOL, then record the new value here");
     }
 
     /// A host and two players on this computer; the host leaves mid-match and the game goes on.
