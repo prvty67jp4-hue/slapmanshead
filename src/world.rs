@@ -73,6 +73,15 @@ impl MapId {
     }
 }
 
+/// What a surface is made of, for how shots and steps sound and what flies off them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surf {
+    Stone,
+    Wood,
+    Metal,
+    Water,
+}
+
 /// Set dressing: CC0 Quaternius models (see assets/CREDITS.txt). Props are looks only (nothing
 /// collides with them) and sit where nobody runs: tucked into corners, against walls, or high on
 /// them (the placement test checks this).
@@ -618,7 +627,21 @@ impl World {
         let l2 = 3.5;
         let l3 = 7.0;
         let mut v = Vec::new();
-        let (deco, banners) = walls(&mut v, h, wall_h, 7.6, 12.0);
+        let (mut deco, banners) = walls(&mut v, h, wall_h, 7.6, 12.0);
+        // the clock tower beyond the west wall: seen from every lane (its faces glow, see
+        // crate::zones::glows), a fire in its belfry
+        let (cx, cz) = crate::zones::CLOCK;
+        deco.push(bx(cx - 2.0, 0.0, cz - 2.0, cx + 2.0, 18.0, cz + 2.0, Mat::Stone));
+        deco.push(bx(cx - 2.3, 13.6, cz - 2.3, cx + 2.3, 14.0, cz + 2.3, Mat::Trim));
+        deco.push(bx(cx - 2.3, 18.0, cz - 2.3, cx + 2.3, 18.4, cz + 2.3, Mat::Trim));
+        for (x0, z0) in [(-2.0f32, -2.0f32), (1.4, -2.0), (-2.0, 1.4), (1.4, 1.4)] {
+            deco.push(bx(cx + x0, 18.4, cz + z0, cx + x0 + 0.6, 21.4, cz + z0 + 0.6, Mat::Stone));
+        }
+        deco.push(bx(cx - 2.3, 21.4, cz - 2.3, cx + 2.3, 21.8, cz + 2.3, Mat::Trim));
+        for (k, r) in [1.9f32, 1.4, 0.9, 0.45].iter().enumerate() {
+            let y = 21.8 + k as f32 * 0.9;
+            deco.push(bx(cx - r, y, cz - r, cx + r, y + 0.9, cz + r, Mat::Metal));
+        }
         // mirrored across the river (z -> -z): blue's half written, red's made from it
         let zm = |v: &mut Vec<Block>, b: Block| {
             v.push(b);
@@ -763,6 +786,11 @@ impl World {
             b.push(v3(x, y + 0.75, z));
         };
         fire(&mut v, &mut braziers, 0.0, 2.6, 0.0);
+        // the forges: fire on each workshop furnace, and the clock tower's belfry fire
+        for s in [1.0f32, -1.0] {
+            braziers.push(v3(21.25, 1.65, 12.0 * s));
+        }
+        braziers.push(v3(crate::zones::CLOCK.0, 18.9, crate::zones::CLOCK.1));
         for s in [1.0f32, -1.0] {
             fire(&mut v, &mut braziers, -9.75, l3, 6.1 * s);
             fire(&mut v, &mut braziers, 12.0, l2, 7.4 * s);
@@ -792,6 +820,10 @@ impl World {
         // banners on the front walls, facing out (team colours)
         for x in [-15.0f32, -7.0, 7.0, 15.0] {
             pm(&mut props, if x < 0.0 { BannerA } else { BannerB }, x, 3.2, 16.99, pi, 1.0, 1);
+        }
+        // team cloth inside each base: on the barracks and the flag room fronts, facing the yard
+        for x in [-24.0f32, -11.0, -1.5] {
+            pm(&mut props, if x < -5.0 { BannerB } else { BannerA }, x, 3.2, 21.99, pi, 1.0, 1);
         }
         // cargo, barrels and rubble along the walls
         pm(&mut props, CrateStack, -14.5, 0.0, 5.1, pi, 1.0, 255);
@@ -880,6 +912,80 @@ impl World {
             }
         }
         best
+    }
+
+    /// What a shot meets: the material of the nearest block a ray hits (and where, and its face's
+    /// normal), or the water's surface if that comes first.
+    pub fn surface_hit(&self, o: V3, d: V3, max_t: f32) -> Option<(f32, V3, Surf)> {
+        let mut best: Option<(f32, V3, Surf)> = None;
+        for bl in self.blocks.iter() {
+            if let Some((t, n)) = bl.b.ray(o, d, max_t) {
+                if t > 0.0 && best.map_or(true, |(bt, _, _)| t < bt) {
+                    // by how it looks there (marble pillars ring like stone, the bridges' iron sparks)
+                    let small_iron = bl.mat == Mat::Metal && bl.b.max.y - bl.b.min.y < 2.0;
+                    let layer = crate::zones::surface(self.map, bl.mat, o + d * t).layer;
+                    let s = if small_iron || layer == crate::env::L_IRON {
+                        Surf::Metal
+                    } else if layer == crate::env::L_WOOD {
+                        Surf::Wood
+                    } else {
+                        Surf::Stone
+                    };
+                    best = Some((t, n, s));
+                }
+            }
+        }
+        if let Some(t) = self.water_hit(o, d, best.map_or(max_t, |b| b.0)) {
+            return Some((t, v3(0.0, 1.0, 0.0), Surf::Water));
+        }
+        best
+    }
+
+    /// Where a ray from `o` along `d` meets the water's surface within `max_t`, if it does.
+    pub fn water_hit(&self, o: V3, d: V3, max_t: f32) -> Option<f32> {
+        for w in &self.water {
+            let y = w.max.y;
+            if d.y.abs() < 1e-4 || (o.y - y) * d.y >= 0.0 {
+                continue;
+            }
+            let t = (y - o.y) / d.y;
+            let p = o + d * t;
+            if t > 0.0 && t < max_t && p.x >= w.min.x && p.x <= w.max.x && p.z >= w.min.z && p.z <= w.max.z {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// Is `p` indoors (for how sound rings): a roof within 8 m overhead, or walls within 6 m on
+    /// at least five of eight sides.
+    pub fn enclosed(&self, p: V3) -> bool {
+        let o = p + v3(0.0, 0.3, 0.0);
+        if self.raycast(o, v3(0.0, 1.0, 0.0), 8.0).is_some() {
+            return true;
+        }
+        let walls = (0..8).filter(|k| {
+            let a = *k as f32 / 8.0 * std::f32::consts::TAU;
+            self.raycast(o, v3(a.cos(), 0.0, a.sin()), 6.0).is_some()
+        });
+        walls.count() >= 5
+    }
+
+    /// Is `p` in the water (under its surface, inside the river)?
+    pub fn in_water(&self, p: V3) -> bool {
+        self.water.iter().any(|w| p.x >= w.min.x && p.x <= w.max.x && p.z >= w.min.z && p.z <= w.max.z && p.y <= w.max.y + 0.05 && p.y >= w.min.y - 1.5)
+    }
+
+    /// The face a point on a block's surface lies on (its outward normal), found by stepping out
+    /// each way; straight up when it isn't on one.
+    pub fn face_normal(&self, p: V3) -> V3 {
+        let inside = |q: V3| self.blocks.iter().any(|b| b.mat != Mat::Hidden && b.b.contains(q));
+        for n in [v3(0.0, 1.0, 0.0), v3(1.0, 0.0, 0.0), v3(-1.0, 0.0, 0.0), v3(0.0, 0.0, 1.0), v3(0.0, 0.0, -1.0), v3(0.0, -1.0, 0.0)] {
+            if !inside(p + n * 0.04) && inside(p - n * 0.04) {
+                return n;
+            }
+        }
+        v3(0.0, 1.0, 0.0)
     }
 
     pub fn ground_below(&self, p: V3) -> f32 {

@@ -24,6 +24,9 @@ mod update;
 mod weapons;
 mod watchdog;
 mod world;
+mod zones;
+#[cfg(test)]
+mod tactics_tests;
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, Stroke, Vec2, ViewportCommand};
 use game::*;
@@ -151,7 +154,7 @@ enum Bind {
     Unbound,
 }
 
-const N_ACTIONS: usize = 21;
+const N_ACTIONS: usize = 25;
 const A_FWD: usize = 0;
 const A_BACK: usize = 1;
 const A_LEFT: usize = 2;
@@ -173,6 +176,10 @@ const A_MUSIC: usize = 17;
 const A_KICK: usize = 18;
 const A_FINISH: usize = 19;
 const A_ABILITY: usize = 20;
+const A_SNEAK: usize = 21;
+const A_UTILITY: usize = 22;
+const A_INSPECT: usize = 23;
+const A_PING: usize = 24;
 
 /// (saved id, what it does)
 const ACTIONS: [(&str, &str); N_ACTIONS] = [
@@ -197,6 +204,10 @@ const ACTIONS: [(&str, &str); N_ACTIONS] = [
     ("kick", "Kick"),
     ("finish", "Execution"),
     ("ability", "Ability"),
+    ("sneak", "Sneak (walk quietly, hold)"),
+    ("utility", "Utility (smoke / flash)"),
+    ("inspect", "Inspect weapon"),
+    ("ping", "Ping (tap: enemy, hold: wheel)"),
 ];
 
 fn default_binds() -> [Bind; N_ACTIONS] {
@@ -224,6 +235,10 @@ fn default_binds() -> [Bind; N_ACTIONS] {
         Key(egui::Key::F),
         Key(egui::Key::E),
         Key(egui::Key::Q),
+        Ctrl,
+        Key(egui::Key::X),
+        Key(egui::Key::V),
+        Key(egui::Key::Z),
     ]
 }
 
@@ -417,7 +432,11 @@ impl Settings {
                             "fov" => s.fov = v.parse().unwrap_or(s.fov),
                             "bot" => s.bot_level = v.parse().unwrap_or(s.bot_level).min(3),
                             "rounds" => s.rounds = v.parse().unwrap_or(s.rounds).clamp(1, 50),
-                            "mode" => s.mode = v.parse().unwrap_or(0u8).min(5),
+                            "mode" => s.mode = match v.trim().parse().unwrap_or(0u8) {
+                                // (Gauntlet is started from Practice, never saved as the mode)
+                                m @ (0..=5 | 7) => m,
+                                _ => 0,
+                            },
                             "map" => s.map = v.parse().unwrap_or(0u8).min(2),
                             "fill_bots" => s.fill_bots = v.parse().unwrap_or(0usize).min(8),
                             "gauntlet_best" => s.gauntlet_best = v.parse().unwrap_or(0u32),
@@ -660,6 +679,8 @@ struct Latch {
     kick: bool,
     finish: bool,
     ability: bool,
+    utility: bool,
+    inspect: bool,
     select: Option<u8>,
 }
 
@@ -735,6 +756,12 @@ struct App {
     quick: Option<f32>,
     /// A Quick Play lobby: keep it filled with bots.
     quick_host: bool,
+    /// The ping key: how long it has been held, and the wheel while it's open (where the view
+    /// was when it opened, and the cursor moved since).
+    ping_hold: f32,
+    ping_wheel: Option<(f32, f32, f32, f32)>,
+    /// The minimap's picture of the map, made once per map and screen place.
+    minimap_cache: std::cell::RefCell<Option<((MapId, usize, u32, u32, u32), std::sync::Arc<egui::Mesh>)>>,
     /// Where an execution preview goes back to when it ends.
     preview_back: Option<Page>,
     /// An execution's camera: which shot (execution, shot, victim's view) and the angle chosen for it.
@@ -893,6 +920,9 @@ impl App {
             quick: None,
             quick_host: false,
             preview_back: None,
+            ping_hold: 0.0,
+            ping_wheel: None,
+            minimap_cache: Default::default(),
             exec_cam: std::cell::Cell::new(((0, 0, false), 0)),
             news: load_news(),
             show_spot: (V3::ZERO, 0.0),
@@ -1621,7 +1651,7 @@ impl App {
                 .selected_text(self.browse.mode.map_or("Any".to_string(), |m| Mode::from_u8(m).name().to_string()))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.browse.mode, None, "Any");
-                    for m in 0..6u8 {
+                    for m in Mode::ALL.iter().map(|m| *m as u8) {
                         ui.selectable_value(&mut self.browse.mode, Some(m), Mode::from_u8(m).name());
                     }
                 });
@@ -3047,6 +3077,12 @@ impl App {
             if b[A_ABILITY].tapped(i, prev) {
                 self.latch.ability = true;
             }
+            if b[A_UTILITY].tapped(i, prev) {
+                self.latch.utility = true;
+            }
+            if b[A_INSPECT].tapped(i, prev) {
+                self.latch.inspect = true;
+            }
             if b[A_ITEM].tapped(i, prev) {
                 self.latch.item = true;
             }
@@ -3168,6 +3204,46 @@ impl App {
     }
 
 
+    /// The ping key: a tap marks an enemy where you aim; held, a wheel opens (the view stays put
+    /// and the mouse picks a call) and letting go marks that call there. Teammates see it.
+    fn ping_frame(&mut self, dt: f32, held: bool) {
+        let Screen::Play { game, .. } = &mut self.screen else {
+            self.ping_hold = 0.0;
+            self.ping_wheel = None;
+            return;
+        };
+        let l = game.local;
+        let mut fire: Option<u8> = None;
+        if held && self.captured && !self.chat_open && game.f[l].alive {
+            self.ping_hold += dt;
+            if self.ping_hold > 0.18 && self.ping_wheel.is_none() {
+                self.ping_wheel = Some((self.aim_yaw, self.aim_pitch, 0.0, 0.0));
+            }
+            if let Some((oy, op, cx, cy)) = self.ping_wheel.as_mut() {
+                *cx = (*cx + wrap_angle(self.aim_yaw - *oy)).clamp(-0.3, 0.3);
+                *cy = (*cy + (self.aim_pitch - *op)).clamp(-0.3, 0.3);
+                // the view stays where it was while picking
+                self.aim_yaw = *oy;
+                self.aim_pitch = *op;
+            }
+        } else if self.ping_hold > 0.0 {
+            fire = match self.ping_wheel.take() {
+                Some((_, _, cx, cy)) => ping_sector(cx, cy),
+                None => Some(0),
+            };
+            self.ping_hold = 0.0;
+        }
+        if let Some(kind) = fire {
+            let f = &game.f[l];
+            let eye = f.eye();
+            let dir = look_dir(self.aim_yaw, self.aim_pitch);
+            let at = match game.world.surface_hit(eye, dir, 80.0) {
+                Some((t, n, _)) => eye + dir * t + n * 0.1,
+                None => eye + dir * 30.0,
+            };
+            game.ping(kind, at);
+        }
+    }
     fn current_input(&self, ctx_keys: &KeysHeld) -> Input {
         let mut inp = Input { yaw: self.aim_yaw, pitch: self.aim_pitch, ..Default::default() };
         if !self.captured {
@@ -3186,6 +3262,9 @@ impl App {
         inp.kick = self.latch.kick;
         inp.finish = self.latch.finish;
         inp.ability = self.latch.ability;
+        inp.utility = self.latch.utility;
+        inp.inspect = self.latch.inspect;
+        inp.sneak = ctx_keys.sneak;
         inp.item = self.latch.item;
         inp.select = self.latch.select;
         inp
@@ -3199,6 +3278,7 @@ impl App {
             }
         }
         let keys = self.keys_snapshot();
+        self.ping_frame(dt, keys.ping);
         let mut inp = self.current_input(&keys);
         if self.chat_open {
             inp = Input { yaw: self.aim_yaw, pitch: self.aim_pitch, ..Default::default() };
@@ -3240,6 +3320,8 @@ impl App {
         let Screen::Play { game, net } = &mut self.screen else { return };
         if let Some(n) = net.as_mut() {
             n.sim = sim;
+            // (for checking players' hits at the exact moment they saw)
+            game.net_clock = n.clock();
         }
         if let Some(m) = map_vote_req.filter(|_| game.mt.phase == Phase::MatchOver) {
             game.vote_map(m);
@@ -3771,6 +3853,8 @@ struct KeysHeld {
     fire: bool,
     guard: bool,
     crouch: bool,
+    sneak: bool,
+    ping: bool,
 }
 
 thread_local! {
@@ -3779,6 +3863,27 @@ thread_local! {
     static KEYS: std::cell::RefCell<KeysHeld> = std::cell::RefCell::new(KeysHeld::default());
 }
 
+/// A ping's colour by its call.
+fn ping_color(kind: u8) -> Color32 {
+    match kind {
+        0 => Color32::from_rgb(255, 70, 60),
+        1 => Color32::from_rgb(110, 200, 255),
+        2 => Color32::from_rgb(255, 230, 120),
+        3 => Color32::from_rgb(120, 230, 150),
+        4 => Color32::from_rgb(255, 150, 60),
+        _ => Color32::from_rgb(200, 160, 255),
+    }
+}
+/// Which call of the ping wheel the cursor points at (`cx` right, `cy` up, radians of mouse
+/// travel): six slices round the clock, the first at twelve; None in the middle (cancelled).
+fn ping_sector(cx: f32, cy: f32) -> Option<u8> {
+    if (cx * cx + cy * cy).sqrt() < 0.05 {
+        return None;
+    }
+    let a = cx.atan2(cy).rem_euclid(std::f32::consts::TAU);
+    let n = game::PINGS.len() as f32;
+    Some(((a / std::f32::consts::TAU * n + 0.5).floor() as usize % game::PINGS.len()) as u8)
+}
 fn sample_keys(ctx: &egui::Context, b: &[Bind; N_ACTIONS]) {
     let k = ctx.input(|i| KeysHeld {
         w: b[A_FWD].down(i) || i.key_down(Key::ArrowUp),
@@ -3788,6 +3893,8 @@ fn sample_keys(ctx: &egui::Context, b: &[Bind; N_ACTIONS]) {
         fire: b[A_FIRE].down(i),
         guard: b[A_GUARD].down(i),
         crouch: b[A_SLIDE].down(i),
+        sneak: b[A_SNEAK].down(i),
+        ping: b[A_PING].down(i),
     });
     KEYS.with(|c| *c.borrow_mut() = k);
 }
@@ -4792,6 +4899,123 @@ impl App {
             }
         }
     }
+    /// Tactics on screen: a flash's white-out, the grey inside a smoke, the team's pings in the
+    /// world, the minimap (top left: the map from above in its areas' colours, you, your team,
+    /// pings and flags) with the callout of where you stand, and the ping wheel while it's open.
+    fn draw_tactics(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game, s: f32) {
+        let me = &g.f[g.local];
+        let c = rect.center();
+        // inside a smoke cloud: everything greys out
+        let inside = g.smokes.iter().map(|sm| {
+            let d = (cam.pos - (sm.pos + v3(0.0, 1.2, 0.0))).len();
+            let r = game::SMOKE_R * (0.6 + 0.4 * sm.density());
+            sm.density() * (1.0 - (d / r).clamp(0.0, 1.0)).sqrt()
+        });
+        let fog = inside.fold(0.0f32, f32::max);
+        if fog > 0.02 {
+            p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(150, 152, 158, (235.0 * fog.min(1.0)) as u8));
+        }
+        // pings in the world: a diamond, the call and the place, and how far
+        for pg in &g.pings {
+            let Some(sp) = cam.project(pg.pos) else { continue };
+            let fade = (1.0 - (pg.t - game::PING_LIFE + 1.0).max(0.0)).clamp(0.0, 1.0);
+            let col = ping_color(pg.kind).gamma_multiply(fade);
+            let d = 9.0 * s * (1.0 + 0.15 * (g.time * 6.0).sin());
+            let pts = vec![sp + Vec2::new(0.0, -d), sp + Vec2::new(d, 0.0), sp + Vec2::new(0.0, d), sp + Vec2::new(-d, 0.0)];
+            p.add(egui::Shape::convex_polygon(pts, col.gamma_multiply(0.5), Stroke::new(2.0 * s, col)));
+            let dist = (pg.pos - me.pos).len();
+            let place = zones::callout(g.world.map, pg.pos + v3(0.0, 0.3, 0.0));
+            text_shadow(p, sp + Vec2::new(0.0, -d - 4.0 * s), Align2::CENTER_BOTTOM, &format!("{} · {place}", game::PINGS[pg.kind as usize % game::PINGS.len()]), 13.0 * s, col);
+            text_shadow(p, sp + Vec2::new(0.0, d + 3.0 * s), Align2::CENTER_TOP, &format!("{dist:.0} m  {}", g.f[pg.owner.min(g.f.len() - 1)].name), 11.0 * s, Color32::from_gray(210).gamma_multiply(fade));
+        }
+        // the minimap (not in training or an execution preview)
+        if g.train.is_none() && g.preview.is_none() && me.present && !me.spectate {
+            let size = 176.0 * s;
+            let r = Rect::from_min_size(Pos2::new(rect.left() + 14.0 * s, rect.top() + 14.0 * s), Vec2::splat(size));
+            p.rect_filled(r.expand(3.0 * s), 6.0 * s, Color32::from_rgba_unmultiplied(10, 10, 16, 200));
+            let h = g.world.half;
+            let k = size / (2.0 * h);
+            // north (+z) is up
+            let at = |x: f32, z: f32| Pos2::new(r.left() + (x + h) * k, r.top() + (h - z) * k);
+            let map = g.world.map;
+            // the map itself never changes during a match: its picture is made once (per map and
+            // screen place) and reused every frame
+            let key = (map, g.world.blocks.len(), r.min.x.to_bits(), r.min.y.to_bits(), size.to_bits());
+            let mut cache = self.minimap_cache.borrow_mut();
+            if cache.as_ref().map_or(true, |(k, _)| *k != key) {
+                let mut mesh = egui::Mesh::default();
+                let mut blocks: Vec<&world::Block> = g.world.blocks.iter().filter(|b| b.mat != world::Mat::Hidden && b.b.max.y > -3.5).collect();
+                blocks.sort_by(|a, b| a.b.max.y.total_cmp(&b.b.max.y));
+                for b in blocks {
+                    let mid = (b.b.min + b.b.max) * 0.5;
+                    let tint = zones::surface(map, b.mat, v3(mid.x, b.b.max.y, mid.z)).tint;
+                    // higher is lighter: the levels read at a glance
+                    let lift = (b.b.max.y.clamp(-3.0, 8.0) + 3.0) / 11.0;
+                    let shade = 0.55 + 0.6 * lift;
+                    let col = Color32::from_rgb((tint[0] as f32 * shade).min(255.0) as u8, (tint[1] as f32 * shade).min(255.0) as u8, (tint[2] as f32 * shade).min(255.0) as u8);
+                    mesh.add_colored_rect(Rect::from_two_pos(at(b.b.min.x.max(-h), b.b.min.z.max(-h)), at(b.b.max.x.min(h), b.b.max.z.min(h))), col);
+                }
+                for w in &g.world.water {
+                    mesh.add_colored_rect(Rect::from_two_pos(at(w.min.x, w.min.z), at(w.max.x, w.max.z)), Color32::from_rgba_unmultiplied(40, 110, 130, 210));
+                }
+                *cache = Some((key, std::sync::Arc::new(mesh)));
+            }
+            if let Some((_, mesh)) = cache.as_ref() {
+                p.add(egui::Shape::mesh(mesh.clone()));
+            }
+            drop(cache);
+            if g.mt.mode == Mode::Ctf {
+                for t in 0..2 {
+                    let fp = g.mt.flags[t].pos;
+                    p.circle_filled(at(fp.x, fp.z), 4.0 * s, if t == 0 { Color32::from_rgb(230, 60, 50) } else { Color32::from_rgb(70, 120, 240) });
+                }
+            }
+            for pg in &g.pings {
+                p.circle_stroke(at(pg.pos.x, pg.pos.z), 4.5 * s, Stroke::new(2.0 * s, ping_color(pg.kind)));
+            }
+            // your team (in team modes), then you as an arrow
+            if g.mt.mode.teams() {
+                for f in g.f.iter().filter(|f| f.present && f.alive && f.slot != g.local && f.team == me.team) {
+                    p.circle_filled(at(f.pos.x, f.pos.z), 3.5 * s, player_color(f.color_idx));
+                }
+            }
+            if me.alive {
+                let ap = at(me.pos.x, me.pos.z);
+                let fw = Vec2::new(me.yaw.sin(), -me.yaw.cos());
+                let sd = Vec2::new(fw.y, -fw.x);
+                let pts = vec![ap + fw * 7.0 * s, ap - fw * 4.0 * s + sd * 4.5 * s, ap - fw * 4.0 * s - sd * 4.5 * s];
+                p.add(egui::Shape::convex_polygon(pts, ACCENT, Stroke::new(1.0, Color32::BLACK)));
+            }
+            p.rect_stroke(r.expand(3.0 * s), 6.0 * s, Stroke::new(1.0, Color32::from_white_alpha(50)), egui::StrokeKind::Inside);
+            // where you are, by its callout
+            let place = zones::callout(map, me.pos + v3(0.0, 0.3, 0.0));
+            text_display(p, Pos2::new(r.left(), r.bottom() + 8.0 * s), Align2::LEFT_TOP, &place.to_uppercase(), 15.0 * s, Color32::from_rgb(245, 235, 220));
+        }
+        // the ping wheel: six calls round the middle, the one pointed at lit up
+        if let Some((_, _, cx, cy)) = self.ping_wheel {
+            let pick = ping_sector(cx, cy);
+            let rad = 120.0 * s;
+            p.circle_filled(c, rad + 40.0 * s, Color32::from_rgba_unmultiplied(10, 10, 16, 150));
+            for (k, name) in game::PINGS.iter().enumerate() {
+                let a = k as f32 / game::PINGS.len() as f32 * std::f32::consts::TAU;
+                let at = c + Vec2::new(a.sin(), -a.cos()) * rad;
+                let on = pick == Some(k as u8);
+                let col = if on { ping_color(k as u8) } else { Color32::from_gray(200) };
+                if on {
+                    p.circle_filled(at, 34.0 * s, ping_color(k as u8).gamma_multiply(0.25));
+                }
+                text_display(p, at, Align2::CENTER_CENTER, &name.to_uppercase(), if on { 17.0 * s } else { 14.0 * s }, col);
+            }
+            let cur = c + Vec2::new(cx, -cy) * (rad / 0.3);
+            p.line_segment([c, cur], Stroke::new(2.0 * s, Color32::from_white_alpha(120)));
+            p.circle_filled(cur, 4.0 * s, Color32::WHITE);
+        }
+        // a flash: the screen whites out, fading as it wears off
+        if me.blind_t > 0.0 {
+            let a = (me.blind_t / 1.2).clamp(0.0, 1.0);
+            p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 255, 250, (245.0 * a) as u8));
+        }
+    }
     fn draw_hud(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game) {
         if test_view().is_some() {
             return; // a clean picture of the map
@@ -4887,6 +5111,9 @@ impl App {
             let a = ((g.time * 4.0).sin().abs() * 50.0) as u8;
             p.rect_stroke(rect.shrink(4.0), 0.0, Stroke::new(8.0 * s, Color32::from_rgba_unmultiplied(220, 0, 0, a)), egui::StrokeKind::Inside);
         }
+
+        // flashes, smoke, pings, the minimap and the ping wheel
+        self.draw_tactics(p, rect, cam, g, s);
 
         // name tags over everyone you can see
         for other in g.f.iter().filter(|o| o.present && !o.spectate && o.slot != g.local && o.invis_t <= 0.0) {
@@ -5135,9 +5362,17 @@ impl App {
             // hit confirm: a small X on the crosshair, thicker for headshots, red for a kill
             if g.hitmarker > 0.0 {
                 let a = ((g.hitmarker / 0.18).min(1.0) * 255.0) as u8;
-                let head = g.hit_head;
-                let kill = g.kill_t > 1.2;
-                let hc = if kill { Color32::from_rgba_unmultiplied(255, 50, 40, a) } else { Color32::from_rgba_unmultiplied(255, 255, 255, a) };
+                // three clear kinds: a body hit (thin white), a headshot (thick gold, a diamond
+                // round it), a kill (thick red, a ring round it)
+                let head = g.hit_kind == 1 || (g.hit_head && g.hit_kind != 2);
+                let kill = g.hit_kind == 2 || g.kill_t > 1.2;
+                let hc = if kill {
+                    Color32::from_rgba_unmultiplied(255, 50, 40, a)
+                } else if head {
+                    Color32::from_rgba_unmultiplied(255, 205, 60, a)
+                } else {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, a)
+                };
                 let pop = 1.0 + ((g.hitmarker - 0.2) / 0.15).clamp(0.0, 1.0) * 0.25;
                 let r0 = (gap * 0.72 + 4.0 * s).max(5.0 * s) * pop;
                 let r1 = r0 + 6.0 * s * if head || kill { 1.25 } else { 1.0 };
@@ -5146,6 +5381,15 @@ impl App {
                     let dir = Vec2::new(dx, dy) * std::f32::consts::FRAC_1_SQRT_2;
                     p.line_segment([c + dir * (r0 - 1.0), c + dir * (r1 + 1.0)], Stroke::new(th + 2.0, Color32::from_black_alpha((a as f32 * 0.6) as u8)));
                     p.line_segment([c + dir * r0, c + dir * r1], Stroke::new(th, hc));
+                }
+                if kill {
+                    p.circle_stroke(c, r1 + 5.0 * s, Stroke::new(2.0 * s, hc));
+                } else if head {
+                    let d = r1 + 4.0 * s;
+                    let pts = [c + Vec2::new(0.0, -d), c + Vec2::new(d, 0.0), c + Vec2::new(0.0, d), c + Vec2::new(-d, 0.0), c + Vec2::new(0.0, -d)];
+                    for w in pts.windows(2) {
+                        p.line_segment([w[0], w[1]], Stroke::new(1.5 * s, hc));
+                    }
                 }
             }
             if g.headshot_t > 0.0 {
@@ -5510,6 +5754,36 @@ impl App {
                 text_display(p, c + Vec2::new(0.0, 60.0 * s), Align2::CENTER_CENTER, "UNSEEN", 20.0 * s, Color32::from_rgb(190, 180, 230));
             }
         }
+        // ---- the utility (a smoke or a flash): its name, throws left and key, left of the ability
+        if g.train.is_none() {
+            let sz = 50.0 * s;
+            let x = right.left() - 10.0 * s - if g.abilities_on() { 64.0 * s + 12.0 * s } else { 0.0 } - sz;
+            let r = Rect::from_min_size(Pos2::new(x, right.bottom() - sz), Vec2::splat(sz));
+            let ready = me.util > 0;
+            p.rect_filled(r, 7.0 * s, hud_fill);
+            p.rect_stroke(r, 7.0 * s, Stroke::new(1.0, Color32::from_white_alpha(if ready { 90 } else { 30 })), egui::StrokeKind::Inside);
+            let smoke = game::Utility::of(me.loadout.body) == game::Utility::Smoke;
+            let col = if ready { Color32::WHITE } else { Color32::from_gray(110) };
+            if smoke {
+                for (dx, dy, rr) in [(-7.0f32, 3.0f32, 8.0f32), (6.0, 2.0, 9.0), (0.0, -6.0, 9.5)] {
+                    p.circle_filled(r.center() + Vec2::new(dx, dy) * s, rr * s, col.gamma_multiply(0.75));
+                }
+            } else {
+                for k in 0..8 {
+                    let a = k as f32 / 8.0 * std::f32::consts::TAU;
+                    let d = Vec2::new(a.cos(), a.sin());
+                    p.line_segment([r.center() + d * 6.0 * s, r.center() + d * 15.0 * s], Stroke::new(2.0 * s, col));
+                }
+                p.circle_filled(r.center(), 5.0 * s, col);
+            }
+            for k in 0..game::UTIL_PER_ROUND as usize {
+                let at = Pos2::new(r.center().x + (k as f32 - (game::UTIL_PER_ROUND as f32 - 1.0) * 0.5) * 10.0 * s, r.bottom() - 6.0 * s);
+                p.circle_filled(at, 3.0 * s, if (k as u8) < me.util { ACCENT } else { Color32::from_white_alpha(50) });
+            }
+            let key = self.settings.binds[A_UTILITY].name();
+            ui_kit::keycap(p, Pos2::new(r.left() + 10.0 * s, r.top() + 1.0 * s), &key, s * 0.8);
+            text_display(p, Pos2::new(r.center().x, r.top() - 6.0 * s), Align2::CENTER_BOTTOM, &game::Utility::name(me.loadout.body).to_uppercase(), 11.5 * s, if ready { Color32::from_gray(220) } else { Color32::from_gray(140) });
+        }
 
         // ---- chat, above the health panel, wrapped to its own column
         let chat_w = (rect.width() * 0.42).max(pw);
@@ -5688,14 +5962,15 @@ impl App {
                 let a = (r.t / 0.4).min(1.0);
                 let w = 380.0 * s;
                 let top = rect.top() + rect.height() * 0.66;
-                let box_r = Rect::from_min_size(Pos2::new(c.x - w * 0.5, top), Vec2::new(w, 86.0 * s));
+                let box_r = Rect::from_min_size(Pos2::new(c.x - w * 0.5, top), Vec2::new(w, 110.0 * s));
                 p.rect_filled(box_r, 6.0 * s, Color32::from_rgba_unmultiplied(14, 12, 22, (215.0 * a) as u8));
                 p.rect_filled(Rect::from_min_size(box_r.min, Vec2::new(4.0 * s, box_r.height())), 2.0, Color32::from_rgba_unmultiplied(230, 70, 60, (255.0 * a) as u8));
                 let st = &r.stats;
                 let head = if r.head { "  (headshot)" } else { "" };
                 let lines = [
                     (format!("Killed by {} - {}{head}", r.killer, r.weapon), 16.0, Color32::from_rgb(255, 210, 200)),
-                    (format!("Damage dealt {:.0}   taken {:.0}", st.dealt, st.taken), 13.5, Color32::from_gray(220)),
+                    (format!("You dealt {} {:.0}   {} dealt you {:.0}", r.killer, r.dealt, r.killer, r.taken), 13.5, Color32::from_rgb(255, 225, 190)),
+                    (format!("This life: damage dealt {:.0}   taken {:.0}", st.dealt, st.taken), 13.5, Color32::from_gray(220)),
                     (format!("Accuracy {:.0}%  ({} of {} shots)   headshots {:.0}%", st.accuracy() * 100.0, st.hits, st.shots, st.headshot_rate() * 100.0), 13.5, Color32::from_gray(220)),
                 ];
                 let mut y = top + 10.0 * s;
@@ -6035,6 +6310,7 @@ impl App {
                                 }
                             }
                         });
+                        ui.label(egui::RichText::new(format!("Utility: {} - {}", game::Utility::name(b), game::Utility::blurb(b))).size(12.5).color(Color32::from_gray(205)));
                         // the fighter's executions: name, when it unlocks, and a preview
                         ui.label(egui::RichText::new("Executions").size(13.0).color(Color32::from_rgb(235, 220, 200)));
                         for k in exec::of_fighter(b) {
@@ -6265,6 +6541,10 @@ impl App {
                             ("1  2  3 / wheel", "melee, gun 1, gun 2 (pick them on the loadout screen)"),
                             ("R", "reload"),
                             ("G", "use your item (medkit, armor kit or grenade; 2 per life)"),
+                            ("X", "your utility: Corvin and Bram a smoke, Sable and Ilya a flash (2 a round or life)"),
+                            ("Ctrl (hold)", "sneak: walk quietly, no footsteps"),
+                            ("V", "inspect your weapon"),
+                            ("Z", "ping: tap to mark an enemy, hold for the wheel (team modes)"),
                             ("Enter / T", "chat"),
                             ("Tab", "player list and scores"),
                             ("F5", "(host) start the match from the warm-up"),

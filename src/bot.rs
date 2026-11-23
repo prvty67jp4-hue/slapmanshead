@@ -227,7 +227,8 @@ impl Bot {
         }
 
         let dist = (en.pos - me.pos).len();
-        let visible = en.alive && g.world.line_clear(eye, en.chest());
+        // (smoke hides them; a flash leaves the bot seeing nothing for a moment)
+        let visible = en.alive && g.world.line_clear(eye, en.chest()) && !g.smoke_blocks(eye, en.chest()) && g.f[i].blind_t < 0.4;
 
         // the ability, when it fits the moment (thought over every couple of seconds)
         self.ab_wait -= dt;

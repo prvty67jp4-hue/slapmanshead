@@ -1,0 +1,22 @@
+=== Duel Rush performance run, v0.2.0 dev build (261123.2108) ===
+graphics: NVIDIA GeForce RTX 3060 (Vulkan, driver NVIDIA 617.42)
+system: Windows (windows)
+window: 1280x800 pixels; 3D picture drawn at 1152x720 (0.83 million pixels; 1920x1080 is 2.07)
+quality Steam Deck, vsync off, no frame limit, no dynamic resolution
+match: Tdm on Bridgeworks, 8 fighters
+counted: 17843 frames over 40 s (after 5 s to settle)
+average: 446 fps (2.24 ms a frame)
+1% low: 265 fps  (99th percentile frame 3.77 ms)
+0.1% low: 237 fps  (99.9th percentile frame 4.22 ms), slowest frame 5.0 ms
+median frame: 2.13 ms  (95th percentile 3.32 ms)
+game logic: 0.05 ms average, 0.24 ms 99th percentile
+3D drawing (processor side): 1.36 ms average, 2.52 ms 99th percentile
+frames slower than 144 fps (6.94 ms): 0.00%   slower than 60 fps (16.7 ms): 0.00%
+
+memory (every 10 s): time, MB committed / MB in RAM, then each game list's size
+     0 s    933.2 /   319.8 MB  position history 1152, pose history 1152
+    10 s    814.0 /   324.8 MB  particles 29, casings 10, decoys 1, replay frames 181, replay items 8818, position history 1160, pose history 1160
+    20 s    821.0 /   332.0 MB  particles 49, tracers 1, casings 5, feed 3, replay frames 181, replay items 14265, play of the match items 11947, position history 1160, pose history 897
+    30 s    834.7 /   345.5 MB  particles 93, casings 5, feed 2, marks 1, hurt arcs 1, replay frames 181, replay items 15564, play of the match items 11947, position history 1160, pose history 1135
+    40 s    834.7 /   345.9 MB  particles 38, casings 5, feed 2, decoys 1, replay frames 180, replay items 10033, play of the match items 11947, position history 1152, pose history 1076
+memory from 0 s to 40 s: committed 933.2 -> 834.7 MB (-147.74 MB a minute), in RAM 319.8 -> 345.9 MB (+39.15 MB a minute)

@@ -586,7 +586,8 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     let dashing = f.dash_t > 0.0;
     let melee = f.weapon.is_melee();
     // the hero pose: standing still with a blade, in the menu or on the loadout screen
-    let hero = hero && show && melee && f.alive && f.on_ground && f.stun_t <= 0.0 && speed < 0.6 && f.slash_t <= 0.0 && f.fin == 0 && !f.guard;
+    // (looking a blade over is its hero pose)
+    let hero = (hero || f.inspect_t > 0.0) && show && melee && f.alive && f.on_ground && f.stun_t <= 0.0 && speed < 0.6 && f.slash_t <= 0.0 && f.fin == 0 && !f.guard;
     let mut target_yaw = 0.0;
     let want: Play = if !f.alive {
         Play::new("Death01", 1.0, false)
@@ -874,7 +875,14 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
             // (in the picture the gun sits up in the fist, so the front hand follows it)
             let hl = if show { hl.map(|h| h - down * GUN_GRIP_UP + aim * 0.07) } else { hl };
             let reload = f.reload_t > 0.0;
-            let hr = if reload { hr + down * 0.15 - aim * 0.05 } else { hr };
+            // handling (crate::character::gun_handling): drawn up on equip, each weapon's own
+            // reload, and the inspect that turns the gun to show it off
+            let hand = gun_handling(f, aim, side, chest);
+            let hr = hr + hand.right;
+            let hl = match (hl, hand.left) {
+                (_, Some(l)) => Some(l),
+                (h, None) => h,
+            };
             // the throw: the hand starts tucked in across the chest and whips out forward and
             // to the side (the fan sweeps wider and flatter), elbow leading
             let (hr, pole_r) = match phases {
@@ -894,10 +902,10 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
             };
             rig.two_bone_ik(&mut pose, b.up_r, b.lo_r, b.hand_r, to_model(hr), to_model(pole_r));
             if let Some(hl) = hl {
-                let hl = if reload { hr + Vec3::new(-0.12, 0.05, 0.0) } else { hl };
                 rig.two_bone_ik(&mut pose, b.up_l, b.lo_l, b.hand_l, to_model(hl), to_model(pole_l));
             }
-            weapon_dir = Some(if reload { (aim + down * 0.7).normalize() } else { aim });
+            let _ = reload;
+            weapon_dir = Some(hand.dir.unwrap_or(aim));
         }
     }
 
@@ -1452,6 +1460,83 @@ mod melee_clip_tests {
             assert!(moved, "{name}: the picture plays the clip");
         }
     }
+}
+/// How a gun is being handled (our space, the picture and the hit shapes alike): where the gun
+/// hand moves from its hold, where the other hand goes (None: as held), and the way the gun points
+/// (None: where you aim).
+pub struct Handling {
+    pub right: Vec3,
+    pub left: Option<Vec3>,
+    pub dir: Option<Vec3>,
+}
+
+/// Each gun's handling: drawn up from low on equip; its own reload (a magazine swapped out of the
+/// grip or the belly, the revolver's cylinder swung out and the gun tipped up, the scattergun fed
+/// shell by shell, the rocket's tube lowered and loaded from behind); and the inspect, which
+/// brings the gun in and turns it to show one side, then the other.
+pub fn gun_handling(f: &Fighter, aim: Vec3, side: Vec3, chest: Vec3) -> Handling {
+    let down = Vec3::NEG_Y;
+    let s01 = |x: f32| {
+        let x = x.clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    };
+    let bump = |p: f32, a: f32, b: f32| s01((p - a) / 0.12) * (1.0 - s01((p - b) / 0.12));
+    let mut h = Handling { right: Vec3::ZERO, left: None, dir: None };
+    // equip: from low and turned in, up to the hold
+    if f.switch_t > 0.0 {
+        let k = s01(f.switch_t / 0.22);
+        h.right += down * (0.32 * k) - aim * (0.1 * k);
+        h.dir = Some((aim + down * (1.3 * k) - side * (0.4 * k)).normalize());
+    }
+    if f.reload_t > 0.0 {
+        let total = if f.weapon == Weapon::Shotgun { crate::game::SHELL_TIME } else { f.weapon.reload_time() }.max(0.05);
+        let p = (1.0 - f.reload_t / total).clamp(0.0, 1.0);
+        let belt = chest + down * 0.42 - side * 0.12 + aim * 0.05;
+        match f.weapon {
+            Weapon::Revolver => {
+                // the cylinder swung out, the gun tipped up for the empties, the speed-loader in
+                h.right += down * 0.05 - aim * 0.12 + side * 0.04;
+                h.dir = Some((aim * 0.35 + Vec3::Y * (0.6 + 0.4 * bump(p, 0.0, 0.4)) - side * 0.3).normalize());
+                let at_gun = chest + aim * 0.32 + side * 0.02;
+                h.left = Some(belt.lerp(at_gun, s01((p - 0.35) / 0.3)));
+            }
+            Weapon::Shotgun => {
+                // a shell from the belt into the port, again for each one
+                h.right += down * 0.08 + side * 0.03;
+                h.dir = Some((aim + down * 0.25 + side * 0.25).normalize());
+                let port = chest + aim * 0.3 + down * 0.12;
+                h.left = Some(belt.lerp(port, (p * std::f32::consts::PI).sin()));
+            }
+            Weapon::Rocket => {
+                // lowered, loaded from behind
+                h.right += down * 0.25;
+                h.dir = Some((aim + down * 0.6).normalize());
+                h.left = Some(chest - aim * 0.25 + down * 0.15 + side * 0.08);
+            }
+            Weapon::Shuriken => {}
+            _ => {
+                // a magazine: out (the gun tilted to the side), a fresh one from the belt, in,
+                // and a slap home
+                let tilt = bump(p, 0.0, 0.8);
+                h.right += down * (0.1 * tilt) - aim * (0.06 * tilt);
+                h.dir = Some((aim + side * (0.55 * tilt) + down * (0.2 * tilt)).normalize());
+                let well = chest + aim * 0.22 + down * 0.16;
+                let left = if p < 0.45 { well.lerp(belt, s01(p / 0.4)) } else { belt.lerp(well, s01((p - 0.45) / 0.3)) };
+                h.left = Some(left + Vec3::Y * (0.05 * bump(p, 0.78, 0.9)));
+            }
+        }
+    } else if f.inspect_t > 0.0 {
+        let p = 1.0 - f.inspect_t / crate::game::INSPECT_TIME;
+        let k = bump(p, 0.0, 0.9);
+        // in close, turned to show its side, then the other side, then back
+        let turn = 1.1 * s01(p / 0.3) - 2.0 * s01((p - 0.45) / 0.25) + 0.9 * s01((p - 0.8) / 0.15);
+        let (c, s) = (turn.cos(), turn.sin());
+        let dir = (aim * c + side * s).normalize();
+        h.right += (chest + aim * 0.15 - (chest + aim * 0.35)) * k + Vec3::Y * (0.08 * k);
+        h.dir = Some(aim.lerp((dir + Vec3::Y * 0.25).normalize(), k).normalize());
+        h.left = Some(chest + aim * 0.2 - side * 0.12 + down * (0.1 - 0.05 * k));
+    }
+    h
 }
 fn yaw_fwd_of(yaw: f32) -> V3 {
     v3(yaw.sin(), 0.0, yaw.cos())

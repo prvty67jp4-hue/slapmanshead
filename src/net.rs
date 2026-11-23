@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 const MAGIC: [u8; 4] = *b"DRB2";
 /// The protocol version as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA10";
+pub const PROTOCOL: &str = "DRA11";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
@@ -225,7 +225,7 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.u8(*wp);
             w.u8(*spark);
         }
-        Ev::Hit { victim, dmg, knock, stun, head, w: wp, o, dir, guard } => {
+        Ev::Hit { victim, dmg, knock, stun, head, w: wp, o, dir, guard, vt } => {
             w.u8(2);
             w.u8(*victim);
             w.f(*dmg);
@@ -236,6 +236,7 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.v(*o);
             w.v(*dir);
             w.f(*guard);
+            w.f(*vt);
         }
         Ev::Deflect { by, dmg } => {
             w.u8(9);
@@ -292,6 +293,12 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.u8(*target);
             w.u8(*open);
         }
+        Ev::Ping { who, kind, p } => {
+            w.u8(15);
+            w.u8(*who);
+            w.u8(*kind);
+            w.v(*p);
+        }
         Ev::Exec { who, target, kind } => {
             w.u8(14);
             w.u8(*who);
@@ -304,8 +311,8 @@ fn write_ev(w: &mut W, ev: &Ev) {
 fn read_ev(r: &mut R) -> Option<Ev> {
     Some(match r.u8()? {
         1 => Ev::Shot { o: r.v()?, e: r.v()?, w: r.u8()?, spark: r.u8()? },
-        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, LETHAL), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()?, guard: r.f()?.clamp(0.0, 100.0) },
-        3 => Ev::Grenade { p: r.v()?, v: clamp_v(r.v()?, 70.0), kind: r.u8()?.min(2) },
+        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, LETHAL), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()?, guard: r.f()?.clamp(0.0, 100.0), vt: r.f()? },
+        3 => Ev::Grenade { p: r.v()?, v: clamp_v(r.v()?, 70.0), kind: r.u8()?.min(4) },
         4 => Ev::Died { victim: r.u8()?, killer: r.u8()?, w: r.u8()?, head: r.u8()? == 1 },
         5 => {
             let n = r.u8()? as usize;
@@ -319,6 +326,7 @@ fn read_ev(r: &mut R) -> Option<Ev> {
         11 => Ev::Ability { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.min(3), p: r.v()?, d: clamp_v(r.v()?, 40.0) },
         12 => Ev::Confirm { attacker: r.u8()?.min(MAX_PLAYERS as u8 - 1), victim: r.u8()?.min(MAX_PLAYERS as u8 - 1), hp: r.f()?.clamp(0.0, 999.0), ap: r.f()?.clamp(0.0, 999.0), head: r.u8()? != 0 },
         10 => Ev::ExecAsk { target: r.u8()?.min(MAX_PLAYERS as u8 - 1), open: r.u8()? & 0b1111 },
+        15 => Ev::Ping { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.min(crate::game::PINGS.len() as u8 - 1), p: clamp_v(r.v()?, 500.0) },
         14 => Ev::Exec { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), target: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.clamp(1, crate::exec::COUNT as u8) },
         _ => return None,
     })
@@ -739,6 +747,11 @@ impl Net {
     }
 
     /// Start a packet: kind, a number that grows with every packet to that address, and our clock.
+    /// The clock snapshots are stamped with (seconds since this connection opened).
+    pub fn clock(&self) -> f32 {
+        self.start.elapsed().as_secs_f32()
+    }
+
     fn head(&mut self, kind: u8, to: SocketAddr) -> W {
         let seq = match self.peers.iter_mut().find(|p| p.addr == to) {
             Some(p) => {
@@ -1555,7 +1568,7 @@ mod melee_net_tests {
 
     #[test]
     fn guard_drain_and_deflects_cross_the_network() {
-        match round_trip(Ev::Hit { victim: 3, dmg: 0.0, knock: v3(1.0, 0.0, 0.0), stun: 0.5, head: false, w: crate::game::KICK_TOOL, o: V3::ZERO, dir: V3::ZERO, guard: 31.0 }) {
+        match round_trip(Ev::Hit { victim: 3, dmg: 0.0, knock: v3(1.0, 0.0, 0.0), stun: 0.5, head: false, w: crate::game::KICK_TOOL, o: V3::ZERO, dir: V3::ZERO, guard: 31.0, vt: 0.0 }) {
             Ev::Hit { victim, guard, w, stun, .. } => assert!(victim == 3 && (guard - 31.0).abs() < 1e-3 && w == crate::game::KICK_TOOL && (stun - 0.5).abs() < 1e-3),
             e => panic!("{e:?}"),
         }

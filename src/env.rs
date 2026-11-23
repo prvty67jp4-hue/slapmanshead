@@ -341,8 +341,9 @@ fn sky_src(map: MapId) -> SkySrc {
             sun_azimuth: -1.9,
             elevation: (0.38, 0.44),
             sun_power: 1.35,
-            fog_density: 0.004,
-            grade: Grade { lift: [0.004, 0.0, 0.018], gamma: [1.0, 0.99, 1.02], gain: [1.04, 0.98, 0.94], saturation: 0.9, contrast: 1.05, exposure: 0.8 },
+            // (light haze and a neutral grade: each area keeps its own colours at a distance)
+            fog_density: 0.0018,
+            grade: Grade { lift: [0.0, 0.004, 0.01], gamma: [1.0, 1.0, 1.01], gain: [1.0, 0.99, 0.98], saturation: 1.02, contrast: 1.07, exposure: 0.84 },
         },
     }
 }

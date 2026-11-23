@@ -10,6 +10,89 @@ pub const GRAVITY: f32 = 25.0;
 pub const JUMP_VEL: f32 = 9.4;
 /// Base running speed: flow chains and dashes are where the real speed comes from.
 pub const RUN_SPEED: f32 = 6.6;
+/// The ping wheel's calls (key Z: tap for the first, hold for the wheel).
+pub const PINGS: [&str; 6] = ["Enemy", "Going here", "Look here", "Defend here", "Need help", "Utility here"];
+/// How long a ping stays up.
+pub const PING_LIFE: f32 = 6.0;
+
+/// A place marked for the team.
+#[derive(Clone, Debug)]
+pub struct Ping {
+    pub owner: usize,
+    pub kind: u8,
+    pub pos: V3,
+    pub t: f32,
+}
+/// Utility throws each fighter has per round (refilled when they come back in).
+pub const UTIL_PER_ROUND: u8 = 2;
+/// A smoke cloud: how wide, how long it lasts (it thickens over the first second and thins over
+/// the last two).
+pub const SMOKE_R: f32 = 4.2;
+pub const SMOKE_LIFE: f32 = 13.0;
+/// A flash: how far it blinds, and the longest it blinds for (looking straight at it, close).
+pub const FLASH_RANGE: f32 = 24.0;
+pub const FLASH_MAX: f32 = 2.4;
+/// How long looking a weapon over takes.
+pub const INSPECT_TIME: f32 = 2.4;
+
+/// Each fighter's utility (key X): two make smoke, two flash. Original designs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Utility {
+    Smoke,
+    Flash,
+}
+
+impl Utility {
+    pub fn of(body: u8) -> Utility {
+        if body % 2 == 0 { Utility::Smoke } else { Utility::Flash }
+    }
+    /// Its grenade kind (3 smoke, 4 flash).
+    pub fn kind(self) -> u8 {
+        match self {
+            Utility::Smoke => 3,
+            Utility::Flash => 4,
+        }
+    }
+    /// What the fighter calls it.
+    pub fn name(body: u8) -> &'static str {
+        match body {
+            0 => "Ash Lantern",
+            1 => "Magnesium Flare",
+            2 => "Forge Smoke",
+            _ => "Spark Cracker",
+        }
+    }
+    pub fn blurb(body: u8) -> &'static str {
+        match body {
+            0 => "A warden's lantern packed with ash: a wall of grey smoke for 13 s",
+            1 => "A hunter's flare: blinds everyone looking its way (you too)",
+            2 => "A clay pot of forge slag: thick, warm smoke for 13 s",
+            _ => "A Lower Ward firecracker: a blinding pop",
+        }
+    }
+}
+
+/// A thrown utility's time before it goes off.
+pub fn util_fuse(kind: u8) -> f32 {
+    if kind == 3 { 1.1 } else { 0.95 }
+}
+
+/// A smoke cloud where it burst, how long ago, and the thrower's fighter (its colour is theirs).
+#[derive(Clone, Debug)]
+pub struct Smoke {
+    pub pos: V3,
+    pub t: f32,
+    pub body: u8,
+}
+
+impl Smoke {
+    /// How thick it is now (0..1): it billows out over a second and thins over the last two.
+    pub fn density(&self) -> f32 {
+        (self.t / 1.0).clamp(0.0, 1.0) * ((SMOKE_LIFE - self.t) / 2.0).clamp(0.0, 1.0)
+    }
+}
+/// Sneaking speed: a walk too slow for footsteps to be heard (they start just above it).
+pub const SNEAK_SPEED: f32 = 2.6;
 pub const MAX_HP: f32 = 100.0;
 pub const MAX_AP: f32 = 50.0;
 pub const TICK: f32 = 1.0 / 120.0;
@@ -429,6 +512,9 @@ pub const RECAP_TIME: f32 = 3.0;
 /// The death recap: who killed you, with what, and how that life went.
 #[derive(Clone, Debug)]
 pub struct Recap {
+    /// Damage you dealt your killer this life, and they dealt you.
+    pub dealt: f32,
+    pub taken: f32,
     pub killer: String,
     pub weapon: &'static str,
     pub head: bool,
@@ -558,6 +644,12 @@ pub struct Input {
     pub finish: bool,
     /// Pressed: the fighter's ability.
     pub ability: bool,
+    /// Held: walk quietly (slower; no footsteps).
+    pub sneak: bool,
+    /// Pressed: throw the fighter's utility (a smoke or a flash).
+    pub utility: bool,
+    /// Pressed: look the weapon over (inspect).
+    pub inspect: bool,
     pub yaw: f32,
     pub pitch: f32,
 }
@@ -1295,6 +1387,16 @@ pub struct Fighter {
     still_t: f32,
     /// Sliding time left (0 = not sliding).
     pub sliding: f32,
+    /// Sneaking (a quiet walk) this tick.
+    pub sneak: bool,
+    /// Utility throws left this round (or this life outside round modes), and how blinded by a
+    /// flash this fighter is (seconds left).
+    pub util: u8,
+    pub blind_t: f32,
+    /// Looking the weapon over (seconds left; the picture only).
+    pub inspect_t: f32,
+    /// (the picture only) reloading last tick (to drop the magazine as one begins).
+    was_reloading: bool,
     /// "Perfect" timing pop on screen.
     pub perfect_t: f32,
     /// Health still to come back after a kill.
@@ -1494,6 +1596,11 @@ impl Fighter {
             fin_target: 0,
             fin_hit: false,
             fin_dir: V3::ZERO,
+            sneak: false,
+            util: UTIL_PER_ROUND,
+            blind_t: 0.0,
+            inspect_t: 0.0,
+            was_reloading: false,
             ghost: 0.0,
             exec_seen: 0.0,
             exec_seen_kind: 0,
@@ -1730,10 +1837,12 @@ pub enum Mode {
     Ctf = 5,
     /// Solo: survive waves of ever better bots (Practice only).
     Gauntlet = 6,
+    /// Red vs Blue rounds, one life each: no economy, just planning (utility refills each round).
+    Rounds = 7,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 6] = [Mode::Ffa, Mode::Tdm, Mode::Duel, Mode::Gladiator, Mode::Lms, Mode::Ctf];
+    pub const ALL: [Mode; 7] = [Mode::Ffa, Mode::Tdm, Mode::Duel, Mode::Gladiator, Mode::Lms, Mode::Ctf, Mode::Rounds];
     pub fn from_u8(v: u8) -> Mode {
         match v {
             1 => Mode::Tdm,
@@ -1742,6 +1851,7 @@ impl Mode {
             4 => Mode::Lms,
             5 => Mode::Ctf,
             6 => Mode::Gauntlet,
+            7 => Mode::Rounds,
             _ => Mode::Ffa,
         }
     }
@@ -1754,6 +1864,7 @@ impl Mode {
             Mode::Lms => "Last Man Standing",
             Mode::Ctf => "Capture the Flag",
             Mode::Gauntlet => "Gauntlet",
+            Mode::Rounds => "Team Rounds",
         }
     }
     pub fn blurb(self) -> &'static str {
@@ -1765,13 +1876,14 @@ impl Mode {
             Mode::Lms => "rounds with no respawns, last one alive wins",
             Mode::Ctf => "Red vs Blue, bring the enemy flag to your base",
             Mode::Gauntlet => "solo: survive waves of ever better bots for a high score",
+            Mode::Rounds => "Red vs Blue rounds, one life each: plan, smoke, flash and take space",
         }
     }
     pub fn teams(self) -> bool {
-        matches!(self, Mode::Tdm | Mode::Ctf)
+        matches!(self, Mode::Tdm | Mode::Ctf | Mode::Rounds)
     }
     pub fn rounds(self) -> bool {
-        matches!(self, Mode::Duel | Mode::Lms)
+        matches!(self, Mode::Duel | Mode::Lms | Mode::Rounds)
     }
     pub fn melee_only(self) -> bool {
         self == Mode::Gladiator
@@ -1779,7 +1891,7 @@ impl Mode {
     /// What the score limit counts.
     pub fn goal_word(self) -> &'static str {
         match self {
-            Mode::Duel | Mode::Lms => "round wins",
+            Mode::Duel | Mode::Lms | Mode::Rounds => "round wins",
             Mode::Ctf => "captures",
             Mode::Gauntlet => "score",
             _ => "kills",
@@ -1913,6 +2025,8 @@ pub struct Preview {
 #[derive(Clone, Debug)]
 pub struct Decal {
     pub pos: V3,
+    /// The face it lies on (straight up for the floor).
+    pub normal: V3,
     pub size: f32,
     pub kind: u8,
     pub color: [u8; 3],
@@ -1960,6 +2074,8 @@ pub struct Casing {
     pub life: f32,
     pub spin: f32,
     pub color: [u8; 3],
+    /// 0 a spent shell, 1 an empty magazine dropped on a reload.
+    pub kind: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -2053,7 +2169,9 @@ pub enum Ev {
     Confirm { attacker: u8, victim: u8, hp: f32, ap: f32, head: bool },
     /// From a player: "I hit them" (the host checks it). From the host: "you were hit".
     /// `guard` drains the victim's guard meter (a blocked hit).
-    Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3, guard: f32 },
+    /// `vt`: (a player's claim) the moment on the host's clock that the target was where the
+    /// player saw it, so the host checks the hit against exactly that (0 when not given).
+    Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3, guard: f32, vt: f32 },
     /// From a player: "my bullet was sent back at me by `by`" (the host trusts self-inflicted hurt).
     Deflect { by: u8, dmg: f32 },
     /// From a player to the host: "may I execute `target`"? `open`: which of their fighter's
@@ -2073,6 +2191,8 @@ pub enum Ev {
     Vote,
     /// "I'd like this map next" (crate::world::MapId as a number).
     MapVote { map: u8 },
+    /// A ping for the team: what (see PINGS) and where.
+    Ping { who: u8, kind: u8, p: V3 },
 }
 
 #[derive(Clone, Debug)]
@@ -2145,6 +2265,19 @@ pub struct Game {
     pub kill_chain: Vec<(u32, f32)>,
     /// Finisher styles the local player hasn't unlocked yet (bit per style; from their mastery).
     pub fin_locks: u32,
+    /// (online) the network's clock now (what snapshots are stamped with), and recent pairs of
+    /// it with the game's clock, to turn a moment on one into the other.
+    pub net_clock: f32,
+    clock_map: VecDeque<(f32, f32)>,
+    /// What the last hit marker was: 0 a body hit, 1 a headshot, 2 a kill.
+    pub hit_kind: u8,
+    /// This life: damage we dealt each fighter, and each dealt us (the death recap).
+    pub life_dealt: [f32; MAX_PLAYERS],
+    pub life_taken: [f32; MAX_PLAYERS],
+    /// Pings: places marked for the team (with the wheel).
+    pub pings: Vec<Ping>,
+    /// Smoke clouds in the air.
+    pub smokes: Vec<Smoke>,
     /// Watching an execution on a training dummy (Fighters & Mastery's Preview), when it is.
     pub preview: Option<Preview>,
     /// Settings > Game > Violence: how wounds look (blood, sparks or white flashes).
@@ -2364,7 +2497,7 @@ impl Training {
 }
 
 /// Room for every kind of sound (must stay above the number of `Sfx` kinds; a test checks).
-pub const SFX_SLOTS: usize = 64;
+pub const SFX_SLOTS: usize = 80;
 
 /// Every sound the game makes (recorded clips live in audio.rs).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2430,6 +2563,16 @@ pub enum Sfx {
     ExecImpact,
     ExecRing,
     Crowd,
+    /// Footsteps on iron and in water; a gunshot's tail in a room and in the open.
+    StepMetal,
+    StepWater,
+    TailRoom,
+    TailOpen,
+    /// Hit markers: a kill confirmed; utility: a smoke bursting, a flash popping; a ping.
+    KillConfirm,
+    SmokePop,
+    FlashPop,
+    PingSound,
 }
 
 impl Sfx {
@@ -2486,6 +2629,61 @@ pub enum Act {
     Execute,
     /// A throwing star, turned this far (radians) from where you aim.
     Star { off: f32 },
+    /// The fighter's utility (smoke or flash) is thrown.
+    Utility,
+}
+
+/// How long a flash at `p` blinds someone whose eyes are at `eye` looking along `look` (0: not at
+/// all): only with a clear line to it (walls and smoke stop it), the more the closer and the more
+/// they face it (even with their back to it a little, from the light round them).
+pub fn flash_blind(world: &World, smokes: &[Smoke], eye: V3, look: V3, p: V3) -> f32 {
+    let d = p - eye;
+    let dist = d.len();
+    if dist > FLASH_RANGE || !world.line_clear(eye, p) || smoke_between(smokes, eye, p) {
+        return 0.0;
+    }
+    let facing = look.dot(d * (1.0 / dist.max(0.01)));
+    let face_k = ((facing + 0.3) / 1.2).clamp(0.0, 1.0);
+    let near_k = 1.0 - dist / FLASH_RANGE;
+    (FLASH_MAX * face_k * face_k * near_k.sqrt()).max(0.25 * near_k)
+}
+
+/// Does a thick smoke stand between `a` and `b`?
+pub fn smoke_between(smokes: &[Smoke], a: V3, b: V3) -> bool {
+    smokes.iter().any(|s| {
+        let k = s.density();
+        if k < 0.5 {
+            return false;
+        }
+        let c = s.pos + v3(0.0, 1.2, 0.0);
+        let r = SMOKE_R * (0.6 + 0.4 * k) * 0.9;
+        crate::math::seg_dist(c, a, b) < r && (a - c).len() > 0.0
+    })
+}
+/// A footstep's sound by what's underfoot at `p`: the river, iron, wood or stone.
+pub fn step_sound(world: &World, p: V3) -> Sfx {
+    if world.in_water(p + v3(0.0, 0.05, 0.0)) {
+        return Sfx::StepWater;
+    }
+    let m = world.ground_mat(p + v3(0.0, 0.02, 0.0));
+    let layer = crate::zones::surface(world.map, m, p).layer;
+    if m == Mat::Metal || layer == crate::env::L_IRON {
+        Sfx::StepMetal
+    } else if matches!(m, Mat::Crate | Mat::Trim) || layer == crate::env::L_WOOD {
+        Sfx::StepWood
+    } else {
+        Sfx::StepStone
+    }
+}
+
+/// The impact a bullet makes on a surface (see Game::impact_fx).
+pub fn surf_spark(s: crate::world::Surf) -> u8 {
+    match s {
+        crate::world::Surf::Stone => 3,
+        crate::world::Surf::Wood => 11,
+        crate::world::Surf::Metal => 12,
+        crate::world::Surf::Water => 13,
+    }
 }
 
 /// Start execution `kind` (number + 1) by `ff` on fighter `t` standing at `tp`.
@@ -2572,6 +2770,13 @@ impl Game {
             streaks: vec![0; MAX_PLAYERS],
             kill_chain: vec![(0, -10.0); MAX_PLAYERS],
             fin_locks: 0,
+            net_clock: 0.0,
+            clock_map: VecDeque::new(),
+            hit_kind: 0,
+            life_dealt: [0.0; MAX_PLAYERS],
+            life_taken: [0.0; MAX_PLAYERS],
+            pings: Vec::new(),
+            smokes: Vec::new(),
             preview: None,
             violence: crate::exec::Violence::default(),
             decals: Vec::new(),
@@ -3457,7 +3662,7 @@ impl Game {
                 }
                 f.fall_vy = 0.0;
                 let n = (f.walk_phase / std::f32::consts::PI).floor() as i32;
-                if n != f.step_n && f.vel.flat().len() > 2.0 && out.is_none() {
+                if n != f.step_n && f.vel.flat().len() > SNEAK_SPEED + 0.25 && out.is_none() {
                     out = Some(Sfx::StepStone); // the surface is checked below
                 }
                 f.step_n = n;
@@ -3476,8 +3681,9 @@ impl Game {
             f.was_ground = f.on_ground;
             let p = f.pos;
             if let Some(mut s) = out {
-                if s == Sfx::StepStone && matches!(self.world.ground_mat(p + v3(0.0, 0.02, 0.0)), Mat::Crate | Mat::Trim) {
-                    s = Sfx::StepWood;
+                // by what's underfoot: stone, wood, iron or the river
+                if s == Sfx::StepStone {
+                    s = step_sound(&self.world, p);
                 }
                 self.sfx(s, p);
             }
@@ -3490,6 +3696,13 @@ impl Game {
                 self.particles.push(Particle { pos: p + v3(self.rng.range(-0.15, 0.15), 0.0, self.rng.range(-0.15, 0.15)), vel: v, life, max_life: life, size, color: [150, 140, 122], gravity: 1.2 });
             }
         }
+    }
+
+    /// A gunshot's tail: a short slap in a room (a roof overhead, or walls close on most sides),
+    /// a long roll in the open.
+    fn gun_tail(&mut self, p: V3) {
+        let s = if self.world.enclosed(p) { Sfx::TailRoom } else { Sfx::TailOpen };
+        self.sfx(s, p);
     }
 
     /// A sound that isn't in the world (hit markers, countdown, jingles).
@@ -3673,6 +3886,12 @@ impl Game {
             }
             // remember where everyone was (and how they stood), to check hits against the past
             let now = self.time;
+            if self.net_clock > 0.0 && self.clock_map.back().map_or(true, |b| self.net_clock > b.0) {
+                self.clock_map.push_back((self.net_clock, now));
+                while self.clock_map.front().map_or(false, |e| now - e.1 > 1.5) {
+                    self.clock_map.pop_front();
+                }
+            }
             for i in 0..self.f.len() {
                 if self.f[i].present {
                     let p = self.f[i].pos;
@@ -3738,6 +3957,7 @@ impl Game {
 
         self.preview_step(dt);
         self.exec_cues();
+        self.weapon_fx();
         if self.hitstop > 1e5 {
             self.impact_t = 0.0; // a still picture: no flash over it
         }
@@ -3819,6 +4039,8 @@ impl Game {
             inp.jump = false;
             inp.dash = false;
             inp.ability = false;
+            inp.utility = false;
+            inp.inspect = false;
             inp.fire_pressed = false;
             inp.reload = false;
             inp.item = false;
@@ -3974,7 +4196,12 @@ impl Game {
         if victim == self.local {
             // what happened: who, with what, and how that life went
             let s = self.life_stats.get(victim).copied().unwrap_or_default();
+            let (dealt, taken) = k.map_or((0.0, 0.0), |k| (self.life_dealt[k], self.life_taken[k]));
+            self.life_dealt = [0.0; MAX_PLAYERS];
+            self.life_taken = [0.0; MAX_PLAYERS];
             self.recap = Some(Recap {
+                dealt,
+                taken,
                 killer: k.map_or_else(|| "yourself".to_string(), |k| self.f[k].name.clone()),
                 weapon: kill_tool(w),
                 head,
@@ -4063,8 +4290,10 @@ impl Game {
             self.kill_t = 1.6;
             self.heal_pop = 1.6;
             self.hitmarker = self.hitmarker.max(0.35); // the hit confirm turns red
+            self.hit_kind = 2;
             self.kill_name = self.f[victim].name.clone();
             self.sfx2d(Sfx::Kill);
+            self.sfx2d(Sfx::KillConfirm);
         }
         if k == Some(self.local) && victim != self.local {
             let fin = if w == EXEC_TOOL { self.f[self.local].fin.max(self.last_finisher) } else { 0 };
@@ -4102,7 +4331,7 @@ impl Game {
         let t = self.mt.target as i32;
         let won = match self.mt.mode {
             Mode::Ffa | Mode::Gladiator => self.f.iter().any(|f| f.present && f.kills >= t),
-            Mode::Tdm | Mode::Ctf => self.mt.team_score.iter().any(|&s| s as i32 >= t),
+            Mode::Tdm | Mode::Ctf | Mode::Rounds => self.mt.team_score.iter().any(|&s| s as i32 >= t),
             Mode::Duel | Mode::Lms => self.f.iter().any(|f| f.present && f.wins >= t),
             Mode::Gauntlet => false, // it ends when you fall
         };
@@ -4384,7 +4613,7 @@ impl Game {
             return false;
         }
         match self.mt.mode {
-            Mode::Tdm | Mode::Ctf => {
+            Mode::Tdm | Mode::Ctf | Mode::Rounds => {
                 let t = (me.team as usize).min(1);
                 self.mt.team_score[t] > self.mt.team_score[1 - t]
             }
@@ -4559,10 +4788,40 @@ impl Game {
                 return;
             }
         }
+        if self.mt.mode.teams() {
+            // team rounds: a side with nobody left loses; at the time limit, the side with more
+            // still standing wins (the same number: a draw)
+            let left = |t: u8| alive.iter().filter(|&&i| self.f[i].team == t).count();
+            let (r, b) = (left(0), left(1));
+            if r == 0 || b == 0 || self.mt.timer <= 0.0 {
+                let winner = if r > b { Some(0) } else if b > r { Some(1) } else { None };
+                self.finish_team_round(winner);
+            }
+            return;
+        }
         if alive.len() <= 1 || self.mt.timer <= 0.0 {
             let winner = if alive.len() == 1 { Some(alive[0]) } else { None };
             self.finish_round(winner);
         }
+    }
+
+    /// A team round is over: the winning side scores a round (or nobody, on a draw).
+    fn finish_team_round(&mut self, team: Option<usize>) {
+        if self.round_finished == (self.mt.number, self.mt.round) {
+            return;
+        }
+        self.round_finished = (self.mt.number, self.mt.round);
+        let text = match team {
+            Some(t) => {
+                self.mt.team_score[t] += 1;
+                format!("{} WINS THE ROUND", TEAM_NAMES[t].to_uppercase())
+            }
+            None => "DRAW".to_string(),
+        };
+        self.banner = Some((text.clone(), 2.5));
+        self.say(text.to_lowercase());
+        self.mt.round_end = 3.0;
+        self.check_win();
     }
 
     fn finish_round(&mut self, winner: Option<usize>) {
@@ -5183,6 +5442,20 @@ impl Game {
         // jumping or dashing right as you land: a little extra
         let perfect_window = ff.on_ground && ff.land_t < PERFECT_WINDOW && ff.last_air > 0.25;
 
+        // utility: the fighter's smoke or flash (a couple a round)
+        if inp.utility && can_act && ff.util > 0 && ff.fin == 0 && ff.nade_wind <= 0.0 {
+            ff.util -= 1;
+            acts.push(Act::Utility);
+        }
+        // inspecting the weapon: anything else you do puts it away
+        if inp.inspect && can_act && ff.reload_t <= 0.0 && ff.switch_t <= 0.0 && !ff.slashing() && ff.fire_cd <= 0.0 {
+            ff.inspect_t = INSPECT_TIME;
+        }
+        if inp.fire || inp.reload || inp.select.is_some() || inp.guard || ff.fin > 0 {
+            ff.inspect_t = 0.0;
+        }
+        ff.inspect_t = (ff.inspect_t - dt).max(0.0);
+        ff.blind_t = (ff.blind_t - dt).max(0.0);
         // weapon switching
         if let Some(s) = inp.select {
             let s = (s as usize).min(2);
@@ -5451,6 +5724,11 @@ impl Game {
         let mut speed = run * flow_k;
         if ff.guard {
             speed = run * tn.guard_speed;
+        }
+        // sneaking: a quiet walk (below the speed footsteps are heard at)
+        ff.sneak = inp.sneak && ff.on_ground && can_act;
+        if ff.sneak {
+            speed = speed.min(SNEAK_SPEED);
         }
         if ff.slashing() {
             speed = 5.5;
@@ -6291,6 +6569,7 @@ impl Game {
                 }
                 let o = if self.f[i].is_bot { o } else { muzzle };
                 self.sfx(Sfx::gun(w), o);
+            self.gun_tail(o);
                 // muzzle flash
                 let fsize = match w {
                     Weapon::Shotgun => 0.55,
@@ -6312,7 +6591,7 @@ impl Game {
                 if w != Weapon::Revolver && w != Weapon::Shotgun {
                     let color = if w == Weapon::Shotgun { [170, 30, 30] } else { [214, 172, 70] };
                     let v = right * self.rng.range(2.0, 3.2) + v3(0.0, self.rng.range(2.0, 3.0), 0.0) - dir * 0.5;
-                    self.casings.push(Casing { pos: o - dir * 0.35 + right * 0.05, vel: v, life: 2.0, spin: self.rng.range(0.0, 6.0), color });
+                    self.casings.push(Casing { pos: o - dir * 0.35 + right * 0.05, vel: v, life: 2.0, spin: self.rng.range(0.0, 6.0), color, kind: 0 });
                     if self.casings.len() > 80 {
                         self.casings.remove(0);
                     }
@@ -6351,7 +6630,7 @@ impl Game {
                 let at = ff.pos + v3(0.0, 1.3, 0.0) + right * 0.3 + ff.fwd() * 0.3;
                 let v = right * self.rng.range(2.2, 3.4) + v3(0.0, self.rng.range(2.2, 3.2), 0.0) - ff.fwd() * 0.6;
                 self.sfx(Sfx::Pump, at);
-                self.casings.push(Casing { pos: at, vel: v, life: 2.0, spin: self.rng.range(0.0, 6.0), color: [170, 30, 30] });
+                self.casings.push(Casing { pos: at, vel: v, life: 2.0, spin: self.rng.range(0.0, 6.0), color: [170, 30, 30], kind: 0 });
                 if self.casings.len() > 80 {
                     self.casings.remove(0);
                 }
@@ -6378,6 +6657,20 @@ impl Game {
             }
             Act::Execute => self.execute(i),
             Act::Star { off } => self.throw_star(i, off),
+            Act::Utility => {
+                // the fighter's own smoke or flash, lobbed a little softer than a grenade
+                let kind = Utility::of(self.f[i].loadout.body).kind();
+                let tp = self.f[i].pos + v3(0.0, 1.4, 0.0);
+                self.sfx(Sfx::Throw, tp);
+                let ff = &self.f[i];
+                let dir = look_dir(ff.yaw, ff.pitch + 0.12);
+                let p = ff.eye() + ff.fwd() * 0.5;
+                let v = dir * 15.0 + v3(0.0, 2.5, 0.0) + ff.vel * 0.4;
+                self.grenades.push(Grenade { pos: p, vel: v, fuse: util_fuse(kind), owner: i, kind, vis: V3::ZERO });
+                if self.kind == Kind::Host || self.kind == Kind::Client {
+                    self.out_events.push(Ev::Grenade { p, v, kind });
+                }
+            }
             Act::Throw => {
                 let tp = self.f[i].pos + v3(0.0, 1.4, 0.0);
                 self.sfx(Sfx::Throw, tp);
@@ -6419,9 +6712,11 @@ impl Game {
     fn fire_ray(&mut self, shooter: usize, o: V3, d: V3, dmg: f32, range: f32, w: Weapon) {
         let mut t = range;
         let mut hit_world = false;
-        if let Some((wt, _)) = self.world.raycast(o, d, range) {
+        let mut surf = crate::world::Surf::Stone;
+        if let Some((wt, _, s)) = self.world.surface_hit(o, d, range) {
             t = wt;
             hit_world = true;
+            surf = s;
         }
         let t_world = t;
         let mut victim: Option<(usize, Part, bool)> = None;
@@ -6525,7 +6820,8 @@ impl Game {
                 }
             }
         } else if hit_world {
-            spark = 3;
+            // what flies off depends on what it hit: stone dust, wood splinters, metal sparks, a splash
+            spark = surf_spark(surf);
         }
         if shielded {
             spark = 2;
@@ -6575,11 +6871,59 @@ impl Game {
                 let w = crate::exec::wound(self.violence);
                 self.burst(p, w.main, 6, 3.0);
             }
-            3 => {
-                self.sfx(Sfx::ImpactStone, p);
-                self.burst(p, [200, 190, 160], 5, 2.5);
-                // sparks off stone
-                self.burst(p, [255, 205, 120], 5, 7.0);
+            3 | 11 | 12 => {
+                // a bullet into the level: what flies off (and the mark it leaves) by what it hit
+                let n = self.world.face_normal(p);
+                let surf_tint = crate::zones::surface(self.world.map, Mat::Wall, p).tint;
+                match spark {
+                    11 => {
+                        // wood: splinters, pale fresh wood inside
+                        self.sfx(Sfx::StepWood, p);
+                        for _ in 0..9 {
+                            let v = (n * 1.5 + v3(self.rng.range(-1.0, 1.0), self.rng.range(-0.2, 1.0), self.rng.range(-1.0, 1.0))).norm() * self.rng.range(2.0, 5.0);
+                            let life = self.rng.range(0.35, 0.7);
+                            let color = if self.rng.f() < 0.5 { [176, 132, 86] } else { [120, 84, 52] };
+                            self.particles.push(Particle { pos: p, vel: v, life, max_life: life, size: self.rng.range(0.03, 0.06), color, gravity: 12.0 });
+                        }
+                    }
+                    12 => {
+                        // metal: a spray of hot sparks and a ring
+                        self.sfx(Sfx::Clang, p);
+                        for _ in 0..14 {
+                            let v = (n * 1.2 + v3(self.rng.range(-1.0, 1.0), self.rng.range(-0.3, 1.0), self.rng.range(-1.0, 1.0))).norm() * self.rng.range(4.0, 9.0);
+                            let life = self.rng.range(0.15, 0.4);
+                            self.particles.push(Particle { pos: p, vel: v, life, max_life: life, size: 0.035, color: [255, 214, 140], gravity: 9.0 });
+                        }
+                    }
+                    _ => {
+                        // stone: a puff of dust the colour of the wall, a few chips and sparks
+                        self.sfx(Sfx::ImpactStone, p);
+                        let dust = [(surf_tint[0] as u16 + 40).min(255) as u8, (surf_tint[1] as u16 + 36).min(255) as u8, (surf_tint[2] as u16 + 30).min(255) as u8];
+                        for _ in 0..4 {
+                            let v = n * self.rng.range(0.6, 1.4) + v3(self.rng.range(-0.4, 0.4), self.rng.range(0.0, 0.5), self.rng.range(-0.4, 0.4));
+                            let life = self.rng.range(0.45, 0.8);
+                            self.particles.push(Particle { pos: p + n * 0.05, vel: v, life, max_life: life, size: self.rng.range(0.16, 0.26), color: dust, gravity: 0.4 });
+                        }
+                        self.burst(p, surf_tint, 5, 3.0);
+                        self.burst(p, [255, 205, 120], 3, 7.0);
+                    }
+                }
+                // a bullet hole that fades away
+                let seed = self.rng.next_u32();
+                let color = if spark == 12 { [38, 36, 34] } else if spark == 11 { [52, 36, 24] } else { [44, 40, 36] };
+                self.decals.push(Decal { pos: p + n * 0.012, normal: n, size: 0.09, kind: 3, color, life: 9.0, max_life: 9.0, seed });
+            }
+            13 => {
+                // water: a splash column and rings
+                self.sfx(Sfx::StepWater, p);
+                for k in 0..16 {
+                    let a = k as f32 / 16.0 * std::f32::consts::TAU;
+                    let v = v3(a.cos() * self.rng.range(0.5, 1.4), self.rng.range(2.5, 5.0), a.sin() * self.rng.range(0.5, 1.4));
+                    let life = self.rng.range(0.4, 0.7);
+                    self.particles.push(Particle { pos: p, vel: v, life, max_life: life, size: self.rng.range(0.05, 0.1), color: [210, 228, 232], gravity: 11.0 });
+                }
+                let seed = self.rng.next_u32();
+                self.decals.push(Decal { pos: p + v3(0.0, 0.02, 0.0), normal: v3(0.0, 1.0, 0.0), size: 0.6, kind: 4, color: [220, 232, 236], life: 0.9, max_life: 0.9, seed });
             }
             6 => {
                 // a deflected bullet: a bright blue-white flash and a ring
@@ -7009,7 +7353,7 @@ impl Game {
     /// A hit seen on this computer. The host (or a game on this computer) applies it right away;
     /// a player sends it to the host, which checks it against where the target was a moment ago.
     #[allow(clippy::too_many_arguments)]
-    fn damage(&mut self, attacker: usize, victim: usize, amount: f32, knock: V3, stun: f32, head: bool, at: V3, w: u8, o: V3, dir: V3) {
+    pub(crate) fn damage(&mut self, attacker: usize, victim: usize, amount: f32, knock: V3, stun: f32, head: bool, at: V3, w: u8, o: V3, dir: V3) {
         self.damage_g(attacker, victim, amount, knock, stun, head, at, w, o, dir, 0.0);
     }
 
@@ -7035,8 +7379,13 @@ impl Game {
         if attacker == self.local && victim != self.local && amount > 0.0 {
             self.combo_hit(amount);
             self.hitmarker = if head { 0.35 } else { 0.25 };
+            // (a kill's marker stays a kill's for its moment)
+            if !(self.hit_kind == 2 && self.hitmarker > 0.1 && self.time - self.hit_chain_t < 0.05) {
+                self.hit_kind = head as u8;
+            }
             self.hit_head = head || (self.hit_head && self.time - self.hit_chain_t < 0.02);
             let shown = if amount >= LETHAL { (self.f[victim].hp + self.f[victim].ap).max(1.0) } else { amount };
+            self.life_dealt[victim] += shown.min(200.0);
             // one crisp tick per shot (a shotgun's pellets count once), climbing in pitch while
             // the hits keep coming
             let volley = self.time - self.hit_chain_t < 0.02;
@@ -7078,7 +7427,8 @@ impl Game {
         if self.is_authority() {
             self.authority_hit_g(victim, Some(attacker), amount, knock, stun, head, w, guard);
         } else {
-            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir, guard });
+            let vt = self.view_time(victim);
+            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir, guard, vt });
         }
     }
 
@@ -7198,7 +7548,7 @@ impl Game {
             if amount <= 0.0 {
                 // a blocked hit: only their guard meter (on their computer) takes it
                 let o = attacker.filter(|&a| a < self.f.len()).map_or(V3::ZERO, |a| self.f[a].pos);
-                self.out_events.push(Ev::Hit { victim: victim as u8, dmg: 0.0, knock, stun, head: false, w, o, dir: V3::ZERO, guard });
+                self.out_events.push(Ev::Hit { victim: victim as u8, dmg: 0.0, knock, stun, head: false, w, o, dir: V3::ZERO, guard, vt: 0.0 });
                 return;
             }
             let ff = &mut self.f[victim];
@@ -7220,8 +7570,36 @@ impl Game {
             }
             // tell the victim, with where the attacker stands (for their hit-direction marker)
             let o = attacker.filter(|&a| a < self.f.len()).map_or(V3::ZERO, |a| self.f[a].pos);
-            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir: V3::ZERO, guard });
+            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir: V3::ZERO, guard, vt: 0.0 });
         }
+    }
+
+    /// When (on the host's network clock, which snapshots are stamped with) the moment we're
+    /// showing of fighter `j` happened: our playback of them runs their clock offset plus their
+    /// playback delay behind.
+    pub fn view_time(&self, j: usize) -> f32 {
+        match self.f.get(j) {
+            Some(f) => match f.clock_off {
+                Some(off) => self.time - off - f.interp,
+                None => self.time - INTERP_DELAY,
+            },
+            None => self.time,
+        }
+    }
+
+    /// The game-clock moment of a moment on our network clock (what a player's claim names).
+    pub fn game_time_of(&self, net: f32) -> Option<f32> {
+        let m = &self.clock_map;
+        let (first, last) = (m.front()?, m.back()?);
+        if net <= first.0 {
+            return None;
+        }
+        if net >= last.0 {
+            return Some(last.1 + (net - last.0).min(0.05));
+        }
+        let k = m.iter().position(|e| e.0 >= net)?;
+        let (a, b) = (m[k - 1], m[k]);
+        Some(a.1 + (b.1 - a.1) * ((net - a.0) / (b.0 - a.0).max(1e-5)))
     }
 
     /// Where a fighter was `t` seconds into the game (from the host's recent history).
@@ -7246,7 +7624,16 @@ impl Game {
     /// Returns None when the claim is thrown out; otherwise whether a claimed headshot holds up
     /// and whether the shot touched the body proper (not just a hand, forearm, shin or foot).
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn validate_claim(&self, shooter: usize, victim: usize, w: u8, dmg: f32, o: V3, dir: V3, head: bool) -> Option<ClaimCheck> {
+        self.validate_claim_at(shooter, victim, w, dmg, o, dir, head, None)
+    }
+
+    /// The same, with the moment the shooter says they saw the target (`vt`, the host's clock):
+    /// when it fits their connection it's checked exactly then (a body hit within one tick of
+    /// movement), so what a player hits on their screen counts no matter who peeked whom.
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_claim_at(&self, shooter: usize, victim: usize, w: u8, dmg: f32, o: V3, dir: V3, head: bool, vt: Option<f32>) -> Option<ClaimCheck> {
         if victim >= self.f.len() || !self.f[victim].present || !self.f[victim].alive || !self.is_enemy(shooter, victim) {
             return None;
         }
@@ -7311,8 +7698,12 @@ impl Game {
         let mut hit = false;
         let mut head_ok = false;
         let mut core_ok = false;
-        for back in [INTERP_DELAY, (INTERP_DELAY + MAX_INTERP) * 0.5, MAX_INTERP] {
-            let rewind = (ping + back + 0.015).clamp(0.0, 0.7);
+        // the moment they say they saw it, if it fits their connection (no older than their ping
+        // and the longest playback delay allow), first; then the range it could have been
+        let said = vt.and_then(|v| self.game_time_of(v)).filter(|&v| v <= self.time + 0.02 && self.time - v <= (ping + MAX_INTERP + 0.1).min(0.7));
+        let mut rewinds: Vec<f32> = said.map(|v| (self.time - v).max(0.0)).into_iter().collect();
+        rewinds.extend([INTERP_DELAY, (INTERP_DELAY + MAX_INTERP) * 0.5, MAX_INTERP].map(|back| (ping + back + 0.015).clamp(0.0, 0.7)));
+        for rewind in rewinds {
             let t = self.time - rewind;
             let vp = self.pos_at(victim, t);
             let sp_then = self.pos_at(shooter, t);
@@ -7571,6 +7962,14 @@ impl Game {
                 (_, Some(a)) if a < self.f.len() && a != victim => self.f[a].pos,
                 _ => me - knock.flat(),
             };
+            // who hurt us this life (the death recap shows it): the attacker, or whoever stood
+            // where it came from
+            let who = attacker.filter(|&a| a < self.f.len() && a != victim).or_else(|| {
+                (0..self.f.len()).filter(|&j| j != victim && self.f[j].present && self.is_enemy(victim, j)).min_by(|&a, &b| (self.f[a].pos - from).len().total_cmp(&(self.f[b].pos - from).len()))
+            });
+            if let Some(a) = who {
+                self.life_taken[a] += amount.min(200.0);
+            }
             if (from - me).flat().len() > 0.3 {
                 self.hurt_dirs.push((from, 1.2));
                 if self.hurt_dirs.len() > 6 {
@@ -7739,7 +8138,7 @@ impl Game {
             let at = v3(p.x, ground + 0.02, p.z) + dir.flat() * 0.4;
             let seed = self.rng.next_u32();
             let size = self.rng.range(0.7, 1.0);
-            self.decals.push(Decal { pos: at, size, kind: 0, color: [96, 8, 14], life: 20.0, max_life: 20.0, seed });
+            self.decals.push(Decal { pos: at, normal: v3(0.0, 1.0, 0.0), size, kind: 0, color: [96, 8, 14], life: 20.0, max_life: 20.0, seed });
         }
     }
 
@@ -7853,10 +8252,10 @@ impl Game {
                     self.particles.push(Particle { pos: at + v3(0.0, 0.1, 0.0), vel: r * sp, life, max_life: life, size, color: [118, 108, 96], gravity: 14.0 });
                 }
                 let seed = self.rng.next_u32();
-                self.decals.push(Decal { pos: v3(at.x, ground + 0.025, at.z), size: 1.6, kind: 1, color: [22, 18, 16], life: 14.0, max_life: 14.0, seed });
+                self.decals.push(Decal { pos: v3(at.x, ground + 0.025, at.z), normal: v3(0.0, 1.0, 0.0), size: 1.6, kind: 1, color: [22, 18, 16], life: 14.0, max_life: 14.0, seed });
                 if fighter == 2 {
                     // the smith's blade is hot: a scorch and sparks from the forge
-                    self.decals.push(Decal { pos: v3(at.x, ground + 0.03, at.z), size: 0.9, kind: 2, color: [255, 120, 40], life: 3.5, max_life: 3.5, seed: seed ^ 0x55 });
+                    self.decals.push(Decal { pos: v3(at.x, ground + 0.03, at.z), normal: v3(0.0, 1.0, 0.0), size: 0.9, kind: 2, color: [255, 120, 40], life: 3.5, max_life: 3.5, seed: seed ^ 0x55 });
                     self.exec_cue(i, t, kind, Cue::Embers);
                 }
             }
@@ -7916,6 +8315,88 @@ impl Game {
         }
     }
 
+    /// Mark a place for the team (the ping wheel): everyone on our side sees it, named by its
+    /// callout ("Enemy · Blue Crane"), on the minimap and in the world.
+    pub fn ping(&mut self, kind: u8, p: V3) {
+        let l = self.local;
+        self.add_ping(l, kind.min(PINGS.len() as u8 - 1), p);
+        if self.kind == Kind::Host || self.kind == Kind::Client {
+            self.out_events.push(Ev::Ping { who: l as u8, kind, p });
+        }
+    }
+
+    fn add_ping(&mut self, owner: usize, kind: u8, p: V3) {
+        if !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) || owner >= self.f.len() {
+            return;
+        }
+        // one per player at a time
+        self.pings.retain(|q| q.owner != owner);
+        self.pings.push(Ping { owner, kind, pos: p, t: 0.0 });
+        self.sfx2d(Sfx::PingSound);
+        let name = self.f[owner].name.clone();
+        let place = crate::zones::callout(self.world.map, p + v3(0.0, 0.3, 0.0));
+        self.say(format!("{name}: {} · {place}", PINGS[kind as usize % PINGS.len()]));
+    }
+    /// A smoke goes off: a cloud that blocks sight (players' and bots') until it thins.
+    fn pop_smoke(&mut self, p: V3, owner: usize) {
+        let ground = self.world.ground_below(p + v3(0.0, 0.3, 0.0));
+        let at = v3(p.x, ground.max(p.y - 1.0) + 0.2, p.z);
+        let body = self.f.get(owner).map_or(0, |f| f.loadout.body);
+        self.smokes.push(Smoke { pos: at, t: 0.0, body });
+        if self.smokes.len() > 8 {
+            self.smokes.remove(0);
+        }
+        self.sfx(Sfx::SmokePop, at);
+        self.burst(at, [200, 200, 205], 16, 3.0);
+    }
+
+    /// A flash goes off: everyone with a clear line to it is blinded, the more the closer they are
+    /// and the more they're looking at it (teammates and the thrower too).
+    fn pop_flash(&mut self, p: V3, _owner: usize) {
+        self.sfx(Sfx::FlashPop, p);
+        self.burst(p, [255, 255, 255], 30, 9.0);
+        self.flashes.push(Flash { pos: p, dir: v3(0.0, 1.0, 0.0), life: 0.12, size: 3.0 });
+        for j in 0..self.f.len() {
+            let blind = {
+                let f = &self.f[j];
+                if !f.present || !f.alive || f.spectate {
+                    continue;
+                }
+                flash_blind(&self.world, &self.smokes, f.eye(), look_dir(f.yaw, f.pitch), p)
+            };
+            if blind > 0.0 {
+                self.f[j].blind_t = self.f[j].blind_t.max(blind);
+            }
+        }
+    }
+
+    /// Does a smoke cloud stand between `a` and `b` (thick enough to hide someone)?
+    pub fn smoke_blocks(&self, a: V3, b: V3) -> bool {
+        smoke_between(&self.smokes, a, b)
+    }
+
+    /// Weapon handling everyone sees: an empty magazine falls when a reload begins.
+    fn weapon_fx(&mut self) {
+        for i in 0..self.f.len() {
+            let (start, w, pos, yaw) = {
+                let f = &self.f[i];
+                let reloading = f.present && f.alive && f.reload_t > 0.0;
+                let start = reloading && !f.was_reloading;
+                (start, f.weapon, f.pos, f.yaw)
+            };
+            self.f[i].was_reloading = self.f[i].present && self.f[i].alive && self.f[i].reload_t > 0.0;
+            if start && matches!(w, Weapon::Smg | Weapon::Rifle | Weapon::HandCannon | Weapon::Sniper) {
+                let right = yaw_right(yaw);
+                let at = pos + v3(0.0, 1.05, 0.0) + right * 0.2 + yaw_fwd(yaw) * 0.25;
+                let v = right * 0.4 + v3(0.0, -0.5, 0.0) + yaw_fwd(yaw) * 0.3;
+                let color = if w == Weapon::Rifle || w == Weapon::Sniper { [58, 54, 50] } else { [70, 66, 62] };
+                self.casings.push(Casing { pos: at, vel: v, life: 4.0, spin: self.rng.range(0.0, 6.0), color, kind: 1 });
+                if self.casings.len() > 80 {
+                    self.casings.remove(0);
+                }
+            }
+        }
+    }
     /// Afterimage copies of fighters in the middle of a speedy execution (the picture only).
     pub fn exec_ghosts(&self) -> Vec<Fighter> {
         let mut out = Vec::new();
@@ -8100,6 +8581,11 @@ impl Game {
     }
 
     fn explode(&mut self, p: V3, owner: usize, kind: u8) {
+        match kind {
+            3 => return self.pop_smoke(p, owner),
+            4 => return self.pop_flash(p, owner),
+            _ => {}
+        }
         self.sfx(Sfx::Boom, p);
         self.burst(p, [255, 170, 60], 40, 9.0);
         self.burst(p, [90, 90, 90], 20, 4.0);
@@ -8177,13 +8663,21 @@ impl Game {
     }
 
     fn update_fx(&mut self, dt: f32) {
+        for p in self.pings.iter_mut() {
+            p.t += dt;
+        }
+        self.pings.retain(|p| p.t < PING_LIFE);
+        for s in self.smokes.iter_mut() {
+            s.t += dt;
+        }
+        self.smokes.retain(|s| s.t < SMOKE_LIFE);
         self.update_casings(dt);
         for d in self.decals.iter_mut() {
             d.life -= dt;
         }
         self.decals.retain(|d| d.life > 0.0);
-        if self.decals.len() > 48 {
-            let n = self.decals.len() - 48;
+        if self.decals.len() > 96 {
+            let n = self.decals.len() - 96;
             self.decals.drain(..n);
         }
         self.exec_ask_t = (self.exec_ask_t - dt).max(0.0);
@@ -8248,6 +8742,7 @@ impl Game {
                     if from < MAX_PLAYERS && self.time - self.shot_last[from] > 0.04 {
                         self.shot_last[from] = self.time;
                         self.sfx(Sfx::gun(Weapon::from_u8(w)), o);
+                        self.gun_tail(o);
                     }
                     if spark == 1 || spark == 5 {
                         self.sfx(Sfx::BulletFlesh, e);
@@ -8260,7 +8755,7 @@ impl Game {
                 }
                 self.impact_fx(e, spark);
             }
-            Ev::Hit { victim, dmg, knock, stun, head, w, o, dir, guard } => {
+            Ev::Hit { victim, dmg, knock, stun, head, w, o, dir, guard, vt } => {
                 let v = victim as usize;
                 if v >= self.f.len() {
                     return;
@@ -8268,7 +8763,7 @@ impl Game {
                 if self.kind == Kind::Host {
                     // a player says they hit someone: check it against the recent past
                     if from != 0 {
-                        if let Some(chk) = self.validate_claim(from, v, w, dmg, o, dir, head) {
+                        if let Some(chk) = self.validate_claim_at(from, v, w, dmg, o, dir, head, (vt > 0.0).then_some(vt)) {
                             if dmg > 0.0 {
                                 self.f[v].invis_t = 0.0;
                             }
@@ -8316,6 +8811,21 @@ impl Game {
                     let l = self.local;
                     self.stat(l, |s| s.dealt += hp.clamp(0.0, 999.0) + ap.clamp(0.0, 999.0));
                     self.show_confirmed(victim as usize, hp.clamp(0.0, 999.0), ap.clamp(0.0, 999.0), head);
+                }
+            }
+            Ev::Ping { who, kind, p } => {
+                // a player's own ping (passed on by the host); only teammates' are shown (in modes
+                // without teams, nobody else's)
+                let w = who as usize;
+                let host = from == 0 || from == self.host_slot;
+                if w >= self.f.len() || !(from == w || host) || w == self.local {
+                    return;
+                }
+                if self.kind == Kind::Host && from == w {
+                    self.out_events.push(Ev::Ping { who, kind, p });
+                }
+                if self.mt.mode.teams() && self.f[w].team == self.f[self.local].team {
+                    self.add_ping(w, kind, p);
                 }
             }
             Ev::ExecAsk { target, open } => {
@@ -8370,6 +8880,7 @@ impl Game {
                 let fuse = match kind {
                     1 => 5.0,
                     2 => STAR_LIFE,
+                    3 | 4 => util_fuse(kind),
                     _ => 1.7,
                 };
                 let vis = if kind == 2 && from < self.f.len() { self.star_from_hand(from, p) } else { V3::ZERO };
@@ -8978,7 +9489,7 @@ mod movement_tests {
     fn speed(g: &Game) -> f32 {
         g.f[0].vel.flat().len()
     }
-    const FWD: Input = Input { fwd: 1.0, right: 0.0, jump: false, dash: false, fire: false, fire_pressed: false, guard: false, select: None, reload: false, item: false, crouch: false, kick: false, finish: false, ability: false, yaw: 0.0, pitch: 0.0 };
+    const FWD: Input = Input { fwd: 1.0, right: 0.0, jump: false, dash: false, fire: false, fire_pressed: false, guard: false, select: None, reload: false, item: false, crouch: false, kick: false, finish: false, ability: false, sneak: false, utility: false, inspect: false, yaw: 0.0, pitch: 0.0 };
 
     #[test]
     fn landing_from_a_dash_keeps_speed_then_eases() {
@@ -11236,6 +11747,7 @@ mod net_play_tests {
     /// One frame on both computers (two game ticks each, one network send).
     fn pump(p: &mut Pair, host_in: &Input, client_in: &Input) {
         let dt = TICK * 2.0;
+        p.hg.net_clock = p.hn.clock();
         for m in p.hn.poll() {
             match m {
                 Incoming::Join { slot, name } => p.hg.add_player(slot, &name, false, None, 0),
@@ -11293,6 +11805,48 @@ mod net_play_tests {
             p.cn.send(g, dt);
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    /// Peeker's advantage, over a real connection: the host's fighter strafes back and forth
+    /// across the player's view. Whenever the player could shoot, the moment their claim names
+    /// (Game::view_time) puts the target where the player's screen showed it to within about one
+    /// tick of running, so a hit on what you see counts whoever peeked whom. (The old estimate, a
+    /// fixed guess from the ping, is kept as a fallback and reported for comparison.)
+    #[test]
+    fn a_hit_on_what_you_saw_is_checked_where_you_saw_it() {
+        let mut p = pair(Mode::Ffa, 50);
+        let one_tick = RUN_SPEED * TICK;
+        let mut errs = Vec::new();
+        let mut old = Vec::new();
+        for frame in 0..620 {
+            let right = if (frame / 70) % 2 == 0 { 1.0 } else { -1.0 };
+            pump(&mut p, &Input { right, ..Default::default() }, &Input::default());
+            // (in real time, as a match runs: the game's clock and the network's keep step)
+            std::thread::sleep(std::time::Duration::from_millis(14));
+            if frame < 150 {
+                continue;
+            }
+            let g = p.cg.as_ref().unwrap();
+            // only while it's running steadily (not the instant it turns round)
+            if (frame % 70) < 12 || g.f[0].vel.flat().len() < RUN_SPEED * 0.9 {
+                continue;
+            }
+            let shown = g.f[0].pos;
+            let vt = g.view_time(0);
+            let Some(vt_game) = p.hg.game_time_of(vt) else { continue };
+            let at = p.hg.pos_at(0, vt_game);
+            errs.push((at - shown).flat().len());
+            let ping = p.hg.f[1].ping_ms as f32 / 1000.0;
+            let guess = p.hg.pos_at(0, p.hg.time - (ping + INTERP_DELAY + 0.015));
+            old.push((guess - shown).flat().len());
+        }
+        assert!(errs.len() > 200, "enough samples ({})", errs.len());
+        errs.sort_by(f32::total_cmp);
+        old.sort_by(f32::total_cmp);
+        let p95 = errs[errs.len() * 95 / 100];
+        let med = errs[errs.len() / 2];
+        println!("rewind error: median {:.3} m, 95% {:.3} m ({:.2} ticks); the old guess: median {:.3} m", med, p95, p95 / one_tick, old[old.len() / 2]);
+        assert!(p95 <= one_tick * 1.5, "within about a tick of running: {p95:.3} m ({:.2} ticks)", p95 / one_tick);
     }
 
     /// Over a real connection: the player executes the host's fighter. The player's game asks,

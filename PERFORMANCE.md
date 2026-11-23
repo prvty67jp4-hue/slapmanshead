@@ -102,3 +102,23 @@ the fighters' drawing (at most the eight spare fighter slots). Estimated, not me
     set DUEL_RENDER_SCALE=1.299   (draws a 1280x960 window's 3D picture at 1080p's pixel count)
     set DUEL_BENCH=60,C:\temp\bench.txt
     duel_arena.exe
+
+## Map identity, weapon feel and tactics pass (23 November 2026)
+
+Steam Deck preset, 1280x800 (3D picture 1152x720), Team Deathmatch on Varrow Bridgeworks, 8 fighters, 40 s,
+on the RTX 3060 PC above. Nothing else was running.
+
+| Build | Average | 1% low | 3D drawing (processor side) |
+| --- | --- | --- | --- |
+| Before this pass | 526 fps (1.90 ms) | 332 fps | 1.18 ms |
+| First try with the new areas, minimap, foam, smoke, shells | 353 fps (2.84 ms) | 189 fps | 1.50 ms |
+| Minimap picture made once, foam edges found once, area cuts only where the look changes | 446 fps (2.24 ms) | 265 fps | 1.36 ms |
+
+What cost the most and what was done:
+- The minimap redrew all 277 blocks (with an area lookup each) every frame: it is now one picture made per map.
+- The river foam searched every block against every other block every frame: the edges are now found once.
+- Blocks crossing an area edge were cut at every area line, even where both sides look the same: Bridgeworks
+  went from 128,000 to 108,000 triangles (102,000 before this pass; the clock tower and the new pieces are the rest).
+
+Steam Deck estimate (processor share x3, graphics share x8): about 11 ms a frame, roughly 90 fps, before was about
+9 ms. That is above 60 fps with room for the 1% lows; confirm on a real Deck.

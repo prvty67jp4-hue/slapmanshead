@@ -393,12 +393,19 @@ fn shade(i: VOut) -> vec4<f32> {
   if (is_char) { rough = 0.62; metal = 0.0; }
   if (is_water) {
     let t = u.params.x;
-    let p = i.wpos.xz;
+    // the river flows east (+x): the ripples are carried along with it
+    let p = i.wpos.xz - vec2<f32>(t * 1.3, 0.0);
     let wx = sin(p.x * 1.3 + t * 1.1) * 0.5 + sin((p.x + p.y) * 2.3 - t * 1.7) * 0.3 + sin(p.x * 5.1 - p.y * 3.7 + t * 2.6) * 0.15;
     let wz = sin(p.y * 1.7 - t * 0.9) * 0.5 + sin((p.x - p.y) * 2.9 + t * 1.3) * 0.3 + sin(p.y * 6.3 + p.x * 2.1 - t * 2.2) * 0.15;
     n = normalize(vec3<f32>(wx * 0.09, 1.0, wz * 0.09));
     rough = 0.08;
     metal = 0.0;
+    // foam: long streaks drifting with the current, and a white edge where it laps the banks
+    let streak = smoothstep(0.72, 0.9, vnoise(vec2<f32>(p.x * 0.22, i.wpos.z * 1.4)) * 0.75 + vnoise(vec2<f32>(p.x * 0.9, i.wpos.z * 3.0)) * 0.25);
+    let edge = smoothstep(3.05, 3.95, abs(i.wpos.z)) * (0.6 + 0.4 * sin(i.wpos.x * 3.1 - t * 4.0));
+    let foam = clamp(streak * 0.55 + edge, 0.0, 1.0);
+    base = vec4<f32>(mix(base.rgb, vec3<f32>(0.78, 0.84, 0.86), foam * 0.75), base.a);
+    rough = mix(0.08, 0.6, foam);
   }
   let albedo = base.rgb;
   let l = normalize(u.sun.xyz);
@@ -1479,15 +1486,40 @@ fn build_world(world: &World) -> Vec<Vtx> {
         }
         let b = bl.b;
         let sy = b.max.y - b.min.y;
-        let surf = if bl.mat == Mat::Metal && sy < 2.0 { env::IRON } else { env::surface(map, bl.mat) };
         let bevel = match bl.mat {
             Mat::Floor => 0.0,
             Mat::Trim | Mat::Crate => 0.03,
             _ => 0.05,
         };
-        let mut lk = BoxLook::new(world, surf, &b, bevel);
-        lk.top_only = bl.mat == Mat::Floor;
-        box_into(&mut mb, world, &b, &lk);
+        // a block crossing from one area into another is drawn in pieces, each in its own area's
+        // look (crate::zones: the bases' brick and slate, the river's wet stone, the bridges...)
+        let (mut xs, mut zs) = crate::zones::cuts(map, b.min, b.max);
+        let look_at = |x0: f32, x1: f32, z0: f32, z1: f32| {
+            let at = v3((x0 + x1) * 0.5, b.max.y.min((b.min.y + b.max.y) * 0.5 + 0.5), (z0 + z1) * 0.5);
+            if bl.mat == Mat::Metal && sy < 2.0 { env::IRON } else { crate::zones::surface(map, bl.mat, at) }
+        };
+        let same = |a: &env::Surface, c: &env::Surface| a.layer == c.layer && a.tint == c.tint && a.shine == c.shine;
+        // a cut only stays where the look really changes across it (fewer pieces, fewer triangles)
+        let mut i = 1;
+        while i + 1 < xs.len() {
+            let keep = (0..zs.len() - 1).any(|j| !same(&look_at(xs[i - 1], xs[i], zs[j], zs[j + 1]), &look_at(xs[i], xs[i + 1], zs[j], zs[j + 1])));
+            if keep { i += 1 } else { xs.remove(i); }
+        }
+        let mut j = 1;
+        while j + 1 < zs.len() {
+            let keep = (0..xs.len() - 1).any(|i| !same(&look_at(xs[i], xs[i + 1], zs[j - 1], zs[j]), &look_at(xs[i], xs[i + 1], zs[j], zs[j + 1])));
+            if keep { j += 1 } else { zs.remove(j); }
+        }
+        for i in 0..xs.len() - 1 {
+            for j in 0..zs.len() - 1 {
+                let piece = crate::math::Aabb::new(v3(xs[i], b.min.y, zs[j]), v3(xs[i + 1], b.max.y, zs[j + 1]));
+                let surf = look_at(xs[i], xs[i + 1], zs[j], zs[j + 1]);
+                let bevel: f32 = bevel;
+                let mut lk = BoxLook::new(world, surf, &piece, if xs.len() > 2 || zs.len() > 2 { bevel.min(0.02) } else { bevel });
+                lk.top_only = bl.mat == Mat::Floor;
+                box_into(&mut mb, world, &piece, &lk);
+            }
+        }
     }
     for (b, own, t) in trims(world) {
         let (surf, shade) = trim_surface(map, own, t);
@@ -1511,13 +1543,101 @@ fn build_world(world: &World) -> Vec<Vtx> {
             while z < w.max.z - 1e-3 {
                 let z1 = (z + 4.0).min(w.max.z);
                 let q = [v3(x, y, z), v3(x, y, z1), v3(x1, y, z1), v3(x1, y, z)];
-                mb.quad(q, V3::UP, [[x * 0.25, z * 0.25], [x * 0.25, z1 * 0.25], [x1 * 0.25, z1 * 0.25], [x1 * 0.25, z * 0.25]], lin([22, 40, 44]), [-2.0, 0.0, 1.0, 3.0]);
+                mb.quad(q, V3::UP, [[x * 0.25, z * 0.25], [x * 0.25, z1 * 0.25], [x1 * 0.25, z1 * 0.25], [x1 * 0.25, z * 0.25]], lin([34, 68, 74]), [-2.0, 0.0, 1.0, 3.0]);
                 z = z1;
             }
             x = x1;
         }
     }
+    // glowing landmarks (crate::zones::glows): clock faces with their hands, the forges' mouths
+    for (c, n, r, col) in crate::zones::glows(map) {
+        let up = V3::UP;
+        let side = n.cross(up).norm();
+        let seg = 20;
+        for k in 0..seg {
+            let a0 = k as f32 / seg as f32 * std::f32::consts::TAU;
+            let a1 = (k + 1) as f32 / seg as f32 * std::f32::consts::TAU;
+            let p = |a: f32| c + side * (a.cos() * r) + up * (a.sin() * r);
+            for q in [c, p(a0), p(a1)] {
+                mb.vert(q, n, [0.5, 0.5], [col[0], col[1], col[2], 1.0], [-1.0, 2.0, 1.0, 0.0]);
+            }
+        }
+        if r > 1.0 {
+            // a clock: two dark hands (ten past ten) and a rim
+            let f = c + n * 0.02;
+            let dark = [0.03f32, 0.025, 0.02, 1.0];
+            for (ang, len, w) in [(1.05f32, 0.55f32, 0.07f32), (2.3, 0.85, 0.05)] {
+                let d = side * ang.cos() + up * ang.sin();
+                let wv = d.cross(n).norm() * w;
+                let q = [f - wv, f + wv, f + wv + d * (r * len), f - wv + d * (r * len)];
+                mb.quad(q, n, [[0.5, 0.5]; 4], dark, [-1.0, 2.0, 1.0, 0.0]);
+            }
+            for k in 0..24 {
+                let a0 = k as f32 / 24.0 * std::f32::consts::TAU;
+                let a1 = (k + 1) as f32 / 24.0 * std::f32::consts::TAU;
+                let ring = |a: f32, rr: f32| f + side * (a.cos() * rr) + up * (a.sin() * rr);
+                mb.quad([ring(a0, r), ring(a1, r), ring(a1, r + 0.12), ring(a0, r + 0.12)], n, [[0.5, 0.5]; 4], [0.12, 0.1, 0.08, 1.0], [-1.0, 2.0, 1.0, 0.0]);
+            }
+        }
+    }
     mb.v
+}
+
+/// Foam round everything that stands in the water (bridge piers, the bank steps), stirred by the
+/// current: rings of white that pulse and drift downstream. Drawn each frame.
+fn water_foam(al: &mut MB, world: &World, time: f32) {
+    // where the foam goes never changes during a match: the edges are found once per map (the
+    // search looks at every block against every other) and only animated each frame
+    thread_local! {
+        static EDGES: std::cell::RefCell<Option<((u8, usize, usize), Vec<(V3, V3, V3, usize)>)>> = const { std::cell::RefCell::new(None) };
+    }
+    let key = (world.map as u8, world.blocks.len(), world.water.len());
+    EDGES.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.as_ref().map_or(true, |(k, _)| *k != key) {
+            *cell = Some((key, foam_edges(world)));
+        }
+        let Some((_, edges)) = cell.as_ref() else { return };
+        for &(a, c, out, k) in edges {
+            let len = (c - a).len();
+            let n = ((len / 0.6).ceil() as usize).max(1);
+            for s in 0..n {
+                let t0 = s as f32 / n as f32;
+                let t1 = (s + 1) as f32 / n as f32;
+                let pulse = 0.55 + 0.45 * (time * 3.0 + (a.x + a.z) * 1.7 + s as f32 * 1.3 + k as f32).sin();
+                // the downstream side trails further
+                let reach = 0.35 + 0.25 * pulse + if out.x > 0.5 { 0.5 } else { 0.0 };
+                let p0 = a.lerp(c, t0);
+                let p1 = a.lerp(c, t1);
+                let drift = v3((time * 1.3 + s as f32 * 0.37).fract() * 0.2, 0.0, 0.0);
+                al.quad([p0, p1, p1 + out * reach + drift, p0 + out * reach + drift], V3::UP, [[0.5, 0.5]; 4], lina([225, 236, 238], 0.55 * pulse), [-1.0, 2.0, 1.0, 0.0]);
+            }
+        }
+    });
+}
+
+/// The water-line edges of everything standing in the water: (start, end, outward, side index).
+fn foam_edges(world: &World) -> Vec<(V3, V3, V3, usize)> {
+    let mut out_edges = Vec::new();
+    for w in &world.water {
+        let y = w.max.y + 0.015;
+        for bl in world.blocks.iter().filter(|b| b.mat != Mat::Hidden && b.b.min.y < y && b.b.max.y > y - 0.05) {
+            let b = bl.b;
+            if b.max.x < w.min.x || b.min.x > w.max.x || b.max.z < w.min.z || b.min.z > w.max.z {
+                continue;
+            }
+            // only edges that are in the water
+            let (x0, x1, z0, z1) = (b.min.x.max(w.min.x), b.max.x.min(w.max.x), b.min.z.max(w.min.z), b.max.z.min(w.max.z));
+            for (k, (a, c, out)) in [(v3(x0, y, z0), v3(x1, y, z0), v3(0.0, 0.0, -1.0)), (v3(x1, y, z1), v3(x0, y, z1), v3(0.0, 0.0, 1.0)), (v3(x0, y, z1), v3(x0, y, z0), v3(-1.0, 0.0, 0.0)), (v3(x1, y, z0), v3(x1, y, z1), v3(1.0, 0.0, 0.0))].into_iter().enumerate() {
+                let mid = (a + c) * 0.5 + out * 0.3;
+                if mid.z <= w.min.z + 0.1 || mid.z >= w.max.z - 0.1 || world.blocks.iter().any(|o| o.mat != Mat::Hidden && o.b.contains(mid + v3(0.0, 0.05, 0.0))) {
+                    continue; // against the bank or inside something else: no water there
+                }
+                out_edges.push((a, c, out, k));
+            }
+        }
+    }
+    out_edges
 }
 // ------------------------------------------------------------------ characters
 
@@ -1973,12 +2093,15 @@ fn exec_view(g: &Game, f: &Fighter) -> Option<(Option<Fighter>, bool)> {
 fn decal_into(al: &mut MB, ad: &mut MB, d: &crate::game::Decal) {
     let fade = (d.life / d.max_life.max(0.01)).clamp(0.0, 1.0);
     let fade = (fade * 4.0).min(1.0);
-    let up = v3(0.0, 1.0, 0.0);
+    // on whatever face it lies on: the floor, a wall, a ceiling
+    let up = if d.normal.len() > 0.5 { d.normal.norm() } else { v3(0.0, 1.0, 0.0) };
+    let t1 = if up.y.abs() > 0.9 { v3(1.0, 0.0, 0.0) } else { v3(0.0, 1.0, 0.0).cross(up).norm() };
+    let t2 = up.cross(t1).norm();
     let mut rng = Rng((d.seed as u64).wrapping_mul(2_654_435_761) | 1);
     let flat = |c: V3, r: f32, a: f32| -> [V3; 4] {
         let (s, co) = a.sin_cos();
-        let x = v3(co, 0.0, s) * r;
-        let z = v3(-s, 0.0, co) * r;
+        let x = (t1 * co + t2 * s) * r;
+        let z = (t2 * co - t1 * s) * r;
         [c - x - z, c + x - z, c + x + z, c - x + z]
     };
     let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
@@ -1986,7 +2109,7 @@ fn decal_into(al: &mut MB, ad: &mut MB, d: &crate::game::Decal) {
         0 => {
             // a stain: a few soft overlapping splashes and drops
             for k in 0..6 {
-                let off = v3(rng.range(-0.5, 0.5), 0.0, rng.range(-0.5, 0.5)) * d.size * if k == 0 { 0.0 } else { 1.0 };
+                let off = (t1 * rng.range(-0.5, 0.5) + t2 * rng.range(-0.5, 0.5)) * d.size * if k == 0 { 0.0 } else { 1.0 };
                 let r = d.size * if k == 0 { 0.55 } else { rng.range(0.12, 0.3) };
                 al.quad(flat(d.pos + off + up * (0.001 * k as f32), r, rng.range(0.0, 6.28)), up, uv, lina(d.color, 0.85 * fade), [-1.0, 3.0, 1.0, 0.0]);
             }
@@ -2001,13 +2124,29 @@ fn decal_into(al: &mut MB, ad: &mut MB, d: &crate::game::Decal) {
                 for _ in 0..4 {
                     a += rng.range(-0.6, 0.6);
                     let len = d.size * rng.range(0.12, 0.22);
-                    let dir = v3(a.cos(), 0.0, a.sin());
-                    let side = v3(-dir.z, 0.0, dir.x);
+                    let dir = t1 * a.cos() + t2 * a.sin();
+                    let side = up.cross(dir).norm();
                     let p1 = p0 + dir * len;
                     al.quad([p0 - side * w, p1 - side * (w * 0.6), p1 + side * (w * 0.6), p0 + side * w], up, [[0.5, 0.5]; 4], lina(d.color, 0.9 * fade), [-1.0, 2.0, 1.0, 0.0]);
                     p0 = p1;
                     w *= 0.6;
                 }
+            }
+        }
+        3 => {
+            // a bullet hole: a dark pit, a paler ring of chipped surface round it
+            al.quad(flat(d.pos, d.size * 1.6, rng.range(0.0, 6.28)), up, uv, lina([150, 142, 130], 0.22 * fade), [-1.0, 3.0, 1.0, 0.0]);
+            al.quad(flat(d.pos + up * 0.002, d.size * 0.55, rng.range(0.0, 6.28)), up, uv, lina(d.color, 0.95 * fade), [-1.0, 3.0, 1.0, 0.0]);
+        }
+        4 => {
+            // a ripple spreading on the water
+            let k = 1.0 - (d.life / d.max_life.max(0.01)).clamp(0.0, 1.0);
+            let r = d.size * (0.3 + 1.2 * k);
+            for s in 0..16 {
+                let a0 = s as f32 / 16.0 * std::f32::consts::TAU;
+                let a1 = (s + 1) as f32 / 16.0 * std::f32::consts::TAU;
+                let ring = |a: f32, rr: f32| d.pos + (t1 * a.cos() + t2 * a.sin()) * rr;
+                al.quad([ring(a0, r), ring(a1, r), ring(a1, r + 0.06), ring(a0, r + 0.06)], up, [[0.5, 0.5]; 4], lina(d.color, 0.6 * (1.0 - k)), [-1.0, 2.0, 1.0, 0.0]);
             }
         }
         _ => {
@@ -3440,6 +3579,7 @@ impl Gpu {
         for d in &g.decals {
             decal_into(&mut al, &mut ad, d);
         }
+        water_foam(&mut al, &g.world, g.time);
         // an execution's afterimages shimmer in their colour
         for f in decoys.iter().filter(|f| f.ghost > 0.0) {
             let c = PALETTE[(f.color_idx as usize) % PALETTE.len()];
@@ -3471,9 +3611,43 @@ impl Gpu {
             ad.billboard(cam, fl.pos, fl.size * 0.35, lina([255, 255, 230], k));
             ad.beam(cam, fl.pos, fl.pos + fl.dir * fl.size * 1.8, fl.size * 0.3, lina([255, 185, 90], k * 0.9));
         }
-        for c in g.casings.iter().filter(|_| self.quality.extras) {
+        // spent shells and dropped magazines (cheap: drawn on every preset)
+        for c in g.casings.iter() {
             let r = M3::rot_y(c.spin).mul(&M3::rot_x(c.spin * 1.3));
-            op.obox(c.pos, &r, v3(0.012, 0.012, 0.03), lin(c.color), -1.0, 1.8);
+            if c.kind == 1 {
+                op.obox(c.pos, &r, v3(0.022, 0.07, 0.035), lin(c.color), -1.0, 1.2);
+            } else {
+                op.obox(c.pos, &r, v3(0.012, 0.012, 0.03), lin(c.color), -1.0, 1.8);
+            }
+        }
+        // smoke clouds: dense, soft puffs (they hide what's behind them)
+        for (si, s) in g.smokes.iter().enumerate() {
+            let k = s.density();
+            if k <= 0.01 {
+                continue;
+            }
+            let col = if s.body == 2 { [132, 120, 108] } else { [150, 154, 162] };
+            let mut rng = Rng(0x9E37_79B9 ^ (si as u64 + 1).wrapping_mul(2_654_435_761));
+            let r = crate::game::SMOKE_R * (0.6 + 0.4 * k);
+            for n in 0..34 {
+                let a = rng.range(0.0, std::f32::consts::TAU);
+                let rr = rng.range(0.0, 1.0f32).sqrt() * r * 0.8;
+                let y = rng.range(0.2, 2.6);
+                let drift = v3((g.time * 0.21 + n as f32).sin() * 0.25, (g.time * 0.13 + n as f32 * 0.7).sin() * 0.1, (g.time * 0.17 + n as f32 * 1.3).cos() * 0.25);
+                let p = s.pos + v3(a.cos() * rr, y, a.sin() * rr) + drift;
+                let size = rng.range(1.3, 2.1) * (0.7 + 0.3 * k);
+                let shade = rng.range(0.85, 1.05);
+                let c = [(col[0] as f32 * shade) as u8, (col[1] as f32 * shade) as u8, (col[2] as f32 * shade) as u8];
+                al.billboard(cam, p, size, lina(c, 0.62 * k));
+            }
+            if s.body == 2 && k > 0.3 {
+                // the forge smoke carries a few embers
+                for n in 0..6 {
+                    let ph = (g.time * 0.4 + n as f32 * 0.17).fract();
+                    let a = n as f32 * 1.1 + g.time * 0.3;
+                    ad.billboard(cam, s.pos + v3(a.cos() * 1.5, 0.3 + ph * 2.6, a.sin() * 1.5), 0.08, lina([255, 150, 60], 0.8 * (1.0 - ph) * k));
+                }
+            }
         }
         for tr in &g.tracers {
             let t = (tr.life / tr.max_life.max(0.01)).clamp(0.0, 1.0);

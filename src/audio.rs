@@ -110,6 +110,19 @@ fn props(s: Sfx) -> Props {
         Sfx::ExecImpact => p(clips!["flesh_2.ogg", "boom_crunch.ogg"], 1.0, 30.0),
         Sfx::ExecRing => p(clips!["clang_3.ogg"], 0.75, 40.0),
         Sfx::Crowd => p(clips!["wall_1.ogg", "wall_2.ogg"], 0.7, 0.0),
+        // steps on iron (a hollow ring) and through water (a splash, designed below)
+        Sfx::StepMetal => pp(clips!["armor.ogg", "clang_2.ogg"], 0.28, 6.0, 1.35),
+        Sfx::StepWater => p(clips!["land_1.ogg", "land_2.ogg"], 0.45, 7.0),
+        // a gunshot's tail: a short slap off close walls in a room, a long roll in the open
+        // (designed below from the boom); heard far, quieter than the shot itself
+        Sfx::TailRoom => p(clips!["boom_1.ogg"], 0.35, 30.0),
+        Sfx::TailOpen => p(clips!["boom_2.ogg"], 0.3, 45.0),
+        // hit markers: a kill is a deep double knock, unlike the hit tick and the headshot ping
+        Sfx::KillConfirm => pp(clips!["kill.ogg"], 0.75, 0.0, 0.82),
+        // utility: a smoke canister's hiss and thump, a flash's sharp crack
+        Sfx::SmokePop => pp(clips!["rocket.ogg"], 0.6, 20.0, 1.45),
+        Sfx::FlashPop => pp(clips!["boom_crunch.ogg", "clang_2.ogg"], 0.85, 26.0, 1.7),
+        Sfx::PingSound => pp(clips!["ui_tick.ogg"], 0.6, 0.0, 1.35),
     }
 }
 
@@ -377,10 +390,84 @@ fn finish_clip(s: Sfx, k: usize, clip: Vec<f32>, rate: f32) -> Vec<f32> {
     match gun_voice(s) {
         Some(v) if !clip.is_empty() => design_gunshot(&clip, &v, rate, s as u32 * 16 + k as u32 + 1),
         _ if matches!(s, Sfx::ExecWhoosh | Sfx::ExecImpact | Sfx::ExecRing | Sfx::Crowd) && !clip.is_empty() => design_exec(s, &clip, rate, k as u32 + 1),
+        _ if matches!(s, Sfx::StepWater | Sfx::TailRoom | Sfx::TailOpen) && !clip.is_empty() => design_env(s, &clip, rate, k as u32 + 1),
         _ => clip,
     }
 }
 
+/// Sounds of the place: a footstep in water (the step's thud under a burst of splashing, bright
+/// noise in short drops), and a gunshot's tail: in a room a quick slap and a short dense ring off
+/// close walls (about 0.6 s), in the open a soft rolling echo that carries on for about 2 s.
+pub fn design_env(s: Sfx, rec: &[f32], rate: f32, seed: u32) -> Vec<f32> {
+    let mut rng = seed.wrapping_mul(2_654_435_761) | 1;
+    let mut noise = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        (rng >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    };
+    let peak_of = |x: &[f32]| x.iter().fold(0.0f32, |m, s| m.max(s.abs())).max(1e-4);
+    let mut out: Vec<f32> = match s {
+        Sfx::StepWater => {
+            let n = (0.35 * rate) as usize;
+            let mut o = vec![0.0f32; n.max(rec.len())];
+            let rp = peak_of(rec);
+            for (i, v) in rec.iter().enumerate() {
+                o[i] += v / rp * 0.35;
+            }
+            let raw: Vec<f32> = (0..n).map(|_| noise()).collect();
+            let wet = band_pass(&raw, 1800.0, 6000.0, rate);
+            let wp = peak_of(&wet);
+            // a few drops: short bursts at random moments
+            let mut drops = Vec::new();
+            for k in 0..7 {
+                drops.push((0.01 + k as f32 * 0.035 + noise().abs() * 0.02) * rate);
+            }
+            for i in 0..n {
+                let x = i as f32;
+                let env: f32 = drops.iter().map(|&d| if x >= d { (-(x - d) / (0.012 * rate)).exp() } else { 0.0 }).sum();
+                o[i] += wet[i] / wp * env.min(1.2) * 0.8;
+            }
+            o
+        }
+        _ => {
+            let room = s == Sfx::TailRoom;
+            // the boom's first moment, then only its reflections
+            let head: Vec<f32> = rec.iter().take((0.06 * rate) as usize).copied().collect();
+            let len = if room { 0.6 } else { 2.0 };
+            let wet = echo(&head, len, rate);
+            let mut o: Vec<f32> = wet.iter().map(|v| *v).collect();
+            let mut lp = o.clone();
+            low_pass(&mut lp, if room { 2400.0 } else { 900.0 }, rate);
+            o = lp;
+            if room {
+                // the slap: one bright early reflection at about 25 ms
+                let d = (0.025 * rate) as usize;
+                for i in 0..head.len() {
+                    if i + d < o.len() {
+                        o[i + d] += head[i] * 0.8;
+                    }
+                }
+            }
+            // no direct sound: fade in over the first few milliseconds
+            let fade_in = (0.012 * rate) as usize;
+            for i in 0..fade_in.min(o.len()) {
+                o[i] *= i as f32 / fade_in as f32;
+            }
+            o
+        }
+    };
+    let peak = peak_of(&out);
+    let len = out.len();
+    let fade = (0.05 * rate) as usize;
+    for i in 0..fade.min(len) {
+        out[len - 1 - i] *= i as f32 / fade as f32;
+    }
+    for v in out.iter_mut() {
+        *v = *v / peak * 0.85;
+    }
+    out
+}
 /// The executions' sounds, built from a recording and designed layers (all made here):
 /// - whoosh: the swing stretched long and low, with a band of rushing air sweeping down;
 /// - impact: the hit with a deep thump dropping in pitch and a short room boom after it;
@@ -557,7 +644,7 @@ pub struct Audio {
 }
 
 /// Every sound, in the order of `Sfx`.
-pub const ALL: [Sfx; 58] = [
+pub const ALL: [Sfx; 66] = [
     Sfx::Shotgun,
     Sfx::Revolver,
     Sfx::Smg,
@@ -616,6 +703,14 @@ pub const ALL: [Sfx; 58] = [
     Sfx::ExecImpact,
     Sfx::ExecRing,
     Sfx::Crowd,
+    Sfx::StepMetal,
+    Sfx::StepWater,
+    Sfx::TailRoom,
+    Sfx::TailOpen,
+    Sfx::KillConfirm,
+    Sfx::SmokePop,
+    Sfx::FlashPop,
+    Sfx::PingSound,
 ];
 
 fn mix_into(m: &Arc<Mutex<Mixer>>, frames: usize, channels: usize, rate: f32, mut write: impl FnMut(usize, f32)) {
