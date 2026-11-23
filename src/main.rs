@@ -25,8 +25,11 @@ mod weapons;
 mod watchdog;
 mod world;
 mod zones;
+mod lore;
 #[cfg(test)]
 mod tactics_tests;
+#[cfg(test)]
+mod story_tests;
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, Stroke, Vec2, ViewportCommand};
 use game::*;
@@ -659,8 +662,10 @@ enum Page {
     Browse,
     /// Career stats, finishers included.
     Stats,
-    /// Each fighter's mastery: badge, outfits, finishers, lore.
+    /// Each fighter's mastery: badge, outfits, finishers.
     Mastery,
+    /// The story: the world, each fighter's entries (opening with mastery), the places.
+    Lore,
 }
 
 enum Screen {
@@ -764,6 +769,9 @@ struct App {
     minimap_cache: std::cell::RefCell<Option<((MapId, usize, u32, u32, u32), std::sync::Arc<egui::Mesh>)>>,
     /// Where an execution preview goes back to when it ends.
     preview_back: Option<Page>,
+    /// The Lore page's tab: 0 the world, 1.. a fighter, then the places.
+    lore_tab: u8,
+
     /// An execution's camera: which shot (execution, shot, victim's view) and the angle chosen for it.
     exec_cam: std::cell::Cell<((u8, usize, bool), usize)>,
     /// The News / Patch notes text.
@@ -920,6 +928,8 @@ impl App {
             quick: None,
             quick_host: false,
             preview_back: None,
+            lore_tab: 0,
+
             ping_hold: 0.0,
             ping_wheel: None,
             minimap_cache: Default::default(),
@@ -1048,6 +1058,10 @@ impl App {
                 app.screen = Screen::Menu(Page::Host);
             } else if pg == "mastery" {
                 app.screen = Screen::Menu(Page::Mastery);
+            } else if let Some(tab) = pg.strip_prefix("lore") {
+                // DUEL_PAGE=lore or lore:<tab> (0 the world, 1-4 a fighter, 5 the places)
+                app.lore_tab = tab.trim_start_matches(':').parse().unwrap_or(0);
+                app.screen = Screen::Menu(Page::Lore);
             } else if pg == "play" {
                 app.screen = Screen::Menu(Page::Play);
             } else if pg == "loadout" {
@@ -1067,6 +1081,15 @@ impl App {
             let mut g = if std::env::var_os("DUEL_GAUNTLET").is_some() { Game::gauntlet("Tester", 0) } else { Game::offline("Tester", nb, 0.6, mode, kills) };
             if let Some(m) = std::env::var("DUEL_MAP").ok().and_then(|v| v.parse::<u8>().ok()) {
                 g.set_map(MapId::from_u8(m));
+            }
+            // test switch: DUEL_BOT_BODY=0..3 puts every bot in that fighter (rival pictures)
+            if let Some(b) = std::env::var("DUEL_BOT_BODY").ok().and_then(|v| v.parse::<u8>().ok()) {
+                for i in 1..g.f.len() {
+                    if g.f[i].present && g.f[i].is_bot {
+                        g.f[i].loadout.body = b.min(chars::COUNT as u8 - 1);
+                        g.f[i].equip();
+                    }
+                }
             }
             if std::env::var_os("DUEL_HUMAN").is_none() {
                 g.f[0].is_bot = true;
@@ -4697,7 +4720,12 @@ impl App {
             Screen::Play { game, .. } => game.mt.mode.melee_only(),
             _ => false,
         };
-        ui_kit::LoadoutView { timer, melee_only, pad: self.pad_active, tab_step: std::mem::take(&mut self.pad_tab), keys, hint, subtitle, action, back }
+        // before a match (it has a timer): the map it's on and the map's lore line
+        let map = match (&self.screen, timer) {
+            (Screen::Play { game, .. }, Some(_)) => Some((game.world.map.name(), lore::map_lore(game.world.map))),
+            _ => None,
+        };
+        ui_kit::LoadoutView { timer, melee_only, pad: self.pad_active, tab_step: std::mem::take(&mut self.pad_tab), keys, hint, subtitle, map, action, back }
     }
 
     /// The HUD's size: follows the window, and the Couch / TV interface size on top (the UI's
@@ -4899,6 +4927,107 @@ impl App {
             }
         }
     }
+    /// The story in a match (all its words from assets/lore.txt): a 1v1's intro card before the
+    /// bell (both fighters, their titles, their rival lines if they are rivals, and the map), the
+    /// map's card as a match starts on it, speech bubbles over whoever is speaking, and subtitles
+    /// for the lines that concern you and the announcer's.
+    fn draw_story(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game, s: f32) {
+        if test_view().is_some() || g.preview.is_some() || g.train.is_some() || g.kind == game::Kind::Demo {
+            return;
+        }
+        let c = rect.center();
+        let wrap = |text: &str, size: f32, col: Color32, w: f32| p.layout(text.to_string(), FontId::proportional(size), col, w);
+        let card_bg = Color32::from_rgba_unmultiplied(10, 9, 18, 215);
+        let intro = g.intro_pair().filter(|_| g.mt.phase == Phase::Countdown);
+        // ---- a duel's intro card
+        if let Some((a, b)) = intro {
+            let w = (rect.width() * 0.62).min(760.0 * s);
+            let top = rect.top() + 84.0 * s;
+            let (ba, bb) = (g.f[a].loadout.body, g.f[b].loadout.body);
+            let rivals = lore::rival(ba) == Some(bb) || lore::rival(bb) == Some(ba);
+            let lines: Vec<(u8, &str)> = if rivals { [(ba, bb), (bb, ba)].iter().filter_map(|&(x, y)| lore::vs_line(x, y).map(|l| (x, l))).collect() } else { Vec::new() };
+            let map_g = wrap(lore::map_lore(g.world.map), 13.0 * s, Color32::from_gray(200), w - 40.0 * s);
+            let h = 128.0 * s + if lines.is_empty() { 0.0 } else { 26.0 * s * lines.len() as f32 + 22.0 * s } + map_g.size().y + 34.0 * s;
+            let r = Rect::from_min_size(Pos2::new(c.x - w * 0.5, top), Vec2::new(w, h));
+            p.rect_filled(r, 8.0 * s, card_bg);
+            ui_kit::edge_marks(p, r, s, false);
+            let half = w * 0.5;
+            for (k, (i, body)) in [(a, ba), (b, bb)].into_iter().enumerate() {
+                let x = if k == 0 { r.left() + half * 0.5 } else { r.right() - half * 0.5 };
+                let col = player_color(g.f[i].color_idx);
+                p.rect_filled(Rect::from_center_size(Pos2::new(x, r.top() + 14.0 * s), Vec2::new(half * 0.55, 4.0 * s)), 2.0, col);
+                text_display(p, Pos2::new(x, r.top() + 48.0 * s), Align2::CENTER_CENTER, &chars::name(body).to_uppercase(), 26.0 * s, Color32::WHITE);
+                text_display(p, Pos2::new(x, r.top() + 78.0 * s), Align2::CENTER_CENTER, &lore::fighter_title(body).to_uppercase(), 15.0 * s, col);
+                text_shadow(p, Pos2::new(x, r.top() + 102.0 * s), Align2::CENTER_CENTER, &g.f[i].name, 13.0 * s, Color32::from_gray(190));
+            }
+            text_display(p, Pos2::new(c.x, r.top() + 60.0 * s), Align2::CENTER_CENTER, "VS", 34.0 * s, ACCENT);
+            let mut y = r.top() + 128.0 * s;
+            if !lines.is_empty() {
+                text_display(p, Pos2::new(c.x, y), Align2::CENTER_TOP, "RIVALS", 13.0 * s, Color32::from_rgb(255, 150, 100));
+                y += 22.0 * s;
+                for (body, line) in &lines {
+                    text_shadow(p, Pos2::new(c.x, y), Align2::CENTER_TOP, &format!("{}: \u{201c}{line}\u{201d}", chars::name(*body)), 16.0 * s, Color32::from_rgb(245, 235, 220));
+                    y += 26.0 * s;
+                }
+            }
+            p.line_segment([Pos2::new(r.left() + 20.0 * s, y + 4.0 * s), Pos2::new(r.right() - 20.0 * s, y + 4.0 * s)], Stroke::new(1.0, Color32::from_white_alpha(30)));
+            text_display(p, Pos2::new(c.x, y + 10.0 * s), Align2::CENTER_TOP, &g.world.map.name().to_uppercase(), 15.0 * s, ACCENT);
+            p.galley(Pos2::new(c.x - map_g.size().x * 0.5, y + 30.0 * s), map_g, Color32::WHITE);
+        }
+        // ---- the map's card while the match gets going (a 1v1's is on its intro card)
+        if g.intro_pair().is_none() && matches!(g.mt.phase, Phase::Warmup | Phase::Countdown) && g.mt.mode != Mode::Gauntlet {
+            let a = 1.0;
+            let w = (rect.width() * 0.46).min(560.0 * s);
+            let lg = wrap(lore::map_lore(g.world.map), 13.5 * s, Color32::from_gray(210).gamma_multiply(a), w - 36.0 * s);
+            let r = Rect::from_min_size(Pos2::new(c.x - w * 0.5, rect.top() + 84.0 * s), Vec2::new(w, 46.0 * s + lg.size().y + 14.0 * s));
+            p.rect_filled(r, 8.0 * s, card_bg.gamma_multiply(a));
+            text_display(p, Pos2::new(c.x, r.top() + 10.0 * s), Align2::CENTER_TOP, &g.world.map.name().to_uppercase(), 24.0 * s, ACCENT.gamma_multiply(a));
+            p.galley(Pos2::new(c.x - lg.size().x * 0.5, r.top() + 46.0 * s), lg, Color32::WHITE);
+        }
+        // ---- speech bubbles over whoever is speaking (not you: yours is in the subtitles)
+        for v in g.voice.iter().filter(|v| v.t >= 0.0) {
+            let Some(i) = v.who.filter(|&i| i < g.f.len() && i != g.local) else { continue };
+            let f = &g.f[i];
+            if !f.present || f.invis_t > 0.0 || (f.pos - cam.pos).len() > 45.0 {
+                continue;
+            }
+            let head = f.pos + v3(0.0, 2.55, 0.0);
+            let Some(sp) = cam.project(head) else { continue };
+            if !rect.contains(sp) || !g.world.line_clear(cam.pos, head) {
+                continue;
+            }
+            let a = (v.t / 0.15).min(1.0) * ((game::VOICE_LIFE - v.t) / 0.5).clamp(0.0, 1.0);
+            let gal = wrap(&v.text, 13.5 * s, Color32::from_rgb(30, 24, 20).gamma_multiply(a), 220.0 * s);
+            let bs = gal.size() + Vec2::new(18.0 * s, 12.0 * s);
+            let br = Rect::from_min_size(Pos2::new(sp.x - bs.x * 0.5, sp.y - bs.y - 10.0 * s), bs);
+            let fill = Color32::from_rgba_unmultiplied(246, 240, 228, (235.0 * a) as u8);
+            p.rect_filled(br, 7.0 * s, fill);
+            p.add(egui::Shape::convex_polygon(vec![Pos2::new(sp.x - 7.0 * s, br.bottom() - 1.0), Pos2::new(sp.x + 7.0 * s, br.bottom() - 1.0), Pos2::new(sp.x, br.bottom() + 9.0 * s)], fill, Stroke::NONE));
+            p.rect_stroke(br, 7.0 * s, Stroke::new(1.5 * s, player_color(f.color_idx).gamma_multiply(a)), egui::StrokeKind::Inside);
+            p.galley(br.min + Vec2::new(9.0 * s, 6.0 * s), gal, Color32::WHITE);
+        }
+        // ---- subtitles: the lines that concern you and the announcer's, newest at the bottom
+        let subs: Vec<&game::Voice> = g.voice.iter().filter(|v| v.subtitle && v.t >= 0.0).collect();
+        let mut y = rect.bottom() - 150.0 * s;
+        for v in subs.iter().rev().take(3) {
+            let a = (v.t / 0.15).min(1.0) * ((game::VOICE_LIFE - v.t) / 0.5).clamp(0.0, 1.0);
+            let (who, col) = match v.who {
+                Some(i) if i < g.f.len() => (chars::name(g.f[i].loadout.body).to_string(), player_color(g.f[i].color_idx)),
+                _ => ("THE ANNOUNCER".to_string(), Color32::from_rgb(255, 170, 90)),
+            };
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = (rect.width() * 0.6).min(720.0 * s);
+            job.append(&format!("{who}  "), 0.0, egui::TextFormat::simple(ui_kit::display(15.0 * s), col.gamma_multiply(a)));
+            job.append(&format!("\u{201c}{}\u{201d}", v.text), 0.0, egui::TextFormat::simple(FontId::proportional(17.0 * s), Color32::from_rgb(245, 238, 226).gamma_multiply(a)));
+            let gal = p.layout_job(job);
+            let sz = gal.size();
+            y -= sz.y + 10.0 * s;
+            let r = Rect::from_center_size(Pos2::new(c.x, y + sz.y * 0.5), sz + Vec2::new(22.0 * s, 8.0 * s));
+            p.rect_filled(r, 5.0 * s, Color32::from_rgba_unmultiplied(8, 7, 14, (170.0 * a) as u8));
+            p.galley(Pos2::new(c.x - sz.x * 0.5, y), gal, Color32::WHITE);
+        }
+    }
+
     /// Tactics on screen: a flash's white-out, the grey inside a smoke, the team's pings in the
     /// world, the minimap (top left: the map from above in its areas' colours, you, your team,
     /// pings and flags) with the callout of where you stand, and the ping wheel while it's open.
@@ -5114,6 +5243,8 @@ impl App {
 
         // flashes, smoke, pings, the minimap and the ping wheel
         self.draw_tactics(p, rect, cam, g, s);
+        // the story: a duel's intro card, the map's card, voice lines and the announcer
+        self.draw_story(p, rect, cam, g, s);
 
         // name tags over everyone you can see
         for other in g.f.iter().filter(|o| o.present && !o.spectate && o.slot != g.local && o.invis_t <= 0.0) {
@@ -5894,12 +6025,18 @@ impl App {
             text_shadow(p, Pos2::new(c.x, sb.bottom() + 40.0 * s), Align2::CENTER_CENTER, note, 16.0 * s, Color32::from_rgba_unmultiplied(200, 220, 255, a));
         }
         // banner and phase messages
+        // (before the bell the story card takes the top: the intro card or the map's card, see
+        // draw_story; "GET READY" stays on the scoreboard and the count goes under the card)
+        let story_card = g.mt.phase == Phase::Countdown && g.train.is_none() && g.preview.is_none() && g.mt.mode != Mode::Gauntlet;
         if let Some((text, _)) = &g.banner {
-            fit_center(p, Pos2::new(c.x, rect.top() + rect.height() * 0.3), text, 46.0 * s, rect.width() - 40.0, ACCENT);
+            if !story_card {
+                fit_center(p, Pos2::new(c.x, rect.top() + rect.height() * 0.3), text, 46.0 * s, rect.width() - 40.0, ACCENT);
+            }
         }
         if g.mt.phase == Phase::Countdown {
             let n = g.mt.timer.ceil().max(1.0) as i32;
-            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * 0.42), Align2::CENTER_CENTER, &format!("{n}"), 64.0 * s, Color32::WHITE);
+            let y = if story_card { 0.6 } else { 0.42 };
+            text_shadow(p, Pos2::new(c.x, rect.top() + rect.height() * y), Align2::CENTER_CENTER, &format!("{n}"), 64.0 * s, Color32::WHITE);
         }
         let mut under_sb = sb.bottom() + 8.0 * s;
         if g.mt.phase == Phase::Warmup {
@@ -6220,7 +6357,7 @@ impl App {
             next = Some(Page::Main);
         }
         let width = match page {
-            Page::Settings | Page::Mastery => 600.0,
+            Page::Settings | Page::Mastery | Page::Lore => 600.0,
             Page::Play => 520.0,
             _ => 380.0,
         };
@@ -6326,16 +6463,22 @@ impl App {
                                 }
                             });
                         }
-                        for (pg, (title, text)) in career::LORE[b as usize].iter().enumerate() {
-                            if cr.lore_unlocked(b, pg) {
-                                egui::CollapsingHeader::new(egui::RichText::new(*title).color(Color32::from_rgb(235, 220, 200))).id_salt(("lore", b, pg)).show(ui, |ui| {
-                                    ui.label(egui::RichText::new(*text).size(13.5).italics());
-                                });
-                            } else {
-                                ui.label(egui::RichText::new(format!("Locked lore page: \"{title}\" (mastery {})", career::LORE_LEVELS[pg])).size(12.5).color(Color32::from_gray(140)));
+                        // their story lives on the Lore page; here, how much of it is open
+                        let open = (0..lore::ENTRIES).filter(|&k| cr.lore_unlocked(b, k)).count();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("{}  ·  lore {open} / {}", lore::fighter_title(b), lore::ENTRIES)).size(12.5).color(Color32::from_rgb(235, 220, 200)));
+                            if ui.small_button("Read").on_hover_text("Their story on the Lore page").clicked() {
+                                self.lore_tab = b + 1;
+                                next = Some(Page::Lore);
                             }
-                        }
+                        });
                     }
+                    if Self::big_button(ui, "Back") {
+                        next = Some(Page::Main);
+                    }
+                }
+                Page::Lore => {
+                    self.lore_page(ui);
                     if Self::big_button(ui, "Back") {
                         next = Some(Page::Main);
                     }
@@ -7192,6 +7335,60 @@ impl App {
         (Cam::new(pos, yaw0, pitch0, hfov, rect), focus)
     }
 
+    /// The Lore page: the world's introduction, each fighter's story (name, title, bio, why they
+    /// fight and five entries that open with their mastery), and the places the Rush is fought.
+    /// Every word comes from assets/lore.txt, read as the game runs.
+    fn lore_page(&mut self, ui: &mut egui::Ui) {
+        let cr = self.career.clone();
+        let warm = Color32::from_rgb(235, 220, 200);
+        let soft = Color32::from_gray(205);
+        let n = chars::COUNT as u8;
+        ui.heading(lore::world_title());
+        ui.horizontal_wrapped(|ui| {
+            let mut tab = |ui: &mut egui::Ui, k: u8, label: String| {
+                if ui.selectable_label(self.lore_tab == k, egui::RichText::new(label).font(ui_kit::display(16.0))).clicked() {
+                    self.lore_tab = k;
+                }
+            };
+            tab(ui, 0, "THE WORLD".into());
+            for b in 0..n {
+                tab(ui, b + 1, chars::name(b).to_uppercase());
+            }
+            tab(ui, n + 1, "PLACES".into());
+        });
+        ui.add_space(4.0);
+        let t = self.lore_tab.min(n + 1);
+        if t == 0 {
+            for (head, text) in lore::world_intro() {
+                ui_kit::section(ui, head);
+                ui.label(egui::RichText::new(text).size(14.0).color(soft));
+            }
+        } else if t <= n {
+            let b = t - 1;
+            ui_kit::section(ui, chars::name(b));
+            ui.label(egui::RichText::new(lore::fighter_title(b).to_uppercase()).font(ui_kit::display(17.0)).color(ACCENT));
+            ui.label(egui::RichText::new(lore::fighter_bio(b)).size(14.0).color(soft));
+            ui.label(egui::RichText::new(format!("Why they fight: {}", lore::fighter_why(b))).size(14.0).italics().color(warm));
+            if let Some(r) = lore::rival(b) {
+                ui.label(egui::RichText::new(format!("Rival: {}", chars::name(r))).size(13.0).color(Color32::from_rgb(255, 170, 120)));
+            }
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("Mastery {} with {}", cr.mastery_level(b), chars::name(b))).size(12.5).color(Color32::from_gray(170)));
+            for (k, text) in lore::fighter_entries(b).into_iter().enumerate() {
+                if cr.lore_unlocked(b, k) {
+                    ui.label(egui::RichText::new(format!("{}.  {text}", k + 1)).size(14.0).color(warm));
+                } else {
+                    ui.label(egui::RichText::new(format!("{}.  Locked: reach mastery {} with {}", k + 1, career::LORE_LEVELS[k], chars::name(b))).size(13.0).color(Color32::from_gray(135)));
+                }
+            }
+        } else {
+            for m in MapId::ALL {
+                ui_kit::section(ui, m.name());
+                ui.label(egui::RichText::new(lore::map_lore(m)).size(14.0).color(soft));
+            }
+        }
+    }
+
     /// The main page: one big PLAY, smaller buttons under it, the news on the right.
     fn main_page(&mut self, ctx: &egui::Context, rect: Rect, next: &mut Option<Page>, quit: &mut bool) {
         let x0 = rect.left() + 48.0;
@@ -7218,6 +7415,9 @@ impl App {
             }
             if Self::big_button_h(ui, "Fighters & Mastery", 42.0) {
                 *next = Some(Page::Mastery);
+            }
+            if Self::big_button_h(ui, "Lore", 42.0) {
+                *next = Some(Page::Lore);
             }
             if Self::big_button_h(ui, "Stats", 42.0) {
                 *next = Some(Page::Stats);

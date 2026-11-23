@@ -43,13 +43,10 @@ impl MapId {
             _ => MapId::Arena,
         }
     }
+    /// The map's name, as assets/lore.txt gives it (Sunfall Keep, Old Marble Court, The
+    /// Undercroft, Varrow Bridgeworks).
     pub fn name(self) -> &'static str {
-        match self {
-            MapId::Arena => "Arena",
-            MapId::Courtyard => "Open Courtyard",
-            MapId::CloseQuarters => "Close Quarters",
-            MapId::Bridgeworks => "Varrow Bridgeworks",
-        }
+        crate::lore::map_name(self)
     }
     pub fn blurb(self) -> &'static str {
         match self {

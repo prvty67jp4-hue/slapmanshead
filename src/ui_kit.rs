@@ -631,6 +631,8 @@ pub struct LoadoutView<'a> {
     /// The controls line, top right.
     pub hint: String,
     pub subtitle: &'a str,
+    /// Before a match: the map it's on and its lore line (from assets/lore.txt).
+    pub map: Option<(&'a str, &'a str)>,
     /// The big button's words.
     pub action: &'a str,
     /// Also offer a Back button.
@@ -765,7 +767,20 @@ pub fn loadout_screen(ctx: &egui::Context, rect: Rect, lo: &mut Loadout, st: &mu
         label(&p, Pos2::new(l.left(), y - 6.0 * k), Align2::LEFT_TOP, "LOADOUT", display(46.0 * k), Color32::WHITE);
         let tw = text_width(&p, "LOADOUT", display(46.0 * k));
         p.rect_filled(Rect::from_min_size(Pos2::new(l.left(), y + 40.0 * k), Vec2::new(tw * 0.5, 3.0 * k)), 1.0, ACCENT);
-        p.text(Pos2::new(l.left() + tw + 16.0 * k, y + 30.0 * k), Align2::LEFT_BOTTOM, v.subtitle, fitted(&p, v.subtitle, body(14.0 * k), l.right() - l.left() - tw - 16.0 * k), Color32::from_gray(190));
+        let sx = l.left() + tw + 16.0 * k;
+        let sw = l.right() - sx;
+        match v.map {
+            // before a match: where it's played, and the place's story
+            Some((name, lore)) => {
+                let head = format!("{}  ·  {}", name.to_uppercase(), v.subtitle);
+                label(&p, Pos2::new(sx, y - 4.0 * k), Align2::LEFT_TOP, &head, fitted(&p, &head, display(15.0 * k), sw), ACCENT);
+                let g = p.layout(lore.to_string(), body(11.5 * k), Color32::from_gray(200), sw);
+                p.galley(Pos2::new(sx, y + 15.0 * k), g, Color32::WHITE);
+            }
+            None => {
+                p.text(Pos2::new(sx, y + 30.0 * k), Align2::LEFT_BOTTOM, v.subtitle, fitted(&p, v.subtitle, body(14.0 * k), sw), Color32::from_gray(190));
+            }
+        }
         y += 52.0 * k;
         let fighter_y = y;
         y += 40.0 * k;
@@ -931,12 +946,13 @@ pub fn loadout_screen(ctx: &egui::Context, rect: Rect, lo: &mut Loadout, st: &mu
             p.rect_stroke(r, 4.0 * k, if sel { Stroke::new(2.0 * k, ACCENT) } else { Stroke::new(1.0, mix(Color32::from_white_alpha(24), ACCENT, hot)) }, StrokeKind::Inside);
             let name = chars::name(b).to_uppercase();
             p.text(r.center() + Vec2::new(0.0, 1.0 * k), Align2::CENTER_CENTER, &name, fitted(&p, &name, display(18.0 * k), cw - 10.0 * k), if sel || hot > 0.5 { Color32::WHITE } else { Color32::from_gray(190) });
+            let about = format!("{}  ·  {}", crate::lore::fighter_title(b), chars::blurb(b));
             if resp.hovered() || resp.has_focus() {
-                hover = Some((chars::name(b).to_string(), chars::blurb(b).to_string()));
+                hover = Some((chars::name(b).to_string(), about.clone()));
             }
             if resp.clicked() {
                 lo.body = b;
-                click(st, None, chars::name(b), chars::blurb(b));
+                click(st, None, chars::name(b), &about);
             }
         }
         // what's pointed at (or last picked)
@@ -955,12 +971,31 @@ pub fn loadout_screen(ctx: &egui::Context, rect: Rect, lo: &mut Loadout, st: &mu
         let br = Rect::from_min_size(Pos2::new(rect.right() - m - bw, rect.bottom() - m - bh), Vec2::new(bw, bh));
         let fname = chars::name(lo.body).to_uppercase();
         label(&p, Pos2::new(br.right(), br.top() - 34.0 * k), Align2::RIGHT_BOTTOM, &fname, display(40.0 * k), Color32::WHITE);
-        let bl = chars::blurb(lo.body);
-        p.text(Pos2::new(br.right(), br.top() - 30.0 * k), Align2::RIGHT_TOP, bl, fitted(&p, bl, body(13.5 * k), right_w - m * 1.5), Color32::from_gray(215));
+        // their title (assets/lore.txt) under the name
+        let bl = crate::lore::fighter_title(lo.body).to_uppercase();
+        label(&p, Pos2::new(br.right(), br.top() - 30.0 * k), Align2::RIGHT_TOP, &bl, fitted(&p, &bl, display(16.0 * k), right_w - m * 1.5), ACCENT);
         // their ability and passive, over the name
         let ab = crate::game::Ability::of(lo.body);
         let at = format!("{}  ·  passive: {}", ab.name().to_uppercase(), ab.passive());
         let ay = br.top() - 128.0 * k;
+        // who they are and why they fight, over the ability (from assets/lore.txt)
+        {
+            let bw = (right_w - m * 1.5).min(430.0 * k);
+            let pad = 9.0 * k;
+            let bio = p.layout(crate::lore::fighter_bio(lo.body).to_string(), body(12.5 * k), Color32::from_gray(222), bw - pad * 2.0);
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = bw - pad * 2.0;
+            job.append("WHY THEY FIGHT  ", 0.0, egui::TextFormat::simple(display(13.0 * k), ACCENT));
+            job.append(crate::lore::fighter_why(lo.body), 0.0, egui::TextFormat { font_id: body(12.5 * k), color: Color32::from_rgb(245, 225, 200), italics: true, ..Default::default() });
+            let why = p.layout_job(job);
+            let h = bio.size().y + why.size().y + pad * 2.0 + 6.0 * k;
+            let r = Rect::from_min_size(Pos2::new(br.right() + 6.0 * k - bw, ay - 34.0 * k - h), Vec2::new(bw, h));
+            p.rect_filled(r, 5.0 * k, Color32::from_rgba_unmultiplied(10, 9, 18, 205));
+            p.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0 * k, r.height())), 1.0, ACCENT);
+            let (bh_y, why_y) = (r.top() + pad, r.top() + pad + bio.size().y + 6.0 * k);
+            p.galley(Pos2::new(r.left() + pad + 2.0 * k, bh_y), bio, Color32::WHITE);
+            p.galley(Pos2::new(r.left() + pad + 2.0 * k, why_y), why, Color32::WHITE);
+        }
         let aw = fitted(&p, &at, display(15.0 * k), right_w - m * 1.5 - 30.0 * k);
         let tw = text_width(&p, &at, aw.clone());
         let back = Rect::from_min_max(Pos2::new(br.right() - tw - 34.0 * k, ay - 22.0 * k), Pos2::new(br.right() + 6.0 * k, ay + 3.0 * k));

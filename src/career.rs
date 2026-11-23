@@ -40,37 +40,9 @@ pub const BADGES: [(&str, u32, [u8; 3]); 6] = [
 /// Outfit colours (the coat or cape): name, mastery level, colour (None: the fighter's own).
 pub const OUTFITS: [(&str, u32, Option<[u8; 3]>); 4] = [("Standard", 1, None), ("Ember", 3, Some([150, 42, 30])), ("Midnight", 6, Some([34, 40, 78])), ("Gilded", 10, Some([176, 134, 52]))];
 
-/// Lore pages unlock at these mastery levels.
-pub const LORE_LEVELS: [u32; 4] = [2, 5, 9, 13];
-
-/// Each fighter's lore: (title, text) per page.
-pub const LORE: [[(&str, &str); 4]; FIGHTERS] = [
-    [
-        ("The Watch on the Ridge", "The Ranger kept the ridge road for eleven winters. Travellers knew the hooded figure only by the lantern that never went out and the arrows that never missed."),
-        ("Old Steel", "The blade at the Ranger's hip was forged for a captain who never came back from the pass. The Ranger carries it the way you carry a promise: quietly, and always."),
-        ("Why the Arena", "When the roads closed, the purses moved to the arenas. The Ranger came for the coin and stayed for the only fights left that still had rules."),
-        ("Calm", "The crowds call it coldness. Those who have faced the Ranger call it patience: every cut is decided before the blade moves."),
-    ],
-    [
-        ("Forest-Born", "The Huntress learned to stalk before she learned to read, tracking stags through pines so thick the noon sun never touched the ground."),
-        ("The Pauldrons", "Her shoulder guards were cut from the hide of the boar that took her father's hunting party. She wears the trophy, not the grief."),
-        ("Prey and Predator", "In the arena she circles longer than anyone else, waiting for the moment the other fighter forgets they are being hunted."),
-        ("A Name in the Trees", "The forest villages leave carved tokens at the arena gates before her bouts. She never mentions them, and never leaves without touching one."),
-    ],
-    [
-        ("Dock Fighter", "The Brawler grew up on the harbour, settling cargo disputes with fists long before anyone handed him a sword taller than a deckhand."),
-        ("The Greatsword", "He won the blade in a wager he says he can't remember. The smith who made it says he remembers it very well."),
-        ("Showman", "He rests the steel on his shoulder between rounds because the crowd loves it. He swings it because he does."),
-        ("Soft Spot", "Half his winnings go to the harbour orphanage. He'll deny it with a grin, and then buy the next round."),
-    ],
-    [
-        ("Quick Feet", "The Striker was a courier in the hill cities, running messages across rooftops faster than any horse could take the streets."),
-        ("First Blood", "A courier who can't fight doesn't stay a courier for long. The Striker learned the blade from the same rooftops, one ambush at a time."),
-        ("Never Still", "Crowds count her steps between strikes. Nobody has ever seen her stand flat-footed in the ring."),
-        ("The Last Message", "She still carries one sealed letter she was never able to deliver. She says she'll open it the day someone beats her clean."),
-    ],
-];
-
+/// Each fighter's five lore entries (in assets/lore.txt, see crate::lore) unlock at these mastery
+/// levels: the first from the start.
+pub const LORE_LEVELS: [u32; crate::lore::ENTRIES] = [1, 3, 6, 10, 15];
 /// A weekly challenge: what to do, how many times, what it pays.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Challenge {
@@ -442,7 +414,9 @@ pub fn unlocks_at(body: u8, level: u32) -> Vec<String> {
     }
     for (p, &l) in LORE_LEVELS.iter().enumerate() {
         if l == level {
-            out.push(format!("lore: {}", LORE[(body as usize).min(FIGHTERS - 1)][p].0));
+            if level > 1 {
+                out.push(format!("lore entry {}", p + 1));
+            }
         }
     }
     for b in BADGES.iter().filter(|b| b.1 == level && level > 1) {
@@ -541,13 +515,15 @@ mod tests {
         assert!(c.finisher_unlocked(1, sable[0]) && !c.finisher_unlocked(1, sable[1]) && !c.finisher_unlocked(1, sable[3]));
         assert!(!c.finisher_unlocked(1, crate::exec::of_fighter(0)[0]));
         assert_eq!((0..EXEC_COUNT).filter(|&k| c.finisher_unlocked(1, k)).count(), 1);
-        assert!(!c.lore_unlocked(1, 0));
+        assert!(c.lore_unlocked(1, 0) && !c.lore_unlocked(1, 1), "the first lore entry is open from the start");
+        assert!(!c.lore_unlocked(1, crate::lore::ENTRIES), "no entry past the last");
         // play the Huntress a long time
         for _ in 0..400 {
             c.apply_as(CareerEv::Kill { head: true, finisher: 0 }, Some(1), 20_000);
         }
         assert!(c.mastery_level(1) >= 20 && c.badge(1).0 == "Champion");
         assert!((0..OUTFITS.len()).all(|k| c.outfit_unlocked(1, k)));
+        assert!((0..crate::lore::ENTRIES).all(|k| c.lore_unlocked(1, k)), "every lore entry at top mastery");
         assert!(sable.iter().all(|&k| c.finisher_unlocked(1, k)), "every Sable execution at top mastery");
         assert_eq!(c.finisher_locks(1), !sable.iter().fold(0u32, |m, &k| m | 1 << k) & ((1 << EXEC_COUNT) - 1));
         assert!(c.finisher_locks(0) != 0, "other fighters keep their own progress");

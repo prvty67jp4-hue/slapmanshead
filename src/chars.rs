@@ -333,8 +333,9 @@ const SPECS: [Spec; 4] = [
 
 pub const COUNT: usize = SPECS.len();
 
+/// The fighter's name, as assets/lore.txt gives it (the built-in one if the file doesn't).
 pub fn name(i: u8) -> &'static str {
-    SPECS[(i as usize).min(COUNT - 1)].name
+    crate::lore::fighter_name(i, SPECS[(i as usize).min(COUNT - 1)].name)
 }
 pub fn blurb(i: u8) -> &'static str {
     SPECS[(i as usize).min(COUNT - 1)].blurb

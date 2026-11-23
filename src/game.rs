@@ -15,6 +15,21 @@ pub const PINGS: [&str; 6] = ["Enemy", "Going here", "Look here", "Defend here",
 /// How long a ping stays up.
 pub const PING_LIFE: f32 = 6.0;
 
+/// How long a spoken line stays on screen, and how many are kept at once.
+pub const VOICE_LIFE: f32 = 3.4;
+pub const VOICE_MAX: usize = 6;
+
+/// A line being spoken: a fighter's (`who`) or the announcer's (None). `t` counts up from when it
+/// starts (below zero: still waiting to be said).
+#[derive(Clone, Debug)]
+pub struct Voice {
+    pub who: Option<usize>,
+    pub text: String,
+    pub t: f32,
+    /// Also in the subtitle strip (it concerns you, or it's the announcer).
+    pub subtitle: bool,
+}
+
 /// A place marked for the team.
 #[derive(Clone, Debug)]
 pub struct Ping {
@@ -2331,6 +2346,12 @@ pub struct Game {
     pub shake: f32,
     pub time: f32,
     pub banner: Option<(String, f32)>,
+    /// Lines being spoken (fighters' voice lines and the announcer's, from assets/lore.txt), shown
+    /// as subtitles and speech bubbles.
+    pub voice: Vec<Voice>,
+    voice_seed: u64,
+    /// A round was over last tick (to call each round's end once, on every computer).
+    seen_round_end: bool,
     /// Sounds to play: where they happened (None = not in the world, e.g. a hit marker).
     pub sounds: Vec<(Sfx, Option<V3>, f32)>,
     /// When each kind of sound last played (to keep a shotgun's pellets from stacking up).
@@ -2793,6 +2814,9 @@ impl Game {
             potm_stash: None,
             flow_noted: vec![false; MAX_PLAYERS],
             seen_phase: Phase::Warmup,
+            voice: Vec::new(),
+            voice_seed: 0x5EED,
+            seen_round_end: false,
             round_since: 0.0,
             round_armed: false,
             round_finished: (u32::MAX, 0),
@@ -3719,6 +3743,118 @@ impl Game {
         }
     }
 
+    /// Voice lines show in real matches (not the menu's background fight, training or a preview).
+    fn voices_on(&self) -> bool {
+        self.kind != Kind::Demo && self.train.is_none() && self.preview.is_none()
+    }
+
+    /// A new number for picking among a fighter's lines.
+    fn voice_pick(&mut self) -> u64 {
+        self.voice_seed = self.voice_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.voice_seed ^ self.time.to_bits() as u64
+    }
+
+    /// Someone (or the announcer, `who` None) says `text`, after `delay` seconds. `subtitle`: it
+    /// also goes in the subtitle strip (lines that concern you, and the announcer's); otherwise
+    /// only a speech bubble over the speaker.
+    pub fn speak(&mut self, who: Option<usize>, text: &str, delay: f32, subtitle: bool) {
+        if text.is_empty() || !self.voices_on() {
+            return;
+        }
+        self.voice.push(Voice { who, text: text.to_string(), t: -delay, subtitle });
+        if self.voice.len() > VOICE_MAX {
+            self.voice.remove(0);
+        }
+    }
+
+    /// A fighter's line for a moment (one of theirs, at random).
+    fn fighter_says(&mut self, i: usize, cue: crate::lore::Cue, delay: f32, subtitle: bool) {
+        let seed = self.voice_pick();
+        let line = crate::lore::voice(self.f[i].loadout.body, cue, seed);
+        self.speak(Some(i), line, delay, subtitle);
+    }
+
+    /// The announcer calls a moment.
+    fn announce(&mut self, c: crate::lore::Call, delay: f32) {
+        let seed = self.voice_pick();
+        let line = crate::lore::announcer(c, seed);
+        self.speak(None, line, delay, true);
+    }
+
+    /// The two fighters of a 1v1 (a Duel's pair, or a match with only two people in it), for the
+    /// pre-match intro card.
+    pub fn intro_pair(&self) -> Option<(usize, usize)> {
+        if self.mt.mode.teams() || self.mt.mode == Mode::Gauntlet || !self.voices_on() {
+            return None;
+        }
+        if self.mt.mode == Mode::Duel {
+            let d = self.mt.duel.map(|x| x as usize);
+            if d[0] != d[1] && d.iter().all(|&x| x < self.f.len() && self.f[x].present) {
+                return Some((d[0], d[1]));
+            }
+        }
+        let ps: Vec<usize> = (0..self.f.len()).filter(|&i| self.f[i].present && !self.f[i].spectate).collect();
+        (ps.len() == 2 || (self.mt.mode == Mode::Duel && ps.len() > 2)).then(|| (ps[0], ps[1]))
+    }
+
+    /// Who speaks when (every computer works it out from what it sees): the bell and the first
+    /// words as a match starts (rivals greet each other), each round's and the match's end.
+    fn voice_watch(&mut self, dt: f32) {
+        for v in self.voice.iter_mut() {
+            v.t += dt;
+        }
+        self.voice.retain(|v| v.t < VOICE_LIFE);
+        let phase = self.mt.phase;
+        if phase == Phase::Fight && self.seen_phase != Phase::Fight && self.seen_phase != Phase::MatchOver {
+            self.announce(crate::lore::Call::MatchStart, 0.0);
+            let l = self.local;
+            if let Some((a, b)) = self.intro_pair() {
+                // a duel: both speak (their rival lines were on the intro card)
+                self.fighter_says(a, crate::lore::Cue::Start, 1.2, true);
+                self.fighter_says(b, crate::lore::Cue::Start, 2.6, true);
+            } else if self.f[l].present && !self.f[l].spectate {
+                let me = self.f[l].loadout.body;
+                // your rival is here: you greet each other; otherwise a word as you go in
+                let rival = crate::lore::rival(me).and_then(|r| (0..self.f.len()).find(|&i| i != l && self.f[i].present && self.f[i].loadout.body == r));
+                match rival {
+                    Some(r) => {
+                        let rb = self.f[r].loadout.body;
+                        if let Some(line) = crate::lore::vs_line(me, rb) {
+                            self.speak(Some(l), line, 1.2, true);
+                        }
+                        if let Some(line) = crate::lore::vs_line(rb, me) {
+                            self.speak(Some(r), line, 2.8, true);
+                        }
+                    }
+                    None => self.fighter_says(l, crate::lore::Cue::Start, 1.2, true),
+                }
+            }
+        }
+        let round_over = self.mt.mode.rounds() && self.mt.round_end > 0.0 && phase == Phase::Fight;
+        if round_over && !self.seen_round_end {
+            self.announce(crate::lore::Call::RoundWin, 0.2);
+        }
+        self.seen_round_end = round_over;
+        if phase == Phase::MatchOver && self.seen_phase == Phase::Fight && self.mt.mode != Mode::Gauntlet {
+            self.announce(crate::lore::Call::MatchWin, 0.4);
+        }
+    }
+
+    /// A death's words: the one who fell, then the one who did it (an execution's own line is
+    /// already under its picture, so it only shows over their head).
+    fn voice_death(&mut self, victim: usize, killer: Option<usize>, w: u8) {
+        let l = self.local;
+        let mine = victim == l || killer == Some(l);
+        self.fighter_says(victim, crate::lore::Cue::Death, 0.0, mine);
+        if let Some(k) = killer.filter(|&k| self.is_enemy(k, victim)) {
+            if w == EXEC_TOOL {
+                self.fighter_says(k, crate::lore::Cue::Finisher, 0.5, false);
+            } else {
+                self.fighter_says(k, crate::lore::Cue::Kill, 0.6, mine);
+            }
+        }
+    }
+
     pub fn say(&mut self, s: String) {
         self.feed.push(FeedLine { killer: None, victim: (String::new(), 0), tool: "", head: false, text: Some(s), life: 5.0 });
         if self.feed.len() > 6 {
@@ -3975,6 +4111,7 @@ impl Game {
             self.mt.timer = (self.mt.timer - dt).max(0.0);
         }
         self.record(dt);
+        self.voice_watch(dt);
         if self.mt.phase == Phase::MatchOver && self.seen_phase != Phase::MatchOver {
             self.on_match_over();
         }
@@ -4219,6 +4356,7 @@ impl Game {
         let wcol = crate::exec::wound(self.violence).main;
         self.burst(p, wcol, 26, 6.0);
         self.last_kill = Some((victim, k, w, head));
+        self.voice_death(victim, k, w);
         // Writs: a streak of WRIT_STREAK kills marks you; whoever takes you down claims it
         let writ_modes = matches!(self.mt.mode, Mode::Ffa | Mode::Tdm) && self.kind != Kind::Demo && self.train.is_none();
         let held = self.streaks.get(victim).copied().unwrap_or(0);
@@ -4261,6 +4399,7 @@ impl Game {
                     self.banner = Some(("WRIT CLAIMED".into(), 1.6));
                 }
                 self.highlight(kk, 180.0 + 30.0 * held as f32, "WRIT CLAIMED".into());
+                self.announce(crate::lore::Call::WritClaimed, 1.0);
             }
             if writ_modes && n == WRIT_STREAK {
                 self.feed.push(FeedLine { killer: None, victim: (String::new(), 0), tool: "", head: false, text: Some(format!("WRIT  {kn} is on a {n}-kill streak: take them down for XP")), life: 6.0 });
@@ -4861,6 +5000,7 @@ impl Game {
             ("grenades", self.grenades.len()),
             ("feed", self.feed.len()),
             ("chat", self.chat.len()),
+            ("voice lines", self.voice.len()),
             ("marks", self.marks.len()),
             ("decoys", self.decoys.len()),
             ("hurt arcs", self.hurt_dirs.len()),
@@ -10625,7 +10765,7 @@ mod map_tests {
     fn close_quarters_is_small_dense_and_vertical() {
         let w = World::build(MapId::CloseQuarters);
         assert_eq!(w.map, MapId::CloseQuarters);
-        assert_eq!(MapId::CloseQuarters.name(), "Close Quarters");
+        assert_eq!(MapId::CloseQuarters.name(), "The Undercroft");
         assert!((w.half * 2.0 - 30.0).abs() < 0.01, "30 x 30 m");
         let bl = blockers(&w);
         let mut widest: f32 = 0.0;

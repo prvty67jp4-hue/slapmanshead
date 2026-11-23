@@ -1113,29 +1113,9 @@ pub fn is_blood(c: [u8; 3]) -> bool {
 
 // ---------------------------------------------------------------------------- announcer
 
-static LORE: &str = include_str!("../assets/lore.txt");
-
-/// A value from assets/lore.txt: `key` in `[section]` (the first if it repeats).
+/// A value from assets/lore.txt (read while the game runs, see crate::lore): `key` in `[section]`.
 pub fn lore(section: &str, key: &str) -> Option<&'static str> {
-    let mut in_section = false;
-    for line in LORE.lines() {
-        let t = line.trim();
-        if t.starts_with('#') || t.is_empty() {
-            continue;
-        }
-        if t.starts_with('[') && t.ends_with(']') {
-            in_section = &t[1..t.len() - 1] == section;
-            continue;
-        }
-        if in_section {
-            if let Some((k, v)) = t.split_once('=') {
-                if k.trim() == key {
-                    return Some(v.trim());
-                }
-            }
-        }
-    }
-    None
+    crate::lore::text(section, key)
 }
 
 /// The announcer's line for an execution (from assets/lore.txt `[executions]`).
@@ -1145,8 +1125,7 @@ pub fn announcer_line(style: usize) -> &'static str {
 
 /// The fighter's own line as they finish someone (lore.txt `finisher` under the fighter).
 pub fn fighter_line(body: u8) -> &'static str {
-    let key = ["corvin", "sable", "anvil", "ilya"][(body as usize).min(3)];
-    lore(&format!("fighter.{key}"), "finisher").unwrap_or("")
+    lore(&crate::lore::fighter_section(body), "finisher").unwrap_or("")
 }
 
 #[cfg(test)]
