@@ -558,6 +558,10 @@ pub fn kill_tool(w: u8) -> &'static str {
 pub const KICK_TOOL: u8 = 21;
 /// A finisher, as a "weapon" number (kill feed: EXECUTED).
 pub const EXEC_TOOL: u8 = 23;
+/// Kill-feed / shot id for the Rigger's Hook thrown on its chain (Ledger Duels' Haul).
+pub const HOOK_TOOL: u8 = 25;
+/// Haul's yank: speed per metre it has to cover.
+pub const HAUL_PULL: f32 = 3.3;
 /// Finishers: how close, and how hurt the target must be (and staggered, guard-broken or launched).
 pub const FINISH_RANGE: f32 = 2.6;
 pub const FINISH_HP: f32 = 25.0;
@@ -665,6 +669,9 @@ pub struct Input {
     pub utility: bool,
     /// Pressed: look the weapon over (inspect).
     pub inspect: bool,
+    /// Ledger Duels: use this pack slot (equip or eat), and start the weapon's special.
+    pub inv: Option<u8>,
+    pub spec: bool,
     pub yaw: f32,
     pub pitch: f32,
 }
@@ -1502,6 +1509,8 @@ pub struct Fighter {
     pub air_slashes: u8,
     pub float_t: f32,
     pub walljumps: u8,
+    /// Ledger Duels: their gear (see crate::gear).
+    pub kit: Option<Box<crate::gear::Kit>>,
 }
 
 impl Fighter {
@@ -1661,6 +1670,7 @@ impl Fighter {
             grapple_t: 0.0,
             shield_t: 0.0,
             invis_t: 0.0,
+            kit: None,
         }
     }
 
@@ -1679,6 +1689,12 @@ impl Fighter {
         n.vote = self.vote;
         n.ping_ms = self.ping_ms;
         n.loss_pct = self.loss_pct;
+        // a new round in a Ledger Duel: the loadout as it was at the start, food and bar full
+        n.kit = self.kit.as_ref().filter(|k| !k.remote).map(|k| {
+            let mut fresh = crate::gear::Kit::new(&k.base);
+            fresh.no_sets = k.no_sets;
+            Box::new(fresh)
+        });
         n.equip();
         n.alive = true;
         n.spawn_prot = SPAWN_PROT;
@@ -1736,7 +1752,19 @@ impl Fighter {
     pub fn rifle_rested(&self, tn: &Tuning) -> bool {
         self.since_shot >= Weapon::Rifle.interval() + tn.rifle_reset
     }
+    /// The spread the next shot will have, with a Ledger Duel's gear accuracy (see spread_raw).
     pub fn spread(&self, tn: &Tuning) -> f32 {
+        let s = self.spread_raw(tn);
+        match &self.kit {
+            Some(k) if s > 0.0 => s * k.spread_mult(),
+            _ => s,
+        }
+    }
+    /// A blade's reach (gear accuracy lengthens it a little in a Ledger Duel).
+    pub fn reach(&self) -> f32 {
+        self.weapon.melee_range() * self.kit.as_ref().map_or(1.0, |k| k.reach_mult())
+    }
+    fn spread_raw(&self, tn: &Tuning) -> f32 {
         if self.weapon.is_melee() || self.weapon == Weapon::Rocket {
             return 0.0;
         }
@@ -1854,10 +1882,13 @@ pub enum Mode {
     Gauntlet = 6,
     /// Red vs Blue rounds, one life each: no economy, just planning (utility refills each round).
     Rounds = 7,
+    /// Ledger Duels: 1v1 Ashen Court duels with gear, sets, switches, specials and food, under
+    /// the challenger's rules (see crate::gear).
+    Ledger = 8,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 7] = [Mode::Ffa, Mode::Tdm, Mode::Duel, Mode::Gladiator, Mode::Lms, Mode::Ctf, Mode::Rounds];
+    pub const ALL: [Mode; 8] = [Mode::Ffa, Mode::Tdm, Mode::Duel, Mode::Gladiator, Mode::Lms, Mode::Ctf, Mode::Rounds, Mode::Ledger];
     pub fn from_u8(v: u8) -> Mode {
         match v {
             1 => Mode::Tdm,
@@ -1867,6 +1898,7 @@ impl Mode {
             5 => Mode::Ctf,
             6 => Mode::Gauntlet,
             7 => Mode::Rounds,
+            8 => Mode::Ledger,
             _ => Mode::Ffa,
         }
     }
@@ -1880,6 +1912,7 @@ impl Mode {
             Mode::Ctf => "Capture the Flag",
             Mode::Gauntlet => "Gauntlet",
             Mode::Rounds => "Team Rounds",
+            Mode::Ledger => "Ledger Duels",
         }
     }
     pub fn blurb(self) -> &'static str {
@@ -1892,13 +1925,18 @@ impl Mode {
             Mode::Ctf => "Red vs Blue, bring the enemy flag to your base",
             Mode::Gauntlet => "solo: survive waves of ever better bots for a high score",
             Mode::Rounds => "Red vs Blue rounds, one life each: plan, smoke, flash and take space",
+            Mode::Ledger => "1v1 Ashen Court duels: gear, sets, switches, specials and food, under the challenger's rules",
         }
     }
     pub fn teams(self) -> bool {
         matches!(self, Mode::Tdm | Mode::Ctf | Mode::Rounds)
     }
     pub fn rounds(self) -> bool {
-        matches!(self, Mode::Duel | Mode::Lms | Mode::Rounds)
+        matches!(self, Mode::Duel | Mode::Lms | Mode::Rounds | Mode::Ledger)
+    }
+    /// 1v1 rounds with a queue: the Duel and Ledger Duels.
+    pub fn duel_like(self) -> bool {
+        matches!(self, Mode::Duel | Mode::Ledger)
     }
     pub fn melee_only(self) -> bool {
         self == Mode::Gladiator
@@ -1906,7 +1944,7 @@ impl Mode {
     /// What the score limit counts.
     pub fn goal_word(self) -> &'static str {
         match self {
-            Mode::Duel | Mode::Lms | Mode::Rounds => "round wins",
+            Mode::Duel | Mode::Lms | Mode::Rounds | Mode::Ledger => "round wins",
             Mode::Ctf => "captures",
             Mode::Gauntlet => "score",
             _ => "kills",
@@ -2001,6 +2039,8 @@ pub struct MatchState {
     /// Duel: who is fighting (255 = nobody).
     pub duel: [u8; 2],
     pub flags: [Flag; 2],
+    /// Ledger Duels: the challenger's rules.
+    pub rules: crate::gear::Rules,
 }
 
 #[derive(Clone, Debug)]
@@ -2186,7 +2226,10 @@ pub enum Ev {
     /// `guard` drains the victim's guard meter (a blocked hit).
     /// `vt`: (a player's claim) the moment on the host's clock that the target was where the
     /// player saw it, so the host checks the hit against exactly that (0 when not given).
-    Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3, guard: f32, vt: f32 },
+    /// `spec`: (Ledger Duels) the special the hit carries (crate::gear::Spec as a number; 0 none).
+    Hit { victim: u8, dmg: f32, knock: V3, stun: f32, head: bool, w: u8, o: V3, dir: V3, guard: f32, vt: f32, spec: u8 },
+    /// (Ledger Duels) from a player: "I ate this" (an item id): the host gives the health back.
+    Eat { item: u8 },
     /// From a player: "my bullet was sent back at me by `by`" (the host trusts self-inflicted hurt).
     Deflect { by: u8, dmg: f32 },
     /// From a player to the host: "may I execute `target`"? `open`: which of their fighter's
@@ -2264,6 +2307,9 @@ pub struct Game {
     pub history: Vec<VecDeque<(f32, V3)>>,
     /// The loadout you'll respawn with.
     pub my_loadout: Loadout,
+    /// Ledger Duels: the gear you bring (your saved loadout), and the bots' thinking about theirs.
+    pub my_kit: crate::gear::GearLoadout,
+    pub lbrain: Vec<LedgerBrain>,
     /// The menu's showcased fighter: posed in front of the camera, outside the match (nobody
     /// targets, hits or bumps into it).
     pub showcase: Option<usize>,
@@ -2759,6 +2805,7 @@ impl Game {
                 round_end: 0.0,
                 duel: [255, 255],
                 flags: [0, 1].map(|t| Flag { state: 0, carrier: 255, pos: flag_homes[t], timer: 0.0 }),
+                rules: crate::gear::Rules::default(),
             },
             queue: VecDeque::new(),
             host_slot: 0,
@@ -2783,6 +2830,8 @@ impl Game {
             chat: Vec::new(),
             history: (0..MAX_PLAYERS).map(|_| VecDeque::new()).collect(),
             my_loadout: Loadout::default(),
+            my_kit: crate::gear::GearLoadout::default(),
+            lbrain: vec![LedgerBrain::default(); MAX_PLAYERS],
             showcase: None,
             marks: Vec::new(),
             decoys: Vec::new(),
@@ -3085,7 +3134,7 @@ impl Game {
             let b = &self.f[j];
             let d = b.pos - a.pos;
             let dist = d.flat().len();
-            if dist > a.weapon.melee_range() || d.y.abs() > if a.on_ground { 1.9 } else { 2.5 } {
+            if dist > a.reach() || d.y.abs() > if a.on_ground { 1.9 } else { 2.5 } {
                 return false;
             }
             if dist > 0.3 && fwd.dot(d.flat().norm()) < 0.25 {
@@ -3358,7 +3407,7 @@ impl Game {
         self.refresh_colors();
         // in round modes, newcomers wait for the next round
         let waiting = self.mt.mode.rounds() && self.mt.phase == Phase::Fight;
-        if self.mt.mode == Mode::Duel && !self.queue.contains(&slot) && self.mt.duel.iter().all(|&d| d as usize != slot) {
+        if self.mt.mode.duel_like() && !self.queue.contains(&slot) && self.mt.duel.iter().all(|&d| d as usize != slot) {
             self.queue.push_back(slot);
         }
         if waiting {
@@ -3586,7 +3635,7 @@ impl Game {
 
     /// The spawn point furthest from enemies (on your team's side in Team Deathmatch).
     pub fn pick_spawn(&mut self, slot: usize) -> (V3, f32) {
-        if self.mt.mode == Mode::Duel && self.mt.phase == Phase::Fight {
+        if self.mt.mode.duel_like() && self.mt.phase == Phase::Fight {
             if let Some(side) = self.duel_side(slot) {
                 let n = self.world.spawn_points.len();
                 return self.world.spawn_points[if side == 0 { 0 } else { n / 2 }];
@@ -3787,14 +3836,14 @@ impl Game {
         if self.mt.mode.teams() || self.mt.mode == Mode::Gauntlet || !self.voices_on() {
             return None;
         }
-        if self.mt.mode == Mode::Duel {
+        if self.mt.mode.duel_like() {
             let d = self.mt.duel.map(|x| x as usize);
             if d[0] != d[1] && d.iter().all(|&x| x < self.f.len() && self.f[x].present) {
                 return Some((d[0], d[1]));
             }
         }
         let ps: Vec<usize> = (0..self.f.len()).filter(|&i| self.f[i].present && !self.f[i].spectate).collect();
-        (ps.len() == 2 || (self.mt.mode == Mode::Duel && ps.len() > 2)).then(|| (ps[0], ps[1]))
+        (ps.len() == 2 || (self.mt.mode.duel_like() && ps.len() > 2)).then(|| (ps[0], ps[1]))
     }
 
     /// Who speaks when (every computer works it out from what it sees): the bell and the first
@@ -3925,7 +3974,19 @@ impl Game {
             } else {
                 *local_input
             };
+            // a Ledger Duel: the bots decide about their gear; everyone's gear has its say on
+            // what they can do this tick
+            let mut input = input;
+            if self.ledger_on() {
+                if self.f[i].is_bot {
+                    self.ledger_bot(i, &mut input);
+                }
+                input = self.ledger_pre(i, &input, dt);
+            }
             let acts = self.step_fighter(i, &input, dt, frozen);
+            if self.ledger_on() {
+                self.ledger_post(i, &acts);
+            }
             if self.f[i].invis_t > 0.0 {
                 let attacks = acts.iter().any(|a| match a {
                     Act::Gun { .. } | Act::Slash | Act::Throw | Act::Star { .. } | Act::FinishStart => true,
@@ -4112,6 +4173,7 @@ impl Game {
         }
         self.record(dt);
         self.voice_watch(dt);
+        self.ledger_watch();
         if self.mt.phase == Phase::MatchOver && self.seen_phase != Phase::MatchOver {
             self.on_match_over();
         }
@@ -4209,7 +4271,7 @@ impl Game {
                 let team = (self.f[sh].team as usize).min(1);
                 self.mt.team_score[team] = self.mt.team_score[team].max((t - 1).max(0) as _);
             }
-            Mode::Duel | Mode::Lms => self.f[sh].wins = self.f[sh].wins.max(t - 1),
+            Mode::Duel | Mode::Lms | Mode::Ledger => self.f[sh].wins = self.f[sh].wins.max(t - 1),
             _ => {}
         }
         let here = self.f[me].pos;
@@ -4471,7 +4533,7 @@ impl Game {
         let won = match self.mt.mode {
             Mode::Ffa | Mode::Gladiator => self.f.iter().any(|f| f.present && f.kills >= t),
             Mode::Tdm | Mode::Ctf | Mode::Rounds => self.mt.team_score.iter().any(|&s| s as i32 >= t),
-            Mode::Duel | Mode::Lms => self.f.iter().any(|f| f.present && f.wins >= t),
+            Mode::Duel | Mode::Lms | Mode::Ledger => self.f.iter().any(|f| f.present && f.wins >= t),
             Mode::Gauntlet => false, // it ends when you fall
         };
         if won {
@@ -4511,7 +4573,12 @@ impl Game {
 
     /// Abilities and passives are in play (any mode, Duels too, unless the lobby is Classic).
     pub fn abilities_on(&self) -> bool {
-        !self.mt.classic
+        !self.mt.classic && self.mt.mode != Mode::Ledger
+    }
+
+    /// A Ledger Duel is on (gear counts).
+    pub fn ledger_on(&self) -> bool {
+        self.mt.mode == Mode::Ledger
     }
 
     /// The guard meter's top for this fighter (Bram's passive raises it).
@@ -4756,7 +4823,7 @@ impl Game {
                 let t = (me.team as usize).min(1);
                 self.mt.team_score[t] > self.mt.team_score[1 - t]
             }
-            Mode::Duel | Mode::Lms => self.f.iter().filter(|f| f.present && f.slot != self.local).all(|f| me.wins > f.wins),
+            Mode::Duel | Mode::Lms | Mode::Ledger => self.f.iter().filter(|f| f.present && f.slot != self.local).all(|f| me.wins > f.wins),
             Mode::Gauntlet => false,
             _ => self.f.iter().filter(|f| f.present && f.slot != self.local).all(|f| me.kills > f.kills),
         }
@@ -4969,7 +5036,7 @@ impl Game {
             return;
         }
         self.round_finished = (self.mt.number, self.mt.round);
-        if self.mt.mode == Mode::Duel {
+        if self.mt.mode.duel_like() {
             self.duel_loser = self.mt.duel.iter().map(|&d| d as usize).find(|&d| d < self.f.len() && Some(d) != winner);
         }
         let text = match winner {
@@ -5027,7 +5094,7 @@ impl Game {
         self.mt.round_end = 0.0;
         self.mt.timer = ROUND_TIME;
         self.grenades.clear();
-        if self.mt.mode == Mode::Duel {
+        if self.mt.mode.duel_like() {
             for &s in &self.present() {
                 if !self.queue.contains(&s) && self.duel_side(s).is_none() {
                     self.queue.push_back(s);
@@ -5060,7 +5127,7 @@ impl Game {
             if !self.f[i].present {
                 continue;
             }
-            let plays = self.mt.mode != Mode::Duel || self.duel_side(i).is_some();
+            let plays = !self.mt.mode.duel_like() || self.duel_side(i).is_some();
             if plays {
                 self.f[i].spectate = false;
                 if self.f[i].owned {
@@ -5380,7 +5447,14 @@ impl Game {
         let mut acts = Vec::new();
         let mut ff = self.f[i].clone();
         let mut sounds: Vec<Sfx> = Vec::new();
-        let tn = self.tune;
+        let mut tn = self.tune;
+        // a Ledger Duel: gear (weight, boots, sets, a tonic) sets how fast you move
+        if self.ledger_on() {
+            if let Some(k) = &self.f[i].kit {
+                tn.run_speed *= k.stats(&self.mt.rules).move_mult();
+            }
+        }
+        let tn = tn;
         let run = tn.run_speed;
 
         let cd_before = ff.fire_cd;
@@ -7124,7 +7198,7 @@ impl Game {
             let d = b.pos - a.pos;
             let dist = d.flat().len();
             let wpn = a.weapon;
-            if dist > wpn.melee_range() || d.y.abs() > if a.on_ground { 1.9 } else { 2.5 } {
+            if dist > a.reach() || d.y.abs() > if a.on_ground { 1.9 } else { 2.5 } {
                 continue;
             }
             if dist > 0.3 && fwd.dot(d.flat().norm()) < 0.25 {
@@ -7192,7 +7266,9 @@ impl Game {
                 }
                 continue;
             }
-            let heavy = heavy || a.slash_idx == SLASH_HEAVY;
+            // a crushing special (Headsman's Drop) smashes a guard like a charged heavy
+            let spec_break = a.kit.as_ref().and_then(|k| k.hit_spec()).is_some_and(|s| s.info().guard_break);
+            let heavy = heavy || a.slash_idx == SLASH_HEAVY || spec_break;
             if b.guard && facing && !heavy && !counter {
                 // blocked: the guard meter takes it
                 self.impact_fx(hit_at, 2);
@@ -7564,11 +7640,27 @@ impl Game {
                 self.burst(at, [140, 190, 255], 16, 6.0);
             }
         }
+        // a Ledger Duel special the attacker's hit carries (decided on their computer, checked by
+        // the host against their weapon)
+        let spec = if self.ledger_on() { self.f[attacker].kit.as_ref().and_then(|k| k.hit_spec()).map_or(0, |s| s as u8) } else { 0 };
+        // the Bridgewright's Rig: a blade hit and a gun hit close together pay special bar
+        if self.ledger_on() && amount > 0.0 && attacker != victim && self.f[attacker].owned {
+            let (now, rules) = (self.time, self.mt.rules);
+            let blade = w < 3 || w == KICK_TOOL;
+            let paid = self.f[attacker].kit.as_mut().is_some_and(|k| k.landed(blade, now, &rules));
+            if paid {
+                let p = self.f[attacker].pos;
+                self.sfx(Sfx::ChargeReady, p);
+                if let Some(k) = self.f[attacker].kit.as_mut() {
+                    k.say("Change of Tools: +10 special");
+                }
+            }
+        }
         if self.is_authority() {
-            self.authority_hit_g(victim, Some(attacker), amount, knock, stun, head, w, guard);
+            self.authority_hit_s(victim, Some(attacker), amount, knock, stun, head, w, guard, spec);
         } else {
             let vt = self.view_time(victim);
-            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir, guard, vt });
+            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir, guard, vt, spec });
         }
     }
 
@@ -7583,7 +7675,15 @@ impl Game {
     /// armour lost) told to whoever hit: that's the number they see.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_hit_g(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8, guard: f32) {
+        self.authority_hit_s(victim, attacker, amount, knock, stun, head, w, guard, 0);
+    }
+
+    /// `authority_hit_g` for a hit that may carry a Ledger Duel special (`spec`, 0 for none).
+    #[allow(clippy::too_many_arguments)]
+    pub fn authority_hit_s(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8, guard: f32, spec: u8) {
         let before = self.f.get(victim).map(|f| (f.hp.max(0.0), f.ap.max(0.0), f.alive));
+        // a Ledger Duel: the gear on both sides decides how much it does
+        let amount = if self.ledger_on() && amount > 0.0 { self.ledger_scale(attacker, victim, amount, w, spec) } else { amount };
         self.authority_hit_inner(victim, attacker, amount, knock, stun, head, w, guard);
         if let (Some((hp0, ap0, true)), Some(a)) = (before, attacker) {
             if a != victim && a < self.f.len() {
@@ -7688,7 +7788,7 @@ impl Game {
             if amount <= 0.0 {
                 // a blocked hit: only their guard meter (on their computer) takes it
                 let o = attacker.filter(|&a| a < self.f.len()).map_or(V3::ZERO, |a| self.f[a].pos);
-                self.out_events.push(Ev::Hit { victim: victim as u8, dmg: 0.0, knock, stun, head: false, w, o, dir: V3::ZERO, guard, vt: 0.0 });
+                self.out_events.push(Ev::Hit { victim: victim as u8, dmg: 0.0, knock, stun, head: false, w, o, dir: V3::ZERO, guard, vt: 0.0, spec: 0 });
                 return;
             }
             let ff = &mut self.f[victim];
@@ -7710,7 +7810,7 @@ impl Game {
             }
             // tell the victim, with where the attacker stands (for their hit-direction marker)
             let o = attacker.filter(|&a| a < self.f.len()).map_or(V3::ZERO, |a| self.f[a].pos);
-            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir: V3::ZERO, guard, vt: 0.0 });
+            self.out_events.push(Ev::Hit { victim: victim as u8, dmg: amount, knock, stun, head, w, o, dir: V3::ZERO, guard, vt: 0.0, spec: 0 });
         }
     }
 
@@ -8873,6 +8973,12 @@ impl Game {
                 self.tracers.push(Tracer::shot(o, e, Weapon::Revolver, [150, 220, 255]));
             }
             Ev::Shot { o, e, w, spark } => {
+                if w == HOOK_TOOL {
+                    // a Rigger's Hook on its chain
+                    self.tracers.push(Tracer { a: o, b: e, life: 0.3, max_life: 0.3, width: 0.05, color: [60, 230, 210] });
+                    self.sfx(Sfx::GrappleFire, o);
+                    return;
+                }
                 if w != 0 {
                     self.tracers.push(Tracer::shot(o, e, Weapon::from_u8(w), [255, 170, 120]));
                     for _ in 0..4 {
@@ -8895,7 +9001,7 @@ impl Game {
                 }
                 self.impact_fx(e, spark);
             }
-            Ev::Hit { victim, dmg, knock, stun, head, w, o, dir, guard, vt } => {
+            Ev::Hit { victim, dmg, knock, stun, head, w, o, dir, guard, vt, spec } => {
                 let v = victim as usize;
                 if v >= self.f.len() {
                     return;
@@ -8920,7 +9026,9 @@ impl Game {
                             } else if head && !chk.head_ok && !wpn.is_melee() {
                                 dmg /= gs.head.max(1.0);
                             }
-                            self.authority_hit_g(v, Some(from), dmg, knock, stun, head && chk.head_ok, w, guard.clamp(0.0, GUARD_MAX));
+                            // a special only counts with the weapon that has it, when specials are on
+                            let spec = if self.ledger_on() && !self.mt.rules.no_specs && self.f[from].kit.as_ref().and_then(|k| k.main()).and_then(|m| m.spec).map(|s| s as u8) == Some(spec) { spec } else { 0 };
+                            self.authority_hit_s(v, Some(from), dmg, knock, stun, head && chk.head_ok, w, guard.clamp(0.0, GUARD_MAX), spec);
                         }
                     }
                 } else if from == 0 && v == self.local && self.f[v].owned {
@@ -9043,6 +9151,15 @@ impl Game {
             Ev::Chat { text } => {
                 self.add_chat(from, &text);
             }
+            Ev::Eat { item } => {
+                // a player ate: their health comes back here too (the host keeps health)
+                if self.kind == Kind::Host && from < self.f.len() && self.f[from].alive && self.ledger_on() && !self.mt.rules.no_food {
+                    if let Some(it) = crate::gear::item(item).filter(|it| it.heal > 0) {
+                        let f = &mut self.f[from];
+                        f.hp = (f.hp + it.heal as f32).min(MAX_HP);
+                    }
+                }
+            }
             Ev::Item { kind } => {
                 if self.kind == Kind::Host && from < self.f.len() && self.f[from].alive && self.f[from].items > 0 && kind < 2 && self.f[from].loadout.item == kind {
                     self.f[from].items -= 1;
@@ -9065,6 +9182,499 @@ impl Game {
                 }
             }
         }    }
+}
+// ---------------------------------------------------------------------------- Ledger Duels
+
+/// A Ledger Duel bot's thinking about its gear, and what everyone's gear was doing last tick.
+#[derive(Clone, Debug, Default)]
+pub struct LedgerBrain {
+    /// The weapon it fights with (it goes back to it after a special), and seconds until it may
+    /// swap again.
+    pub primary: u8,
+    pub cd: f32,
+    /// A special's wind-up and a swap seen last tick (their sounds play as they start).
+    pub seen_wind: bool,
+    pub seen_swap: bool,
+}
+
+impl Game {
+    /// A fighter on this computer gets their gear when a Ledger Duel needs it (you: your saved
+    /// loadout; a bot: one of the Court's), fitted to the duel's rules.
+    pub fn ensure_kit(&mut self, i: usize) {
+        if self.f[i].kit.is_some() || !self.f[i].owned || !self.f[i].present {
+            return;
+        }
+        // (you bring your own loadout, also when a bot plays for you)
+        let base = if i == self.local {
+            self.my_kit.clone()
+        } else {
+            let p = crate::gear::presets();
+            p[(i * 3 + self.mt.number as usize) % p.len()].clone()
+        };
+        self.give_kit(i, &base);
+    }
+
+    /// Put this loadout (fitted to the rules) on fighter `i`.
+    pub fn give_kit(&mut self, i: usize, base: &crate::gear::GearLoadout) {
+        let rules = self.mt.rules;
+        let mut kit = crate::gear::Kit::new(&base.for_rules(&rules));
+        kit.no_sets = rules.no_sets;
+        self.lbrain[i] = LedgerBrain { primary: kit.equip[crate::gear::Slot::Main as usize], ..Default::default() };
+        self.f[i].kit = Some(Box::new(kit));
+        self.sync_kit_weapon(i);
+    }
+
+    /// The weapon in hand follows the main-hand item (a gun swapped out keeps its rounds).
+    fn sync_kit_weapon(&mut self, i: usize) {
+        let f = &mut self.f[i];
+        let Some(kit) = f.kit.as_mut() else { return };
+        let w = kit.weapon();
+        let held = if f.cur == 0 { f.loadout.melee } else { f.loadout.gun1 };
+        if held == w && (f.cur == 0) == w.is_melee() {
+            return;
+        }
+        if !held.is_melee() {
+            let m = f.mag[1];
+            kit.mags.retain(|e| e.0 != held as u8);
+            kit.mags.push((held as u8, m));
+        }
+        if w.is_melee() {
+            f.loadout.melee = w;
+            f.cur = 0;
+        } else {
+            f.loadout.gun1 = w;
+            f.loadout.gun2 = w;
+            f.cur = 1;
+            let m = kit.mags.iter().find(|e| e.0 == w as u8).map_or(w.mag(), |e| e.1);
+            f.mag[1] = m;
+            f.mag[2] = m;
+        }
+        f.weapon = w;
+        f.reload_t = 0.0;
+        f.slash_t = 0.0;
+        f.slash_queued = false;
+        f.charge_t = 0.0;
+        f.charged = false;
+    }
+
+    /// A tick of a Ledger Duel for fighter `i` (on this computer): gear and abilities that
+    /// don't belong are put away, swaps and meals and specials run, and what they lock out is
+    /// taken out of the input. Returns the input the fighter acts on.
+    fn ledger_pre(&mut self, i: usize, inp: &Input, dt: f32) -> Input {
+        let rules = self.mt.rules;
+        let mut inp = *inp;
+        inp.select = None;
+        inp.item = false;
+        inp.utility = false;
+        inp.ability = false;
+        if rules.no_move {
+            inp.fwd = 0.0;
+            inp.right = 0.0;
+            inp.jump = false;
+            inp.dash = false;
+            inp.crouch = false;
+        }
+        // before the bell: a changed loadout is picked up
+        if i == self.local && !self.f[i].is_bot && matches!(self.mt.phase, Phase::Loadout | Phase::Countdown | Phase::Warmup) {
+            let want = self.my_kit.for_rules(&rules);
+            if self.f[i].kit.as_ref().is_some_and(|k| k.base != want) {
+                self.f[i].kit = None;
+            }
+        }
+        self.ensure_kit(i);
+        {
+            // no armour, medkits or utility in a Ledger Duel: gear and food instead
+            let f = &mut self.f[i];
+            f.ap = 0.0;
+            f.items = 0;
+            f.util = 0;
+        }
+        let Some(mut kit) = self.f[i].kit.take() else { return inp };
+        kit.no_sets = rules.no_sets;
+        let fighting = self.f[i].alive && self.mt.phase == Phase::Fight && self.f[i].fin == 0 && self.f[i].held_by.is_none();
+        let (swapped, fired) = kit.tick(dt, &rules);
+        let pos = self.f[i].pos;
+        let mut ate: Option<(f32, u8)> = None;
+        // (these happen once the gear is back on the fighter: their hits read it)
+        let mut haul = false;
+        let mut snub = false;
+        if fighting {
+            if let Some(k) = inp.inv.map(|k| k as usize) {
+                match kit.inv.get(k).and_then(|&id| crate::gear::item(id)).map(|it| it.kind) {
+                    Some(crate::gear::Kind::Gear(_)) => {
+                        if let Err(e) = kit.begin_swap(k, &rules) {
+                            kit.say(e);
+                        }
+                    }
+                    Some(_) => match kit.eat(k, &rules) {
+                        Ok((h, it)) => ate = Some((h, it.id)),
+                        Err(e) => kit.say(e),
+                    },
+                    None => kit.say("Empty slot"),
+                }
+            }
+            if inp.spec {
+                match kit.start_spec(&rules) {
+                    Ok(_) => self.sfx(Sfx::ChargeReady, pos),
+                    Err(e) => kit.say(e),
+                }
+            }
+        }
+        if kit.busy() {
+            // swapping, eating or winding up a special: no attacking, no guard; slower on foot
+            inp.fire = false;
+            inp.fire_pressed = false;
+            inp.kick = false;
+            inp.finish = false;
+            inp.guard = false;
+            inp.reload = false;
+            inp.dash = false;
+            let slow = if kit.wind.is_some() {
+                crate::gear::WIND_SLOW
+            } else if kit.eat_t > 0.0 {
+                crate::gear::EAT_SLOW
+            } else {
+                1.0
+            };
+            inp.fwd *= slow;
+            inp.right *= slow;
+        }
+        if let Some(s) = fired {
+            if s == crate::gear::Spec::Haul {
+                // the hook flies (it isn't a swing)
+                kit.armed = None;
+                haul = fighting;
+            } else {
+                self.sfx(Sfx::ExecWhoosh, pos);
+                if s.info().timed <= 0.0 {
+                    inp.fire_pressed = true;
+                }
+            }
+        }
+        // the off-hand pistol: R with a one-handed blade in hand
+        if fighting && inp.reload && kit.snub_ready() {
+            kit.fire_snub();
+            snub = true;
+        }
+        if kit.armed.is_some() && fighting {
+            // a strike special goes with the next attack: it's thrown now
+            inp.fire = true;
+            inp.fire_pressed = true;
+        }
+        if swapped.is_some() {
+            let w = kit.weapon();
+            self.sfx(if w.is_melee() { Sfx::SwitchBlade } else { Sfx::SwitchGun }, pos);
+        }
+        if let Some((h, id)) = ate {
+            self.sfx(Sfx::Heal, pos);
+            if h > 0.0 {
+                let f = &mut self.f[i];
+                f.hp = (f.hp + h).min(MAX_HP);
+                if self.kind == Kind::Client && i == self.local {
+                    // the host keeps health: it's told, and ours holds until its word catches up
+                    self.hp_hold = self.f[i].ping_ms as f32 / 1000.0 + 0.2;
+                    self.out_events.push(Ev::Eat { item: id });
+                }
+            }
+        }
+        self.f[i].kit = Some(kit);
+        self.sync_kit_weapon(i);
+        if haul {
+            self.ledger_haul(i);
+        }
+        if snub {
+            self.fire_snub(i);
+        }
+        inp
+    }
+
+    /// Haul: the hook flies on its chain along the aim, up to 8 m. Whoever it catches is yanked
+    /// in and staggered for a moment; stepping out of its line dodges it, and a perfect parry
+    /// knocks it away (the thrower reels instead).
+    fn ledger_haul(&mut self, i: usize) {
+        use crate::gear::{Spec, HAUL_RANGE, HAUL_STAGGER};
+        let me = &self.f[i];
+        let (eye, yaw) = (me.eye(), me.yaw);
+        let aim = look_dir(yaw, me.pitch);
+        let hand = me.pos + v3(0.0, 1.35, 0.0) + yaw_right(yaw) * 0.3 + yaw_fwd(yaw) * 0.3;
+        let mut best: Option<(usize, f32)> = None;
+        for j in 0..self.f.len() {
+            if j == i || !self.f[j].alive || !self.f[j].present || !self.is_enemy(i, j) {
+                continue;
+            }
+            let d = self.f[j].chest() - eye;
+            let along = d.dot(aim);
+            let off = (d - aim * along).len();
+            if along > 0.3 && along < HAUL_RANGE + 0.4 && off < 0.5 && self.world.line_clear(eye, self.f[j].chest()) && best.map_or(true, |b| along < b.1) {
+                best = Some((j, along));
+            }
+        }
+        let end = best.map_or(eye + aim * HAUL_RANGE, |(j, _)| self.f[j].chest());
+        self.tracers.push(Tracer { a: hand, b: end, life: 0.3, max_life: 0.3, width: 0.05, color: [60, 230, 210] });
+        if self.kind == Kind::Host || self.kind == Kind::Client {
+            self.out_events.push(Ev::Shot { o: hand, e: end, w: HOOK_TOOL, spark: 0 });
+        }
+        self.sfx(Sfx::GrappleFire, hand);
+        let Some((j, _)) = best else {
+            if i == self.local {
+                self.say("The hook missed".to_string());
+            }
+            return;
+        };
+        let t = &self.f[j];
+        if t.guard && t.guard_t <= PERFECT_PARRY && t.parry_lock <= 0.0 {
+            // parried: the hook is knocked away and the thrower reels
+            self.impact_fx(end, 4);
+            self.stat(j, |s| s.parries += 1);
+            let f = &mut self.f[i];
+            f.stun_t = f.stun_t.max(0.35);
+            f.stagger_t = f.stagger_t.max(0.35);
+            if i == self.local || j == self.local {
+                self.say(if j == self.local { "Hook parried!".to_string() } else { "Your hook was parried!".to_string() });
+            }
+            return;
+        }
+        let d = (self.f[i].pos - self.f[j].pos).flat();
+        let speed = ((d.len() - 1.6).max(0.0) * HAUL_PULL).min(24.0);
+        let knock = d.norm() * speed + v3(0.0, 2.0, 0.0);
+        if let Some(k) = self.f[i].kit.as_mut() {
+            k.strike = Some((Spec::Haul, 0.05));
+        }
+        self.damage_g(i, j, 6.0, knock, HAUL_STAGGER, false, end, Weapon::Katana as u8, eye, aim, 0.0);
+        if let Some(k) = self.f[i].kit.as_mut() {
+            k.strike = None;
+        }
+        if self.f[j].owned {
+            let f = &mut self.f[j];
+            f.stagger_t = f.stagger_t.max(HAUL_STAGGER);
+        }
+        if i == self.local {
+            self.say("HAULED IN!".to_string());
+        }
+        if j == self.local {
+            self.say("Hauled in!".to_string());
+        }
+    }
+
+    /// The off-hand pistol's shot: from the left hand, along the aim.
+    fn fire_snub(&mut self, i: usize) {
+        let (o, dir) = self.shot_ray(i);
+        let ff = &self.f[i];
+        let muzzle = ff.pos + v3(0.0, 1.3, 0.0) - yaw_right(ff.yaw) * 0.3 + ff.fwd() * 0.4;
+        let pos = ff.pos;
+        if !ff.is_bot {
+            self.tracer_from = Some(muzzle);
+        }
+        self.fire_ray(i, o, dir, crate::gear::SNUB_DMG, 120.0, Weapon::Revolver);
+        self.tracer_from = None;
+        self.sfx(Sfx::Revolver, pos);
+    }
+
+    /// After fighter `i` acted: an armed special went with the attack just made.
+    fn ledger_post(&mut self, i: usize, acts: &[Act]) {
+        let Some(kit) = self.f[i].kit.as_mut() else { return };
+        if kit.armed.is_none() {
+            return;
+        }
+        if acts.iter().any(|a| matches!(a, Act::Slash)) {
+            kit.attacked(true);
+        } else if acts.iter().any(|a| matches!(a, Act::Gun { .. } | Act::Star { .. } | Act::Throw)) {
+            kit.attacked(false);
+        }
+    }
+
+    /// (the host, or a game on this computer) What a hit does in a Ledger Duel: capped, times the
+    /// attacker's gear (and special), less the victim's defence against that kind of hit, with a
+    /// small spread either way.
+    pub fn ledger_scale(&self, attacker: Option<usize>, victim: usize, amount: f32, w: u8, spec: u8) -> f32 {
+        use crate::gear::{Dmg, Spec, BASE_CAP, NORMAL_MAX, VARIANCE};
+        let Some(kind) = Dmg::of(w) else { return amount }; // an execution or a combo KO stands
+        let rules = self.mt.rules;
+        let a = attacker.filter(|&a| a < self.f.len());
+        let akit = a.and_then(|a| self.f[a].kit.as_deref());
+        let sp = Spec::from_u8(spec).filter(|s| !rules.no_specs && akit.and_then(|k| k.main()).and_then(|m| m.spec) == Some(*s)).map(|s| s.info());
+        let mut d = amount.min(sp.map_or(BASE_CAP, |s| s.cap));
+        if let (Some(a), Some(k)) = (a, akit) {
+            d *= k.attack_mult(&rules, self.f[a].hp, w);
+        }
+        if let Some(s) = sp {
+            d *= s.mult;
+        }
+        if let Some(k) = self.f[victim].kit.as_deref() {
+            d *= k.defend(&rules, kind, sp.map_or(0.0, |s| s.pierce));
+        }
+        // the spread: +-6%, from the moment and who's involved (not the game's dice)
+        let mut h = (self.time.to_bits() as u64) ^ (victim as u64) << 40 ^ (a.unwrap_or(9) as u64) << 48 ^ (amount.to_bits() as u64) << 8;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        let u = (h % 10_000) as f32 / 10_000.0;
+        d *= 1.0 + VARIANCE * (2.0 * u - 1.0);
+        d.min(sp.map_or(NORMAL_MAX, |s| s.cap)).max(1.0)
+    }
+
+    /// (every computer) A special's wind-up or a swap starting on someone else's fighter is
+    /// heard where they stand: the tells the other side reacts to.
+    fn ledger_watch(&mut self) {
+        if !self.ledger_on() {
+            return;
+        }
+        // no armour in a Ledger Duel (a copy of a player on another computer is reset with it
+        // each round): gear's defence instead
+        for f in self.f.iter_mut() {
+            f.ap = 0.0;
+        }
+        for i in 0..self.f.len() {
+            let (wind, swap, pos, owned) = match &self.f[i].kit {
+                Some(k) if self.f[i].present => (k.wind.is_some(), k.swap.is_some(), self.f[i].pos, self.f[i].owned),
+                _ => continue,
+            };
+            if !owned {
+                if wind && !self.lbrain[i].seen_wind {
+                    self.sfx(Sfx::ChargeReady, pos);
+                }
+                if swap && !self.lbrain[i].seen_swap {
+                    self.sfx(Sfx::SwitchGun, pos);
+                }
+            }
+            self.lbrain[i].seen_wind = wind;
+            self.lbrain[i].seen_swap = swap;
+        }
+    }
+
+    /// A Ledger Duel bot's gear: eat when hurt and not under pressure (a bite straight after),
+    /// throw a special when it can finish or it's worth it, swap to a weapon with a special
+    /// that can finish them, back to its own weapon after, and between a blade and a gun by
+    /// range.
+    fn ledger_bot(&mut self, i: usize, inp: &mut Input) {
+        use crate::gear::{item, Item, Kind as GK, Slot, Tonic, INV};
+        if self.mt.phase != Phase::Fight || !self.f[i].alive {
+            return;
+        }
+        let rules = self.mt.rules;
+        let Some(kit) = self.f[i].kit.as_deref() else { return };
+        let me = &self.f[i];
+        let near = (0..self.f.len()).filter(|&j| j != i && self.f[j].present && self.f[j].alive && self.is_enemy(i, j)).min_by(|&a, &b| (self.f[a].pos - me.pos).len().total_cmp(&(self.f[b].pos - me.pos).len()));
+        let Some(o) = near else { return };
+        let op = &self.f[o];
+        let dist = (op.pos - me.pos).flat().len();
+        let (hp, ohp) = (me.hp, op.hp);
+        let mut brain = self.lbrain[i].clone();
+        brain.cd -= TICK;
+        // a blade against a gun: close in and cut (circling at sword's length only gets you
+        // shot), weaving so the shots have to be aimed; a dash to cover the last stretch
+        if kit.weapon().is_melee() && !op.weapon.is_melee() && !kit.busy() && hp > 25.0 {
+            inp.fwd = 1.0;
+            inp.right = (self.time * 2.1 + i as f32 * 1.7).sin() * 0.7;
+            inp.guard = false;
+            if dist < me.reach() * 0.9 {
+                inp.fire_pressed = true;
+                inp.right = 0.0;
+            } else if (3.5..7.0).contains(&dist) && me.dash_charges >= 1.0 && (self.time * 0.7 + i as f32).fract() < 0.02 {
+                inp.dash = true;
+            }
+        }
+        let slot = |pred: &dyn Fn(&Item) -> bool| (0..INV).find(|&k| kit.inv[k] != 0 && item(kit.inv[k]).is_some_and(|it| pred(it)) && kit.can_use(k, &rules).is_ok());
+        let pick = (|| {
+            // a bite straight after a meal, while still hurt
+            if kit.eat_t > 0.0 && !kit.combo_used && hp < 80.0 {
+                return slot(&|it| it.kind == GK::Bite).map(|k| (k, false));
+            }
+            if kit.busy() || kit.armed.is_some() || kit.strike.is_some() {
+                return None;
+            }
+            // eat: hurt, and not in the middle of a trade (unless it's that or fall)
+            if !rules.no_food && hp < 50.0 && (dist > 4.0 || hp < 28.0) {
+                if let Some(k) = slot(&|it| it.kind == GK::Food).or_else(|| slot(&|it| it.kind == GK::Bite)) {
+                    return Some((k, false));
+                }
+            }
+            // a tonic early on, from a distance
+            if !rules.no_food && dist > 7.0 && kit.buffs.iter().all(|&b| b <= 0.0) && hp > 60.0 {
+                if let Some(k) = slot(&|it| matches!(it.kind, GK::Tonic(Tonic::Fury | Tonic::Iron | Tonic::Haste))) {
+                    return Some((k, false));
+                }
+            }
+            let los = self.world.line_clear(me.eye(), op.chest());
+            let off_aim = {
+                let d = op.chest() - me.eye();
+                wrap_angle(d.x.atan2(d.z) - me.yaw).abs()
+            };
+            let aimed = off_aim < 0.2;
+            // the Rig: the off-hand pistol between swings
+            if kit.snub_ready() && (3.5..16.0).contains(&dist) && off_aim < 0.06 && los && !me.slashing() {
+                return Some((98, true));
+            }
+            // hauled in and reeling: out with the cleaver for the finish
+            if op.stun_t > 0.0 && dist < 4.0 && !rules.no_switch && kit.main().is_some_and(|m| m.id == crate::gear::HOOK) {
+                if let Some(k) = slot(&|it| it.id == 25) {
+                    return Some((k, false));
+                }
+            }
+            if !rules.no_specs {
+                let w = kit.weapon();
+                let in_range = |w: Weapon| if w.is_melee() { dist < w.melee_range() * 0.85 } else { dist < 28.0 && los };
+                if let Some(s) = kit.main().and_then(|m| m.spec) {
+                    let si = s.info();
+                    if s == crate::gear::Spec::Haul {
+                        // the hook: from a few metres off, dead on target
+                        if kit.spec >= si.cost && (3.0..crate::gear::HAUL_RANGE - 0.5).contains(&dist) && off_aim < 0.08 && los {
+                            return Some((99, true));
+                        }
+                    } else {
+                        let finish = ohp <= 30.0 + 25.0 * si.mult;
+                        let worth = si.timed > 0.0 || finish || (si.cost <= 25.0 && ohp < 85.0);
+                        if kit.spec >= si.cost && in_range(w) && aimed && worth {
+                            return Some((99, true));
+                        }
+                    }
+                }
+                // swap to a weapon whose special can finish them (and the range suits it)
+                if brain.cd <= 0.0 && !rules.no_switch && ohp <= 55.0 {
+                    let k = slot(&|it| {
+                        it.kind == GK::Gear(Slot::Main)
+                            && it.spec.is_some_and(|s| s.info().cost <= kit.spec && s.info().timed <= 0.0)
+                            && it.base.is_some_and(|b| if b.is_melee() { dist < 5.0 } else { dist >= 5.0 })
+                            && Some(it.id) != kit.main().map(|m| m.id)
+                    });
+                    if let Some(k) = k {
+                        return Some((k, false));
+                    }
+                }
+            }
+            if brain.cd <= 0.0 && !rules.no_switch {
+                let w = kit.weapon();
+                let gun = |it: &Item| it.kind == GK::Gear(Slot::Main) && it.base.is_some_and(|b| !b.is_melee() && (b != Weapon::Shotgun || dist < 8.0));
+                let blade = |it: &Item| it.kind == GK::Gear(Slot::Main) && it.base.is_some_and(|b| b.is_melee());
+                if w.is_melee() && dist > 10.0 {
+                    if let Some(k) = slot(&gun) {
+                        return Some((k, false));
+                    }
+                } else if !w.is_melee() && w != Weapon::Shotgun && dist < 3.2 {
+                    if let Some(k) = slot(&blade) {
+                        return Some((k, false));
+                    }
+                } else if kit.main().map(|m| m.id) != Some(brain.primary) && kit.spec < 25.0 && (3.2..10.0).contains(&dist) {
+                    if let Some(k) = (0..INV).find(|&k| kit.inv[k] == brain.primary && kit.can_use(k, &rules).is_ok()) {
+                        return Some((k, false));
+                    }
+                }
+            }
+            None
+        })();
+        match pick {
+            Some((98, true)) => inp.reload = true,
+            Some((_, true)) => inp.spec = true,
+            Some((k, false)) => {
+                if item(kit.inv[k]).is_some_and(|it| matches!(it.kind, GK::Gear(_))) {
+                    brain.cd = 2.5;
+                }
+                inp.inv = Some(k as u8);
+            }
+            None => {}
+        }
+        self.lbrain[i] = brain;
+    }
 }
 
 
@@ -9629,7 +10239,7 @@ mod movement_tests {
     fn speed(g: &Game) -> f32 {
         g.f[0].vel.flat().len()
     }
-    const FWD: Input = Input { fwd: 1.0, right: 0.0, jump: false, dash: false, fire: false, fire_pressed: false, guard: false, select: None, reload: false, item: false, crouch: false, kick: false, finish: false, ability: false, sneak: false, utility: false, inspect: false, yaw: 0.0, pitch: 0.0 };
+    const FWD: Input = Input { inv: None, spec: false, fwd: 1.0, right: 0.0, jump: false, dash: false, fire: false, fire_pressed: false, guard: false, select: None, reload: false, item: false, crouch: false, kick: false, finish: false, ability: false, sneak: false, utility: false, inspect: false, yaw: 0.0, pitch: 0.0 };
 
     #[test]
     fn landing_from_a_dash_keeps_speed_then_eases() {
@@ -11834,7 +12444,8 @@ mod ability_mode_tests {
 
     #[test]
     fn every_practice_mode_has_abilities() {
-        for mode in Mode::ALL.into_iter().chain([Mode::Gauntlet]) {
+        // (Ledger Duels trade abilities for gear: see ledger_tests)
+        for mode in Mode::ALL.into_iter().filter(|m| *m != Mode::Ledger).chain([Mode::Gauntlet]) {
             let mut g = if mode == Mode::Gauntlet { Game::gauntlet("A", 0) } else { Game::offline("A", 1, 0.5, mode, 5) };
             g.mt.classic = false; // the menu's "Abilities" setting, on (the default)
             g.f[0].ready = true;

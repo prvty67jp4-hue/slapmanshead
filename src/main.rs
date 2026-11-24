@@ -26,10 +26,13 @@ mod watchdog;
 mod world;
 mod zones;
 mod lore;
+mod gear;
 #[cfg(test)]
 mod tactics_tests;
 #[cfg(test)]
 mod story_tests;
+#[cfg(test)]
+mod ledger_tests;
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, Stroke, Vec2, ViewportCommand};
 use game::*;
@@ -687,6 +690,8 @@ struct Latch {
     utility: bool,
     inspect: bool,
     select: Option<u8>,
+    /// Ledger Duels: a pack slot to use (keys 1-6, or the radial).
+    inv: Option<u8>,
 }
 
 struct App {
@@ -771,6 +776,16 @@ struct App {
     preview_back: Option<Page>,
     /// The Lore page's tab: 0 the world, 1.. a fighter, then the places.
     lore_tab: u8,
+    /// Ledger Duels: the saved loadouts, rules and honour ledger; the gear screen's state and
+    /// whether it's open from the menu; the duel whose terms you accepted and whose result was
+    /// noted; the pack radial (time held, and where the view was with the cursor's offset).
+    ledger: gear::LedgerSave,
+    gear_ui: GearUi,
+    menu_gear: bool,
+    rules_ok: Option<u32>,
+    honour_noted: Option<u32>,
+    inv_hold: f32,
+    inv_wheel: Option<(f32, f32, f32, f32)>,
 
     /// An execution's camera: which shot (execution, shot, victim's view) and the angle chosen for it.
     exec_cam: std::cell::Cell<((u8, usize, bool), usize)>,
@@ -929,6 +944,13 @@ impl App {
             quick_host: false,
             preview_back: None,
             lore_tab: 0,
+            ledger: gear::LedgerSave::load(),
+            gear_ui: GearUi::default(),
+            menu_gear: false,
+            rules_ok: None,
+            honour_noted: None,
+            inv_hold: 0.0,
+            inv_wheel: None,
 
             ping_hold: 0.0,
             ping_wheel: None,
@@ -1064,10 +1086,29 @@ impl App {
                 app.screen = Screen::Menu(Page::Lore);
             } else if pg == "play" {
                 app.screen = Screen::Menu(Page::Play);
+            } else if pg == "gear" {
+                app.menu_gear = true;
+            } else if let Some(side) = pg.strip_prefix("gear_preview") {
+                // DUEL_PAGE=gear_preview or gear_preview_back: your fighter in your Ledger gear
+                app.menu_gear = true;
+                app.gear_ui.preview = true;
+                app.gear_ui.back = side == "_back";
+                app.menu_fx = 0.5;
             } else if pg == "loadout" {
                 app.menu_loadout = true;
                 app.menu_fx = 0.80;
             }
+        }
+        // test switches for Ledger Duels pictures (menus and matches): DUEL_LEDGER_RULES=<rule
+        // bits>,<best of> sets the challenger's terms; DUEL_LEDGER_KIT=<preset> picks your gear
+        if let Ok(v) = std::env::var("DUEL_LEDGER_RULES") {
+            let mut it = v.split(',').filter_map(|x| x.trim().parse::<u8>().ok());
+            app.ledger.rules = gear::Rules::from_bits(it.next().unwrap_or(0), it.next().unwrap_or(3));
+        }
+        if let Some(k) = std::env::var("DUEL_LEDGER_KIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+            let p = gear::presets();
+            app.ledger.kits[0] = p[k.min(p.len() - 1)].clone();
+            app.ledger.pick = 0;
         }
         // hidden test mode: a bot plays the local fighter (used to photograph gameplay)
         if std::env::var_os("DUEL_AUTOPLAY").is_some() {
@@ -1082,6 +1123,7 @@ impl App {
             if let Some(m) = std::env::var("DUEL_MAP").ok().and_then(|v| v.parse::<u8>().ok()) {
                 g.set_map(MapId::from_u8(m));
             }
+
             // test switch: DUEL_BOT_BODY=0..3 puts every bot in that fighter (rival pictures)
             if let Some(b) = std::env::var("DUEL_BOT_BODY").ok().and_then(|v| v.parse::<u8>().ok()) {
                 for i in 1..g.f.len() {
@@ -1176,6 +1218,13 @@ impl App {
     }
 
     fn start_game(&mut self, mut game: Game, net: Option<Net>) {
+        // Ledger Duels: the gear you bring, and (as challenger) your rules and the best-of
+        game.my_kit = self.ledger.current().clone();
+        if game.mt.mode == Mode::Ledger && game.kind != Kind::Client {
+            game.mt.rules = self.ledger.rules;
+            game.mt.target = game.mt.rules.target();
+        }
+        self.rules_ok = None;
         let l = game.local;
         let own = game.train.is_none() && game.preview.is_none();
         if own {
@@ -2556,6 +2605,7 @@ impl eframe::App for App {
             self.read_play_input(&ctx);
             let t_sim = std::time::Instant::now();
             self.step_play(dt);
+            self.ledger_after_match();
             self.sim_ms = t_sim.elapsed().as_secs_f32() * 1000.0;
         } else {
             self.set_capture(&ctx, false);
@@ -2997,7 +3047,14 @@ impl App {
 
     fn handle_screenshot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.screenshot.clone() else { return };
-        let shot_frame: u32 = std::env::var("DUEL_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+        let mut shot_frame: u32 = std::env::var("DUEL_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+        // (a test switch can move it: DUEL_SHOT_AFTER, counted from a forced moment)
+        if std::env::var_os("DUEL_SHOT_AFTER").is_some() {
+            shot_frame = match SHOT_AT.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => u32::MAX - 2000,
+                f => f,
+            };
+        }
         let killcam_now = std::env::var_os("DUEL_SHOT_KILLCAM").is_some()
             && matches!(&self.screen, Screen::Play { game, .. } if game.killcam.as_ref().map_or(false, |k| k.t > 1.3));
         // an execution still (DUEL_EXEC=n,share): as soon as time has stopped at that moment
@@ -3133,6 +3190,12 @@ impl App {
             for (k, a) in [A_MELEE, A_GUN1, A_GUN2].into_iter().enumerate() {
                 if b[a].tapped(i, prev) {
                     self.latch.select = Some(k as u8);
+                }
+            }
+            // Ledger Duels: the number keys use the pack's first six slots
+            for (k, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6].into_iter().enumerate() {
+                if i.key_pressed(key) {
+                    self.latch.inv = Some(k as u8);
                 }
             }
         });
@@ -3311,10 +3374,114 @@ impl App {
         inp.sneak = ctx_keys.sneak;
         inp.item = self.latch.item;
         inp.select = self.latch.select;
+        // Ledger Duels: the pack, and the special on the ability key
+        inp.inv = self.latch.inv;
+        inp.spec = self.latch.ability;
         inp
     }
 
+    /// Test switch DUEL_LEDGER_FORCE=swap@<frame> | spec@<frame>: at that frame of a Ledger Duel
+    /// you start swapping to your first pack item, or both sides start a special (for pictures).
+    fn ledger_force(&mut self) {
+        let Ok(v) = std::env::var("DUEL_LEDGER_FORCE") else { return };
+        let Some((what, at)) = v.split_once('@') else { return };
+        if what == "haul" {
+            self.ledger_force_haul(at.trim().parse().unwrap_or(0));
+            return;
+        }
+        if at.trim().parse::<u32>().ok() != Some(self.frames) {
+            return;
+        }
+        let Screen::Play { game, .. } = &mut self.screen else { return };
+        let rules = game.mt.rules;
+        let n = if what == "spec" { 2 } else { 1 };
+        if what == "spec" && game.f.len() > 1 {
+            // the opponent steps into view, facing you
+            let y = game.f[0].yaw;
+            let at = game.f[0].pos + v3(y.sin(), 0.0, y.cos()) * 4.5;
+            let o = &mut game.f[1];
+            o.pos = at;
+            o.prev_pos = at;
+            o.vel = V3::ZERO;
+            o.yaw = y + std::f32::consts::PI;
+            // with DUEL_LEDGER_KIT the opponent wears the same gear (the Haul seen from the front)
+            if std::env::var_os("DUEL_LEDGER_KIT").is_some() {
+                let mine = game.my_kit.clone();
+                game.give_kit(1, &mine);
+            }
+        }
+        for i in 0..n.min(game.f.len()) {
+            if let Some(k) = game.f[i].kit.as_mut() {
+                if what == "spec" {
+                    k.swap = None;
+                    k.eat_t = 0.0;
+                    k.armed = None;
+                    k.strike = None;
+                    k.spec = 100.0;
+                    let _ = k.start_spec(&rules);
+                } else {
+                    let _ = k.begin_swap(0, &rules);
+                }
+            }
+        }
+    }
+
+    /// DUEL_LEDGER_FORCE=haul@<frame> (for pictures): from that frame, once the fight is on, the
+    /// opponent (in your gear) stands 6 m away in the open, facing you, and throws a Haul;
+    /// DUEL_SHOT_AFTER=<frames> takes the picture that many frames later.
+    fn ledger_force_haul(&mut self, from: u32) {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.frames < from || DONE.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let frames = self.frames;
+        let Screen::Play { game, .. } = &mut self.screen else { return };
+        if game.mt.phase != game::Phase::Fight || game.f.len() < 2 || !game.f[0].alive || !game.f[1].alive {
+            return;
+        }
+        // (and once the round clock runs: a round opens with a pause)
+        static CLOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seen = f32::from_bits(CLOCK.load(std::sync::atomic::Ordering::Relaxed));
+        if seen == 0.0 || game.mt.timer > seen - 0.25 {
+            if seen == 0.0 {
+                CLOCK.store(game.mt.timer.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        // the first direction with 6 m of open floor
+        let me = game.f[0].pos;
+        let eye = me + v3(0.0, 1.5, 0.0);
+        let Some(y) = (0..16).map(|k| k as f32 * std::f32::consts::TAU / 16.0).find(|&y| {
+            let at = me + v3(y.sin(), 0.0, y.cos()) * 6.5;
+            game.world.line_clear(eye, at + v3(0.0, 1.5, 0.0)) && game.world.line_clear(me + v3(0.0, 0.4, 0.0), at + v3(0.0, 0.4, 0.0))
+        }) else {
+            return;
+        };
+        DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let at = me + v3(y.sin(), 0.0, y.cos()) * 6.0;
+        game.f[0].yaw = y;
+        game.f[0].pitch = 0.0;
+        game.f[0].vel = V3::ZERO;
+        let o = &mut game.f[1];
+        o.pos = at;
+        o.prev_pos = at;
+        o.vel = V3::ZERO;
+        o.yaw = y + std::f32::consts::PI;
+        o.pitch = 0.0;
+        let mine = game.my_kit.clone();
+        game.give_kit(1, &mine);
+        let rules = game.mt.rules;
+        if let Some(k) = game.f[1].kit.as_mut() {
+            k.spec = 100.0;
+            let _ = k.start_spec(&rules);
+        }
+        if let Some(after) = std::env::var("DUEL_SHOT_AFTER").ok().and_then(|v| v.parse::<u32>().ok()) {
+            SHOT_AT.store(frames + after, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn step_play(&mut self, dt: f32) {
+        self.ledger_force();
         if let Some((_, t)) = self.music_note.as_mut() {
             *t -= dt;
             if *t <= 0.0 {
@@ -3323,6 +3490,7 @@ impl App {
         }
         let keys = self.keys_snapshot();
         self.ping_frame(dt, keys.ping);
+        self.inv_frame(dt, keys.pack);
         let mut inp = self.current_input(&keys);
         if self.chat_open {
             inp = Input { yaw: self.aim_yaw, pitch: self.aim_pitch, ..Default::default() };
@@ -3897,6 +4065,8 @@ struct KeysHeld {
     crouch: bool,
     sneak: bool,
     ping: bool,
+    /// Ledger Duels: the radial key (the utility key) held.
+    pack: bool,
 }
 
 thread_local! {
@@ -3926,7 +4096,135 @@ fn ping_sector(cx: f32, cy: f32) -> Option<u8> {
     let n = game::PINGS.len() as f32;
     Some(((a / std::f32::consts::TAU * n + 0.5).floor() as usize % game::PINGS.len()) as u8)
 }
+/// The Ledger Gear armoury's tabs.
+const GEAR_CATS: [(&str, Option<gear::Slot>); 9] = [
+    ("Main hand", Some(gear::Slot::Main)),
+    ("Off hand", Some(gear::Slot::Off)),
+    ("Head", Some(gear::Slot::Head)),
+    ("Body", Some(gear::Slot::Body)),
+    ("Legs", Some(gear::Slot::Legs)),
+    ("Hands", Some(gear::Slot::Hands)),
+    ("Feet", Some(gear::Slot::Feet)),
+    ("Charm", Some(gear::Slot::Charm)),
+    ("Food & tonics", None),
+];
+
+/// The Ledger Gear screen's state: the armoury tab, the item whose card shows.
+#[derive(Default)]
+struct GearUi {
+    cat: usize,
+    hover: Option<u8>,
+    /// Looking at the loadout on your fighter (the menu's), from the front or the back.
+    preview: bool,
+    back: bool,
+}
+
+/// An item's stats in one line (only what it changes).
+fn short_stats(it: &gear::Item) -> &'static str {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<u8, &'static str>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|c| {
+        *c.borrow_mut().entry(it.id).or_insert_with(|| {
+            let mut v = Vec::new();
+            if it.heal > 0 {
+                v.push(format!("heals {}", it.heal));
+            }
+            if let gear::Kind::Tonic(_) = it.kind {
+                v.push(it.blurb.split(';').next().unwrap_or("").to_string());
+            }
+            if it.acc != 0 {
+                v.push(format!("acc {:+}%", it.acc));
+            }
+            if it.dmg != 0 {
+                v.push(format!("dmg {:+}%", it.dmg));
+            }
+            if it.def.iter().any(|&d| d != 0) {
+                v.push(format!("def {}/{}/{}", it.def[0], it.def[1], it.def[2]));
+            }
+            if it.speed != 0 {
+                v.push(format!("speed {:+}%", it.speed));
+            }
+            if it.regen != 0 {
+                v.push(format!("spec bar {:+}%", it.regen));
+            }
+            if it.weight > 0 {
+                v.push(format!("{} kg", it.weight));
+            }
+            if it.two_handed {
+                v.push("two hands".into());
+            }
+            Box::leak(v.join(" · ").into_boxed_str())
+        })
+    })
+}
+
+/// An item's full card: everything it does, in words and numbers.
+fn item_card(ui: &mut egui::Ui, it: &gear::Item, finish: &str, fcol: Color32, rules: &gear::Rules) {
+    use gear::Kind;
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(58.0), egui::Sense::hover());
+        ui.painter().rect_filled(r, 6.0, Color32::from_rgba_unmultiplied(24, 22, 34, 240));
+        ui.painter().rect_stroke(r, 6.0, Stroke::new(2.0, fcol), egui::StrokeKind::Inside);
+        ui_kit::gear_icon(ui.painter(), r.shrink(6.0), it, Color32::WHITE);
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(it.name).font(ui_kit::display(22.0)).color(fcol));
+            let what = match it.kind {
+                Kind::Gear(s) => format!("{}{}  ·  {finish} finish (mastery look only)", s.name(), if it.two_handed { ", two hands" } else { "" }),
+                Kind::Food => "Food: a meal".to_string(),
+                Kind::Bite => "Food: a bite (can follow a meal)".to_string(),
+                Kind::Tonic(_) => "Tonic (can follow a meal)".to_string(),
+            };
+            ui.label(egui::RichText::new(what).size(12.5).color(Color32::from_gray(185)));
+        });
+    });
+    if matches!(it.kind, Kind::Gear(_)) {
+        egui::Grid::new(("card", it.id)).num_columns(4).spacing([14.0, 2.0]).show(ui, |ui| {
+            let cell = |ui: &mut egui::Ui, k: &str, v: String| {
+                ui.label(egui::RichText::new(k).size(12.5).color(Color32::from_gray(170)));
+                ui.label(egui::RichText::new(v).size(13.5).strong());
+            };
+            cell(ui, "Accuracy", format!("{:+}%", it.acc));
+            cell(ui, "Damage", format!("{:+}%", it.dmg));
+            ui.end_row();
+            cell(ui, "Defence vs blade", format!("{}%", it.def[0]));
+            cell(ui, "vs bullet", format!("{}%", it.def[1]));
+            ui.end_row();
+            cell(ui, "vs blast", format!("{}%", it.def[2]));
+            cell(ui, "Move speed", format!("{:+}%", it.speed));
+            ui.end_row();
+            cell(ui, "Weight", format!("{} kg", it.weight));
+            cell(ui, "Swap time", format!("{:.2} s", gear::swap_time(it, None)));
+            ui.end_row();
+        });
+    } else {
+        ui.label(egui::RichText::new(format!("Heals {}  ·  {}", it.heal, it.blurb)).size(13.5));
+    }
+    if let Some(s) = it.set {
+        ui.label(egui::RichText::new(format!("{} set: {}", s.name(), s.bonus())).size(12.5).color(Color32::from_rgb(160, 230, 170)));
+    }
+    if let Some(sp) = it.spec {
+        let i = sp.info();
+        ui.label(egui::RichText::new(format!("Special: {} ({:.0}%, {:.2} s wind-up) - {}", i.name, i.cost, i.windup, i.blurb)).size(12.5).color(Color32::from_rgb(255, 210, 150)));
+    }
+    ui.label(egui::RichText::new(it.blurb).size(12.5).italics().color(Color32::from_gray(200)));
+    if !rules.allows(it) {
+        ui.label(egui::RichText::new("Not allowed under this duel's rules").size(12.5).color(Color32::from_rgb(255, 120, 100)));
+    }
+}
+
+/// Which of the twelve pack slots the radial points at (none near the middle).
+fn inv_sector(cx: f32, cy: f32) -> Option<u8> {
+    if (cx * cx + cy * cy).sqrt() < 0.05 {
+        return None;
+    }
+    let a = cx.atan2(cy).rem_euclid(std::f32::consts::TAU);
+    let n = gear::INV as f32;
+    Some(((a / std::f32::consts::TAU * n + 0.5).floor() as usize % gear::INV) as u8)
+}
+
 fn sample_keys(ctx: &egui::Context, b: &[Bind; N_ACTIONS]) {
+
     let k = ctx.input(|i| KeysHeld {
         w: b[A_FWD].down(i) || i.key_down(Key::ArrowUp),
         a: b[A_LEFT].down(i) || i.key_down(Key::ArrowLeft),
@@ -3937,6 +4235,7 @@ fn sample_keys(ctx: &egui::Context, b: &[Bind; N_ACTIONS]) {
         crouch: b[A_SLIDE].down(i),
         sneak: b[A_SNEAK].down(i),
         ping: b[A_PING].down(i),
+        pack: b[A_UTILITY].down(i),
     });
     KEYS.with(|c| *c.borrow_mut() = k);
 }
@@ -4404,6 +4703,7 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
             g.remove_player(s);
         }
     }
+    g.mt.rules = m.rules;
     g.apply_match(m.mode, m.phase, m.timer, m.target, m.team_score, m.number, m.round, m.round_end, m.duel, m.flags);
     let now = g.time;
     for (s, st) in &m.fighters {
@@ -5778,10 +6078,13 @@ impl App {
         ui_kit::seg_bar(p, hp_r, me.hp / MAX_HP, 5, red, Color32::from_white_alpha(26));
         let y2 = left.top() + 66.0 * s;
         let blue = Color32::from_rgb(90, 160, 250);
-        ui_kit::shield_icon(p, Pos2::new(left.left() + pad + 9.0 * s, y2), 8.0 * s, blue);
-        text_display(p, Pos2::new(left.left() + pad + 24.0 * s, y2 + 1.0 * s), Align2::LEFT_CENTER, &format!("{}", me.ap.max(0.0).ceil() as i32), 28.0 * s, Color32::from_rgb(190, 215, 255));
-        let ap_r = Rect::from_min_max(Pos2::new(bar_x, y2 - 4.0 * s), Pos2::new(left.right() - pad, y2 + 4.0 * s));
-        ui_kit::seg_bar(p, ap_r, me.ap / MAX_AP, 5, blue, Color32::from_white_alpha(26));
+        let ledger = g.ledger_on() && me.kit.is_some();
+        if !ledger {
+            ui_kit::shield_icon(p, Pos2::new(left.left() + pad + 9.0 * s, y2), 8.0 * s, blue);
+            text_display(p, Pos2::new(left.left() + pad + 24.0 * s, y2 + 1.0 * s), Align2::LEFT_CENTER, &format!("{}", me.ap.max(0.0).ceil() as i32), 28.0 * s, Color32::from_rgb(190, 215, 255));
+            let ap_r = Rect::from_min_max(Pos2::new(bar_x, y2 - 4.0 * s), Pos2::new(left.right() - pad, y2 + 4.0 * s));
+            ui_kit::seg_bar(p, ap_r, me.ap / MAX_AP, 5, blue, Color32::from_white_alpha(26));
+        }
 
         // ---- bottom-right: weapon, ammo and the slot icons with their keys
         let rw = 316.0 * s;
@@ -5810,8 +6113,11 @@ impl App {
             ammo_w = tw + 4.0 * s + ui_kit::text_width(p, &ms, mf.clone());
             ui_kit::label(p, Pos2::new(right.right() - pad - 6.0 * s - tw - 4.0 * s, r1 + 2.0 * s), Align2::RIGHT_CENTER, &ms, mf, col);
         }
-        // weapon name and dashes, left
-        let name = me.weapon.name().to_uppercase();
+        // weapon name and dashes, left (a Ledger Duel's main-hand item by name)
+        let name = match me.kit.as_deref().and_then(|k| k.main()).filter(|_| ledger) {
+            Some(m) => m.name.to_uppercase(),
+            None => me.weapon.name().to_uppercase(),
+        };
         let room = rw - pad * 3.0 - ammo_w - 8.0 * s;
         let nf = ui_kit::fitted(p, &name, ui_kit::display(24.0 * s), room);
         ui_kit::label(p, Pos2::new(right.left() + pad, r1 - 3.0 * s), Align2::LEFT_BOTTOM, &name, nf, ACCENT);
@@ -5841,7 +6147,7 @@ impl App {
         let tw = (rw - pad * 2.0 - tgap * 3.0) / 4.0;
         let th = 50.0 * s;
         let ty = right.bottom() - 10.0 * s - th;
-        for k in 0..4usize {
+        for k in 0..if ledger { 0 } else { 4usize } {
             let r = Rect::from_min_size(Pos2::new(right.left() + pad + k as f32 * (tw + tgap), ty), Vec2::new(tw, th));
             let sel = k < 3 && me.cur == k;
             let empty = k == 3 && me.items == 0;
@@ -5861,8 +6167,11 @@ impl App {
         }
         // ---- the ability: icon, cooldown, charges and key, left of the weapons (or a note
         // that this lobby plays Classic)
-        if !g.abilities_on() && g.train.is_none() {
+        if !g.abilities_on() && g.train.is_none() && !ledger {
             text_display(p, Pos2::new(right.left() - 12.0 * s, right.bottom() - 4.0 * s), Align2::RIGHT_BOTTOM, "CLASSIC: NO ABILITIES", 13.0 * s, Color32::from_gray(160));
+        }
+        if ledger {
+            self.draw_ledger_hud(p, rect, cam, g, s, left, right);
         }
         if g.abilities_on() {
             let ab = Ability::of(me.loadout.body);
@@ -5905,7 +6214,7 @@ impl App {
             }
         }
         // ---- the utility (a smoke or a flash): its name, throws left and key, left of the ability
-        if g.train.is_none() {
+        if g.train.is_none() && !ledger {
             let sz = 50.0 * s;
             let x = right.left() - 10.0 * s - if g.abilities_on() { 64.0 * s + 12.0 * s } else { 0.0 } - sz;
             let r = Rect::from_min_size(Pos2::new(x, right.bottom() - sz), Vec2::splat(sz));
@@ -6285,9 +6594,620 @@ impl App {
         clicked
     }
 
+    /// Ledger Duels: the challenger's rules (Practice and Host pages, with Ledger Duels picked).
+    fn ledger_rules_ui(&mut self, ui: &mut egui::Ui) {
+        if Mode::from_u8(self.settings.mode) != Mode::Ledger {
+            return;
+        }
+        ui_kit::section(ui, "The Court's terms (you set them; both sides see them before accepting)");
+        let mut r = self.ledger.rules;
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut r.no_guns, "No guns");
+            ui.checkbox(&mut r.no_blades, "No blades");
+            ui.checkbox(&mut r.no_food, "No food");
+            ui.checkbox(&mut r.no_specs, "No specials");
+            ui.checkbox(&mut r.no_move, "No movement");
+            ui.checkbox(&mut r.no_switch, "No gear switching");
+            ui.checkbox(&mut r.no_sets, "No sets");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Best of");
+            for n in [1u8, 3, 5] {
+                ui.selectable_value(&mut r.best_of, n, format!("{n}"));
+            }
+        });
+        if r.no_guns && r.no_blades {
+            // something has to be allowed in the hand: the newer choice wins
+            if self.ledger.rules.no_guns {
+                r.no_guns = false;
+            } else {
+                r.no_blades = false;
+            }
+        }
+        if r != self.ledger.rules {
+            self.ledger.rules = r;
+            self.ledger.save();
+        }
+        ui.label(egui::RichText::new(format!("{}. Your gear: {} (Ledger Gear on the main menu). Nothing is staked: the honour ledger only keeps wins and streaks.", r.summary(), self.ledger.current().name)).size(12.5).color(Color32::from_gray(190)));
+    }
+
+    /// The Court's terms before a Ledger Duel: both sides read them and accept (or leave).
+    /// Returns 1 accepted, 2 leave.
+    fn rules_card(&mut self, ctx: &egui::Context, rect: Rect, rules: gear::Rules, challenger: &str, you_set_them: bool) -> u8 {
+        let mut out = 0;
+        let w = 540.0f32.min(rect.width() - 40.0);
+        let pos = Pos2::new(rect.center().x - w * 0.5, rect.top() + rect.height() * 0.16);
+        let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("rules-dim")));
+        p.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
+        egui::Area::new(egui::Id::unique("rules-card")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
+            ui_kit::panel_frame(ui, |ui| {
+                ui.set_width(w);
+                ui.label(egui::RichText::new("THE ASHEN COURT'S TERMS").font(ui_kit::display(30.0)).color(ACCENT));
+                ui.label(egui::RichText::new(format!("A sanctioned Ledger Duel. Challenger: {challenger}")).size(14.0).color(Color32::from_gray(210)));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(format!("Best of {} ({} round wins take it)", rules.best_of, rules.target())).font(ui_kit::display(20.0)));
+                let lines = rules.lines();
+                if lines.is_empty() {
+                    ui.label(egui::RichText::new("Standard Court rules: everything allowed.").size(15.0));
+                }
+                for l in lines {
+                    ui.label(egui::RichText::new(format!("-  {l}")).size(15.5).color(Color32::from_rgb(255, 215, 170)));
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Aim and timing decide hits; gear changes damage, defence and speed. Nothing is staked: the honour ledger only records wins and streaks.").size(12.5).color(Color32::from_gray(180)));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new(if you_set_them { "Seal the terms" } else { "Accept the terms" }).font(ui_kit::display(20.0))).min_size(Vec2::new(220.0, 40.0))).clicked() {
+                        out = 1;
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new("Leave").font(ui_kit::display(18.0))).min_size(Vec2::new(110.0, 40.0))).clicked() {
+                        out = 2;
+                    }
+                });
+            });
+        });
+        if out != 0 {
+            UI_SOUND.with(|u| u.set(Some(if out == 1 { Sfx::UiConfirm } else { Sfx::UiBack })));
+        }
+        out
+    }
+
+    /// The Ledger Gear screen: five named loadouts (with the honour ledger), what's worn, the
+    /// 12-slot pack, the armoury (every item, open to everyone) and an item's full card, and the
+    /// totals. Returns 1 Ready / Done, 2 Back.
+    fn gear_screen(&mut self, ctx: &egui::Context, rect: Rect, timer: Option<f32>, action: &str, rules: gear::Rules, back: bool) -> u8 {
+        use gear::{item, Kind, Slot};
+        let mut out = 0u8;
+        let mut changed = false;
+        let mastery = self.career.mastery_level(self.settings.loadout.body.min(3));
+        let (finish, fcol) = gear::variant(mastery);
+        let fcol = Color32::from_rgb(fcol[0], fcol[1], fcol[2]);
+        let dim = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("gear-dim")));
+        dim.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(8, 7, 14, 238));
+        let hover: std::cell::Cell<Option<u8>> = std::cell::Cell::new(None);
+        let warn = Color32::from_rgb(255, 120, 100);
+        // a row for an item: its picture in its finish's frame, its name, a line of stats
+        let item_row = |ui: &mut egui::Ui, it: &'static gear::Item, hot: Option<&str>, allowed: bool, tag: Option<&str>| -> egui::Response {
+            let h = 36.0;
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), egui::Sense::click());
+            let p = ui.painter();
+            let on = resp.hovered();
+            p.rect_filled(r, 4.0, if on { Color32::from_rgba_unmultiplied(70, 46, 34, 240) } else { Color32::from_rgba_unmultiplied(24, 22, 34, 230) });
+            p.rect_stroke(r, 4.0, Stroke::new(1.0, fcol.gamma_multiply(if on { 0.9 } else { 0.35 })), egui::StrokeKind::Inside);
+            let ic = Rect::from_min_size(r.min + Vec2::new(4.0, 4.0), Vec2::splat(h - 8.0));
+            ui_kit::gear_icon(p, ic, it, if allowed { Color32::WHITE } else { Color32::from_gray(110) });
+            if let Some(k) = hot {
+                ui_kit::keycap(p, Pos2::new(ic.left() + 6.0, ic.top() + 1.0), k, 0.7);
+            }
+            let x = ic.right() + 8.0;
+            p.text(Pos2::new(x, r.top() + 4.0), Align2::LEFT_TOP, it.name, FontId::proportional(14.5), if allowed { Color32::WHITE } else { warn });
+            p.text(Pos2::new(x, r.bottom() - 4.0), Align2::LEFT_BOTTOM, short_stats(it), FontId::proportional(11.5), Color32::from_gray(185));
+            if let Some(tag) = tag {
+                p.text(Pos2::new(r.right() - 6.0, r.top() + 4.0), Align2::RIGHT_TOP, tag, FontId::proportional(11.0), Color32::from_gray(150));
+            }
+            if on {
+                hover.set(Some(it.id));
+            }
+            resp
+        };
+        egui::Area::new(egui::Id::unique("gear-screen")).fixed_pos(rect.min).order(egui::Order::Foreground).show(ctx, |ui| {
+            ui.set_width(rect.width());
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(22, 14)).show(ui, |ui| {
+                ui.set_width(rect.width() - 44.0);
+                // ---- title, the duel's terms, the saved loadouts and their honour
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("LEDGER GEAR").font(ui_kit::display(38.0)));
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(rules.summary()).size(14.0).color(ACCENT));
+                        let t = match timer {
+                            Some(t) => format!("The duel starts in {:.0} s, or when both are ready", t.max(0.0)),
+                            None => "Every item is open to everyone: no grinding, no buying power. Mastery only changes an item card's finish.".to_string(),
+                        };
+                        ui.label(egui::RichText::new(t).size(12.5).color(Color32::from_gray(190)));
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("LOADOUTS").font(ui_kit::display(16.0)).color(Color32::from_gray(170)));
+                    for k in 0..gear::SAVED {
+                        let name = self.ledger.kits[k].name.clone();
+                        if ui.selectable_label(self.ledger.pick == k, egui::RichText::new(name).size(14.0)).clicked() && self.ledger.pick != k {
+                            self.ledger.pick = k;
+                            changed = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let pick = self.ledger.pick;
+                    ui.label("Name");
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.ledger.kits[pick].name).char_limit(24).desired_width(190.0));
+                    if r.changed() {
+                        changed = true;
+                    }
+                    egui::ComboBox::from_id_salt("gear-preset").selected_text("Start from a Court loadout").width(220.0).show_ui(ui, |ui| {
+                        for pr in gear::presets() {
+                            if ui.selectable_label(false, &pr.name).clicked() {
+                                let name = self.ledger.kits[pick].name.clone();
+                                self.ledger.kits[pick] = gear::GearLoadout { name, ..pr };
+                                changed = true;
+                            }
+                        }
+                    });
+                    let h = self.ledger.honour_of(&self.ledger.kits[pick].name);
+                    ui.label(egui::RichText::new(format!("Honour ledger: {} won, {} lost, streak {} (best {})", h.wins, h.losses, h.streak, h.best)).size(13.0).color(Color32::from_rgb(235, 220, 200)));
+                });
+                ui.add_space(4.0);
+                let pick = self.ledger.pick;
+                let col_h = (rect.height() - 430.0).max(220.0);
+                ui.columns(3, |cols| {
+                    // ---- worn
+                    let ui = &mut cols[0];
+                    ui.label(egui::RichText::new("WORN").font(ui_kit::display(18.0)).color(ACCENT));
+                    egui::ScrollArea::vertical().id_salt("worn").max_height(col_h).show(ui, |ui| {
+                        for slot in Slot::ALL {
+                            let id = self.ledger.kits[pick].equip[slot as usize];
+                            match item(id) {
+                                Some(it) => {
+                                    if item_row(ui, it, None, rules.allows(it), Some(slot.name())).on_hover_text("Click: take it off (into the pack)").clicked() {
+                                        self.ledger.kits[pick].take_off(slot);
+                                        changed = true;
+                                    }
+                                }
+                                None => {
+                                    ui.label(egui::RichText::new(format!("  {}: empty", slot.name())).size(13.0).color(Color32::from_gray(120)));
+                                }
+                            }
+                        }
+                    });
+                    // ---- the pack
+                    let ui = &mut cols[1];
+                    ui.label(egui::RichText::new("PACK (12): KEYS 1-6, ALL ON THE RADIAL (HOLD X)").font(ui_kit::display(16.0)).color(ACCENT));
+                    egui::ScrollArea::vertical().id_salt("pack").max_height(col_h).show(ui, |ui| {
+                        for k in 0..gear::INV {
+                            let id = self.ledger.kits[pick].inv[k];
+                            let hot = (k < gear::HOTKEYS).then(|| format!("{}", k + 1));
+                            match item(id) {
+                                Some(it) => {
+                                    let resp = item_row(ui, it, hot.as_deref(), rules.allows(it), None).on_hover_text(if matches!(it.kind, Kind::Gear(_)) { "Click: wear it now · right-click: take it out" } else { "Right-click: take it out" });
+                                    if resp.clicked() && matches!(it.kind, Kind::Gear(_)) {
+                                        if let Err(e) = self.ledger.kits[pick].pack_wear(k) {
+                                            self.menu_msg = Some(e.to_string());
+                                        }
+                                        changed = true;
+                                    }
+                                    if resp.secondary_clicked() {
+                                        self.ledger.kits[pick].inv[k] = 0;
+                                        changed = true;
+                                    }
+                                }
+                                None => {
+                                    ui.label(egui::RichText::new(format!("  {}  - empty -", hot.unwrap_or_default())).size(13.0).color(Color32::from_gray(120)));
+                                }
+                            }
+                        }
+                    });
+                    // ---- the armoury
+                    let ui = &mut cols[2];
+                    ui.label(egui::RichText::new("ARMOURY").font(ui_kit::display(18.0)).color(ACCENT));
+                    ui.horizontal_wrapped(|ui| {
+                        for (k, (name, _)) in GEAR_CATS.iter().enumerate() {
+                            if ui.selectable_label(self.gear_ui.cat == k, egui::RichText::new(*name).size(12.5)).clicked() {
+                                self.gear_ui.cat = k;
+                            }
+                        }
+                    });
+                    let cat = GEAR_CATS[self.gear_ui.cat.min(GEAR_CATS.len() - 1)].1;
+                    egui::ScrollArea::vertical().id_salt("armoury").max_height(col_h - 48.0).show(ui, |ui| {
+                        for it in gear::ITEMS.iter().filter(|it| match cat {
+                            Some(s) => it.kind == Kind::Gear(s),
+                            None => !matches!(it.kind, Kind::Gear(_)),
+                        }) {
+                            let resp = item_row(ui, it, None, rules.allows(it), None).on_hover_text("Click: wear it (gear) or put it in the pack (food) · right-click: into the pack");
+                            let kit = &mut self.ledger.kits[pick];
+                            if resp.clicked() {
+                                let r = if matches!(it.kind, Kind::Gear(_)) { kit.wear(it.id) } else { kit.pack_add(it.id).map(|_| ()) };
+                                if let Err(e) = r {
+                                    self.menu_msg = Some(e.to_string());
+                                }
+                                changed = true;
+                            }
+                            if resp.secondary_clicked() {
+                                if let Err(e) = kit.pack_add(it.id) {
+                                    self.menu_msg = Some(e.to_string());
+                                }
+                                changed = true;
+                            }
+                        }
+                    });
+                });
+                ui.separator();
+                // ---- totals, the item card, and the buttons
+                let kit = self.ledger.kits[pick].clone();
+                let st = gear::stats(&kit.equip, rules.no_sets);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width((rect.width() * 0.36).max(300.0));
+                        ui.label(egui::RichText::new("TOTALS").font(ui_kit::display(16.0)).color(Color32::from_gray(170)));
+                        ui.label(egui::RichText::new(format!("Accuracy {:+.0}%   Damage {:+.0}%   Move speed {:+.0}%   Weight {:.0} kg", st.acc, st.dmg, (st.move_mult() - 1.0) * 100.0, st.weight)).size(14.0));
+                        ui.label(egui::RichText::new(format!("Defence: blade {:.0}%   bullet {:.0}%   blast {:.0}%   (special bar {:+.0}% faster)", st.def[0], st.def[1], st.def[2], st.regen)).size(14.0));
+                        match st.set {
+                            Some(s) => ui.label(egui::RichText::new(format!("{} set (4/4): {}", s.name(), s.bonus())).size(13.5).color(Color32::from_rgb(160, 230, 170))),
+                            None if rules.no_sets => ui.label(egui::RichText::new("Set bonuses are off in this duel").size(13.0).color(Color32::from_gray(170))),
+                            None => ui.label(egui::RichText::new("No full set: wear all four pieces of one (head, body, legs, hands) for its bonus").size(13.0).color(Color32::from_gray(170))),
+                        };
+                        if let Some(sp) = kit.main().and_then(|m| m.spec) {
+                            let i = sp.info();
+                            ui.label(egui::RichText::new(format!("Special (Q): {} - {:.0}% of the bar, {:.2} s wind-up: {}", i.name, i.cost, i.windup, i.blurb)).size(13.0).color(Color32::from_rgb(255, 210, 150)));
+                        }
+                        if kit.main().is_some_and(|m| !rules.allows(m)) {
+                            let f = kit.for_rules(&rules);
+                            ui.label(egui::RichText::new(format!("This duel's rules forbid your main hand: you'll start with {}.", f.main().map_or("-", |m| m.name))).size(13.0).color(warn));
+                        }
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_width((rect.width() * 0.36).max(300.0));
+                        if hover.get().is_some() {
+                            self.gear_ui.hover = hover.get();
+                        }
+                        let shown = self.gear_ui.hover.or(kit.main().map(|m| m.id));
+                        if let Some(it) = shown.and_then(item) {
+                            item_card(ui, it, finish, fcol, &rules);
+                        }
+                        if self.dye_pickers(ui) {
+                            changed = true;
+                        }
+                    });
+                    ui.vertical(|ui| {
+                        if ui.add(egui::Button::new(egui::RichText::new(action.to_uppercase()).font(ui_kit::display(26.0)).color(Color32::from_rgb(28, 14, 6))).min_size(Vec2::new(200.0, 54.0)).fill(Color32::from_rgb(214, 108, 42))).clicked() {
+                            out = 1;
+                        }
+                        if back && ui.add(egui::Button::new(egui::RichText::new("BACK").font(ui_kit::display(20.0))).min_size(Vec2::new(200.0, 40.0))).clicked() {
+                            out = 2;
+                        }
+                        if timer.is_none() && ui.add(egui::Button::new(egui::RichText::new("SEE IT ON YOUR FIGHTER").font(ui_kit::display(16.0))).min_size(Vec2::new(200.0, 34.0))).clicked() {
+                            self.gear_ui.preview = true;
+                            self.gear_ui.back = false;
+                        }
+                        if let Some(m) = &self.menu_msg {
+                            ui.label(egui::RichText::new(m.as_str()).size(12.5).color(warn));
+                        }
+                    });
+                });
+            });
+        });
+        if changed {
+            for k in self.ledger.kits.iter_mut() {
+                k.fix();
+            }
+            self.ledger.save();
+        }
+        if out != 0 {
+            UI_SOUND.with(|u| u.set(Some(if out == 1 { Sfx::UiConfirm } else { Sfx::UiBack })));
+            self.menu_msg = None;
+            self.ledger.save();
+        }
+        out
+    }
+
+    /// The dyes of the loadout being edited: a colour for each zone (coat, trim, accent).
+    fn dye_pickers(&mut self, ui: &mut egui::Ui) -> bool {
+        let pick = self.ledger.pick;
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("DYES").font(ui_kit::display(16.0)).color(Color32::from_gray(170)));
+            for z in 0..3 {
+                let cur = self.ledger.kits[pick].dyes[z];
+                let c = gear::dye(cur);
+                let swatch = |c: [f32; 3]| {
+                    let s = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+                    Color32::from_rgb(s(c[0]), s(c[1]), s(c[2]))
+                };
+                ui.label(egui::RichText::new(gear::DYE_ZONES[z]).size(13.0));
+                egui::ComboBox::from_id_salt(("dye", z)).selected_text(egui::RichText::new(format!("■ {}", gear::DYES[cur as usize].0)).color(swatch(c))).width(130.0).show_ui(ui, |ui| {
+                    for (k, (name, col)) in gear::DYES.iter().enumerate() {
+                        if ui.selectable_label(k as u8 == cur, egui::RichText::new(format!("■ {name}")).color(swatch(*col))).clicked() {
+                            self.ledger.kits[pick].dyes[z] = k as u8;
+                            changed = true;
+                        }
+                    }
+                });
+            }
+            if ui.small_button("Default colours").clicked() {
+                self.ledger.kits[pick].dyes = gear::DEFAULT_DYES;
+                changed = true;
+            }
+        });
+        if changed {
+            self.ledger.save();
+        }
+        changed
+    }
+
+    /// Looking at the loadout on your fighter: front or back, the dyes, back to the gear.
+    fn gear_preview_bar(&mut self, ctx: &egui::Context, rect: Rect) {
+        let name = self.ledger.current().name.clone();
+        let set = gear::full_set(&self.ledger.current().equip);
+        egui::Area::new(egui::Id::unique("gear-preview")).fixed_pos(Pos2::new(rect.left() + 24.0, rect.bottom() - 150.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Frame::new().fill(Color32::from_rgba_unmultiplied(10, 9, 18, 215)).corner_radius(6.0).inner_margin(12.0).show(ui, |ui| {
+                ui.set_width((rect.width() * 0.6).min(760.0));
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(name.to_uppercase()).font(ui_kit::display(26.0)));
+                    if let Some(s) = set {
+                        ui.label(egui::RichText::new(format!("{} set", s.name())).size(15.0).color(ACCENT));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!self.gear_ui.back, egui::RichText::new("FRONT").font(ui_kit::display(18.0))).clicked() {
+                        self.gear_ui.back = false;
+                    }
+                    if ui.selectable_label(self.gear_ui.back, egui::RichText::new("BACK").font(ui_kit::display(18.0))).clicked() {
+                        self.gear_ui.back = true;
+                    }
+                    ui.add_space(20.0);
+                    if ui.button(egui::RichText::new("Back to the gear").size(15.0)).clicked() {
+                        self.gear_ui.preview = false;
+                    }
+                });
+                self.dye_pickers(ui);
+                ui.label(egui::RichText::new("Gear with a model (the Bridgewright's Rig, the Rigger's Hook and Snub) shows on your fighter; dyes colour its coat, trim and accent zones.").size(12.0).color(Color32::from_gray(170)));
+            });
+        });
+    }
+
+    /// Ledger Duels in a match: your special bar under your health (in place of armour), your
+    /// main hand's special, the pack's first six slots with their keys (a swap's progress on the
+    /// slot), the radial, what you tried that didn't work; over the opponent's head, the tells:
+    /// a special winding up, a swap, eating.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_ledger_hud(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game, s: f32, left: Rect, right: Rect) {
+        let me = &g.f[g.local];
+        let Some(kit) = me.kit.as_deref() else { return };
+        let rules = g.mt.rules;
+        let pad = 12.0 * s;
+        // ---- the special bar, where armour usually is
+        let y2 = left.top() + 66.0 * s;
+        let gold = Color32::from_rgb(255, 196, 80);
+        text_display(p, Pos2::new(left.left() + pad, y2 + 1.0 * s), Align2::LEFT_CENTER, "SPEC", 15.0 * s, gold);
+        text_display(p, Pos2::new(left.left() + pad + 44.0 * s, y2 + 1.0 * s), Align2::LEFT_CENTER, &format!("{:.0}%", kit.spec.floor()), 20.0 * s, Color32::WHITE);
+        let bar = Rect::from_min_max(Pos2::new(left.left() + pad + 96.0 * s, y2 - 5.0 * s), Pos2::new(left.right() - pad, y2 + 5.0 * s));
+        p.rect_filled(bar, 2.0 * s, Color32::from_white_alpha(26));
+        let cost = kit.main().and_then(|m| m.spec).map_or(100.0, |sp| sp.info().cost);
+        let ready = kit.spec >= cost && !rules.no_specs;
+        p.rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width() * (kit.spec / 100.0).clamp(0.0, 1.0), bar.height())), 2.0 * s, if ready { gold } else { gold.gamma_multiply(0.55) });
+        for q in [0.25f32, 0.5, 0.75] {
+            let x = bar.left() + bar.width() * q;
+            p.line_segment([Pos2::new(x, bar.top()), Pos2::new(x, bar.bottom())], Stroke::new(1.0, Color32::from_black_alpha(200)));
+        }
+        let cx = bar.left() + bar.width() * (cost / 100.0).clamp(0.0, 1.0);
+        p.line_segment([Pos2::new(cx, bar.top() - 3.0 * s), Pos2::new(cx, bar.bottom() + 3.0 * s)], Stroke::new(2.0 * s, Color32::WHITE));
+        // ---- the special, left of the weapon panel
+        let sz = 64.0 * s;
+        let sr = Rect::from_min_size(Pos2::new(right.left() - 10.0 * s - sz, right.bottom() - sz), Vec2::splat(sz));
+        p.rect_filled(sr, 8.0 * s, Color32::from_rgba_unmultiplied(10, 9, 18, 175));
+        let winding = kit.wind.is_some();
+        p.rect_stroke(sr, 8.0 * s, Stroke::new(if ready || winding { 2.0 * s } else { 1.0 }, if winding { Color32::from_rgb(255, 90, 60) } else if ready { gold } else { Color32::from_white_alpha(40) }), egui::StrokeKind::Inside);
+        if let Some(sp) = kit.main().and_then(|m| m.spec) {
+            let i = sp.info();
+            text_display(p, sr.center() + Vec2::new(0.0, -6.0 * s), Align2::CENTER_CENTER, &format!("{:.0}%", i.cost), 20.0 * s, if ready { Color32::WHITE } else { Color32::from_gray(130) });
+            text_display(p, sr.center() + Vec2::new(0.0, 16.0 * s), Align2::CENTER_CENTER, if rules.no_specs { "OFF" } else if winding { "WIND" } else { "SPEC" }, 12.0 * s, gold);
+            text_display(p, Pos2::new(sr.center().x, sr.top() - 6.0 * s), Align2::CENTER_BOTTOM, &i.name.to_uppercase(), 12.5 * s, if ready { gold } else { Color32::from_gray(170) });
+            if let Some((_, t)) = kit.wind {
+                let k = 1.0 - t / i.windup;
+                p.rect_filled(Rect::from_min_size(Pos2::new(sr.left(), sr.bottom() - 4.0 * s), Vec2::new(sr.width() * k, 4.0 * s)), 1.0, Color32::from_rgb(255, 90, 60));
+            }
+        }
+        let key = if self.pad_active { "LB".to_string() } else { self.settings.binds[A_ABILITY].name() };
+        ui_kit::keycap(p, Pos2::new(sr.left() + 12.0 * s, sr.top() + 1.0 * s), &key, s * 0.85);
+        // ---- the pack's first six, in the weapon panel's lower row
+        let tgap = 4.0 * s;
+        let n = gear::HOTKEYS as f32;
+        let tw = (right.width() - pad * 2.0 - tgap * (n - 1.0)) / n;
+        let th = 50.0 * s;
+        let ty = right.bottom() - 10.0 * s - th;
+        for k in 0..gear::HOTKEYS {
+            let r = Rect::from_min_size(Pos2::new(right.left() + pad + k as f32 * (tw + tgap), ty), Vec2::new(tw, th));
+            let it = gear::item(kit.inv[k]);
+            let swapping = kit.swap.filter(|sw| sw.0 == k);
+            let usable = it.is_some_and(|_| kit.can_use(k, &rules).is_ok());
+            p.rect_filled(r, 4.0 * s, if swapping.is_some() { Color32::from_rgba_unmultiplied(110, 60, 30, 220) } else { Color32::from_black_alpha(130) });
+            p.rect_stroke(r, 4.0 * s, Stroke::new(if swapping.is_some() { 2.0 * s } else { 1.0 }, if swapping.is_some() { ACCENT } else { Color32::from_white_alpha(28) }), egui::StrokeKind::Inside);
+            if let Some(it) = it {
+                let ink = if usable || swapping.is_some() { Color32::from_gray(225) } else { Color32::from_gray(95) };
+                ui_kit::gear_icon(p, r.shrink2(Vec2::new(5.0 * s, 9.0 * s)).translate(Vec2::new(0.0, 4.0 * s)), it, ink);
+            }
+            if let Some((_, t, full)) = swapping {
+                let k = 1.0 - t / full.max(0.01);
+                p.rect_filled(Rect::from_min_size(Pos2::new(r.left(), r.bottom() - 4.0 * s), Vec2::new(r.width() * k, 4.0 * s)), 1.0, ACCENT);
+            }
+            ui_kit::keycap(p, Pos2::new(r.left() + 9.0 * s, r.top() + 1.0 * s), &format!("{}", k + 1), s * 0.75);
+        }
+        // a swap or a meal under way, a special, or what didn't work: under the crosshair
+        let c = rect.center();
+        let mut line = None;
+        if let Some(it) = kit.swapping_to() {
+            let (_, t, _) = kit.swap.unwrap_or((0, 0.0, 0.0));
+            line = Some((format!("SWAPPING TO {}  {:.1} s", it.name.to_uppercase(), t.max(0.0)), ACCENT));
+        } else if kit.eat_t > 0.0 {
+            line = Some((format!("EATING  {:.1} s{}", kit.eat_t, if kit.combo_used { "" } else { "  (a bite or tonic can follow)" }), Color32::from_rgb(170, 230, 160)));
+        } else if let Some((sp, _)) = kit.wind {
+            line = Some((format!("{}!", sp.info().name.to_uppercase()), Color32::from_rgb(255, 120, 80)));
+        } else if kit.armed.is_some() {
+            line = Some(("SPECIAL READY: ATTACK".to_string(), gold));
+        } else if let Some((note, _)) = kit.note {
+            line = Some((note.to_string(), Color32::from_rgb(255, 150, 120)));
+        }
+        if let Some((t, col)) = line {
+            text_display(p, c + Vec2::new(0.0, 86.0 * s), Align2::CENTER_CENTER, &t, 18.0 * s, col);
+        }
+        // tonics running, over the health panel
+        let names = ["FURY", "IRON", "HASTE"];
+        let mut tx = left.left();
+        for (k, b) in kit.buffs.iter().enumerate() {
+            if *b > 0.0 {
+                let t = format!("{} {:.0}s", names[k], b);
+                text_display(p, Pos2::new(tx, left.top() - 8.0 * s), Align2::LEFT_BOTTOM, &t, 13.0 * s, Color32::from_rgb(170, 230, 160));
+                tx += ui_kit::text_width(p, &t, ui_kit::display(13.0 * s)) + 12.0 * s;
+            }
+        }
+        // ---- the tells over the opponent's head: a special winding up, a swap, eating
+        for o in g.f.iter().filter(|o| o.present && o.alive && o.slot != g.local) {
+            let Some(ok) = o.kit.as_deref() else { continue };
+            let head = o.pos + v3(0.0, 2.45, 0.0);
+            let Some(sp) = cam.project(head) else { continue };
+            if !rect.contains(sp) || !g.world.line_clear(cam.pos, head) {
+                continue;
+            }
+            if let Some((spec, _)) = ok.wind.or(ok.armed).or(ok.strike) {
+                let col = spec.color();
+                let col = Color32::from_rgb(col[0], col[1], col[2]);
+                let pulse = 0.6 + 0.4 * (g.time * 18.0).sin().abs();
+                let at = cam.project(o.chest()).unwrap_or(sp);
+                let rr = (70.0 / (o.pos - cam.pos).len().max(2.0)) * 30.0 * s;
+                p.circle_stroke(at, rr.clamp(18.0 * s, 90.0 * s), Stroke::new(4.0 * s * pulse, col.gamma_multiply(pulse)));
+                text_display(p, sp + Vec2::new(0.0, -8.0 * s), Align2::CENTER_BOTTOM, &format!("{}!", spec.info().name.to_uppercase()), 17.0 * s, col);
+            } else if ok.swap.is_some() {
+                text_display(p, sp + Vec2::new(0.0, -8.0 * s), Align2::CENTER_BOTTOM, "SWAPPING", 14.0 * s, ACCENT);
+            } else if ok.eat_t > 0.0 {
+                text_display(p, sp + Vec2::new(0.0, -8.0 * s), Align2::CENTER_BOTTOM, "EATING", 14.0 * s, Color32::from_rgb(170, 230, 160));
+            }
+            // their special bar, small, under the tell
+            let w = 46.0 * s;
+            let r = Rect::from_center_size(sp + Vec2::new(0.0, -2.0 * s), Vec2::new(w, 4.0 * s));
+            p.rect_filled(r, 1.0, Color32::from_black_alpha(150));
+            p.rect_filled(Rect::from_min_size(r.min, Vec2::new(w * (ok.spec / 100.0).clamp(0.0, 1.0), r.height())), 1.0, gold);
+        }
+        // ---- the radial: all twelve pack slots round the middle, the one pointed at lit up
+        if let Some((_, _, cx, cy)) = self.inv_wheel {
+            let pick = inv_sector(cx, cy);
+            let rad = 150.0 * s;
+            p.circle_filled(c, rad + 46.0 * s, Color32::from_rgba_unmultiplied(10, 10, 16, 170));
+            for k in 0..gear::INV {
+                let a = k as f32 / gear::INV as f32 * std::f32::consts::TAU;
+                let at = c + Vec2::new(a.sin(), -a.cos()) * rad;
+                let on = pick == Some(k as u8);
+                let r = Rect::from_center_size(at, Vec2::splat(if on { 58.0 } else { 46.0 } * s));
+                p.rect_filled(r, 6.0 * s, if on { Color32::from_rgba_unmultiplied(110, 60, 30, 235) } else { Color32::from_black_alpha(170) });
+                if let Some(it) = gear::item(kit.inv[k]) {
+                    let ok = kit.can_use(k, &rules).is_ok();
+                    ui_kit::gear_icon(p, r.shrink(7.0 * s), it, if ok { Color32::WHITE } else { Color32::from_gray(100) });
+                    if on {
+                        text_display(p, c + Vec2::new(0.0, -10.0 * s), Align2::CENTER_CENTER, &it.name.to_uppercase(), 18.0 * s, ACCENT);
+                        text_shadow(p, c + Vec2::new(0.0, 14.0 * s), Align2::CENTER_CENTER, short_stats(it), 13.0 * s, Color32::from_gray(220));
+                    }
+                }
+                text_display(p, r.left_top() + Vec2::new(4.0 * s, 2.0 * s), Align2::LEFT_TOP, &format!("{}", k + 1), 11.0 * s, Color32::from_gray(190));
+            }
+        }
+    }
+
+    /// Ledger Duels: hold the radial key (the utility key, X) for all twelve pack slots; the
+    /// mouse picks one, letting go uses it (the view holds still meanwhile).
+    fn inv_frame(&mut self, dt: f32, held: bool) {
+        let Screen::Play { game, .. } = &self.screen else {
+            self.inv_hold = 0.0;
+            self.inv_wheel = None;
+            return;
+        };
+        if !game.ledger_on() {
+            self.inv_hold = 0.0;
+            self.inv_wheel = None;
+            return;
+        }
+        if held && self.captured && !self.chat_open && game.f[game.local].alive {
+            self.inv_hold += dt;
+            if self.inv_wheel.is_none() {
+                self.inv_wheel = Some((self.aim_yaw, self.aim_pitch, 0.0, 0.0));
+            }
+            if let Some((oy, op, cx, cy)) = self.inv_wheel.as_mut() {
+                *cx = (*cx + wrap_angle(self.aim_yaw - *oy)).clamp(-0.3, 0.3);
+                *cy = (*cy + (self.aim_pitch - *op)).clamp(-0.3, 0.3);
+                self.aim_yaw = *oy;
+                self.aim_pitch = *op;
+            }
+        } else if self.inv_hold > 0.0 {
+            if let Some((_, _, cx, cy)) = self.inv_wheel.take() {
+                if let Some(k) = inv_sector(cx, cy) {
+                    self.latch.inv = Some(k);
+                }
+            }
+            self.inv_hold = 0.0;
+        }
+    }
+
+    /// After a Ledger Duel: the honour ledger notes the result for the loadout you fought with.
+    fn ledger_after_match(&mut self) {
+        let Screen::Play { game, .. } = &self.screen else { return };
+        if !game.ledger_on() || game.mt.phase != Phase::MatchOver || self.honour_noted == Some(game.mt.number) || self.autoplay {
+            return;
+        }
+        let me = &game.f[game.local];
+        if !me.present || me.is_bot {
+            return;
+        }
+        let won = me.wins >= game.mt.target as i32;
+        let name = me.kit.as_ref().map_or_else(|| self.ledger.current().name.clone(), |k| k.base.name.clone());
+        self.honour_noted = Some(game.mt.number);
+        self.ledger.record(&name, won);
+        self.ledger.save();
+    }
+
     fn menu_ui(&mut self, ctx: &egui::Context, rect: Rect, page: Page) -> bool {
         self.sync_steam_name();
         self.quick_play_tick();
+        // your fighter wears your Ledger gear while you look at it
+        {
+            let want = self.ledger.current().clone();
+            let f = &mut self.demo.f[0];
+            if self.menu_gear {
+                if f.kit.as_ref().map_or(true, |k| k.base != want) {
+                    f.kit = Some(Box::new(gear::Kit::new(&want)));
+                }
+            } else if f.kit.is_some() {
+                f.kit = None;
+            }
+        }
+        // the Ledger Gear screen
+        if page == Page::Main && self.menu_gear {
+            if self.gear_ui.preview {
+                if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                    self.gear_ui.preview = false;
+                }
+                self.gear_preview_bar(ctx, rect);
+                return false;
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.menu_gear = false;
+                self.ledger.save();
+                return false;
+            }
+            let rules = self.ledger.rules;
+            if self.gear_screen(ctx, rect, None, "Done", rules, false) != 0 {
+                self.menu_gear = false;
+            }
+            return false;
+        }
+
         // the loadout screen, over your fighter
         if page == Page::Main && self.menu_loadout {
             if self.rebinding.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -6541,6 +7461,7 @@ impl App {
                 Page::Practice => {
                     ui.heading("Practice vs Bots");
                     self.mode_and_map(ui);
+                    self.ledger_rules_ui(ui);
                     ui.checkbox(&mut self.settings.abilities, "Abilities (off: Classic)").on_hover_text("Each fighter's ability (Q / LB) and passive.");
                     ui.add(egui::Slider::new(&mut self.settings.bots, 1..=7).text("bots"));
                     ui.label("Bot difficulty");
@@ -6555,7 +7476,9 @@ impl App {
                             let lvl = BOT_LEVELS[app.settings.bot_level].1;
                             let name = clean_name(&app.settings.name, 0);
                             let mode = Mode::from_u8(app.settings.mode);
-                            let mut g = Game::offline(&name, app.settings.bots, lvl, mode, app.settings.rounds as u16);
+                            // a Ledger Duel is one on one
+                            let bots = if mode == Mode::Ledger { 1 } else { app.settings.bots };
+                            let mut g = Game::offline(&name, bots, lvl, mode, app.settings.rounds as u16);
                             g.set_map(MapId::from_u8(app.settings.map));
                             app.settings.save();
                             app.start_game(g, None);
@@ -6606,6 +7529,7 @@ impl App {
                     self.firewall_ui(ui);
                     ui.label(egui::RichText::new("Friends join your Internet address (UDP port forwarded to this PC). You can't join it yourself from home: test with a friend, or 127.0.0.1 from a second copy.").size(13.5).color(Color32::from_gray(200)));
                     self.mode_and_map(ui);
+                    self.ledger_rules_ui(ui);
                     ui.add(egui::Slider::new(&mut self.settings.rounds, 1..=50).text("score to win"));
                     ui.checkbox(&mut self.settings.abilities, "Abilities: On / Off (Classic)").on_hover_text("Each fighter's ability (Q / LB) and passive.");
                     ui.add(egui::Slider::new(&mut self.settings.fill_bots, 0..=MAX_PLAYERS).text("fill with bots up to this many fighters (0 = none)"))
@@ -6817,8 +7741,34 @@ impl App {
             }
         }
 
+        // Ledger Duels before the bell: the Court's terms (both sides accept them), then the gear
+        let ledger = match &self.screen {
+            Screen::Play { game, .. } if game.ledger_on() => {
+                let host = game.f.iter().find(|f| f.present && f.slot == game.host_slot).map_or_else(|| "the host".to_string(), |f| f.name.clone());
+                Some((game.mt.rules, game.mt.number, if game.kind == Kind::Client { host } else { "you".to_string() }, game.kind != Kind::Client))
+            }
+            _ => None,
+        };
+        let in_ledger = ledger.is_some();
+        if let Some((rules, number, challenger, mine)) = ledger {
+            if phase == Phase::Loadout && !ready && self.disconnected.is_none() && !self.paused {
+                if self.rules_ok != Some(number) {
+                    match self.rules_card(ctx, rect, rules, &challenger, mine) {
+                        1 => self.rules_ok = Some(number),
+                        2 => return true,
+                        _ => {}
+                    }
+                } else if self.gear_screen(ctx, rect, Some(timer), "Ready", rules, false) == 1 {
+                    if let Screen::Play { game, .. } = &mut self.screen {
+                        game.my_kit = self.ledger.current().clone();
+                    }
+                    self.ready_request = Some(self.settings.loadout);
+                    self.settings.save();
+                }
+            }
+        }
         // loadout screen before each match
-        if phase == Phase::Loadout && !ready && self.disconnected.is_none() && !self.paused {
+        if !in_ledger && phase == Phase::Loadout && !ready && self.disconnected.is_none() && !self.paused {
             let mut lo = self.settings.loadout;
             let view = self.loadout_view(Some(timer), "Ready", "The match starts when everyone is ready", false);
             let act = ui_kit::loadout_screen(ctx, rect, &mut lo, &mut self.lo_ui, &view);
@@ -7262,7 +8212,11 @@ impl App {
 
     /// The menu camera's place on its slow arc around the showcased fighter.
     fn menu_cam_dir(&self) -> V3 {
-        let phi = self.show_spot.1 + 0.6 * (self.demo_t * std::f32::consts::TAU / 50.0).sin();
+        let mut phi = self.show_spot.1 + 0.6 * (self.demo_t * std::f32::consts::TAU / 50.0).sin();
+        if self.menu_gear && self.gear_ui.preview {
+            // looking at your Ledger gear: square on, from the front or round the back
+            phi = self.show_spot.1 + 0.35 + if self.gear_ui.back { std::f32::consts::PI } else { 0.0 };
+        }
         v3(phi.sin(), 0.0, phi.cos())
     }
 
@@ -7434,6 +8388,9 @@ impl App {
             }
             if Self::big_button_h(ui, "Fighters & Mastery", 42.0) {
                 *next = Some(Page::Mastery);
+            }
+            if Self::big_button_h(ui, "Ledger Gear", 42.0) {
+                self.menu_gear = true;
             }
             if Self::big_button_h(ui, "Lore", 42.0) {
                 *next = Some(Page::Lore);
@@ -7775,3 +8732,5 @@ mod menu_tests {
         assert_eq!(menu_links(Page::Browse, false), vec![Page::Join]);
     }
 }
+/// The frame a forced moment set the picture for (0: not yet; DUEL_SHOT_AFTER).
+static SHOT_AT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

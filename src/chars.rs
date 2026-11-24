@@ -30,7 +30,7 @@ macro_rules! file {
 }
 
 /// The fighters' texture set, one layer each (image bytes, all PNG).
-pub const TEXTURES: [(&str, &[u8]); 12] = [
+pub const TEXTURES: [(&str, &[u8]); 13] = [
     ("ranger", include_bytes!("../assets/characters/ranger.png")),
     ("ranger_alt", include_bytes!("../assets/characters/ranger_alt.png")),
     ("peasant", include_bytes!("../assets/characters/peasant.png")),
@@ -44,7 +44,30 @@ pub const TEXTURES: [(&str, &[u8]); 12] = [
     ("eye", include_bytes!("../assets/characters/eye.png")),
     // the four accessories' baked textures, a quarter each
     ("accessories", include_bytes!("../assets/characters/accessories.png")),
+    // Ledger Duels gear (tools/blender/build_gear.py): the four fighters' bakes, a quarter each
+    ("gear", include_bytes!("../assets/characters/gear.png")),
 ];
+
+/// Ledger Duels gear with a model, fitted to each fighter (tools/blender/build_gear.py), in the
+/// fighters' order; and which item each piece (by mesh name) is.
+const GEAR_FILES: [&[u8]; 4] = [
+    include_bytes!("../assets/characters/gear_bridgewright_ranger.glb"),
+    include_bytes!("../assets/characters/gear_bridgewright_huntress.glb"),
+    include_bytes!("../assets/characters/gear_bridgewright_brawler.glb"),
+    include_bytes!("../assets/characters/gear_bridgewright_striker.glb"),
+];
+pub const GEAR_PIECES: [(&str, u8); 6] = [("bw_head", 51), ("bw_body", 52), ("bw_legs", 53), ("bw_hands", 54), ("bw_feet", 55), ("bw_charm", 56)];
+
+/// A gear material's dye zone (bits 16-17 of the material word): 1 the coat, 2 its trim, 3 the
+/// accent; 0 keeps its own colour.
+pub fn dye_zone(mat: &str) -> u32 {
+    match mat.split("__").next().unwrap_or(mat) {
+        "dye_coat" => 1,
+        "dye_trim" => 2,
+        "dye_accent" | "glow_accent" => 3,
+        _ => 0,
+    }
+}
 
 /// Kinds of surface (bits 1-3 of the material word): picked from the material, or (AUTO) from
 /// the texture's colour in the shader (metal, leather or cloth).
@@ -164,7 +187,9 @@ fn kind_of(mesh: &str, mat: &str) -> u32 {
 fn acc_kind(mat: &str) -> u32 {
     let m = mat.split("__").next().unwrap_or(mat);
     match m {
-        "glow" => KIND_GLOW,
+        "glow" | "glow_accent" => KIND_GLOW,
+        "dye_trim" => KIND_METAL,
+        "dye_coat" | "rope" => KIND_LEATHER,
         "brass" | "iron" | "metal_dark" | "metal_mid" | "steel" | "copper" => KIND_METAL,
         "leather" | "apron" | "tan" => KIND_LEATHER,
         _ => KIND_AUTO,
@@ -351,6 +376,11 @@ pub struct Model {
     rest: Vec<Option<Trs>>,
     /// Scale that brings it to the rig's height (everyone is the same size: fair hit shapes).
     pub norm: f32,
+    /// Indices of the fighter alone (gear pieces follow them).
+    pub base_count: u32,
+    /// Ledger Duels gear pieces fitted to this fighter: item id, first index, index count (each
+    /// drawn only while worn).
+    pub gear: Vec<(u8, u32, u32)>,
 }
 
 /// All four fighters, loaded once (None if the files couldn't be read).
@@ -515,12 +545,18 @@ fn build(rig: &Rig, which: usize, accessory: bool) -> Result<Model, String> {
     if indices.is_empty() {
         return Err("no triangles".into());
     }
+    let base_count = indices.len() as u32;
+    let body_n = verts.len();
+    let gear = if accessory { add_gear(GEAR_FILES[which], &sk, &joint_index, body_n, &mut verts, &mut indices).unwrap_or_else(|e| {
+        eprintln!("gear for {} not loaded: {e}", spec.name);
+        Vec::new()
+    }) } else { Vec::new() };
     outline_normals(&mut verts);
     // its skeleton in the rig's terms
     let inv_bind: Vec<Mat4> = rig_joints.iter().enumerate().map(|(k, n)| sk.inv_bind.get(n).copied().unwrap_or_else(|| rig.palette_inv_bind(k))).collect();
     let n_nodes = rig.node_names.len();
     let rest: Vec<Option<Trs>> = (0..n_nodes).map(|i| sk.rest.get(&rig.node_names[i]).copied().filter(|_| !rig.node_names[i].is_empty())).collect();
-    let mut m = Model { verts, indices, inv_bind, rest, norm: 1.0 };
+    let mut m = Model { verts, indices, inv_bind, rest, norm: 1.0, base_count, gear };
     // same height as the rig: compare where the head bone sits at rest
     if let Some(head) = rig.node("Head") {
         let rig_g = rig.globals(&rig.rest_pose());
@@ -606,6 +642,168 @@ fn add_accessory(acc: &Accessory, sk: &Skeleton, joints: &HashMap<&str, usize>, 
     Ok(())
 }
 
+/// Ledger Duels gear pieces onto the fighter: each vertex follows the bones of the nearest
+/// vertex of the fighter's own skin (the first `body_n`), found through a grid; each piece's
+/// triangles are one range of the index buffer (drawn only while it's worn). Dye zones go in
+/// bits 16-17 of the material word.
+fn add_gear(glb: &[u8], sk: &Skeleton, joints: &HashMap<&str, usize>, body_n: usize, verts: &mut Vec<SkinVtx>, indices: &mut Vec<u32>) -> Result<Vec<(u8, u32, u32)>, String> {
+    let g = gltf::Gltf::from_slice(glb).map_err(|e| format!("gear: {e}"))?;
+    let j = |n: &str| joints.get(n).copied().unwrap_or(0) as u32;
+    let at = |n: &str| sk.inv_bind.get(n).map(|m| m.inverse().w_axis.truncate()).unwrap_or(Vec3::ZERO);
+    // Trousers, boots and the coat's skirt follow the leg bones themselves (the nearest skin
+    // vertex can belong to the other leg or the wrong joint, which stretched them in a stance):
+    // each vertex goes to the nearest bone of its own leg's chain, blended across each joint.
+    let left_x = at("thigh_l").x;
+    // `cx`: the middle of the boot or trouser leg the vertex belongs to (its side)
+    let leg = |p: Vec3, cx: f32| -> ([u32; 4], [f32; 4]) {
+        let s = if (cx >= 0.0) == (left_x >= 0.0) { "l" } else { "r" };
+        let chain = ["pelvis".to_string(), format!("thigh_{s}"), format!("calf_{s}"), format!("foot_{s}"), format!("ball_{s}")];
+        let pts: Vec<Vec3> = chain.iter().map(|n| at(n)).collect();
+        let mut best = (f32::MAX, 0usize, 0.0f32);
+        for k in 0..pts.len() - 1 {
+            let (a, b) = (pts[k], pts[k + 1]);
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            let d = (a + ab * t - p).length_squared();
+            if d < best.0 {
+                best = (d, k, t);
+            }
+        }
+        let (_, k, t) = best;
+        let mut w = [(j(&chain[k]), 1.0f32), (0, 0.0), (0, 0.0)];
+        if t < 0.25 && k > 0 {
+            w[1] = (j(&chain[k - 1]), 0.5 * (1.0 - t / 0.25));
+        }
+        if t > 0.75 {
+            w[2] = (j(&chain[k + 1]), 0.5 * ((t - 0.75) / 0.25));
+        }
+        let sum: f32 = w.iter().map(|x| x.1).sum();
+        ([w[0].0, w[1].0, w[2].0, 0], [w[0].1 / sum, w[1].1 / sum, w[2].1 / sum, 0.0])
+    };
+    let hip = at("pelvis").y.max(0.5);
+    let skirt = |p: Vec3| -> ([u32; 4], [f32; 4]) {
+        let t = ((hip + 0.02 - p.y) / 0.4).clamp(0.0, 1.0);
+        let left = (0.5 + p.x.signum() * left_x.signum() * p.x.abs() / 0.3).clamp(0.0, 1.0);
+        let (tl, tr) = (t * 0.5 * left, t * 0.5 * (1.0 - left));
+        ([j("pelvis"), j("thigh_l"), j("thigh_r"), 0], [1.0 - tl - tr, tl, tr, 0.0])
+    };
+    let blob = g.blob.clone().ok_or("gear: no binary chunk")?;
+    let get = |_b: gltf::Buffer| Some(blob.as_slice());
+    let lay = layer("gear");
+    // the fighter's own vertices in 4 cm cells
+    let cell = 0.04f32;
+    let key = |p: Vec3| ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32, (p.z / cell).floor() as i32);
+    let mut grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    for (k, v) in verts[..body_n].iter().enumerate() {
+        grid.entry(key(Vec3::from(v.pos))).or_default().push(k);
+    }
+    let nearest = |p: Vec3| -> Option<usize> {
+        let (cx, cy, cz) = key(p);
+        for r in 1..12 {
+            let mut best: Option<(f32, usize)> = None;
+            for x in cx - r..=cx + r {
+                for y in cy - r..=cy + r {
+                    for z in cz - r..=cz + r {
+                        if let Some(list) = grid.get(&(x, y, z)) {
+                            for &k in list {
+                                let q = Vec3::from(verts[k].pos);
+                                // off the middle: only the same side of the body (a trouser leg
+                                // must never follow the other leg)
+                                if p.x.abs() > 0.03 && q.x * p.x < 0.0 {
+                                    continue;
+                                }
+                                let d = (q - p).length_squared();
+                                if best.map_or(true, |b| d < b.0) {
+                                    best = Some((d, k));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // found within this ring: nothing outside it can be nearer than the ring's inner edge
+            if let Some((d, k)) = best {
+                if d.sqrt() <= (r as f32 - 0.5) * cell || r >= 11 {
+                    return Some(k);
+                }
+            }
+        }
+        None
+    };
+    let mut out = Vec::new();
+    let mut new_verts: Vec<SkinVtx> = Vec::new();
+    let mut new_idx: Vec<u32> = Vec::new();
+    for (prefix, id) in GEAR_PIECES {
+        let start = (indices.len() + new_idx.len()) as u32;
+        for mesh in g.document.meshes().filter(|m| m.name().is_some_and(|n| n.starts_with(prefix))) {
+            for prim in mesh.primitives() {
+                let r = prim.reader(get);
+                let Some(pos) = r.read_positions() else { continue };
+                let pos: Vec<[f32; 3]> = pos.collect();
+                let nrm: Vec<[f32; 3]> = r.read_normals().map(|i| i.collect()).unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; pos.len()]);
+                let uv: Vec<[f32; 2]> = r.read_tex_coords(0).map(|t| t.into_f32().collect()).unwrap_or_else(|| vec![[0.0, 0.0]; pos.len()]);
+                let mat = prim.material().name().unwrap_or("").to_string();
+                let word = mat_word(lay, false, acc_kind(&mat), 0.0) | dye_zone(&mat) << 16;
+                let base = (verts.len() + new_verts.len()) as u32;
+                let ix: Vec<u32> = match r.read_indices() {
+                    Some(ix) => ix.into_u32().collect(),
+                    None => (0..pos.len() as u32).collect(),
+                };
+                // each separate part (joined by its triangles: a boot, a trouser leg, a band) and
+                // the middle of it (welding by position would join the legs where they touch)
+                let mut part: Vec<usize> = (0..pos.len()).collect();
+                fn root(part: &mut [usize], mut a: usize) -> usize {
+                    while part[a] != a {
+                        part[a] = part[part[a]];
+                        a = part[a];
+                    }
+                    a
+                }
+                for t in ix.chunks(3) {
+                    for (x, y) in [(t[0], t[1]), (t[1], t[2])] {
+                        let (a, b) = (root(&mut part, x as usize), root(&mut part, y as usize));
+                        part[a] = b;
+                    }
+                }
+                let mut mid: HashMap<usize, (f32, f32)> = HashMap::new();
+                for k in 0..pos.len() {
+                    let e = mid.entry(root(&mut part, k)).or_insert((0.0, 0.0));
+                    e.0 += pos[k][0];
+                    e.1 += 1.0;
+                }
+                for k in 0..pos.len() {
+                    let p = Vec3::from(pos[k]);
+                    let (jn, w) = if id == 53 || id == 55 {
+                        let m = mid[&root(&mut part, k)];
+                        if (m.0 / m.1).abs() < 0.03 {
+                            // round the middle (the waistband): the hips
+                            ([j("pelvis"), 0, 0, 0], [1.0, 0.0, 0.0, 0.0])
+                        } else {
+                            leg(p, m.0 / m.1)
+                        }
+                    } else if id == 52 && p.y < hip + 0.02 {
+                        skirt(p)
+                    } else {
+                        match nearest(p) {
+                            Some(n) => (verts[n].joints, verts[n].weights),
+                            None => ([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
+                        }
+                    };
+                    new_verts.push(SkinVtx { pos: pos[k], nrm: nrm[k], joints: jn, weights: w, mat: word, uv: uv[k], onrm: nrm[k] });
+                }
+                new_idx.extend(ix.iter().map(|i| base + i));
+            }
+        }
+        let end = (indices.len() + new_idx.len()) as u32;
+        if end > start {
+            out.push((id, start, end - start));
+        }
+    }
+    verts.extend(new_verts);
+    indices.extend(new_idx);
+    Ok(out)
+}
+
 /// The base character's body mesh (the one we cut the head from).
 fn hero_body_mesh(doc: &gltf::Document) -> &'static str {
     for m in doc.meshes() {
@@ -657,7 +855,11 @@ mod tests {
         for (k, m) in models.iter().enumerate() {
             assert!(m.verts.len() > 3000 && m.indices.len() % 3 == 0, "{}: a real mesh", name(k as u8));
             assert!(m.verts.iter().all(|v| v.joints.iter().all(|&j| j < nj)), "joints in range");
-            assert!(m.verts.iter().all(|v| (v.mat >> 8) < TEXTURES.len() as u32), "every part textured");
+            assert!(m.verts.iter().all(|v| (v.mat >> 8) & 255 < TEXTURES.len() as u32), "every part textured");
+            // the Bridgewright's Rig is fitted to every fighter: six pieces, each a range of its own
+            assert_eq!(m.gear.len(), GEAR_PIECES.len(), "{}: the Rig's pieces", name(k as u8));
+            assert!(m.gear.iter().all(|&(_, s, c)| s >= m.base_count && c > 30 && (s + c) as usize <= m.indices.len()));
+            assert!(m.verts.iter().any(|v| (v.mat >> 16) & 3 == 1) && m.verts.iter().any(|v| (v.mat >> 16) & 3 == 2) && m.verts.iter().any(|v| (v.mat >> 16) & 3 == 3), "its three dye zones");
             assert!(m.verts.iter().any(|v| v.mat & 1 == 1), "{}: has team-colour pieces", name(k as u8));
             // at rest the skinned mesh lands exactly where it was modelled (the parts were moved
             // onto this skeleton correctly, and the pose carries over without twisting)
@@ -735,7 +937,7 @@ mod tests {
         let rig = crate::anim::shared().expect("rig");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/blender/ref");
         std::fs::create_dir_all(&dir).unwrap();
-        let bones = ["Head", "neck_01", "spine_01", "spine_02", "spine_03", "pelvis", "clavicle_l", "clavicle_r", "upperarm_l", "upperarm_r", "thigh_l", "thigh_r", "calf_l", "calf_r"];
+        let bones = ["Head", "neck_01", "spine_01", "spine_02", "spine_03", "pelvis", "clavicle_l", "clavicle_r", "upperarm_l", "upperarm_r", "lowerarm_l", "lowerarm_r", "hand_l", "hand_r", "thigh_l", "thigh_r", "calf_l", "calf_r", "foot_l", "foot_r", "ball_l", "ball_r"];
         let mut json = String::from("{\n");
         for b in 0..COUNT {
             let s = &SPECS[b];
@@ -790,5 +992,52 @@ mod tests {
         let (lo, hi) = tops.iter().fold((f32::MAX, f32::MIN), |(a, b), &t| (a.min(t), b.max(t)));
         assert!(hi - lo < 0.06, "head heights {tops:?}");
         assert!(lo > 1.6 && hi < 2.05);
+    }
+
+    /// (a probe) Each Ledger gear piece skinned in a standing pose: its longest triangle edge.
+    #[test]
+    #[ignore]
+    fn probe_gear_stretch() {
+        let rig = crate::anim::shared().expect("rig");
+        let models = shared().expect("fighters load");
+        for (b, m) in models.iter().enumerate() {
+            let mut f = Fighter::new("t", 0, true);
+            f.present = true;
+            f.alive = true;
+            f.loadout.body = b as u8;
+            let mut st = crate::character::CharState::new();
+            let mut p = None;
+            for k in 0..30 {
+                p = crate::character::animate(rig, &mut st, &f, v3(0.0, 0.0, 0.0), k as f32 * 0.016, &Tuning::default());
+            }
+            let p = p.unwrap();
+            let skin = |i: u32| {
+                let v = &m.verts[i as usize];
+                let mut s = Vec3::ZERO;
+                for q in 0..4 {
+                    s += p.palette[v.joints[q] as usize].transform_point3(Vec3::from(v.pos)) * v.weights[q];
+                }
+                s
+            };
+            for &(id, s, c) in &m.gear {
+                let mut worst = (0.0f32, 0u32);
+                let mut rest = 0.0f32;
+                let mut pair = (0u32, 0u32);
+                for t in m.indices[s as usize..(s + c) as usize].chunks(3) {
+                    for (x, y) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                        let e = (skin(x) - skin(y)).length();
+                        if e > worst.0 {
+                            worst = (e, x);
+                            pair = (x, y);
+                            rest = (Vec3::from(m.verts[x as usize].pos) - Vec3::from(m.verts[y as usize].pos)).length();
+                        }
+                    }
+                }
+                let (va, vb) = (&m.verts[pair.0 as usize], &m.verts[pair.1 as usize]);
+                println!("   rest {rest:.2}: {:?} {:?} -> {:?} {:?}", va.pos, va.joints, vb.pos, vb.joints);
+                let v = &m.verts[worst.1 as usize];
+                println!("body {b} item {id}: longest edge {:.2} m at rest pos {:?} joints {:?} w {:?}", worst.0, v.pos, v.joints, v.weights);
+            }
+        }
     }
 }

@@ -42,3 +42,52 @@ Target: the precise bot wins at least 70% overall and in every melee matchup. Re
 - `shots/weapons/held_check/scattergun_play_1100.png` (before) and `scattergun_play_after.png` (after) - the over-the-shoulder view
 
 The scattergun that "looked like a pistol" was the right model seen end-on: shouldered at cheek height and pointing straight away from the over-the-shoulder camera, its wooden stock hid behind the hood and only the dark receiver showed. Long guns (scattergun, rifle, sniper) are now carried at low ready (muzzle down and a little out to the right) when not shooting, and come up to the shoulder the moment they fire, so their length and pump show from behind.
+
+<!-- section:ledger -->
+## Ledger Duels: loadouts against the field
+
+Made by `cargo test --release ledger_balance -- --ignored --nocapture` (src/ledger_tests.rs).
+
+2016 bot duels on a flat floor, every preset loadout against every other the same number of times (each side starting on each end, 7-15 m apart). Both bots are the precise duelling bot from the weapon benchmark (same aim, reactions and movement) with the Ledger layer on top: they eat when hurt and not pressed, follow a meal with a bite, drink a tonic early, throw a special when it can finish or is worth it, swap to a weapon whose special can finish, and swap between blade and gun by range. A draw (both standing after 75 s) counts as half a win. Average duel: 19.6 s.
+
+| Loadout | Set | Main hand | Win rate vs the field |
+|---|---|---|---|
+| Gravewarden Headsman | Gravewarden | Ashfall Cleaver | **55.0%** |
+| Bastion Wall | Bastion | Courtly Sabre | **53.2%** |
+| Swiftshade Fangs | Swiftshade | Twin Fangs | **45.1%** |
+| Longsight Marksman | Longsight | Ledger Repeater | **46.4%** |
+| Court Duellist | - | Courtly Sabre | **51.0%** |
+| Foundry Brawler | - | Foundry Scattergun | **49.1%** |
+| Lowtown Rattler | Swiftshade | Lowtown Rattler | **50.4%** |
+| Border Warden | Longsight | Warden Longbarrel | **44.9%** |
+| Bridgewright Rigger | Bridgewright's Rig | Rigger's Hook | **54.8%** |
+
+By set (the loadouts wearing it):
+
+| Set | Win rate vs the field |
+|---|---|
+| Gravewarden | 55.0% |
+| Bastion | 53.2% |
+| Swiftshade | 47.8% |
+| Longsight | 45.6% |
+| No set | 50.1% |
+| Bridgewright's Rig | 54.8% |
+
+Target: no loadout above ~55% against the field. Result: the highest is 55.0% - met.
+
+Head to head (row's win rate against the column):
+
+| | Gravewarden | Bastion | Swiftshade | Longsight | Court | Foundry | Lowtown | Border | Bridgewright |
+|---|---|---|---|---|---|---|---|---|---|
+| Gravewarden | - | 59% | 54% | 62% | 51% | 45% | 62% | 52% | 55% |
+| Bastion | 41% | - | 54% | 77% | 50% | 36% | 59% | 59% | 50% |
+| Swiftshade | 46% | 46% | - | 12% | 50% | 27% | 61% | 70% | 49% |
+| Longsight | 38% | 23% | 88% | - | 66% | 79% | 11% | 43% | 25% |
+| Court | 49% | 50% | 50% | 34% | - | 39% | 71% | 57% | 58% |
+| Foundry | 55% | 64% | 73% | 21% | 61% | - | 41% | 25% | 52% |
+| Lowtown | 38% | 41% | 39% | 89% | 29% | 59% | - | 66% | 42% |
+| Border | 48% | 41% | 30% | 57% | 43% | 75% | 34% | - | 30% |
+| Bridgewright | 45% | 50% | 51% | 75% | 42% | 48% | 58% | 70% | - |
+
+No staking or wagering of any kind exists in Ledger Duels: the honour ledger only records wins, losses and streaks per loadout.
+<!-- /section:ledger -->

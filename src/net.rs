@@ -18,9 +18,9 @@ const MAGIC: [u8; 4] = *b"DRB2";
 /// fighter's state carries) or anything both sides must agree on does: map layouts, the hit
 /// rules and the game's tuning. The `match_fingerprint` test notices most such changes and fails
 /// until it's bumped.
-pub const NET_PROTOCOL: u32 = 11;
+pub const NET_PROTOCOL: u32 = 12;
 /// The same as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA11";
+pub const PROTOCOL: &str = "DRA12";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
@@ -167,13 +167,19 @@ pub struct FState {
     pub recoil: f32,
     pub wall_n: V3,
     pub loadout: [u8; 4],
+    /// Ledger Duels: the gear worn (crate::gear item ids; all 0 outside them), the special bar
+    /// and what they're doing (crate::gear::B_* bits).
+    pub gear: [u8; crate::gear::SLOTS],
+    pub spec: u8,
+    pub gbits: u8,
+    pub dyes: [u8; 3],
 }
 
 #[cfg(test)]
 impl FState {
     /// A living, running fighter at `pos` (for tests).
     pub fn test_state(pos: V3, vel: V3) -> FState {
-        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, flags4: 0, ab: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes() }
+        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, flags4: 0, ab: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes(), gear: [0; crate::gear::SLOTS], spec: 0, gbits: 0, dyes: crate::gear::DEFAULT_DYES }
     }
 }
 
@@ -199,6 +205,39 @@ fn write_fstate(w: &mut W, f: &Fighter) {
     for b in f.loadout.to_bytes() {
         w.u8(b);
     }
+    match &f.kit {
+        Some(k) => {
+            for &id in &k.equip {
+                w.u8(id);
+            }
+            w.u8(k.spec.round().clamp(0.0, 100.0) as u8);
+            w.u8(k.bits());
+            for d in k.dyes {
+                w.u8(d);
+            }
+        }
+        None => {
+            for _ in 0..crate::gear::SLOTS + 5 {
+                w.u8(0);
+            }
+        }
+    }
+}
+
+/// (tests) An event written and read back.
+#[cfg(test)]
+pub fn ev_round_trip(ev: &Ev) -> Option<Ev> {
+    let mut w = W(Vec::new());
+    write_ev(&mut w, ev);
+    read_ev(&mut R { b: &w.0, i: 0 })
+}
+
+/// (tests) A fighter's state written and read back.
+#[cfg(test)]
+pub fn fstate_round_trip(f: &Fighter) -> Option<FState> {
+    let mut w = W(Vec::new());
+    write_fstate(&mut w, f);
+    read_fstate(&mut R { b: &w.0, i: 0 })
 }
 
 fn read_fstate(r: &mut R) -> Option<FState> {
@@ -222,6 +261,19 @@ fn read_fstate(r: &mut R) -> Option<FState> {
         recoil: r.f()?,
         wall_n: r.v()?,
         loadout: [r.u8()?, r.u8()?, r.u8()?, r.u8()?],
+        gear: {
+            let mut g = [0u8; crate::gear::SLOTS];
+            for x in g.iter_mut() {
+                *x = r.u8()?;
+            }
+            g
+        },
+        spec: r.u8()?.min(100),
+        gbits: r.u8()?,
+        dyes: {
+            let n = crate::gear::DYES.len() as u8 - 1;
+            [r.u8()?.min(n), r.u8()?.min(n), r.u8()?.min(n)]
+        },
     })
 }
 
@@ -234,7 +286,7 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.u8(*wp);
             w.u8(*spark);
         }
-        Ev::Hit { victim, dmg, knock, stun, head, w: wp, o, dir, guard, vt } => {
+        Ev::Hit { victim, dmg, knock, stun, head, w: wp, o, dir, guard, vt, spec } => {
             w.u8(2);
             w.u8(*victim);
             w.f(*dmg);
@@ -246,6 +298,11 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.v(*dir);
             w.f(*guard);
             w.f(*vt);
+            w.u8(*spec);
+        }
+        Ev::Eat { item } => {
+            w.u8(16);
+            w.u8(*item);
         }
         Ev::Deflect { by, dmg } => {
             w.u8(9);
@@ -320,7 +377,8 @@ fn write_ev(w: &mut W, ev: &Ev) {
 fn read_ev(r: &mut R) -> Option<Ev> {
     Some(match r.u8()? {
         1 => Ev::Shot { o: r.v()?, e: r.v()?, w: r.u8()?, spark: r.u8()? },
-        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, LETHAL), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()?, guard: r.f()?.clamp(0.0, 100.0), vt: r.f()? },
+        2 => Ev::Hit { victim: r.u8()?, dmg: r.f()?.clamp(0.0, LETHAL), knock: clamp_v(r.v()?, 30.0), stun: r.f()?.clamp(0.0, 2.0), head: r.u8()? == 1, w: r.u8()?, o: r.v()?, dir: r.v()?, guard: r.f()?.clamp(0.0, 100.0), vt: r.f()?, spec: r.u8()? },
+        16 => Ev::Eat { item: r.u8()? },
         3 => Ev::Grenade { p: r.v()?, v: clamp_v(r.v()?, 70.0), kind: r.u8()?.min(4) },
         4 => Ev::Died { victim: r.u8()?, killer: r.u8()?, w: r.u8()?, head: r.u8()? == 1 },
         5 => {
@@ -380,6 +438,8 @@ pub struct HostMsg {
     pub round_end: f32,
     pub duel: [u8; 2],
     pub flags: [Flag; 2],
+    /// Ledger Duels: the challenger's (the host's) rules.
+    pub rules: crate::gear::Rules,
     /// What the host thinks of you (it keeps everyone's health).
     pub you_hp: f32,
     pub you_ap: f32,
@@ -1061,6 +1121,10 @@ impl Net {
         let round = r.u32()?;
         let round_end = r.f()?;
         let duel = [r.u8()?, r.u8()?];
+        let rules = {
+            let bits = r.u8()?;
+            crate::gear::Rules::from_bits(bits, r.u8()?)
+        };
         let mut flags = [Flag { state: 0, carrier: 255, pos: V3::ZERO, timer: 0.0 }; 2];
         for fl in flags.iter_mut() {
             fl.state = r.u8()?.min(2);
@@ -1121,7 +1185,7 @@ impl Net {
                 events.push((origin, ev));
             }
         }
-        Some(HostMsg { you, mode, classic, map, phase, timer, target, team_score, number, round, round_end, duel, flags, you_hp, you_ap, you_alive, roster, fighters, events, sent, stale })
+        Some(HostMsg { you, mode, classic, map, phase, timer, target, team_score, number, round, round_end, duel, flags, rules, you_hp, you_ap, you_alive, roster, fighters, events, sent, stale })
     }
 
     pub fn send_hello(&mut self, name: &str, dt: f32) {
@@ -1228,6 +1292,8 @@ impl Net {
                 w.f(g.mt.round_end);
                 w.u8(g.mt.duel[0]);
                 w.u8(g.mt.duel[1]);
+                w.u8(g.mt.rules.bits());
+                w.u8(g.mt.rules.best_of);
                 for fl in &g.mt.flags {
                     w.u8(fl.state);
                     w.u8(fl.carrier);
@@ -1381,6 +1447,22 @@ pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool, sent: f32, now
     if lo != f.loadout {
         f.loadout = lo;
         f.items = f.items.min(2);
+    }
+    // Ledger Duels: their gear as they say it is (what's worn, their bar, what they're doing)
+    if s.gear.iter().any(|&g| g != 0) {
+        match f.kit.as_mut() {
+            Some(k) if k.remote => {
+                k.set_remote(s.gear, s.spec, s.gbits);
+                k.dyes = s.dyes;
+            }
+            _ => {
+                let mut k = crate::gear::Kit::remote(s.gear, s.spec, s.gbits);
+                k.dyes = s.dyes;
+                f.kit = Some(Box::new(k));
+            }
+        }
+    } else if f.kit.as_ref().is_some_and(|k| k.remote) {
+        f.kit = None;
     }
     let reported = s.flags & 1 != 0;
     let alive = if authority {
@@ -1585,7 +1667,7 @@ mod melee_net_tests {
 
     #[test]
     fn guard_drain_and_deflects_cross_the_network() {
-        match round_trip(Ev::Hit { victim: 3, dmg: 0.0, knock: v3(1.0, 0.0, 0.0), stun: 0.5, head: false, w: crate::game::KICK_TOOL, o: V3::ZERO, dir: V3::ZERO, guard: 31.0, vt: 0.0 }) {
+        match round_trip(Ev::Hit { victim: 3, dmg: 0.0, knock: v3(1.0, 0.0, 0.0), stun: 0.5, head: false, w: crate::game::KICK_TOOL, o: V3::ZERO, dir: V3::ZERO, guard: 31.0, vt: 0.0 , spec: 0 }) {
             Ev::Hit { victim, guard, w, stun, .. } => assert!(victim == 3 && (guard - 31.0).abs() < 1e-3 && w == crate::game::KICK_TOOL && (stun - 0.5).abs() < 1e-3),
             e => panic!("{e:?}"),
         }
@@ -1776,7 +1858,7 @@ mod migration_tests {
         for b in bytes {
             hsh = (hsh ^ b as u64).wrapping_mul(0x0100_0000_01b3);
         }
-        let recorded: (u32, u64) = (11, 7365232207368127387);
+        let recorded: (u32, u64) = (12, 10804328520971619681);
         assert_eq!((NET_PROTOCOL, hsh), recorded, "what both sides of a match must agree on changed: bump NET_PROTOCOL and PROTOCOL, then record the new value here");
     }
 

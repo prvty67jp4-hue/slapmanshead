@@ -74,7 +74,7 @@ impl Model {
 }
 
 /// Each weapon's files: its name, the model, the simplified copy for far away, the icon, the texture.
-const FILES: [(&str, &[u8], &[u8], &[u8], &[u8]); 11] = [
+const FILES: [(&str, &[u8], &[u8], &[u8], &[u8]); 13] = [
     ("dagger", include_bytes!("../assets/weapons/dagger.glb"), include_bytes!("../assets/weapons/dagger_far.glb"), include_bytes!("../assets/weapons/icons/dagger.png"), include_bytes!("../assets/weapons/textures/dagger.png")),
     ("katana", include_bytes!("../assets/weapons/katana.glb"), include_bytes!("../assets/weapons/katana_far.glb"), include_bytes!("../assets/weapons/icons/katana.png"), include_bytes!("../assets/weapons/textures/katana.png")),
     ("greatsword", include_bytes!("../assets/weapons/greatsword.glb"), include_bytes!("../assets/weapons/greatsword_far.glb"), include_bytes!("../assets/weapons/icons/greatsword.png"), include_bytes!("../assets/weapons/textures/greatsword.png")),
@@ -86,7 +86,39 @@ const FILES: [(&str, &[u8], &[u8], &[u8], &[u8]); 11] = [
     ("sniper", include_bytes!("../assets/weapons/sniper.glb"), include_bytes!("../assets/weapons/sniper_far.glb"), include_bytes!("../assets/weapons/icons/sniper.png"), include_bytes!("../assets/weapons/textures/sniper.png")),
     ("rocket_launcher", include_bytes!("../assets/weapons/rocket_launcher.glb"), include_bytes!("../assets/weapons/rocket_launcher_far.glb"), include_bytes!("../assets/weapons/icons/rocket_launcher.png"), include_bytes!("../assets/weapons/textures/rocket_launcher.png")),
     ("shuriken", include_bytes!("../assets/weapons/shuriken.glb"), include_bytes!("../assets/weapons/shuriken_far.glb"), include_bytes!("../assets/weapons/icons/shuriken.png"), include_bytes!("../assets/weapons/textures/shuriken.png")),
+    // Ledger Duels: the Bridgewright's Rig's own weapons (held in place of the kind they fight as)
+    ("rigger_hook", include_bytes!("../assets/weapons/rigger_hook.glb"), include_bytes!("../assets/weapons/rigger_hook_far.glb"), include_bytes!("../assets/weapons/icons/rigger_hook.png"), include_bytes!("../assets/weapons/textures/rigger_hook.png")),
+    ("rigger_snub", include_bytes!("../assets/weapons/rigger_snub.glb"), include_bytes!("../assets/weapons/rigger_snub_far.glb"), include_bytes!("../assets/weapons/icons/rigger_snub.png"), include_bytes!("../assets/weapons/textures/rigger_snub.png")),
 ];
+
+/// A Ledger Duels item with its own model (the Rigger's Hook and Snub): its file.
+fn item_file(id: u8) -> Option<usize> {
+    match id {
+        crate::gear::HOOK => Some(11),
+        crate::gear::SNUB => Some(12),
+        _ => None,
+    }
+}
+
+/// An item's own model (near or far), if it has one.
+pub fn item_model(id: u8, far: bool) -> Option<&'static Model> {
+    static NEAR: [OnceLock<Option<Model>>; 2] = [const { OnceLock::new() }; 2];
+    static FAR_M: [OnceLock<Option<Model>>; 2] = [const { OnceLock::new() }; 2];
+    let i = item_file(id)?;
+    if far {
+        load_once(&FAR_M[i - 11], i, FILES[i].2).or_else(|| load_once(&NEAR[i - 11], i, FILES[i].1))
+    } else {
+        load_once(&NEAR[i - 11], i, FILES[i].1)
+    }
+}
+
+/// An item's icon (grey shades), if it has its own model.
+pub fn item_icon(id: u8) -> Option<(Vec<u8>, [usize; 2])> {
+    let i = item_file(id)?;
+    let img = image::load_from_memory_with_format(FILES[i].3, image::ImageFormat::Png).ok()?.to_rgba8();
+    let (iw, ih) = img.dimensions();
+    Some((img.into_raw(), [iw as usize, ih as usize]))
+}
 
 /// Which file a weapon's model is.
 fn file_index(w: Weapon) -> Option<usize> {
@@ -366,7 +398,12 @@ mod tests {
         assert!(edge > 30, "the katana has a bright edge ({edge} corners)");
         // the texture layers: three, each a full mip chain, every weapon's quarter painted
         let layers = texture_layers();
-        assert_eq!(layers.len(), 3);
+        assert_eq!(layers.len(), FILES.len().div_ceil(4));
+        // the Bridgewright's Rig's own weapons
+        for id in [crate::gear::HOOK, crate::gear::SNUB] {
+            assert!(item_model(id, false).is_some_and(|m| m.triangles() > 300), "item {id} has its model");
+            assert!(item_model(id, true).is_some() && item_icon(id).is_some());
+        }
         assert!(layers.iter().all(|l| l[0].len() == (LAYER * LAYER * 4) as usize && l.last().unwrap().len() == 4));
         let px = |l: usize, x: u32, y: u32| { let o = ((y * LAYER + x) * 4) as usize; [layers[l][0][o], layers[l][0][o + 1], layers[l][0][o + 2]] };
         assert_ne!(px(0, 100, 100), [128, 128, 128], "the dagger's quarter is painted");

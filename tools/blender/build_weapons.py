@@ -480,6 +480,53 @@ def shuriken():
     return p, {}
 
 
+# the teal of the Bridgewright's Rig (lit from within in the game, like a lens)
+W.PALETTE["glass_teal"] = ((0.04, 0.62, 0.58), 0.0, 0.05)
+T.RECIPES["glass_teal"] = ("glass", (0.03, 0.50, 0.46), (0.25, 0.85, 0.80), (0.8, 1.0, 1.0), 0.5, 0.2)
+
+
+def rigger_hook():
+    """The Rigger's Hook (Ledger Duels, the Bridgewright's Rig): a one-handed hooked axe. An
+    oak haft wrapped in leather, a dark iron socket, a broad steel bit with a bright edge, a
+    curved hook on the back (it catches on a chain when thrown), a teal inlay, and a short chain
+    hanging from the ring at its butt."""
+    p = []
+    p.append(W.cyl("haft", 0.016, -0.15, 0.54, "wood", verts=10))
+    p.append(W.cyl("grip_wrap", 0.0185, -0.13, 0.09, "leather", verts=10))
+    for k in range(5):
+        p.append(W.ring(f"wrap_band{k}", 0.0188, 0.003, (0, -0.11 + k * 0.045, 0), "leather", maj=10, minr=4))
+    p.append(W.ring("pommel_ring", 0.026, 0.006, (0, -0.175, 0), "metal_dark", axis="X", maj=14, minr=5))
+    for k in range(5):
+        r = W.ring(f"chain{k}", 0.012, 0.0032, (0, -0.2 - 0.004 * k, -0.02 - 0.02 * k), "metal_dark", axis="X" if k % 2 else "Z", maj=10, minr=4)
+        p.append(r)
+    p.append(W.cyl("socket", 0.023, 0.40, 0.54, "metal_dark", verts=10, bevel=0.003))
+    p.append(W.cyl("socket_band", 0.026, 0.40, 0.415, "brass", verts=12, bevel=0.0))
+    p.append(W.profile("bit", [(0.40, 0.02), (0.57, 0.02), (0.63, 0.08), (0.635, 0.17), (0.56, 0.215), (0.46, 0.19), (0.40, 0.10)], 0.014, "steel", bevel=0.004, segments=2))
+    p.append(W.profile("bit_edge", [(0.615, 0.075), (0.645, 0.08), (0.648, 0.175), (0.565, 0.228), (0.555, 0.212), (0.632, 0.168), (0.628, 0.085)], 0.007, "steel_edge", bevel=0.001))
+    p.append(W.profile("hook", [(0.46, -0.02), (0.535, -0.02), (0.525, -0.075), (0.47, -0.125), (0.395, -0.145), (0.36, -0.125), (0.42, -0.112), (0.46, -0.075)], 0.016, "metal_dark", bevel=0.004, segments=2))
+    p.append(W.cyl("inlay", 0.016, -0.0085, 0.0085, "glass_teal", verts=14, axis="X", bevel=0.0))
+    inlay = p[-1]
+    inlay.location = (0, 0.52, 0.115)
+    p.append(W.box("cap", (0.024, 0.03, 0.024), (0, 0.55, 0), "metal_dark", bevel=0.004))
+    return p, {}
+
+
+def rigger_snub():
+    """The Rigger's Snub (Ledger Duels): a stubby off-hand pistol. A brass frame, a short dark
+    barrel with a brass muzzle ring, a wooden grip with a lanyard ring, a teal stripe."""
+    p = []
+    p.append(W.profile("grip", [(-0.026, 0.004), (0.014, 0.004), (0.01, -0.03), (0.002, -0.08), (-0.01, -0.094), (-0.036, -0.092), (-0.042, -0.08), (-0.035, -0.03)], 0.03, "wood", bevel=0.005, segments=2))
+    p.append(W.profile("frame", [(-0.03, -0.004), (0.075, -0.004), (0.075, 0.052), (-0.018, 0.058), (-0.03, 0.046)], 0.03, "brass", bevel=0.004, segments=2))
+    p.append(W.profile("hammer", [(-0.02, 0.05), (-0.006, 0.054), (-0.012, 0.066), (-0.03, 0.074), (-0.034, 0.068)], 0.008, "gunmetal", bevel=0.002))
+    p += trigger_group(0.008, 0.05, -0.004, depth=0.028)
+    p.append(W.cyl("barrel", 0.015, 0.075, 0.17, "gunmetal", z=0.034, verts=14, bevel=0.002))
+    p.append(W.ring("muzzle", 0.0165, 0.004, (0, 0.168, 0.034), "brass", maj=14, minr=5))
+    p.append(W.cyl("bore", 0.008, 0.169, 0.171, "polymer", z=0.034, verts=10, bevel=0.0))
+    p.append(W.ring("lanyard", 0.011, 0.0028, (0, -0.03, -0.1), "metal_dark", axis="X", maj=10, minr=4))
+    p.append(W.box("stripe", (0.031, 0.06, 0.006), (0, 0.025, 0.053), "glass_teal", bevel=0.0))
+    return p, {}
+
+
 WEAPONS = {
     "scattergun": scattergun,
     "katana": katana,
@@ -492,8 +539,10 @@ WEAPONS = {
     "shuriken": shuriken,
     "dagger": dagger,
     "greatsword": greatsword,
+    "rigger_hook": rigger_hook,
+    "rigger_snub": rigger_snub,
 }
-MELEE = {"katana", "dagger", "greatsword", "shuriken"}
+MELEE = {"katana", "dagger", "greatsword", "shuriken", "rigger_hook"}
 
 
 def build(name, renders=True):

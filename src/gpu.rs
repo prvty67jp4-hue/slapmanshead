@@ -34,7 +34,9 @@ const MAX_LIGHTS: usize = 12;
 /// Per character: two tints, the hit flash (three words of joint bits + strength), the joints.
 // tint0, tint1, flash, rim, motion (4 floats each: motion is the velocity and a sway phase),
 // then the joints
-const INST_FLOATS: usize = 20 + MAX_JOINTS * 16;
+// then three dye colours (Ledger Duels gear: coat, trim, accent; the accent's w: the set's charm
+// glows)
+const INST_FLOATS: usize = 32 + MAX_JOINTS * 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -118,7 +120,7 @@ impl Fx {
 const U_DECL: &str = r#"
 struct U { vp: mat4x4<f32>, cam: vec4<f32>, right: vec4<f32>, up: vec4<f32>, fwd: vec4<f32>, sun: vec4<f32>, sun_col: vec4<f32>, fog: vec4<f32>, params: vec4<f32>, light_vp: mat4x4<f32>, shadow: vec4<f32>, sh: array<vec4<f32>, 9>, lpos: array<vec4<f32>, 12>, lcol: array<vec4<f32>, 12> };
 @group(0) @binding(0) var<uniform> u: U;
-struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, motion: vec4<f32>, joints: array<mat4x4<f32>, 72> };
+struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, motion: vec4<f32>, dye0: vec4<f32>, dye1: vec4<f32>, dye2: vec4<f32>, joints: array<mat4x4<f32>, 72> };
 @group(0) @binding(3) var<storage, read> insts: array<Inst>;
 struct VIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32> };
 struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32, @location(5) uv: vec2<f32>, @location(6) on: vec3<f32> };
@@ -129,7 +131,7 @@ fn skin_matrix(v: SIn, ii: u32) -> mat4x4<f32> {
 // behind the way the fighter moves (bits 4-7 of the material word say how much)
 fn sway_offset(v: SIn, ii: u32) -> vec3<f32> {
   let s = f32((v.mat >> 4u) & 15u) / 15.0;
-  if (s <= 0.0 || (v.mat >> 8u) >= 255u) { return vec3<f32>(0.0, 0.0, 0.0); }
+  if (s <= 0.0 || ((v.mat >> 8u) & 255u) >= 255u) { return vec3<f32>(0.0, 0.0, 0.0); }
   let mo = insts[ii].motion;
   let t = u.params.x;
   let ph = mo.w + v.pos.y * 5.0;
@@ -489,7 +491,7 @@ fn shade(i: VOut) -> vec4<f32> {
   let wp = (m * vec4<f32>(v.pos, 1.0)).xyz + sway_offset(v, ii);
   let n = normalize((m * vec4<f32>(v.on, 0.0)).xyz);
   let low = v.mat & 255u;
-  let lay = v.mat >> 8u;
+  let lay = ((v.mat >> 8u) & 255u);
   let kind = (low >> 1u) & 7u;
   let d = length(wp - u.cam.xyz);
   let px = mix(2.0, 1.0, smoothstep(3.0, 30.0, d)) * max(u.cam.w / 1080.0, 0.65);
@@ -524,7 +526,7 @@ fn shade(i: VOut) -> vec4<f32> {
   o.bp = v.pos;
   o.bn = v.nrm;
   o.nrm = normalize((m * vec4<f32>(v.nrm, 0.0)).xyz);
-  let lay = v.mat >> 8u;
+  let lay = ((v.mat >> 8u) & 255u);
   let low = v.mat & 255u;
   o.uv = v.uv;
   var ex = vec4<f32>(-1.0, 0.0, 1.0, 0.35);
@@ -532,12 +534,22 @@ fn shade(i: VOut) -> vec4<f32> {
     // a textured fighter: its own colours, the team colour only on its accent pieces (hood,
     // shoulder guard or tunic), and a red wash when hurt
     let acc = mix(vec3<f32>(1.0, 1.0, 1.0), insts[ii].tint0.rgb * 1.35, 0.62);
-    let base = select(vec3<f32>(1.0, 1.0, 1.0), acc, (low & 1u) == 1u);
+    var base = select(vec3<f32>(1.0, 1.0, 1.0), acc, (low & 1u) == 1u);
+    // Ledger Duels gear: a dye zone takes the wearer's dye (its texture is pale and neutral)
+    let zone = (v.mat >> 16u) & 3u;
+    var dye = insts[ii].dye2;
+    if (zone == 1u) { dye = insts[ii].dye0; } else if (zone == 2u) { dye = insts[ii].dye1; }
+    if (zone > 0u) { base = dye.rgb / 0.6; }
     o.col = vec4<f32>(mix(base, vec3<f32>(1.5, 0.35, 0.3), insts[ii].tint1.w), 1.0);
     // (the kind of surface goes to the toon shader in ex.w)
     let kind = (low >> 1u) & 7u;
     ex = vec4<f32>(f32(lay), 0.5, 1.0, f32(kind));
-    if (kind == 4u) {
+    if (kind == 4u && zone == 3u) {
+      // the Rig's charm: a teal glow, bright while the set's bonus is on (dye2.w)
+      let dc = insts[ii].dye2.rgb;
+      o.col = vec4<f32>(dc / max(max(dc.r, max(dc.g, dc.b)), 0.05) * (0.3 + 2.4 * insts[ii].dye2.w), 1.0);
+      ex = vec4<f32>(-1.0, 2.0, 1.0, 0.0);
+    } else if (kind == 4u) {
       // a glowing trim: unlit, in the player's colour; a soft accent, bright (and blooming) only
       // while the fighter's ability is on (tint0.w)
       let tc = insts[ii].tint0.rgb;
@@ -1898,6 +1910,11 @@ fn coat_style(body: u8, lk: &Look, outfit: u8) -> (f32, f32, [f32; 4], [f32; 4])
     }
 }
 
+/// Wearing the Bridgewright's work coat (Ledger Duels), which takes the cloth coat's place.
+fn wears_work_coat(f: &Fighter) -> bool {
+    f.kit.as_ref().is_some_and(|k| k.equip.contains(&52))
+}
+
 fn coat_cloth(mb: &mut MB, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, sc: f32, body: u8, outfit: u8) {
     let (span, length, base, trim) = coat_style(body, lk, outfit);
     let caps = &p.hit.caps;
@@ -2164,7 +2181,7 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     let dressed = crate::chars::shared().is_some();
     if dressed {
         // the fighters have real hair; the long coat is cloth that swings and drapes
-        if f.alive || f.death_t < 3.0 {
+        if (f.alive || f.death_t < 3.0) && !wears_work_coat(f) {
             coat_cloth(mb, p, st, time, lk, sc, f.loadout.body, f.loadout.outfit);
         }
     } else {
@@ -2188,6 +2205,29 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     // a blade sits in the fist (its handle through it); guns sit at the wrist
     let anchor = p.grip;
     weapon_mesh(mb, add_mb, cam, f, anchor, &p.weapon, time);
+    // Ledger Duels: an off-hand pistol in the left hand, pointing where the forearm does (level)
+    if f.alive && f.kit.as_ref().is_some_and(|k| k.equip[crate::gear::Slot::Off as usize] == crate::gear::SNUB) {
+        let far = (anchor - cam.pos).len() > crate::weapons::FAR;
+        if let Some(m) = crate::weapons::item_model(crate::gear::SNUB, far) {
+            let fwd = f.fwd();
+            let z = (fwd * 0.75 + p.forearm_l * 0.25).flat().norm();
+            let x = v3(z.z, 0.0, -z.x);
+            let wf = M3 { x, y: v3(0.0, 1.0, 0.0), z };
+            for part in &m.parts {
+                for v in &part.tris {
+                    mb.vert(p.hand_l + wf.apply(v.p), wf.apply(v.n), v.uv, v.col, v.ex);
+                }
+            }
+        }
+    }
+    // the Rigger's Hook glows teal while Haul winds up (the chain rattles)
+    if let Some(k) = f.kit.as_ref().filter(|k| k.wind.is_some_and(|w| w.0 == crate::gear::Spec::Haul)) {
+        let _ = k;
+        let tip = anchor + p.weapon.z * 0.55 * sc;
+        let pulse = 0.8 + 0.2 * (time * 30.0).sin();
+        add_mb.billboard(cam, tip, 0.45 * pulse, lina([60, 230, 210], 0.85));
+        add_mb.billboard(cam, anchor, 0.25, lina([60, 230, 210], 0.5));
+    }
     let w = f.weapon;
     // charging a heavy: the blade glows, then flashes once it's ready
     if w.is_melee() && f.alive && (f.charged || f.charge_t > 0.2) {
@@ -2301,7 +2341,9 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
     if dist > 2.5 && to.dot(cam.fwd) < dist * 0.15 {
         return;
     }
-    let m = if dist > crate::weapons::FAR { crate::weapons::model_far(f.weapon) } else { crate::weapons::model(f.weapon) };
+    // (a Ledger Duels item with its own model is held in place of the kind it fights as)
+    let own = f.kit.as_ref().and_then(|k| k.main()).and_then(|it| crate::weapons::item_model(it.id, dist > crate::weapons::FAR));
+    let m = own.or_else(|| if dist > crate::weapons::FAR { crate::weapons::model_far(f.weapon) } else { crate::weapons::model(f.weapon) });
     if let Some(m) = m {
         mb.v.reserve(m.parts.iter().map(|p| p.tris.len()).sum());
         use crate::weapons::PartKind;
@@ -2611,6 +2653,8 @@ struct Skin {
     icount: u32,
     /// Each fighter's mesh (vertices, indices, index count); empty if they didn't load.
     bodies: Vec<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// Each body's Ledger Duels gear pieces: item id, first index, index count.
+    gear: Vec<Vec<(u8, u32, u32)>>,
 }
 
 /// The fighters' textures as layers with their mip levels (RGBA, CHAR_TEX square).
@@ -3067,12 +3111,13 @@ impl Gpu {
                             .map(|m| {
                                 let v = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("fighter verts"), contents: bytemuck::cast_slice(&m.verts), usage: wgpu::BufferUsages::VERTEX });
                                 let i = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("fighter indices"), contents: bytemuck::cast_slice(&m.indices), usage: wgpu::BufferUsages::INDEX });
-                                (v, i, m.indices.len() as u32)
+                                (v, i, m.base_count)
                             })
                             .collect()
                     })
                     .unwrap_or_default();
-                Some(Skin { rig, vbuf, ibuf, icount, bodies })
+                let gear = crate::chars::shared().map(|ms| ms.iter().map(|m| m.gear.clone()).collect()).unwrap_or_default();
+                Some(Skin { rig, vbuf, ibuf, icount, bodies, gear })
             }
             Err(e) => {
                 eprintln!("character model not loaded: {e}");
@@ -3358,6 +3403,8 @@ impl Gpu {
         let mut ad = MB::default();
         let mut insts: Vec<Vec<f32>> = Vec::new();
         let mut inst_body: Vec<usize> = Vec::new();
+        // the Ledger Duels gear each one wears (item ids with a model)
+        let mut inst_gear: Vec<Vec<u8>> = Vec::new();
         // Afterimage decoys are drawn as their owners (after the real fighters)
         // (and an execution's afterimages, after them)
         let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).chain(g.exec_ghosts()).take(MAX_INST - MAX_PLAYERS).collect();
@@ -3438,12 +3485,19 @@ impl Gpu {
                     data.extend_from_slice(&[rc[0] / top * rk, rc[1] / top * rk, rc[2] / top * rk, g.tune.rim_width.max(0.5)]);
                     // how it moves (for the sway of hair, scarves and aprons), and its own phase
                     data.extend_from_slice(&[f.vel.x, f.vel.y, f.vel.z, i as f32 * 1.7]);
+                    // gear dyes (and the Rig's charm glow)
+                    let (dyes, glow) = f.kit.as_ref().map_or((crate::gear::DEFAULT_DYES, false), |k| (k.dyes, k.charm_glows()));
+                    for (z, &d) in dyes.iter().enumerate() {
+                        let c = crate::gear::dye(d);
+                        data.extend_from_slice(&[c[0], c[1], c[2], if z == 2 && glow { 1.0 } else { 0.0 }]);
+                    }
                     for j in 0..MAX_JOINTS {
                         let m = p.palette.get(j).copied().unwrap_or(glam::Mat4::IDENTITY);
                         data.extend_from_slice(&m.to_cols_array());
                     }
                     insts.push(data);
                     inst_body.push(f.loadout.body as usize);
+                    inst_gear.push(f.kit.as_ref().map(|k| k.equip.iter().copied().filter(|&id| id != 0).collect()).unwrap_or_default());
                     character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash, g.tune.char_scale);
                 }
                 None => fighter_mesh(&mut op, &mut ad, cam, f, pos, g.time),
@@ -3737,6 +3791,14 @@ impl Gpu {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..n, 0, k..k + 1);
+                    // the Ledger Duels gear they wear
+                    if let (Some(&b), Some(worn)) = (inst_body.get(k as usize), inst_gear.get(k as usize)) {
+                        for &(id, s, c) in sk.gear.get(b).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if worn.contains(&id) {
+                                pass.draw_indexed(s..s + c, 0, k..k + 1);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3780,6 +3842,14 @@ impl Gpu {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..n, 0, k..k + 1);
+                    // the Ledger Duels gear they wear
+                    if let (Some(&b), Some(worn)) = (inst_body.get(k as usize), inst_gear.get(k as usize)) {
+                        for &(id, s, c) in sk.gear.get(b).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if worn.contains(&id) {
+                                pass.draw_indexed(s..s + c, 0, k..k + 1);
+                            }
+                        }
+                    }
                 }
                 // their outlines
                 pass.set_pipeline(&self.pipe_outline);
@@ -3791,6 +3861,14 @@ impl Gpu {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..n, 0, k..k + 1);
+                    // the Ledger Duels gear they wear
+                    if let (Some(&b), Some(worn)) = (inst_body.get(k as usize), inst_gear.get(k as usize)) {
+                        for &(id, s, c) in sk.gear.get(b).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if worn.contains(&id) {
+                                pass.draw_indexed(s..s + c, 0, k..k + 1);
+                            }
+                        }
+                    }
                 }
             }
             if !all.is_empty() {

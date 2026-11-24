@@ -691,6 +691,29 @@ const NOTES: &str = r#"## What the benchmark changed
 
 The scattergun that "looked like a pistol" was the right model seen end-on: shouldered at cheek height and pointing straight away from the over-the-shoulder camera, its wooden stock hid behind the hood and only the dark receiver showed. Long guns (scattergun, rifle, sniper) are now carried at low ready (muzzle down and a little out to the right) when not shooting, and come up to the shoulder the moment they fire, so their length and pump show from behind."#;
 
+/// Put `text` into BALANCE.md as its own section (marked, so other runs keep it): replaced if
+/// it's there, added at the end if not.
+pub fn write_section(key: &str, text: &str) {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/BALANCE.md");
+    let old = std::fs::read_to_string(path).unwrap_or_default().replace("\r\n", "\n");
+    let (open, close) = (format!("<!-- section:{key} -->"), format!("<!-- /section:{key} -->"));
+    let block = format!("{open}\n{}\n{close}\n", text.trim_end());
+    let new = match (old.find(&open), old.find(&close)) {
+        (Some(a), Some(b)) if b > a => format!("{}{}{}", &old[..a], block, old[b + close.len()..].trim_start_matches('\n')),
+        _ => format!("{}\n\n{}", old.trim_end(), block),
+    };
+    std::fs::write(path, new.replace('\n', "\r\n")).unwrap();
+}
+
+/// The marked sections of BALANCE.md (kept when the weapon benchmark rewrites the file).
+fn kept_sections() -> String {
+    let old = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/BALANCE.md")).unwrap_or_default().replace("\r\n", "\n");
+    match old.find("<!-- section:") {
+        Some(a) => format!("\n{}", &old[a..]),
+        None => String::new(),
+    }
+}
+
 #[test]
 #[ignore]
 fn duel_benchmark() {
@@ -700,6 +723,7 @@ fn duel_benchmark() {
     let rep = report(&rows, n);
     println!("{rep}\n({:.0} s)", t0.elapsed().as_secs_f32());
     if n >= 200 {
+        let rep = format!("{rep}{}", kept_sections());
         std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/BALANCE.md"), rep.replace('\n', "\r\n")).unwrap();
     }
     let total = rows.iter().fold(Tally::default(), |mut a, (_, t)| {

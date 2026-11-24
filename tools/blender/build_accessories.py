@@ -668,4 +668,5 @@ def main():
     compose(textures, os.path.join(OUT, "accessories.png"))
 
 
-main()
+if __name__ == "__main__":
+    main()

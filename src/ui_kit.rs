@@ -1075,4 +1075,84 @@ pub fn loadout_screen(ctx: &egui::Context, rect: Rect, lo: &mut Loadout, st: &mu
     act
 }
 
-
+/// A Ledger Duels item's picture (our own simple drawings): a weapon's silhouette, or a helm,
+/// coat, legs, glove, boot, shield or lantern or book, a charm, a loaf, a cake, a flask.
+pub fn gear_icon(p: &Painter, r: Rect, it: &crate::gear::Item, col: Color32) {
+    use crate::gear::{Kind, Slot};
+    let c = r.center();
+    let s = r.width().min(r.height()) / 40.0;
+    let st = Stroke::new(2.0 * s, col);
+    let fill = col.gamma_multiply(0.35);
+    let pt = |x: f32, y: f32| c + Vec2::new(x * s, y * s);
+    match it.kind {
+        Kind::Gear(Slot::Main) => {
+            if let Some(w) = it.base {
+                weapon_icon(p, r, w, col);
+            }
+        }
+        Kind::Gear(Slot::Head) => {
+            // a dome with a brow band and a slit
+            p.add(egui::Shape::convex_polygon(vec![pt(-12.0, 8.0), pt(-12.0, -2.0), pt(-7.0, -11.0), pt(0.0, -14.0), pt(7.0, -11.0), pt(12.0, -2.0), pt(12.0, 8.0)], fill, st));
+            p.line_segment([pt(-12.0, 1.0), pt(12.0, 1.0)], st);
+            p.line_segment([pt(-6.0, 5.0), pt(6.0, 5.0)], Stroke::new(1.5 * s, col));
+        }
+        Kind::Gear(Slot::Body) => {
+            p.add(egui::Shape::convex_polygon(vec![pt(-14.0, -10.0), pt(-6.0, -14.0), pt(6.0, -14.0), pt(14.0, -10.0), pt(11.0, 14.0), pt(-11.0, 14.0)], fill, st));
+            p.line_segment([pt(0.0, -14.0), pt(0.0, 14.0)], Stroke::new(1.5 * s, col));
+        }
+        Kind::Gear(Slot::Legs) => {
+            p.add(egui::Shape::convex_polygon(vec![pt(-11.0, -13.0), pt(-1.0, -13.0), pt(-2.0, 14.0), pt(-10.0, 14.0)], fill, st));
+            p.add(egui::Shape::convex_polygon(vec![pt(1.0, -13.0), pt(11.0, -13.0), pt(10.0, 14.0), pt(2.0, 14.0)], fill, st));
+        }
+        Kind::Gear(Slot::Hands) => {
+            p.rect(Rect::from_min_max(pt(-9.0, -2.0), pt(9.0, 13.0)), 3.0 * s, fill, st, egui::StrokeKind::Inside);
+            for k in 0..4 {
+                let x = -7.0 + k as f32 * 4.7;
+                p.line_segment([pt(x, -2.0), pt(x, -12.0 + (k as f32 - 1.5).abs() * 2.0)], st);
+            }
+        }
+        Kind::Gear(Slot::Feet) => {
+            p.add(egui::Shape::convex_polygon(vec![pt(-8.0, -13.0), pt(2.0, -13.0), pt(2.0, 4.0), pt(14.0, 8.0), pt(14.0, 13.0), pt(-8.0, 13.0)], fill, st));
+        }
+        Kind::Gear(Slot::Off) => {
+            if it.def[2] > it.def[0] {
+                // a lantern
+                p.rect(Rect::from_min_max(pt(-7.0, -8.0), pt(7.0, 12.0)), 2.0 * s, fill, st, egui::StrokeKind::Inside);
+                p.circle_stroke(pt(0.0, -11.0), 3.0 * s, st);
+                p.circle_filled(pt(0.0, 2.0), 3.5 * s, col);
+            } else if it.regen > 0 {
+                // a ledger book
+                p.rect(Rect::from_min_max(pt(-11.0, -13.0), pt(11.0, 13.0)), 2.0 * s, fill, st, egui::StrokeKind::Inside);
+                for y in [-6.0, -1.0, 4.0] {
+                    p.line_segment([pt(-6.0, y), pt(7.0, y)], Stroke::new(1.5 * s, col));
+                }
+            } else if it.def[1] == 0 {
+                // a hooked parrying knife
+                p.line_segment([pt(-10.0, 12.0), pt(8.0, -10.0)], Stroke::new(3.0 * s, col));
+                p.line_segment([pt(8.0, -10.0), pt(2.0, -13.0)], st);
+                p.line_segment([pt(-6.0, 4.0), pt(-1.0, 9.0)], st);
+            } else {
+                p.circle(c, 13.0 * s, fill, st);
+                p.circle_filled(c, 3.0 * s, col);
+            }
+        }
+        Kind::Gear(Slot::Charm) => {
+            p.add(egui::Shape::convex_polygon(vec![pt(0.0, -13.0), pt(10.0, 0.0), pt(0.0, 13.0), pt(-10.0, 0.0)], fill, st));
+            p.circle_filled(c, 3.0 * s, col);
+        }
+        Kind::Food => {
+            p.add(egui::Shape::convex_polygon(vec![pt(-14.0, 6.0), pt(-12.0, -4.0), pt(-4.0, -9.0), pt(6.0, -9.0), pt(13.0, -4.0), pt(14.0, 6.0)], fill, st));
+            for x in [-6.0, 0.0, 6.0] {
+                p.line_segment([pt(x - 2.0, -6.0), pt(x + 2.0, 2.0)], Stroke::new(1.5 * s, col));
+            }
+        }
+        Kind::Bite => {
+            p.circle(c, 11.0 * s, fill, st);
+            p.circle_filled(pt(8.0, -8.0), 5.0 * s, Color32::from_black_alpha(200));
+        }
+        Kind::Tonic(_) => {
+            p.add(egui::Shape::convex_polygon(vec![pt(-4.0, -13.0), pt(4.0, -13.0), pt(4.0, -5.0), pt(11.0, 10.0), pt(-11.0, 10.0), pt(-4.0, -5.0)], fill, st));
+            p.line_segment([pt(-8.0, 4.0), pt(8.0, 4.0)], st);
+        }
+    }
+}

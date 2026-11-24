@@ -198,6 +198,9 @@ pub struct Posed {
     pub reverse: bool,
     /// Hit shapes following the bones.
     pub hit: HitPose,
+    /// The left wrist and which way the forearm runs to it (an off-hand pistol sits there).
+    pub hand_l: V3,
+    pub forearm_l: V3,
 }
 
 struct Bones {
@@ -1155,7 +1158,8 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
             cap(wp(b.calf_r), wp(b.foot_r), 0.065, Part::LegR),
         ],
     };
-    Some(Posed { palette, hand, weapon: M3 { x, y, z }, head, head_frame: M3 { x: hx, y: hy, z: hz }, waist: wp(b.spine1), hit, grip, knuckles, hand_axis, forearm: (hand - elbow).norm(), fingertip, reverse })
+    let (hand_l, elbow_l) = (wp(b.hand_l), wp(b.lo_l));
+    Some(Posed { palette, hand, weapon: M3 { x, y, z }, head, head_frame: M3 { x: hx, y: hy, z: hz }, waist: wp(b.spine1), hit, grip, knuckles, hand_axis, forearm: (hand - elbow).norm(), fingertip, reverse , hand_l, forearm_l: (hand_l - elbow_l).norm() })
 }
 // ---------------------------------------------------------------------------------- melee clips
 
