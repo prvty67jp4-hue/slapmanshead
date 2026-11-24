@@ -112,3 +112,7 @@ Tactics pass (23 November 2026): no new downloaded files. The new sounds are mad
 clips above: metal and water footsteps, the water splash, indoor and outdoor gunshot tails, the kill
 confirm, the smoke and flash pops and the ping chime. The utility names (Ash Lantern, Magnesium Flare,
 Forge Smoke, Spark Cracker), the callout names and the clock tower, cranes and forges are original.
+
+assets/characters/look_vault_*.glb, look_vault.png (the Ashen Vault's Warden armour, Magistrate's
+  robes and the Ashblood Regent's long coat) and assets/weapons/ashblood_glaive* - original models
+  made for this game with tools/blender/build_vault_outfits.py and build_weapons.py.

@@ -74,7 +74,7 @@ impl Model {
 }
 
 /// Each weapon's files: its name, the model, the simplified copy for far away, the icon, the texture.
-const FILES: [(&str, &[u8], &[u8], &[u8], &[u8]); 13] = [
+const FILES: [(&str, &[u8], &[u8], &[u8], &[u8]); 14] = [
     ("dagger", include_bytes!("../assets/weapons/dagger.glb"), include_bytes!("../assets/weapons/dagger_far.glb"), include_bytes!("../assets/weapons/icons/dagger.png"), include_bytes!("../assets/weapons/textures/dagger.png")),
     ("katana", include_bytes!("../assets/weapons/katana.glb"), include_bytes!("../assets/weapons/katana_far.glb"), include_bytes!("../assets/weapons/icons/katana.png"), include_bytes!("../assets/weapons/textures/katana.png")),
     ("greatsword", include_bytes!("../assets/weapons/greatsword.glb"), include_bytes!("../assets/weapons/greatsword_far.glb"), include_bytes!("../assets/weapons/icons/greatsword.png"), include_bytes!("../assets/weapons/textures/greatsword.png")),
@@ -89,21 +89,27 @@ const FILES: [(&str, &[u8], &[u8], &[u8], &[u8]); 13] = [
     // Ledger Duels: the Bridgewright's Rig's own weapons (held in place of the kind they fight as)
     ("rigger_hook", include_bytes!("../assets/weapons/rigger_hook.glb"), include_bytes!("../assets/weapons/rigger_hook_far.glb"), include_bytes!("../assets/weapons/icons/rigger_hook.png"), include_bytes!("../assets/weapons/textures/rigger_hook.png")),
     ("rigger_snub", include_bytes!("../assets/weapons/rigger_snub.glb"), include_bytes!("../assets/weapons/rigger_snub_far.glb"), include_bytes!("../assets/weapons/icons/rigger_snub.png"), include_bytes!("../assets/weapons/textures/rigger_snub.png")),
+    // the Ashen Vault's Ashblood Glaive (a wardrobe skin for the main hand; fights as a greatsword)
+    ("ashblood_glaive", include_bytes!("../assets/weapons/ashblood_glaive.glb"), include_bytes!("../assets/weapons/ashblood_glaive_far.glb"), include_bytes!("../assets/weapons/icons/ashblood_glaive.png"), include_bytes!("../assets/weapons/textures/ashblood_glaive.png")),
 ];
+
+/// The held id of the Ashblood Glaive's model (the wardrobe's look 94).
+pub const GLAIVE: u8 = 59;
 
 /// A Ledger Duels item with its own model (the Rigger's Hook and Snub): its file.
 fn item_file(id: u8) -> Option<usize> {
     match id {
         crate::gear::HOOK => Some(11),
         crate::gear::SNUB => Some(12),
+        GLAIVE => Some(13),
         _ => None,
     }
 }
 
 /// An item's own model (near or far), if it has one.
 pub fn item_model(id: u8, far: bool) -> Option<&'static Model> {
-    static NEAR: [OnceLock<Option<Model>>; 2] = [const { OnceLock::new() }; 2];
-    static FAR_M: [OnceLock<Option<Model>>; 2] = [const { OnceLock::new() }; 2];
+    static NEAR: [OnceLock<Option<Model>>; 3] = [const { OnceLock::new() }; 3];
+    static FAR_M: [OnceLock<Option<Model>>; 3] = [const { OnceLock::new() }; 3];
     let i = item_file(id)?;
     if far {
         load_once(&FAR_M[i - 11], i, FILES[i].2).or_else(|| load_once(&NEAR[i - 11], i, FILES[i].1))

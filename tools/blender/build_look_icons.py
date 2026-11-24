@@ -29,6 +29,9 @@ RIG = ((0.20, 0.11, 0.05), (0.62, 0.42, 0.14), (0.03, 0.42, 0.40))
 HERALD = ((0.05, 0.10, 0.35), (0.62, 0.42, 0.14), (0.50, 0.03, 0.06))
 SMUGGLER = ((0.03, 0.14, 0.05), (0.62, 0.42, 0.14), (0.40, 0.07, 0.04))
 PILGRIM = ((0.22, 0.23, 0.25), (0.55, 0.45, 0.30), (0.80, 0.30, 0.05))
+WARDEN = ((0.18, 0.18, 0.20), (0.62, 0.42, 0.14), (0.55, 0.45, 0.30))
+MAGISTRATE = ((0.03, 0.03, 0.035), (0.62, 0.42, 0.14), (0.55, 0.12, 0.03))
+REGENT = ((0.025, 0.02, 0.03), (0.62, 0.02, 0.035), (0.45, 0.36, 0.14))
 
 # (file, mesh name prefix, dyes), in hub::LOOKS order
 ICONS = [
@@ -39,6 +42,10 @@ ICONS = [
 ] + [(f"look_{s}_ranger.glb", f"{p}_{slot}", d) for s, p, d in (("herald", "hr", HERALD), ("smuggler", "sm", SMUGGLER), ("pilgrim", "ap", PILGRIM))
      for slot in ("head", "cape", "neck", "body", "legs", "hands", "feet")] + [
     ("w:katana.glb", "", RIG), ("w:greatsword.glb", "", RIG), ("w:dagger.glb", "", RIG), ("w:revolver.glb", "", RIG),
+] + [("look_vault_ranger.glb", f"wv_{slot}", WARDEN) for slot in ("head", "cape", "neck", "body", "legs", "hands", "feet")] + [
+    ("look_vault_ranger.glb", f"mg_{slot}", MAGISTRATE) for slot in ("head", "cape", "neck", "body")] + [
+    ("w:katana.glb", "", RIG), ("w:greatsword.glb", "", RIG), ("w:dagger.glb", "", RIG), ("w:revolver.glb", "", RIG),
+    ("look_vault_ranger.glb", "rg_body", REGENT), ("w:ashblood_glaive.glb", "", RIG),
 ]
 
 

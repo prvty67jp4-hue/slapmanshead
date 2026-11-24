@@ -155,11 +155,25 @@ pub fn zone_at(map: MapId, p: V3) -> Option<&'static Zone> {
 
 /// The callout for a spot: its area's name ("Blue Crane"), or "Open ground" between areas.
 pub fn callout(map: MapId, p: V3) -> &'static str {
+    // (down in the Ashen Vault: its rooms)
+    if map == MapId::Varrow && crate::vault::in_vault(p) {
+        return crate::vault::room_at(p).map_or("The Ashen Vault", |k| crate::vault::ROOMS[k].name);
+    }
     zone_at(map, p).map_or("Open ground", |z| z.name)
 }
 
 /// A material's look in an area (the map's own when the area doesn't change it).
 pub fn surface(map: MapId, m: Mat, p: V3) -> Surface {
+    // the Ashen Vault, under Varrow Centre: soot-dark stone, iron and old timber
+    if map == MapId::Varrow && crate::vault::in_vault(p) {
+        let s = |layer, tint, shine| Surface { layer, tint, shine };
+        return match m {
+            Mat::Floor | Mat::Stone => s(env::L_SLATE, [96, 88, 84], 0.15),
+            Mat::Wall => s(env::L_BLOCKS, [104, 96, 92], 0.05),
+            Mat::Metal => s(env::L_IRON, [70, 62, 58], 0.4),
+            Mat::Trim | Mat::Crate | Mat::Hidden => s(env::L_WOOD, [82, 60, 46], 0.1),
+        };
+    }
     let look = zone_at(map, p).map_or(Map, |z| z.look);
     look_surface(look, m).unwrap_or_else(|| env::surface(map, m))
 }

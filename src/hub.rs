@@ -60,6 +60,8 @@ pub enum Unlock {
     TableHard,
     /// Win this many duels in the Court Pits.
     PitWins(u32),
+    /// Found in the Ashen Vault (a crate::raid::LOOT id).
+    Raid(u8),
 }
 
 impl Unlock {
@@ -70,6 +72,7 @@ impl Unlock {
             Unlock::Rooftop => "finish the Rooftop Run".into(),
             Unlock::TableHard => "beat a Hard bot at a game table".into(),
             Unlock::PitWins(n) => format!("win {n} duels in the Court Pits"),
+            Unlock::Raid(_) => "found in the Ashen Vault (the Vault Gate)".into(),
         }
     }
 }
@@ -137,7 +140,41 @@ pub const LOOKS: &[LookItem] = &[
     li(61, Slot::Main, "Greatsword", "Armoury", 0, 0, Unlock::Always),
     li(62, Slot::Main, "Dagger", "Armoury", 0, 0, Unlock::Always),
     li(63, Slot::Main, "Revolver", "Armoury", 0, 0, Unlock::Always),
+    // the Ashen Vault's: the Vault Warden's plate, the Magistrate's robes, weapon finishes
+    li(70, Slot::Head, "Vault Warden's Helm", WARDEN, 130, 0, Unlock::Raid(0)),
+    li(71, Slot::Cape, "Vault Warden's Mantle", WARDEN, 131, 0, Unlock::Raid(1)),
+    li(72, Slot::Neck, "Vault Warden's Gorget", WARDEN, 132, 0, Unlock::Raid(2)),
+    li(73, Slot::Body, "Vault Warden's Cuirass", WARDEN, 133, 0, Unlock::Raid(3)),
+    li(74, Slot::Legs, "Vault Warden's Greaves", WARDEN, 134, 0, Unlock::Raid(4)),
+    li(75, Slot::Hands, "Vault Warden's Gauntlets", WARDEN, 135, 0, Unlock::Raid(5)),
+    li(76, Slot::Feet, "Vault Warden's Sabatons", WARDEN, 136, 0, Unlock::Raid(6)),
+    li(80, Slot::Head, "Magistrate's Coif", MAGISTRATE, 140, 0, Unlock::Raid(7)),
+    li(81, Slot::Cape, "Cape of Verdicts", MAGISTRATE, 141, 0, Unlock::Raid(8)),
+    li(82, Slot::Neck, "Ember Stole", MAGISTRATE, 142, 0, Unlock::Raid(9)),
+    li(83, Slot::Body, "Robe of Sentence", MAGISTRATE, 143, 0, Unlock::Raid(10)),
+    li(90, Slot::Main, "Ember-Gilt Katana", "Vault finishes", 0, 0, Unlock::Raid(11)),
+    li(91, Slot::Main, "Ashen Greatsword", "Vault finishes", 0, 0, Unlock::Raid(12)),
+    li(92, Slot::Main, "Ledger Quill Dagger", "Vault finishes", 0, 0, Unlock::Raid(13)),
+    li(93, Slot::Main, "Verdict Revolver", "Vault finishes", 0, 0, Unlock::Raid(14)),
+    // the Ashblood Regent's: his long coat, his glaive (a polearm that fights as a greatsword)
+    li(84, Slot::Body, "The Regent's Long Coat", REGENT, 150, 0, Unlock::Raid(25)),
+    li(94, Slot::Main, "Ashblood Glaive", "Vault finishes", 0, crate::weapons::GLAIVE, Unlock::Raid(27)),
 ];
+
+pub const WARDEN: &str = "Vault Warden";
+pub const MAGISTRATE: &str = "Magistrate's Robes";
+pub const REGENT: &str = "The Ashblood Regent";
+
+/// A weapon finish's colour (multiplies the weapon's own): the vault's main-hand looks.
+pub fn look_tint(id: u8) -> Option<[f32; 3]> {
+    match id {
+        90 => Some([1.35, 0.95, 0.42]),
+        91 => Some([0.32, 0.30, 0.31]),
+        92 => Some([0.45, 0.55, 1.15]),
+        93 => Some([1.3, 0.62, 0.3]),
+        _ => None,
+    }
+}
 
 pub fn look(id: u8) -> Option<&'static LookItem> {
     if id == 0 { None } else { LOOKS.iter().find(|l| l.id == id) }
@@ -151,6 +188,11 @@ pub fn look_weapon(id: u8) -> Option<Weapon> {
         62 => Some(Weapon::Dagger),
         63 => Some(Weapon::Revolver),
         7 => Some(Weapon::Katana),
+        90 => Some(Weapon::Katana),
+        91 => Some(Weapon::Greatsword),
+        92 => Some(Weapon::Dagger),
+        93 => Some(Weapon::Revolver),
+        94 => Some(Weapon::Greatsword),
         _ => None,
     }
 }
@@ -161,6 +203,9 @@ pub fn set_dyes(set: &str) -> [u8; 3] {
         HERALD => [7, 1, 12],
         SMUGGLER => [19, 1, 5],
         PILGRIM => [4, 21, 10],
+        WARDEN => [24, 25, 12],
+        MAGISTRATE => [24, 25, 5],
+        REGENT => [22, 26, 12],
         _ => crate::gear::DEFAULT_DYES,
     }
 }
@@ -184,6 +229,8 @@ pub struct Earned {
     pub pit_wins: u32,
     /// The best mastery level of any fighter (from the career, filled in by the menu side).
     pub mastery: u32,
+    /// What the Ashen Vault has given.
+    pub raid: crate::raid::RaidEarned,
 }
 
 impl Earned {
@@ -194,24 +241,39 @@ impl Earned {
             Unlock::Rooftop => self.rooftop,
             Unlock::TableHard => self.table_hard,
             Unlock::PitWins(n) => self.pit_wins >= n,
+            Unlock::Raid(l) => self.raid.has(l),
         }
     }
 }
 
-/// An outfit: a look in each slot (0 none) and three dyes (crate::gear::DYES) for each.
+/// An outfit: a look in each slot (0 none) and three dyes (crate::gear::DYES) for each; the pet
+/// following you (0 none) and the title under your name (a crate::raid::LOOT id, 0 none).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Outfit {
     pub items: [u8; SLOT_COUNT],
     pub dyes: [[u8; 3]; SLOT_COUNT],
+    pub pet: u8,
+    pub title: u8,
 }
 
 impl Default for Outfit {
     fn default() -> Self {
-        Outfit { items: [0; SLOT_COUNT], dyes: [crate::gear::DEFAULT_DYES; SLOT_COUNT] }
+        Outfit { items: [0; SLOT_COUNT], dyes: [crate::gear::DEFAULT_DYES; SLOT_COUNT], pet: 0, title: 0 }
     }
 }
 
-pub const OUTFIT_BYTES: usize = SLOT_COUNT * 4;
+/// The looks and dyes, then the pet and the title.
+pub const OUTFIT_BYTES: usize = SLOT_COUNT * 4 + 2;
+
+/// The dyes the vault gives (locked until found).
+pub fn dye_locked(d: u8, earned: &Earned) -> bool {
+    crate::raid::loot_of_dye(d).is_some_and(|l| !earned.raid.has(l))
+}
+
+/// A title's words (a crate::raid::LOOT id).
+pub fn title_text(t: u8) -> Option<&'static str> {
+    crate::raid::LOOT.get(t as usize).filter(|l| t != 0 && l.kind == crate::raid::LootKind::Title).map(|l| l.name)
+}
 
 impl Outfit {
     /// A whole set worn (its pieces in their slots, in the set's own colours; the rest kept).
@@ -234,8 +296,20 @@ impl Outfit {
             }
         }
         let n = crate::gear::DYES.len() as u8 - 1;
-        for d in self.dyes.iter_mut().flatten() {
-            *d = (*d).min(n);
+        for (k, zones) in self.dyes.iter_mut().enumerate() {
+            for (z, d) in zones.iter_mut().enumerate() {
+                *d = (*d).min(n);
+                if dye_locked(*d, earned) {
+                    *d = crate::gear::DEFAULT_DYES[z];
+                }
+            }
+            let _ = k;
+        }
+        if self.pet != 0 && !earned.raid.has(crate::raid::L_PET) {
+            self.pet = 0;
+        }
+        if title_text(self.title).is_none() || !earned.raid.has(self.title) {
+            self.title = 0;
         }
         self
     }
@@ -252,10 +326,13 @@ impl Outfit {
             b[k] = self.items[k];
             b[SLOT_COUNT + k * 3..SLOT_COUNT + k * 3 + 3].copy_from_slice(&self.dyes[k]);
         }
+        b[SLOT_COUNT * 4] = self.pet;
+        b[SLOT_COUNT * 4 + 1] = self.title;
         b
     }
     pub fn from_bytes(b: &[u8]) -> Option<Outfit> {
-        if b.len() < OUTFIT_BYTES {
+        // (outfits saved before pets and titles are two bytes shorter)
+        if b.len() < SLOT_COUNT * 4 {
             return None;
         }
         let n = crate::gear::DYES.len() as u8 - 1;
@@ -266,6 +343,8 @@ impl Outfit {
                 o.dyes[k][z] = b[SLOT_COUNT + k * 3 + z].min(n);
             }
         }
+        o.pet = b.get(SLOT_COUNT * 4).copied().unwrap_or(0).min(1);
+        o.title = b.get(SLOT_COUNT * 4 + 1).copied().unwrap_or(0).min(crate::raid::LOOT.len() as u8 - 1);
         Some(o)
     }
     pub fn to_text(&self) -> String {
@@ -336,6 +415,9 @@ pub struct FighterHub {
     pub pit: u8,
     /// One of Varrow's townsfolk (scenery drawn on this computer only: no weapon, no name).
     pub townsfolk: bool,
+    /// A raid boss drawn as a fighter (1 the Ashblood Regent: taller, pale, red-eyed; 2 the Ashen
+    /// Magistrate).
+    pub boss: u8,
 }
 
 pub const SEAT_NONE: u16 = u16::MAX;
@@ -344,7 +426,7 @@ pub const TABLE_SEATS: u16 = 1000;
 
 impl Default for FighterHub {
     fn default() -> Self {
-        FighterHub { look: Outfit::default(), emote: 0, emote_t: 0.0, seat: SEAT_NONE, pit: 255, townsfolk: false }
+        FighterHub { look: Outfit::default(), emote: 0, emote_t: 0.0, seat: SEAT_NONE, pit: 255, townsfolk: false, boss: 0 }
     }
 }
 
@@ -607,6 +689,7 @@ impl HubSave {
         s += &format!("aim={}\n", self.aim_best.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","));
         s += &format!("run={}\n", self.run_best);
         s += &format!("ghost={}\n", ghost_to_text(&self.ghost));
+        s += &format!("raid={}\n", self.earned.raid.to_text());
         s
     }
     pub fn from_text(t: &str) -> HubSave {
@@ -637,6 +720,7 @@ impl HubSave {
                 }
                 "run" => h.run_best = v.parse().unwrap_or(0),
                 "ghost" => h.ghost = ghost_from_text(v),
+                "raid" => h.earned.raid = crate::raid::RaidEarned::from_text(v),
                 _ => {}
             }
         }
@@ -675,10 +759,15 @@ pub enum HubEv {
     AimGo { a: u8, b: u8, drill: u8, seed: u32 },
     /// (host) a line for everyone ("Bram beat Sable 2-1 in the West Court Pit").
     Note { text: String },
+    /// The Ashen Vault's messages (crate::raid::RaidMsg).
+    Raid(Vec<u8>),
 }
 
 /// Scoreboards: one per aim drill, then the Rooftop Run (lower is better there), then recent duels.
 pub const BOARD_RUN: u8 = crate::hub_aim::DRILLS as u8;
+/// The Ashen Vault's boards (fastest clears) for parties of 2, 3 and 4: after the run's.
+pub const BOARD_RAID: u8 = BOARD_RUN + 1;
+pub const BOARD_LAST: u8 = BOARD_RAID + 2;
 
 fn wb_s(b: &mut Vec<u8>, s: &str) {
     let s = s.as_bytes();
@@ -820,6 +909,11 @@ impl HubEv {
                 b.push(14);
                 wb_s(&mut b, text);
             }
+            HubEv::Raid(bytes) => {
+                b.push(15);
+                b.extend_from_slice(&(bytes.len().min(4000) as u16).to_le_bytes());
+                b.extend(bytes.iter().take(4000));
+            }
         }
         b
     }
@@ -872,9 +966,9 @@ impl HubEv {
                 let last = r.s()?;
                 HubEv::TableState { table, ver, board, seats, outcome, last }
             }
-            10 => HubEv::Score { who: who(r.u8()?), board: r.u8()?.min(BOARD_RUN), value: r.u32()? },
+            10 => HubEv::Score { who: who(r.u8()?), board: r.u8()?.min(BOARD_LAST), value: r.u32()? },
             11 => {
-                let board = r.u8()?.min(BOARD_RUN);
+                let board = r.u8()?.min(BOARD_LAST);
                 let n = r.u8()?.min(8);
                 let mut rows = Vec::new();
                 for _ in 0..n {
@@ -885,6 +979,10 @@ impl HubEv {
             12 => HubEv::AimDuo { from: who(r.u8()?), to: who(r.u8()?), drill: r.u8()?.min(crate::hub_aim::DRILLS as u8 - 1) },
             13 => HubEv::AimGo { a: who(r.u8()?), b: who(r.u8()?), drill: r.u8()?.min(crate::hub_aim::DRILLS as u8 - 1), seed: r.u32()? },
             14 => HubEv::Note { text: r.s()? },
+            15 => {
+                let n = r.u16()? as usize;
+                HubEv::Raid(r.bytes(n)?.to_vec())
+            }
             _ => return None,
         })
     }
@@ -941,7 +1039,7 @@ impl Hub {
             pits: [None, None],
             challenges: Vec::new(),
             next_id: 1,
-            boards: vec![Vec::new(); BOARD_RUN as usize + 1],
+            boards: vec![Vec::new(); BOARD_LAST as usize + 1],
             results: Vec::new(),
             aim: None,
             run: RunState { next: 0, ..Default::default() },
@@ -975,7 +1073,8 @@ impl Hub {
     /// Put a score on a board (the run: lower is better), best per name, top 8 kept.
     pub fn post(&mut self, board: u8, name: &str, value: u32) -> bool {
         let Some(rows) = self.boards.get_mut(board as usize) else { return false };
-        let low = board == BOARD_RUN;
+        // (the run and the vault: lower is better)
+        let low = board >= BOARD_RUN;
         let better = |a: u32, b: u32| if low { a < b } else { a > b };
         if let Some(r) = rows.iter_mut().find(|r| r.0 == name) {
             if !better(value, r.1) {
@@ -1134,7 +1233,7 @@ impl Game {
     /// The main-hand look decides the weapon held in the hub (a blade, carried, when there's
     /// none: nobody walks the square with a gun up).
     pub fn apply_look_weapon(&mut self, i: usize) {
-        if !self.in_hub() || self.hub.as_ref().is_some_and(|h| h.pit_of(i).is_some()) {
+        if !self.in_hub() || self.hub.as_ref().is_some_and(|h| h.pit_of(i).is_some()) || self.in_raid(i) {
             return;
         }
         let o = self.f[i].hub.look;
@@ -1201,6 +1300,10 @@ impl Game {
             return;
         }
         let auth = self.is_authority();
+        if let HubEv::Raid(b) = &e {
+            crate::raid::on_msg(self, from, b);
+            return;
+        }
         match e {
             HubEv::Look { who, look } => {
                 // (a player only speaks for themselves)
@@ -1332,6 +1435,7 @@ impl Game {
                     *b = rows;
                 }
             }
+            HubEv::Raid(_) => {}
             HubEv::Note { text } => {
                 h.results.insert(0, text.clone());
                 h.results.truncate(8);
@@ -1504,7 +1608,7 @@ impl Game {
         self.hub_broadcast(HubEv::Challenges { list });
     }
 
-    fn host_send_board(&mut self, board: u8) {
+    pub(crate) fn host_send_board(&mut self, board: u8) {
         let rows = self.hub.as_ref().and_then(|h| h.boards.get(board as usize).cloned()).unwrap_or_default();
         self.hub_broadcast(HubEv::Board { board, rows });
     }
@@ -1779,7 +1883,7 @@ impl Game {
         let aiming = self.hub.as_ref().is_some_and(|h| h.aim.is_some());
         for k in 0..self.f.len() {
             let f = &self.f[k];
-            if f.owned && f.present && f.hub.pit == 255 && !(k == me && aiming) && !f.weapon.is_melee() {
+            if f.owned && f.present && f.hub.pit == 255 && !(k == me && aiming) && !f.weapon.is_melee() && !self.in_raid(k) {
                 self.apply_look_weapon(k);
             }
         }
@@ -2094,6 +2198,21 @@ impl Game {
     /// nothing while sitting except standing up.
     pub fn hub_input(&self, i: usize, mut inp: Input) -> Input {
         let Some(h) = self.hub.as_ref() else { return inp };
+        // the Ashen Vault: fight freely, but nothing at all while down
+        if self.in_raid(i) {
+            if self.raid.as_ref().is_some_and(|r| r.is_downed(i)) {
+                return Input { yaw: inp.yaw, pitch: inp.pitch, ..Default::default() };
+            }
+            inp.finish = false;
+            // the Regent's ash-blood pools: no block, no abilities while you stand in one
+            if crate::raid::in_ash(self, i) {
+                inp.guard = false;
+                inp.ability = false;
+                inp.utility = false;
+                inp.spec = false;
+            }
+            return inp;
+        }
         let in_pit = h.pit_of(i).is_some();
         let aiming = i == self.local && h.aim.as_ref().is_some_and(|a| a.live());
         if !in_pit {

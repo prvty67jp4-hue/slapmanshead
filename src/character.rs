@@ -576,7 +576,12 @@ fn hero_pose(rig: &Rig, b: &Bones, pose: &mut Vec<Trs>, f: &Fighter, now: f32) -
 
 fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, tn: &Tuning, show: bool, hero: bool) -> Option<Posed> {
     let b = bones(rig)?;
-    let scale = tn.char_scale;
+    // (the vault's bosses stand taller: the Ashblood Regent most of all)
+    let scale = tn.char_scale * match f.hub.boss {
+        1 => 1.24,
+        2 => 1.08,
+        _ => 1.0,
+    };
     let dt = (now - st.last_time).clamp(0.0, 0.1);
     st.last_time = now;
     let feel = feel_update(st, f, dt, tn);

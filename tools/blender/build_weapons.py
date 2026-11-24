@@ -527,6 +527,41 @@ def rigger_snub():
     return p, {}
 
 
+def ashblood_glaive():
+    """The Ashblood Glaive (the Ashen Vault, from Lord Vesper Kael): a polearm held like a
+    greatsword. A long black shaft with gilt bands, a leather grip where the hands go, a long
+    curved blade with a bright edge, a hooked spur on its back, a socket with a red gem, a red
+    tassel under the head and a spiked butt cap."""
+    p = []
+    p.append(W.cyl("shaft", 0.017, -0.95, 1.34, "metal_dark", verts=10, bevel=0.0))
+    p.append(W.cyl("grip", 0.0195, -0.3, 0.22, "leather", verts=10, bevel=0.0))
+    for k, y in enumerate((-0.32, 0.24, 0.7, 1.05)):
+        p.append(W.cyl(f"band{k}", 0.023, y - 0.018, y + 0.018, "brass", verts=12, bevel=0.003))
+    p.append(W.cyl("butt", 0.024, -1.05, -0.95, "brass", r1=0.02, verts=10, bevel=0.003))
+    p.append(W.cyl("butt_spike", 0.02, -1.17, -1.05, "steel", r1=0.002, verts=8, bevel=0.0))
+    p.append(W.cyl("socket", 0.03, 1.3, 1.44, "metal_dark", r1=0.024, verts=10, bevel=0.004, segments=2))
+    p.append(W.sphere("socket_gem", 0.017, (0, 1.37, 0.028), "red", seg=10, rings=6))
+    p.append(W.sphere("socket_gem2", 0.017, (0, 1.37, -0.028), "red", seg=10, rings=6))
+    # the blade: long, curving back towards its tip, single-edged
+    st = []
+    n = 14
+    for k in range(n + 1):
+        t = k / n
+        y = 1.42 + 0.78 * t
+        hw = 0.095 * (1.0 - t) ** 0.55 + 0.006
+        ht = 0.011 - 0.006 * t
+        st.append((y, -hw * 0.4, hw, ht, 0.22, 0.35 if 0.1 < t < 0.7 else 0.0))
+    blade = W.blade("blade", st, "steel", edge_mat="steel_edge", double=False)
+    p.append(blade)
+    p.append(W.profile("spur", [(1.45, -0.02), (1.53, -0.02), (1.56, -0.07), (1.6, -0.14), (1.55, -0.11), (1.5, -0.06)], 0.012, "metal_dark", bevel=0.003, segments=2))
+    # the red tassel under the head
+    for k in range(5):
+        a = k * 1.256
+        p.append(W.cyl(f"tassel{k}", 0.006, 1.12, 1.29, "red", x=math.sin(a) * 0.012, z=math.cos(a) * 0.012, r1=0.009, verts=5, bevel=0.0))
+    p.append(W.ring("tassel_knot", 0.021, 0.006, (0, 1.29, 0), "brass", maj=10, minr=4))
+    return p, {}
+
+
 WEAPONS = {
     "scattergun": scattergun,
     "katana": katana,
@@ -541,8 +576,9 @@ WEAPONS = {
     "greatsword": greatsword,
     "rigger_hook": rigger_hook,
     "rigger_snub": rigger_snub,
+    "ashblood_glaive": ashblood_glaive,
 }
-MELEE = {"katana", "dagger", "greatsword", "shuriken", "rigger_hook"}
+MELEE = {"katana", "dagger", "greatsword", "shuriken", "rigger_hook", "ashblood_glaive"}
 
 
 def build(name, renders=True):

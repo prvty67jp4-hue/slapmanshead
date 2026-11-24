@@ -24,6 +24,10 @@ pub enum HubPanel {
     Board(usize),
     /// Challenging this player.
     Challenge(usize),
+    /// The Vault Gate, the vault's leaderboard, leaving the vault.
+    Gate,
+    RaidBoard,
+    RaidLeave,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +43,8 @@ pub struct Photo {
 #[derive(Default)]
 pub struct HubUi {
     pub panel: Option<HubPanel>,
+    /// Bots asked for at the Vault Gate.
+    pub raid_bots: usize,
     /// The mirror: the camera faces you.
     pub mirror: bool,
     pub wheel: bool,
@@ -177,7 +183,7 @@ impl App {
         let mut earned = self.hub_ui.save.earned;
         earned.mastery = (0..chars::COUNT as u8).map(|b| self.career.mastery_level(b)).max().unwrap_or(1);
         if self.hub_ui.unlock_all || std::env::var_os("DUEL_UNLOCK_ALL").is_some() {
-            earned = hub::Earned { rooftop: true, table_hard: true, pit_wins: 99, mastery: 99 };
+            earned = hub::Earned { rooftop: true, table_hard: true, pit_wins: 99, mastery: 99, raid: Default::default() };
         }
         let me = g.local;
         g.f[me].hub.look = self.hub_ui.save.look.checked(&earned);
@@ -203,7 +209,16 @@ impl App {
         let e = hub::Earned { mastery: 0, ..h.earned };
         let old = hub::Earned { mastery: 0, ..s.earned };
         if e.rooftop && !old.rooftop || e.table_hard && !old.table_hard || e.pit_wins > old.pit_wins {
-            s.earned = hub::Earned { rooftop: e.rooftop || old.rooftop, table_hard: e.table_hard || old.table_hard, pit_wins: e.pit_wins.max(old.pit_wins), mastery: 0 };
+            let mut raid = old.raid;
+            raid.items |= e.raid.items;
+            raid.cleared |= e.raid.cleared;
+            raid.cleared_hard |= e.raid.cleared_hard;
+            for k in 0..3 {
+                if e.raid.best[k] != 0 && (raid.best[k] == 0 || e.raid.best[k] < raid.best[k]) {
+                    raid.best[k] = e.raid.best[k];
+                }
+            }
+            s.earned = hub::Earned { rooftop: e.rooftop || old.rooftop, table_hard: e.table_hard || old.table_hard, pit_wins: e.pit_wins.max(old.pit_wins), mastery: 0, raid };
             changed = true;
         }
         if h.run_best != 0 && (s.run_best == 0 || h.run_best < s.run_best) {
@@ -320,6 +335,24 @@ impl App {
             // the menu is one key away (online, the pause menu: the others carry on)
             return if online { 0 } else { 2 };
         }
+        // the Ashen Vault: E held revives, pressed opens the chest; Esc asks to leave
+        if game.in_raid(me) {
+            let held = ctx.input(|i| i.key_down(Key::E)) && ui.panel.is_none();
+            game.raid_use(held, e && ui.panel.is_none());
+            if esc && ui.panel.is_none() {
+                ui.panel = Some(HubPanel::RaidLeave);
+                return 1;
+            }
+            return 0;
+        }
+        if e && ui.panel.is_none() && crate::raid_ui::at_gate(game) {
+            ui.panel = Some(HubPanel::Gate);
+            return 0;
+        }
+        if e && ui.panel.is_none() && crate::raid_ui::at_board(game) {
+            ui.panel = Some(HubPanel::RaidBoard);
+            return 0;
+        }
         if e && ui.panel.is_none() {
             let pos = game.f[me].pos;
             if game.f[me].hub.seat != SEAT_NONE {
@@ -416,6 +449,16 @@ impl App {
                     HubPanel::Lectern(k) => lectern(ui, game, ui_state, k, &mut close),
                     HubPanel::Board(k) => board(ui, game, k, &mut close),
                     HubPanel::Challenge(t) => challenge(ui, game, t, &mut close),
+                    HubPanel::Gate => crate::raid_ui::gate_panel(ui, game, &mut ui_state.raid_bots, &mut close),
+                    HubPanel::RaidBoard => crate::raid_ui::board_panel(ui, game),
+                    HubPanel::RaidLeave => {
+                        title(ui, "LEAVE THE VAULT?", 1.0);
+                        ui.label("You go back to the Vault Gate; your party carries on without you (you can't rejoin this run).");
+                        if ui.button(egui::RichText::new("Leave the vault").strong()).clicked() {
+                            game.raid_leave();
+                            close = true;
+                        }
+                    }
                 });
                 ui.add_space(8.0);
                 if ui.button("Close (Esc)").clicked() {
@@ -451,6 +494,7 @@ impl App {
         if let Some(t) = prompt {
             text_shadow(p, Pos2::new(mid, rect.bottom() - 170.0 * s), Align2::CENTER_CENTER, &t, 18.0 * s, Color32::from_rgb(240, 235, 225));
         }
+        crate::raid_ui::hud(p, rect, g);
         // a challenge asked of you
         if let Some(c) = h.asked {
             let from = g.f.get(c.from as usize).map_or("Someone", |f| f.name.as_str());
@@ -711,6 +755,9 @@ fn looked_at(g: &Game, me: usize, reach: f32) -> Option<usize> {
 fn hub_prompt(g: &Game, me: usize, ui: &HubUi) -> Option<String> {
     if ui.panel.is_some() {
         return None;
+    }
+    if let Some(t) = crate::raid_ui::prompt(g) {
+        return Some(t);
     }
     let f = &g.f[me];
     let pos = f.pos;
@@ -1540,6 +1587,32 @@ impl App {
                 }
                 game.f[me].respawn_at(v3(-15.5, 0.0, -20.5), -0.6);
                 self.hub_ui.drill = 99;
+            }
+            "raid" => {
+                // the vault's pictures (raid_ui::stage holds the rest): the gate's and the
+                // leaderboard's panels open
+                let page = std::env::var("DUEL_GALLERY").unwrap_or_default();
+                if page == "raid:gate" {
+                    self.hub_ui.panel = Some(HubPanel::Gate);
+                    self.hub_ui.raid_bots = 1;
+                } else if page == "raid:board" {
+                    self.hub_ui.panel = Some(HubPanel::RaidBoard);
+                    if let Some(h) = game.hub.as_mut() {
+                        let rows: [&[(&str, u32)]; 3] = [
+                            &[("Mira, Oskar", 1_062_400), ("Tamsin, Bo", 1_131_900)],
+                            &[("Mira, Oskar, Lio", 978_300), ("Ivo, Ash, Wren", 1_044_100), ("Tamsin, Bo, Kell", 1_190_600)],
+                            &[("Mira, Oskar, Lio, Ash", 912_700), ("Ivo, Wren, Pell, Bo", 955_200), ("Tamsin, Kell, Dace, Rue", 1_020_800)],
+                        ];
+                        for (k, r) in rows.iter().enumerate() {
+                            h.boards[hub::BOARD_RAID as usize + k] = r.iter().map(|(n, v)| (n.to_string(), *v)).collect();
+                        }
+                        h.earned.raid.best = [0, 1_002_500, 0];
+                        for l in [0u8, 3, 15, 17, 21, 23, 25, 26] {
+                            h.earned.raid.give(l);
+                        }
+                    }
+                }
+                self.aim_yaw = 0.0;
             }
             _ => {
                 // the overview: everyone about the square

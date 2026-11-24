@@ -2298,6 +2298,8 @@ pub struct Game {
     pub gauntlet: Option<Gauntlet>,
     /// The Varrow Hub's shared state, when that's the mode (crate::hub).
     pub hub: Option<Box<crate::hub::Hub>>,
+    /// The Ashen Vault, while a party is in it (crate::raid).
+    pub raid: Option<Box<crate::raid::Raid>>,
     /// Things for the career stats since the menu side last looked.
     pub career: Vec<CareerEv>,
     /// Our last finisher's style (the kill can be confirmed after it has finished playing).
@@ -2828,6 +2830,7 @@ impl Game {
             host_slot: 0,
             gauntlet: None,
             hub: None,
+            raid: None,
             career: Vec::new(),
             last_finisher: 0,
             duel_loser: None,
@@ -3705,6 +3708,11 @@ impl Game {
         self.mt.phase == Phase::Fight
     }
 
+    /// A sound in the world at `at` (for the raid).
+    pub fn sound(&mut self, s: Sfx, at: V3) {
+        self.sfx(s, at);
+    }
+
     /// A sound in the world at `at`.
     fn sfx(&mut self, s: Sfx, at: V3) {
         // quick repeats of small sounds (pellets, impacts) play once
@@ -3985,8 +3993,11 @@ impl Game {
                 }
             }
             let hub_bot = self.f[i].is_bot && self.in_hub() && self.hub.as_ref().is_some_and(|h| h.pit_of(i).is_none());
+            let raid_bot = self.f[i].is_bot && self.in_raid(i);
             let input = if let Some(inp) = self.ext_input.get(i).copied().flatten() {
                 inp // driven from outside (the balance benchmark)
+            } else if raid_bot {
+                crate::raid_bots::input(self, i, dt)
             } else if hub_bot {
                 crate::hub_bots::input(self, i)
             } else if self.f[i].is_bot {
@@ -4208,6 +4219,7 @@ impl Game {
         }
         self.record(dt);
         self.hub_tick(dt);
+        crate::raid::tick(self, dt);
         self.voice_watch(dt);
         self.ledger_watch();
         if self.mt.phase == Phase::MatchOver && self.seen_phase != Phase::MatchOver {
@@ -5479,7 +5491,8 @@ impl Game {
         let h = self.world.half - RADIUS;
         ff.pos.x = ff.pos.x.clamp(-h, h);
         ff.pos.z = ff.pos.z.clamp(-h, h);
-        if ff.pos.y < -5.0 {
+        // (Varrow Centre has the Ashen Vault 40 m down: falling there is the raid's business)
+        if ff.pos.y < if self.world.map == crate::world::MapId::Varrow { -80.0 } else { -5.0 } {
             ff.pos = self.world.spawn_points[ff.slot % self.world.spawn_points.len()].0;
             ff.vel = V3::ZERO;
         }
@@ -7004,6 +7017,20 @@ impl Game {
                 }
             }
         }
+        // the Ashen Vault: a foe nearer than whoever (or whatever) else the shot met takes it
+        if let Some((rt, k)) = crate::raid::ray_hit(self, o, d, t) {
+            let falloff = match w {
+                Weapon::Shotgun => shotgun_falloff(rt),
+                Weapon::Smg => self.tune.smg_falloff(rt),
+                _ => 1.0,
+            };
+            let amount = dmg * falloff * if w == Weapon::Sniper { 3.0 } else { 1.0 };
+            crate::raid::hit_foe(self, shooter, k, amount);
+            t = rt;
+            victim = None;
+            hit_world = true;
+            surf = crate::world::Surf::Metal;
+        }
         // the Iron Wall stops bullets coming at its front
         let mut shielded = false;
         if let Some((j, _, _)) = victim {
@@ -7229,6 +7256,9 @@ impl Game {
     }
 
     fn resolve_slash(&mut self, i: usize) {
+        if self.in_raid(i) {
+            crate::raid::blade(self, i);
+        }
         let a = self.f[i].clone();
         let fwd = a.fwd();
         for j in 0..self.f.len() {

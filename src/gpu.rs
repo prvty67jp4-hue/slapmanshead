@@ -18,6 +18,17 @@ use eframe::egui_wgpu::RenderState;
 use eframe::wgpu;
 use std::f32::consts::PI;
 
+mod raid_draw;
+
+/// How much taller than others a fighter is drawn (the vault's bosses).
+fn boss_scale(f: &Fighter) -> f32 {
+    match f.hub.boss {
+        1 => 1.24,
+        2 => 1.08,
+        _ => 1.0,
+    }
+}
+
 const MSAA: u32 = 4;
 /// The scene is drawn in high dynamic range; post-processing makes the shown picture.
 const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -3681,10 +3692,21 @@ impl Gpu {
             }
         }
         let sky = env::sky(g.world.map);
+        let (mut fog, mut fog_density, mut sun_power, mut sun_col, mut sky_sh) = (sky.fog, sky.fog_density, sky.sun_power, sky.sun_col, sky.sh);
+        // the Regent's roof: a red-moon night (the sun down to a dim red glow, the fill light low)
+        if crate::raid::night(g, cam.pos) > 0.0 {
+            fog = [0.035, 0.008, 0.014];
+            fog_density = 0.006;
+            sun_power *= 0.16;
+            sun_col = [1.0, 0.32, 0.3];
+            for c in sky_sh.iter_mut() {
+                *c = [c[0] * 0.3, c[1] * 0.12, c[2] * 0.16];
+            }
+        }
         let sun = sky.sun_dir;
         let light_vp = light_matrix(&g.world, sun);
         let mut sh = [[0.0f32; 4]; 9];
-        for (k, c) in sky.sh.iter().enumerate() {
+        for (k, c) in sky_sh.iter().enumerate() {
             sh[k] = [c[0], c[1], c[2], 0.0];
         }
         // point lights: braziers and torches flicker, muzzle flashes pop; the nearest few
@@ -3702,6 +3724,7 @@ impl Gpu {
             let k = (fl.life / 0.06).clamp(0.0, 1.0) * 9.0;
             lights.push((fl.pos, 5.0, [1.0 * k, 0.72 * k, 0.4 * k]));
         }
+        lights.extend(crate::raid::lights(g));
         lights.sort_by(|a, b| (a.0 - cam.pos).len().total_cmp(&(b.0 - cam.pos).len()));
         lights.truncate(MAX_LIGHTS);
         let mut lpos = [[0.0f32; 4]; MAX_LIGHTS];
@@ -3717,9 +3740,9 @@ impl Gpu {
             right: [cam.right.x, cam.right.y, cam.right.z, 1.0 / sx],
             up: [cam.up.x, cam.up.y, cam.up.z, 1.0 / sy],
             fwd: [cam.fwd.x, cam.fwd.y, cam.fwd.z, 0.0],
-            sun: [sun.x, sun.y, sun.z, sky.sun_power],
-            sun_col: [sky.sun_col[0], sky.sun_col[1], sky.sun_col[2], 1.0],
-            fog: [sky.fog[0], sky.fog[1], sky.fog[2], sky.fog_density],
+            sun: [sun.x, sun.y, sun.z, sun_power],
+            sun_col: [sun_col[0], sun_col[1], sun_col[2], 1.0],
+            fog: [fog[0], fog[1], fog[2], fog_density],
             params: [g.time, sky.yaw, 1.0, self.sky_lods.min(7.0)],
             light_vp: light_vp.to_cols_array_2d(),
             shadow: [1.0 / self.shadow_size as f32, if self.fx.soft_shadows { 1.0 } else { 0.0 }, lights.len() as f32, 1.0],
@@ -3751,7 +3774,7 @@ impl Gpu {
             gamma: [gr.gamma[0], gr.gamma[1], gr.gamma[2], gr.contrast],
             gain: [gr.gain[0], gr.gain[1], gr.gain[2], 0.0],
             misc: [if fx.vignette { 0.32 } else { 0.0 }, 0.14, 0.35, if self.dof[1] > 0.0 { 0.3 } else { 0.0 }],
-            sun_col: [sky.sun_col[0], sky.sun_col[1], sky.sun_col[2], 0.0],
+            sun_col: [sun_col[0], sun_col[1], sun_col[2], 0.0],
             right: [cam.right.x, cam.right.y, cam.right.z, 1.0 / sx],
             up: [cam.up.x, cam.up.y, cam.up.z, 1.0 / sy],
             fwd: [cam.fwd.x, cam.fwd.y, cam.fwd.z, 0.0],
@@ -3769,7 +3792,7 @@ impl Gpu {
         let mut inst_gear: Vec<Vec<u8>> = Vec::new();
         // Afterimage decoys are drawn as their owners (after the real fighters)
         // (and an execution's afterimages, after them)
-        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).chain(g.exec_ghosts()).chain(g.hub_ghosts()).chain(g.hub_townsfolk(cam.pos)).take(MAX_INST - MAX_PLAYERS).collect();
+        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).chain(g.exec_ghosts()).chain(g.hub_ghosts()).chain(crate::raid::fighters(g)).chain(g.hub_townsfolk(cam.pos)).take(MAX_INST - MAX_PLAYERS).collect();
         for (i, f) in g.f.iter().enumerate().chain(decoys.iter().enumerate().map(|(k, f)| (MAX_PLAYERS + k, f))) {
             if !f.present || f.spectate {
                 continue;
@@ -3877,7 +3900,7 @@ impl Gpu {
                         s == crate::hub::Slot::Body as u32 + 1 || s == crate::hub::Slot::Legs as u32 + 1 || s == crate::hub::Slot::Cape as u32 + 1
                     });
                     inst_gear.push(wear);
-                    character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash, g.tune.char_scale, covered);
+                    character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash, g.tune.char_scale * boss_scale(f), covered);
                 }
                 None => fighter_mesh(&mut op, &mut ad, cam, f, pos, g.time),
             }
@@ -3958,6 +3981,7 @@ impl Gpu {
             }
         }
         hub_visuals(&mut op, &mut ad, &mut al, cam, g);
+        raid_draw::draw(&mut op, &mut ad, &mut al, cam, g);
         for gr in &g.grenades {
             if gr.kind == 2 {
                 // a throwing star, spinning flat as it flies, with a faint streak behind. Fresh
@@ -4426,7 +4450,7 @@ mod final_kill_tests {
                 let pos = f.prev_pos.lerp(f.pos, alpha);
                 if let Some(p) = character::animate_show(rig, &mut self.chars[i], f, pos, g.time, &g.tune) {
                     mb.v.clear();
-                    coat_cloth(&mut mb, &p, &mut self.chars[i], g.time, &lk, g.tune.char_scale, f.loadout.body, f.loadout.outfit);
+                    coat_cloth(&mut mb, &p, &mut self.chars[i], g.time, &lk, g.tune.char_scale * boss_scale(f), f.loadout.body, f.loadout.outfit);
                 }
             }
         }

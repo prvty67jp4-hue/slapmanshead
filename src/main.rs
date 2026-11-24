@@ -39,7 +39,12 @@ mod story_tests;
 #[cfg(test)]
 mod ledger_tests;
 mod hub_tests;
+mod raid_tests;
 mod hub_ui;
+mod raid;
+mod raid_bots;
+mod raid_ui;
+mod vault;
 
 /// (tests) Held by the timing test and the busiest tests, so they never run at once.
 #[cfg(test)]
@@ -4545,6 +4550,11 @@ fn gallery_pose(g: &mut Game, page: &str) {
         App::stage_fit(g, rest);
         return;
     }
+    // raid pages (with DUEL_HUB=raid): a vault mechanic held mid-telegraph
+    if let Some(rest) = page.strip_prefix("raid:") {
+        raid_ui::stage(g, rest);
+        return;
+    }
     let page2 = page == "2";
     // melee pages: 3 = each blow at its contact frame, 4 = mid wind-up, 5 = follow-through
     let melee_at = match page {
@@ -5651,7 +5661,7 @@ impl App {
         }
     }
     fn draw_hud(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game) {
-        if test_view().is_some() {
+        if test_view().is_some() && !std::env::var("DUEL_GALLERY").is_ok_and(|p| p.starts_with("raid:")) {
             return; // a clean picture of the map
         }
         // the hub: its own HUD (none at all in photo mode with the HUD hidden)

@@ -460,7 +460,7 @@ fn outfits_keep_only_what_is_earned_and_in_its_slot() {
     let ok = o.checked(&earned);
     assert_eq!(ok.items[Slot::Head as usize], 1, "the Rig's helm is always yours");
     assert_eq!(ok.items[Slot::Cape as usize], 0, "the herald's cape needs mastery 5");
-    let rich = Earned { mastery: 5, rooftop: true, table_hard: true, pit_wins: 0 };
+    let rich = Earned { mastery: 5, rooftop: true, table_hard: true, pit_wins: 0, raid: Default::default() };
     let all = Outfit::default().with_set(HERALD).checked(&rich);
     assert!(all.items.iter().filter(|&&i| i != 0).count() >= 7);
     // a look in the wrong slot is taken off

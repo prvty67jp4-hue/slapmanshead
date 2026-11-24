@@ -18,9 +18,9 @@ const MAGIC: [u8; 4] = *b"DRB2";
 /// fighter's state carries) or anything both sides must agree on does: map layouts, the hit
 /// rules and the game's tuning. The `match_fingerprint` test notices most such changes and fails
 /// until it's bumped.
-pub const NET_PROTOCOL: u32 = 13;
+pub const NET_PROTOCOL: u32 = 14;
 /// The same as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA13";
+pub const PROTOCOL: &str = "DRA14";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
@@ -1986,7 +1986,7 @@ mod migration_tests {
         for b in bytes {
             hsh = (hsh ^ b as u64).wrapping_mul(0x0100_0000_01b3);
         }
-        let recorded: (u32, u64) = (13, 10911351392787391105);
+        let recorded: (u32, u64) = (14, 10911351392787391105);
         assert_eq!((NET_PROTOCOL, hsh), recorded, "what both sides of a match must agree on changed: bump NET_PROTOCOL and PROTOCOL, then record the new value here");
     }
 

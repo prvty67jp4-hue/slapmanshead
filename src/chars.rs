@@ -30,7 +30,7 @@ macro_rules! file {
 }
 
 /// The fighters' texture set, one layer each (image bytes, all PNG).
-pub const TEXTURES: [(&str, &[u8]); 16] = [
+pub const TEXTURES: [(&str, &[u8]); 17] = [
     ("ranger", include_bytes!("../assets/characters/ranger.png")),
     ("ranger_alt", include_bytes!("../assets/characters/ranger_alt.png")),
     ("peasant", include_bytes!("../assets/characters/peasant.png")),
@@ -50,6 +50,8 @@ pub const TEXTURES: [(&str, &[u8]); 16] = [
     ("look_herald", include_bytes!("../assets/characters/look_herald.png")),
     ("look_smuggler", include_bytes!("../assets/characters/look_smuggler.png")),
     ("look_pilgrim", include_bytes!("../assets/characters/look_pilgrim.png")),
+    // the Ashen Vault's drops (tools/blender/build_vault_outfits.py): Warden, Magistrate, Regent
+    ("look_vault", include_bytes!("../assets/characters/look_vault.png")),
 ];
 
 /// Ledger Duels gear with a model, fitted to each fighter (tools/blender/build_gear.py), in the
@@ -61,13 +63,14 @@ macro_rules! looks {
             (include_bytes!(concat!("../assets/characters/look_herald_", $n, ".glb")) as &[u8], "look_herald"),
             (include_bytes!(concat!("../assets/characters/look_smuggler_", $n, ".glb")) as &[u8], "look_smuggler"),
             (include_bytes!(concat!("../assets/characters/look_pilgrim_", $n, ".glb")) as &[u8], "look_pilgrim"),
+            (include_bytes!(concat!("../assets/characters/look_vault_", $n, ".glb")) as &[u8], "look_vault"),
         ]
     };
 }
 /// Each fighter's fitted gear and outfits: (file, its texture layer).
-const GEAR_FILES: [[(&[u8], &str); 4]; 4] = [looks!("ranger"), looks!("huntress"), looks!("brawler"), looks!("striker")];
+const GEAR_FILES: [[(&[u8], &str); 5]; 4] = [looks!("ranger"), looks!("huntress"), looks!("brawler"), looks!("striker")];
 /// Every gear piece with a model (by mesh name) and its id (crate::hub::LOOKS says its slot).
-pub const GEAR_PIECES: [(&str, u8); 27] = [
+pub const GEAR_PIECES: [(&str, u8); 39] = [
     ("bw_head", 51),
     ("bw_body", 52),
     ("bw_legs", 53),
@@ -95,6 +98,18 @@ pub const GEAR_PIECES: [(&str, u8); 27] = [
     ("ap_legs", 124),
     ("ap_hands", 125),
     ("ap_feet", 126),
+    ("wv_head", 130),
+    ("wv_cape", 131),
+    ("wv_neck", 132),
+    ("wv_body", 133),
+    ("wv_legs", 134),
+    ("wv_hands", 135),
+    ("wv_feet", 136),
+    ("mg_head", 140),
+    ("mg_cape", 141),
+    ("mg_neck", 142),
+    ("mg_body", 143),
+    ("rg_body", 150),
 ];
 
 /// The wardrobe slot a gear piece is worn in, plus one (0: none), for its dyes.

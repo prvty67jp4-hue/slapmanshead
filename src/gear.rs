@@ -512,7 +512,7 @@ impl Rules {
 // ---------------------------------------------------------------- loadouts
 
 /// Dyes for gear with dye zones (the coat, its trim, an accent): name and colour (linear).
-pub const DYES: [(&str, [f32; 3]); 24] = [
+pub const DYES: [(&str, [f32; 3]); 27] = [
     ("Oiled Brown", [0.20, 0.11, 0.05]),
     ("Brass", [0.62, 0.42, 0.14]),
     ("Teal", [0.03, 0.42, 0.40]),
@@ -538,6 +538,11 @@ pub const DYES: [(&str, [f32; 3]); 24] = [
     ("Sand", [0.55, 0.45, 0.30]),
     ("Charcoal", [0.08, 0.08, 0.09]),
     ("Chalk White", [0.85, 0.84, 0.80]),
+    // the Ashen Vault's (found there)
+    ("Ash Black", [0.018, 0.016, 0.017]),
+    ("Ember Gold", [0.95, 0.48, 0.05]),
+    // (the Ashblood Regent's)
+    ("Red Moon", [0.62, 0.02, 0.035]),
 ];
 /// The dye zones, and the Rig's own colours: oiled brown canvas, brass trim, a teal accent.
 pub const DYE_ZONES: [&str; 3] = ["Coat", "Trim", "Accent"];

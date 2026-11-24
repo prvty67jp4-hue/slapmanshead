@@ -340,6 +340,16 @@ pub fn world() -> World {
         put(BannerB, -h + 0.02, 6.4, z, hp);
     }
     market(&mut v, &mut props, &mut torches);
+    // the Vault Gate (an arch over the circle a raid party gathers in) and the raid's board
+    let (gx, gz, _) = crate::vault::GATE;
+    props.push(Prop { kind: PropKind::Archway, pos: v3(gx, 0.0, gz - 3.4), yaw: 0.0, scale: 1.0, team: 255 });
+    v.push(bx(gx - 2.25, 0.0, gz - 3.8, gx - 1.55, 4.2, gz - 3.0, Mat::Hidden));
+    v.push(bx(gx + 1.55, 0.0, gz - 3.8, gx + 2.25, 4.2, gz - 3.0, Mat::Hidden));
+    let (bx_, by_, bz_) = crate::vault::GATE_BOARD;
+    props.push(Prop { kind: PropKind::HubBoard, pos: v3(bx_, by_, bz_), yaw: std::f32::consts::FRAC_PI_2, scale: 1.0, team: 255 });
+    torches.push(v3(gx, 1.0, gz));
+    // the vault itself, 40 m down (its floor tiles are the last blocks: see crate::vault)
+    crate::vault::build(&mut v, &mut deco, &mut props, &mut torches);
     // ivy
     let mut vines = Vec::new();
     for (k, x) in [-30.0f32, -18.0, 2.0, 16.0].iter().enumerate() {
