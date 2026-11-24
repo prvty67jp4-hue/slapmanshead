@@ -2661,6 +2661,7 @@ impl eframe::App for App {
         self.wall_t += dt;
         self.handle_screenshot(&ctx);
         self.take_photo(&ctx);
+        self.take_outfit_thumb(&ctx);
 
         self.watchdog.stage("Steam");
         self.steam_frame(dt);
@@ -2690,6 +2691,9 @@ impl eframe::App for App {
             sample_keys(&ctx, &self.settings.binds);
             // the hub's own keys first (they may use Esc)
             let hk = self.hub_keys(&ctx);
+            if let Some(y) = self.hub_ui.turn_to.take() {
+                self.aim_yaw = y;
+            }
             self.esc_eaten = hk != 0;
             if hk == 2 {
                 self.hub_to_menu();
@@ -2907,6 +2911,8 @@ impl eframe::App for App {
         let track = match &self.screen {
             _ if !self.settings.music_on => None,
             Screen::Play { .. } if !self.settings.match_music => None,
+            // the town square: the calm theme under the market's own sounds
+            Screen::Play { game, .. } if game.in_hub() && game.hub.as_ref().is_none_or(|h| h.pit_of(game.local).is_none()) => Some(audio::TRACK_MENU % n_tracks),
             Screen::Play { game, .. } => {
                 let base = if game.train.is_some() { 0 } else { game.mt.number as usize };
                 Some(audio::TRACK_FIGHTS[(base + self.track_skip) % audio::TRACK_FIGHTS.len()])
@@ -2918,6 +2924,8 @@ impl eframe::App for App {
             let mute = std::env::var_os("DUEL_AUDIO_TEST").is_some();
             a.set_volume(if mute { 0.0 } else { self.settings.volume }, if mute { 0.0 } else { self.settings.music_volume });
             a.set_music(track);
+            let market = matches!(&self.screen, Screen::Play { game, .. } if game.in_hub());
+            a.set_ambience(if market { 0.6 } else { 0.0 });
             if let Some((p, r, f)) = ears {
                 a.set_listener(p, r, f);
             }
@@ -4532,6 +4540,11 @@ fn test_view() -> Option<[f32; 6]> {
 
 /// Test switch: line fighters up, each held in one move, to check the animations.
 fn gallery_pose(g: &mut Game, page: &str) {
+    // fit pages (with DUEL_HUB=fit): an outfit on the four fighters, held in a pose
+    if let Some(rest) = page.strip_prefix("fit:") {
+        App::stage_fit(g, rest);
+        return;
+    }
     let page2 = page == "2";
     // melee pages: 3 = each blow at its contact frame, 4 = mid wind-up, 5 = follow-through
     let melee_at = match page {

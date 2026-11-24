@@ -159,8 +159,8 @@ pub fn look_weapon(id: u8) -> Option<Weapon> {
 pub fn set_dyes(set: &str) -> [u8; 3] {
     match set {
         HERALD => [7, 1, 12],
-        SMUGGLER => [6, 8, 5],
-        PILGRIM => [4, 3, 10],
+        SMUGGLER => [19, 1, 5],
+        PILGRIM => [4, 21, 10],
         _ => crate::gear::DEFAULT_DYES,
     }
 }
@@ -334,6 +334,8 @@ pub struct FighterHub {
     pub emote_t: f32,
     pub seat: u16,
     pub pit: u8,
+    /// One of Varrow's townsfolk (scenery drawn on this computer only: no weapon, no name).
+    pub townsfolk: bool,
 }
 
 pub const SEAT_NONE: u16 = u16::MAX;
@@ -342,7 +344,7 @@ pub const TABLE_SEATS: u16 = 1000;
 
 impl Default for FighterHub {
     fn default() -> Self {
-        FighterHub { look: Outfit::default(), emote: 0, emote_t: 0.0, seat: SEAT_NONE, pit: 255 }
+        FighterHub { look: Outfit::default(), emote: 0, emote_t: 0.0, seat: SEAT_NONE, pit: 255, townsfolk: false }
     }
 }
 
@@ -1973,6 +1975,98 @@ impl Game {
             h.run = RunState { next: 1, t: 0.0, running: true, frames: vec![GhostFrame { t: 0.0, pos, yaw, ground }], rec_acc: 0.0, last: None, last_t: 0.0 };
             h.toast("The Rooftop Run: go!");
         }
+    }
+
+    /// Varrow's townsfolk, as fighters to draw (on this computer only: scenery, never players,
+    /// never sent): three walking their rounds of the square, three browsing at the stalls and
+    /// chatting. Each wears a mix of the wardrobe's pieces in plain market colours; nobody holds
+    /// a weapon. Those further than 45 m from the camera are left out.
+    pub fn hub_townsfolk(&self, cam: V3) -> Vec<Fighter> {
+        if !self.in_hub() {
+            return Vec::new();
+        }
+        let t = self.time;
+        // (name, body, head, body, legs, feet, neck, dyes coat/trim/accent)
+        const FOLK: [(&str, u8, u8, u8, u8, u8, u8, [u8; 3]); 6] = [
+            ("Ada the weaver", 1, 40, 43, 44, 46, 0, [21, 0, 11]),
+            ("Old Pell", 0, 30, 33, 34, 36, 32, [16, 1, 5]),
+            ("Brin the porter", 3, 0, 2, 3, 5, 0, [14, 1, 11]),
+            ("Mags", 2, 20, 23, 24, 26, 0, [19, 1, 12]),
+            ("Tam the carter", 1, 0, 43, 34, 36, 32, [22, 21, 10]),
+            ("Sel", 0, 40, 33, 3, 5, 0, [5, 1, 11]),
+        ];
+        let lap = |pts: &[(f32, f32)], s: f32| -> (V3, V3) {
+            let n = pts.len();
+            let seg: Vec<f32> = (0..n).map(|k| {
+                let (a, b) = (pts[k], pts[(k + 1) % n]);
+                ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt()
+            }).collect();
+            let total: f32 = seg.iter().sum();
+            let mut d = s.rem_euclid(total);
+            for k in 0..n {
+                if d <= seg[k] {
+                    let (a, b) = (pts[k], pts[(k + 1) % n]);
+                    let f = d / seg[k].max(1e-3);
+                    let p = v3(a.0 + (b.0 - a.0) * f, 0.0, a.1 + (b.1 - a.1) * f);
+                    return (p, v3(b.0 - a.0, 0.0, b.1 - a.1).norm());
+                }
+                d -= seg[k];
+            }
+            (v3(pts[0].0, 0.0, pts[0].1), v3(0.0, 0.0, 1.0))
+        };
+        let circle = |r: f32, n: usize, dir: f32| -> Vec<(f32, f32)> { (0..n).map(|k| { let a = dir * k as f32 / n as f32 * std::f32::consts::TAU; (a.cos() * r, a.sin() * r) }).collect() };
+        let round_a = circle(11.0, 20, 1.0);
+        let round_b = circle(13.5, 24, -1.0);
+        let stalls_way = [(-12.0, 13.5), (0.0, 12.5), (12.0, 13.5), (16.5, 6.5), (16.5, -6.5), (11.0, -14.5), (-11.0, -14.5), (-15.0, 0.0)];
+        let mut out = Vec::new();
+        for (k, &(name, body, head, coat, legs, feet, neck, dyes)) in FOLK.iter().enumerate() {
+            let (pos, dir, speed) = match k {
+                0 => { let (p, d) = lap(&round_a, t * 1.25); (p, d, 1.25) }
+                1 => { let (p, d) = lap(&round_b, t * 1.05 + 20.0); (p, d, 1.05) }
+                2 => { let (p, d) = lap(&stalls_way, t * 1.4 + 9.0); (p, d, 1.4) }
+                _ => {
+                    // at a stall, facing its counter, shifting a little
+                    let (_, x, z, fx, fz) = crate::varrow::STALLS[(k - 3) % crate::varrow::STALLS.len()];
+                    let side = v3(-fz, 0.0, fx) * ((k as f32 * 1.3).sin() * 0.8);
+                    let p = v3(x + fx * 1.75, 0.0, z + fz * 1.75) + side;
+                    (p, v3(-fx, 0.0, -fz), 0.0)
+                }
+            };
+            if (pos - cam).len() > 45.0 {
+                continue;
+            }
+            let mut f = Fighter::new(name, MAX_PLAYERS + 8 + k, false);
+            f.present = true;
+            f.alive = true;
+            f.is_bot = true;
+            f.loadout.body = body;
+            f.color_idx = (k % 8) as u8;
+            f.pos = pos;
+            f.prev_pos = pos;
+            f.net_pos = pos;
+            f.yaw = dir.x.atan2(dir.z);
+            f.vel = dir * speed;
+            f.on_ground = true;
+            f.cur = 0;
+            f.weapon = Weapon::Dagger;
+            let mut o = Outfit::default();
+            for (slot, id) in [(Slot::Head, head), (Slot::Body, coat), (Slot::Legs, legs), (Slot::Feet, feet), (Slot::Neck, neck)] {
+                o.items[slot as usize] = id;
+                o.dyes[slot as usize] = dyes;
+            }
+            f.hub.look = o;
+            f.hub.townsfolk = true;
+            // browsers chat now and then (and laugh)
+            if speed == 0.0 {
+                let cycle = (t + k as f32 * 3.7) % 9.0;
+                if cycle < 2.6 {
+                    f.hub.emote = if k % 2 == 0 { Emote::Laugh as u8 } else { Emote::Wave as u8 };
+                    f.hub.emote_t = t - cycle;
+                }
+            }
+            out.push(f);
+        }
+        out
     }
 
     /// The ghost of your best run, where it is now (while you run), as a fighter to draw.

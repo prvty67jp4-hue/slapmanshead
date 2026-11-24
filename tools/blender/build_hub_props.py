@@ -49,6 +49,17 @@ W.PALETTE.update({
     "cloth_teal": ((0.05, 0.32, 0.32), 0.0, 0.9),
     "cloth_ochre": ((0.62, 0.44, 0.12), 0.0, 0.9),
     "felt": ((0.08, 0.20, 0.12), 0.0, 0.95),
+    "cream": ((0.74, 0.68, 0.55), 0.0, 0.9),
+    "leaf_dark": ((0.07, 0.17, 0.06), 0.0, 0.9),
+    "leaf": ((0.15, 0.30, 0.09), 0.0, 0.9),
+    "soil": ((0.10, 0.07, 0.05), 0.0, 1.0),
+    "fruit_red": ((0.55, 0.06, 0.04), 0.0, 0.5),
+    "fruit_orange": ((0.75, 0.32, 0.04), 0.0, 0.5),
+    "fruit_green": ((0.25, 0.45, 0.08), 0.0, 0.5),
+    "clay": ((0.50, 0.22, 0.10), 0.0, 0.8),
+    "flower_pink": ((0.80, 0.30, 0.45), 0.0, 0.8),
+    "flower_white": ((0.85, 0.82, 0.74), 0.0, 0.8),
+    "flower_yellow": ((0.85, 0.62, 0.10), 0.0, 0.8),
 })
 T.RECIPES.update({
     "paper": ("cord", (0.70, 0.64, 0.50), (0.84, 0.79, 0.66), (0.52, 0.46, 0.34), 0.25, 0.4),
@@ -56,6 +67,17 @@ T.RECIPES.update({
     "cloth_teal": ("cord", (0.04, 0.24, 0.24), (0.07, 0.36, 0.35), (0.02, 0.14, 0.14), 0.4, 0.6),
     "cloth_ochre": ("cord", (0.52, 0.36, 0.10), (0.68, 0.50, 0.16), (0.34, 0.22, 0.06), 0.4, 0.6),
     "felt": ("cord", (0.06, 0.16, 0.09), (0.10, 0.24, 0.14), (0.03, 0.09, 0.05), 0.3, 0.5),
+    "cream": ("cord", (0.62, 0.56, 0.44), (0.80, 0.74, 0.60), (0.46, 0.40, 0.30), 0.3, 0.5),
+    "leaf_dark": ("leather", (0.04, 0.11, 0.035), (0.09, 0.20, 0.07), (0.02, 0.06, 0.02), 0.2, 0.8),
+    "leaf": ("leather", (0.10, 0.22, 0.06), (0.20, 0.38, 0.11), (0.28, 0.45, 0.14), 0.5, 0.8),
+    "soil": ("leather", (0.06, 0.04, 0.03), (0.12, 0.085, 0.06), (0.04, 0.03, 0.02), 0.2, 0.6),
+    "fruit_red": ("brass", (0.42, 0.04, 0.03), (0.62, 0.09, 0.05), (0.95, 0.55, 0.45), 0.4, 0.5),
+    "fruit_orange": ("brass", (0.62, 0.24, 0.03), (0.82, 0.40, 0.06), (1.0, 0.75, 0.40), 0.4, 0.5),
+    "fruit_green": ("brass", (0.18, 0.36, 0.05), (0.30, 0.52, 0.10), (0.65, 0.85, 0.40), 0.4, 0.5),
+    "clay": ("leather", (0.38, 0.16, 0.07), (0.56, 0.26, 0.12), (0.70, 0.42, 0.25), 0.5, 0.6),
+    "flower_pink": ("cord", (0.66, 0.22, 0.34), (0.88, 0.40, 0.55), (0.95, 0.70, 0.78), 0.3, 0.4),
+    "flower_white": ("cord", (0.72, 0.70, 0.62), (0.92, 0.90, 0.84), (1.0, 1.0, 0.95), 0.3, 0.4),
+    "flower_yellow": ("cord", (0.70, 0.48, 0.06), (0.92, 0.70, 0.14), (1.0, 0.88, 0.45), 0.3, 0.4),
 })
 _paint = T.paint_material
 
@@ -261,6 +283,131 @@ def wardrobe():
     return [W.bake(parts, "wardrobe")]
 
 
+def blob(name, r, loc, mat, scale=(1, 1, 1), sub=2, seed=0):
+    """A lumpy ball (a clump of leaves, a bush): an icosphere, its points pushed in and out."""
+    import bmesh
+    import random
+    rnd = random.Random(seed)
+    bm = bmesh.new()
+    bmesh.ops.create_icosphere(bm, subdivisions=sub, radius=r)
+    for v in bm.verts:
+        v.co *= 1.0 + rnd.uniform(-0.12, 0.12)
+    bmesh.ops.scale(bm, vec=scale, verts=bm.verts)
+    bmesh.ops.translate(bm, vec=loc, verts=bm.verts)
+    return W.new_object(name, bm, mat)
+
+
+def stall(cloth, goods):
+    """A market stall: timber posts, a counter, a striped awning sloping to the front with a
+    scalloped edge, goods on the counter and a shelf behind, a lantern hung under the awning.
+    3 m wide, 2 m deep; its front (the customers' side) faces -Y (the game's +z at yaw 0)."""
+    import random
+    rnd = random.Random(hash(goods) & 0xFFFF)
+    parts = []
+    for x in (-1.45, 1.45):
+        parts.append(box("post_front", (0.1, 0.1, 2.3), (x, -0.95, 1.15), "wood_dark", 0.012))
+        parts.append(box("post_back", (0.1, 0.1, 2.65), (x, 0.95, 1.325), "wood_dark", 0.012))
+        parts.append(box("side_rail", (0.06, 1.9, 0.08), (x, 0.0, 2.2), "wood", 0.01))
+    # the counter: a panelled front, a thick top
+    parts.append(box("counter", (2.8, 0.55, 0.9), (0, -0.7, 0.45), "wood", 0.015))
+    for x in (-0.95, 0.0, 0.95):
+        parts.append(box("panel", (0.8, 0.03, 0.62), (x, -0.985, 0.46), "wood_dark", 0.01))
+    parts.append(box("counter_top", (2.95, 0.68, 0.07), (0, -0.7, 0.93), "wood_dark", 0.012))
+    # the shelf behind
+    parts.append(box("shelf", (2.6, 0.4, 0.05), (0, 0.75, 1.1), "wood", 0.01))
+    parts.append(box("shelf2", (2.6, 0.35, 0.05), (0, 0.78, 1.55), "wood", 0.01))
+    # the awning: stripes from the back beam down past the front, a scalloped valance
+    slope = math.atan2(0.55, 2.4)
+    stripes = 10
+    for k in range(stripes):
+        x = -1.6 + (k + 0.5) * 3.2 / stripes
+        s = box("awning", (3.2 / stripes + 0.002, 2.45, 0.03), (0, 0, 0), cloth if k % 2 == 0 else "cream", 0.006)
+        s.rotation_euler = (-slope, 0, 0)
+        s.location = (x, -0.25, 2.42)
+        parts.append(s)
+    for k in range(stripes * 2):
+        x = -1.6 + (k + 0.5) * 3.2 / (stripes * 2)
+        tab = W.cyl("valance", 0.085, -1.482, -1.458, cloth if (k // 2) % 2 == 0 else "cream", x=0.0, z=1.98, verts=10, axis="Y", bevel=0.002)
+        tab.location = (x, 0, 0)
+        parts.append(tab)
+    parts.append(box("valance_band", (3.2, 0.03, 0.12), (0, -1.47, 2.08), cloth, 0.005))
+    # goods
+    if goods == "produce":
+        for k in range(4):
+            cx = -1.05 + k * 0.7
+            parts.append(box("crate", (0.55, 0.42, 0.18), (cx, -0.72, 1.05), "wood", 0.01))
+            mat = ("fruit_red", "fruit_orange", "fruit_green", "fruit_red")[k]
+            for j in range(9):
+                parts.append(W.sphere("fruit", 0.055, (cx - 0.18 + (j % 3) * 0.18 + rnd.uniform(-0.02, 0.02), -0.84 + (j // 3) * 0.12, 1.17 + rnd.uniform(0, 0.03)), mat, seg=8, rings=6))
+        for k in range(5):
+            parts.append(cyl_z("basket", 0.17, 1.13, 1.33, "wood_light", x=-1.0 + k * 0.5, y=0.78, r1=0.21, verts=10))
+            parts.append(blob("greens", 0.15, (-1.0 + k * 0.5, 0.78, 1.37), "leaf", scale=(1, 1, 0.6), sub=1, seed=k))
+    elif goods == "cloth":
+        for k in range(5):
+            cx = -1.1 + k * 0.55
+            for j in range(4):
+                mat = ("cloth_red", "cloth_teal", "cloth_ochre", "cream", "felt")[(k + j) % 5]
+                parts.append(box("bolt", (0.46, 0.4, 0.07), (cx, -0.72, 1.0 + j * 0.075), mat, 0.02))
+        for k in range(6):
+            mat = ("cloth_teal", "cloth_red", "cream", "cloth_ochre", "felt", "cloth_teal")[k]
+            parts.append(W.cyl("roll", 0.07, -0.18, 0.18, mat, x=0.78, z=1.2, verts=10, axis="X", bevel=0.01))
+            parts[-1].location = (-1.1 + k * 0.44, 0, 0)
+        for k in range(4):
+            sc = box("scarf", (0.3, 0.02, 0.6), (-0.9 + k * 0.6, -0.92, 1.85), ("cloth_red", "cloth_ochre", "cloth_teal", "cream")[k], 0.01)
+            parts.append(sc)
+    else:  # pottery
+        for k in range(6):
+            cx = -1.15 + k * 0.46
+            hgt = rnd.uniform(0.18, 0.34)
+            parts.append(cyl_z("pot", 0.12, 0.965, 0.965 + hgt, "clay", x=cx, y=-0.72, r1=rnd.uniform(0.06, 0.1), verts=12))
+            parts.append(cyl_z("pot_lip", 0.075, 0.965 + hgt, 0.985 + hgt, "clay", x=cx, y=-0.72, verts=12))
+        for k in range(5):
+            parts.append(W.sphere("jar", 0.16, (-1.0 + k * 0.5, 0.75, 1.3), "clay", seg=12, rings=8, scale=(1, 1, 1.15)))
+            parts.append(W.sphere("jar2", 0.12, (-0.8 + k * 0.42, 0.78, 1.72), "cream", seg=10, rings=7, scale=(1, 1, 1.2)))
+    # a sign board over the counter, a lantern hung from the awning's front beam
+    parts.append(box("sign", (1.1, 0.05, 0.32), (0, -1.2, 2.45), "wood_dark", 0.01))
+    parts.append(box("sign_face", (0.95, 0.02, 0.22), (0, -1.23, 2.45), "paper", 0.004))
+    parts.append(cyl_z("lantern_chain", 0.008, 1.7, 2.05, "metal_dark", x=1.2, y=-0.95, verts=6))
+    parts.append(box("lantern_glass", (0.16, 0.16, 0.22), (1.2, -0.95, 1.58), "glass", 0.004))
+    parts.append(box("lantern_cap", (0.2, 0.2, 0.04), (1.2, -0.95, 1.71), "metal_dark", 0.005))
+    return [W.bake(parts, f"stall_{goods}")]
+
+
+def tree():
+    """A plaza tree: a stone ring with soil, a leaning trunk with two branches, a crown of lumpy
+    leaf clumps (darker inside, lighter out)."""
+    parts = []
+    for a in range(10):
+        ang = a * math.tau / 10
+        b = box("ring_stone", (0.62, 0.32, 0.42), (0, 0, 0), "stone", 0.03)
+        b.rotation_euler = (0, 0, ang)
+        b.location = (math.sin(ang) * 0.95, math.cos(ang) * 0.95, 0.21)
+        parts.append(b)
+    parts.append(cyl_z("soil", 0.9, 0.0, 0.36, "soil", verts=16))
+    trunk = [(0.0, 0.0, 0.3), (0.05, 0.02, 1.2), (0.12, -0.03, 2.1), (0.08, 0.0, 2.9)]
+    parts.append(W.tube_path("trunk", trunk, 0.17, "wood", sides=10))
+    parts.append(W.tube_path("branch_a", [(0.1, 0.0, 1.9), (0.6, 0.2, 2.6), (0.9, 0.3, 3.1)], 0.07, "wood", sides=7))
+    parts.append(W.tube_path("branch_b", [(0.08, 0.0, 2.2), (-0.5, -0.3, 2.9), (-0.8, -0.4, 3.3)], 0.06, "wood", sides=7))
+    for k, (x, y, z, r, mat) in enumerate(((0.0, 0.0, 3.4, 1.15, "leaf_dark"), (0.9, 0.3, 3.3, 0.85, "leaf"), (-0.8, -0.4, 3.5, 0.85, "leaf"), (0.2, -0.8, 3.2, 0.75, "leaf"),
+                                           (-0.2, 0.8, 3.6, 0.8, "leaf"), (0.1, 0.1, 4.15, 0.75, "leaf"), (0.7, -0.4, 3.9, 0.6, "leaf"), (-0.6, 0.5, 4.0, 0.6, "leaf"))):
+        parts.append(blob("crown", r, (x, y, z), mat, scale=(1, 1, 0.82), sub=2, seed=k + 3))
+    return [W.bake(parts, "tree")]
+
+
+def planter():
+    """A long stone planter: a bush along it and flowers in three colours."""
+    import random
+    rnd = random.Random(11)
+    parts = [box("planter", (1.8, 0.62, 0.5), (0, 0, 0.25), "stone", 0.03), box("rim", (1.9, 0.72, 0.08), (0, 0, 0.5), "stone", 0.02),
+             box("soil", (1.66, 0.5, 0.06), (0, 0, 0.5), "soil", 0.0)]
+    for k in range(4):
+        parts.append(blob("bush", 0.3, (-0.6 + k * 0.4, rnd.uniform(-0.05, 0.05), 0.68), "leaf" if k % 2 else "leaf_dark", scale=(1.1, 0.9, 0.85), sub=1, seed=k + 20))
+    for k in range(22):
+        mat = ("flower_pink", "flower_white", "flower_yellow")[k % 3]
+        parts.append(W.sphere("flower", 0.05, (rnd.uniform(-0.8, 0.8), rnd.uniform(-0.24, 0.24), rnd.uniform(0.78, 0.98)), mat, seg=6, rings=4, scale=(1, 1, 0.6)))
+    return [W.bake(parts, "planter")]
+
+
 PIECES = {
     "fountain": fountain,
     "bench": bench,
@@ -272,6 +419,11 @@ PIECES = {
     "chair": chair,
     "mirror": mirror,
     "wardrobe": wardrobe,
+    "stall_produce": lambda: stall("cloth_red", "produce"),
+    "stall_cloth": lambda: stall("cloth_teal", "cloth"),
+    "stall_pottery": lambda: stall("cloth_ochre", "pottery"),
+    "tree": tree,
+    "planter": planter,
 }
 
 

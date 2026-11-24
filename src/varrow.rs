@@ -339,6 +339,7 @@ pub fn world() -> World {
     for z in [-20.0f32, 0.0, 20.0] {
         put(BannerB, -h + 0.02, 6.4, z, hp);
     }
+    market(&mut v, &mut props, &mut torches);
     // ivy
     let mut vines = Vec::new();
     for (k, x) in [-30.0f32, -18.0, 2.0, 16.0].iter().enumerate() {
@@ -362,6 +363,88 @@ pub fn world() -> World {
         water: vec![Aabb::new(v3(-3.8, 0.0, -3.8), v3(3.8, 0.4, 3.8))],
     }
 }
+
+/// The market stalls: (kind, centre, the way its front faces). Off the regulars' paths and the
+/// Rooftop Run.
+pub const STALLS: [(PropKind, f32, f32, f32, f32); 4] = [
+    (PropKind::HubStallProduce, -12.0, 16.6, 0.0, -1.0),
+    (PropKind::HubStallCloth, 12.0, 16.6, 0.0, -1.0),
+    (PropKind::HubStallPottery, 20.8, 6.5, -1.0, 0.0),
+    (PropKind::HubStallProduce, 20.8, -6.5, -1.0, 0.0),
+];
+/// Trees in their stone rings (centre).
+pub const TREES: [(f32, f32); 4] = [(-16.0, 9.0), (16.0, 10.5), (-7.0, -21.0), (14.0, -21.5)];
+
+/// Varrow's market and greenery: the stalls (each solid, lit by its own lantern), trees and
+/// planters, crates and barrels round the stalls, more banners, and warm light from the plaza's
+/// lamp posts.
+fn market(v: &mut Vec<Block>, props: &mut Vec<Prop>, torches: &mut Vec<V3>) {
+    let mut put = |props: &mut Vec<Prop>, kind: PropKind, x: f32, y: f32, z: f32, yaw: f32| props.push(Prop { kind, pos: v3(x, y, z), yaw, scale: 1.0, team: 255 });
+    for (kind, x, z, fx, fz) in STALLS {
+        let yaw = fx.atan2(fz);
+        put(props, kind, x, 0.0, z, yaw);
+        // solid where it stands (3 m along its front, 2 m deep), to the awning's height
+        let (hw, hd) = if fx.abs() > 0.5 { (1.0, 1.5) } else { (1.5, 1.0) };
+        v.push(bx(x - hw, 0.0, z - hd, x + hw, 2.3, z + hd, Mat::Hidden));
+        // its lantern (under the awning's front corner) lights the counter
+        let (lx, lz) = (1.2f32, 0.95f32);
+        let (c, s) = (yaw.cos(), yaw.sin());
+        torches.push(v3(x + lx * c + lz * s, 1.55, z - lx * s + lz * c));
+    }
+    for (x, z) in TREES {
+        put(props, PropKind::HubTree, x, 0.0, z, (x * 0.37 + z).sin() * 3.0);
+        // the ring is a low step, the trunk solid
+        v.push(bx(x - 1.15, 0.0, z - 1.15, x + 1.15, 0.42, z + 1.15, Mat::Hidden));
+        v.push(bx(x - 0.22, 0.42, z - 0.22, x + 0.22, 3.0, z + 0.22, Mat::Hidden));
+    }
+    // planters under the pits' walls and along the Gallery's
+    let hp = std::f32::consts::FRAC_PI_2;
+    for (x, z, yaw) in [(-16.5f32, 20.3f32, 0.0f32), (-8.0, 20.3, 0.0), (8.0, 20.3, 0.0), (16.5, 20.3, 0.0), (23.4, 1.5, hp), (23.4, 14.0, hp)] {
+        put(props, PropKind::HubPlanter, x, 0.0, z, yaw);
+        let (hw, hd) = if yaw != 0.0 { (0.36, 0.95) } else { (0.95, 0.36) };
+        v.push(bx(x - hw, 0.0, z - hd, x + hw, 0.55, z + hd, Mat::Hidden));
+    }
+    // crates and barrels round the stalls
+    for (kind, x, z, yaw) in [
+        (PropKind::Crate, -14.3, 17.9, 0.3),
+        (PropKind::Barrel, -9.6, 17.8, 0.0),
+        (PropKind::Barrel, -9.3, 16.9, 1.2),
+        (PropKind::CrateStack, 14.6, 18.0, 0.2),
+        (PropKind::Barrel, 9.5, 17.6, 0.6),
+        (PropKind::Crate, 22.5, 9.0, 1.4),
+        (PropKind::Barrel, 22.6, 4.0, 0.0),
+        (PropKind::Crate, 22.6, -9.1, 0.2),
+        (PropKind::Barrel, 22.8, -3.9, 0.9),
+    ] {
+        put(props, kind, x, 0.0, z, yaw);
+        let r = if kind == PropKind::CrateStack { 0.85 } else if kind == PropKind::Crate { 0.5 } else { 0.35 };
+        v.push(bx(x - r, 0.0, z - r, x + r, if kind == PropKind::CrateStack { 1.6 } else { 0.9 }, z + r, Mat::Hidden));
+    }
+    // banners on the Gallery's wall and under the pits' walkway
+    for z in [-18.0f32, -2.0, 12.0] {
+        put(props, PropKind::BannerB, 23.98, 5.4, z, -hp);
+    }
+    for x in [-19.5f32, -14.0, 14.0, 19.5] {
+        put(props, PropKind::BannerA, x, 4.3, 20.98, std::f32::consts::PI);
+    }
+    // the plaza's lamp posts glow warm (their lanterns light the paving round them)
+    for (x, z) in [(-12.0f32, -12.0f32), (12.0, -12.0), (-12.0, 12.0), (12.0, 12.0), (-18.0, 0.0), (18.0, 0.0)] {
+        torches.push(v3(x, 3.1, z));
+    }
+}
+
+/// Bunting: strings of pennants across the square, (from, to) at their fixing points. They sag
+/// in the middle (the renderer hangs them, crate::gpu).
+pub const BUNTING: [(V3, V3); 8] = [
+    (V3 { x: -12.0, y: 3.45, z: -12.0 }, V3 { x: 12.0, y: 3.45, z: -12.0 }),
+    (V3 { x: -12.0, y: 3.45, z: 12.0 }, V3 { x: 12.0, y: 3.45, z: 12.0 }),
+    (V3 { x: -12.0, y: 3.45, z: -12.0 }, V3 { x: -12.0, y: 3.45, z: 12.0 }),
+    (V3 { x: 12.0, y: 3.45, z: -12.0 }, V3 { x: 12.0, y: 3.45, z: 12.0 }),
+    (V3 { x: 12.0, y: 3.45, z: -12.0 }, V3 { x: 24.0, y: 5.6, z: -14.0 }),
+    (V3 { x: -12.0, y: 3.45, z: -12.0 }, V3 { x: -14.0, y: 4.2, z: -29.7 }),
+    (V3 { x: -12.0, y: 3.45, z: 12.0 }, V3 { x: -14.0, y: 4.4, z: 20.9 }),
+    (V3 { x: 12.0, y: 3.45, z: 12.0 }, V3 { x: 14.0, y: 4.4, z: 20.9 }),
+];
 
 /// Where a point is in Varrow (the minimap's callouts).
 pub fn place(p: V3) -> &'static str {

@@ -291,7 +291,7 @@ fn toon(i: VOut, albedo_in: vec3<f32>, texel: vec3<f32>, n: vec3<f32>, ng: vec3<
   let mx = max(texel.r, max(texel.g, texel.b));
   let mn = min(texel.r, min(texel.g, texel.b));
   let sat = (mx - mn) / max(mx, 0.001);
-  if (kind == 0u) {
+  if (kind == 0u && i.ex.y < 0.52) {
     if (sat < 0.22 && mx > 0.42) { kind = 6u; }
     else if (texel.r > texel.g && texel.g > texel.b * 1.25 && texel.g > texel.r * 0.25 && sat > 0.4 && mx < 0.3) { kind = 7u; }
   }
@@ -366,7 +366,7 @@ fn shade(i: VOut) -> vec4<f32> {
   let layer = i.ex.x;
   let mat = i.ex.y;
   // every texture is sampled (and the derivatives taken) before any branch
-  let li = i32(clamp(layer, 0.0, 17.0) + 0.5);
+  let li = i32(clamp(layer, 0.0, 19.0) + 0.5);
   let t0 = textureSample(tex, samp, i.uv, li);
   let nt = textureSample(ntex, samp, i.uv, li);
   let t1 = textureSample(ctex, samp, i.uv, i32(max(layer, 0.0) + 0.5));
@@ -385,7 +385,7 @@ fn shade(i: VOut) -> vec4<f32> {
   let is_wpn = mat > 0.75 && mat < 1.25;
   let world_tex = layer >= 0.0 && !is_char && !is_wpn;
   // the level's own materials: the map's palette colour times soft brightness detail
-  let is_level = world_tex && (li <= 5 || (li >= 14 && li <= 16));
+  let is_level = world_tex && (li <= 5 || (li >= 14 && li <= 16) || li == 19);
   // the river (layer -2): rippling, dark, mirroring the sky and the lanterns
   let is_water = layer < -1.5;
   var base = i.col;
@@ -580,12 +580,15 @@ fn shade(i: VOut) -> vec4<f32> {
       let idx = min(slot, 8u) * 3u + zone - 1u;
       let word = insts[ii].dyes[idx / 16u][(idx / 4u) % 4u];
       dye = dye_pal((word >> ((idx % 4u) * 8u)) & 255u);
-      base = dye / 0.6;
+      let dk = (low >> 1u) & 7u;
+      let dl = dot(dye, vec3<f32>(0.2126, 0.7152, 0.0722));
+      base = select(mix(vec3<f32>(dl), dye, 0.78) * 0.86, dye, dk == 6u) / 0.6;
     }
     o.col = vec4<f32>(mix(base, vec3<f32>(1.5, 0.35, 0.3), insts[ii].tint1.w), 1.0);
     // (the kind of surface goes to the toon shader in ex.w)
     let kind = (low >> 1u) & 7u;
-    ex = vec4<f32>(f32(lay), 0.5, 1.0, f32(kind));
+    // (gear marked as plain cloth: 0.55, so the toon shader doesn't guess its kind by colour)
+    ex = vec4<f32>(f32(lay), select(0.5, 0.55, ((v.mat >> 22u) & 1u) == 1u), 1.0, f32(kind));
     if (kind == 4u && zone == 3u) {
       // the Rig's charm: a glow in its accent dye, bright while the set's bonus is on (dyex.x)
       let dc = dye;
@@ -1157,7 +1160,7 @@ impl MB {
 
 /// The hub's moving parts: the pieces on the game tables, the Rooftop Run's rings (the next
 /// one bright), your aim room's targets and sparring post.
-fn hub_visuals(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
+fn hub_visuals(op: &mut MB, ad: &mut MB, al: &mut MB, cam: &Cam, g: &Game) {
     use crate::boards::Board;
     let Some(h) = g.hub.as_ref() else { return };
     let near = |p: V3, r: f32| (p - cam.pos).len() < r;
@@ -1303,6 +1306,7 @@ fn hub_visuals(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
             ad.beam(cam, w[0], w[1], 0.05, lina(col, a));
         }
     }
+    hub_dressing(op, al, cam, g.time);
     // ---- your aim room: the targets, the sparring post
     if let Some(run) = h.aim.as_ref().filter(|a| !a.done) {
         if let Some(t) = run.target {
@@ -1324,6 +1328,114 @@ fn hub_visuals(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
                 ad.billboard(cam, tip, 0.25 + 0.2 * k, lina([255, 170, 60], 0.5 * k));
             }
         }
+    }
+}
+
+/// Varrow's moving dressing: bunting sagging between the lamp posts and the house fronts, its
+/// pennants stirring in the breeze; pigeons pecking along the fountain's rim and a few wheeling
+/// above it; and the paths people have worn smooth across the cobbles (round the fountain and out
+/// to the pits, the Gallery, the pavilion and the tailor's), a little paler and smoother.
+fn hub_dressing(op: &mut MB, al: &mut MB, cam: &Cam, time: f32) {
+    let flat = [-1.0f32, 0.0, 1.0, 0.25];
+    let near = |p: V3, r: f32| (p - cam.pos).len() < r;
+    // ---- bunting
+    let colours = [lin([170, 44, 36]), lin([214, 160, 56]), lin([38, 112, 110]), lin([224, 210, 180])];
+    let cord = lin([60, 46, 34]);
+    for (k, (a, b)) in crate::varrow::BUNTING.iter().enumerate() {
+        if !near((*a + *b) * 0.5, 60.0) {
+            continue;
+        }
+        let len = (*b - *a).len();
+        let sag = 0.2 + 0.035 * len;
+        let at = |t: f32| *a + (*b - *a) * t - V3::UP * (sag * 4.0 * t * (1.0 - t));
+        let dir = (*b - *a).norm();
+        let side = v3(dir.z, 0.0, -dir.x).norm();
+        let segs = 14;
+        for s in 0..segs {
+            let (t0, t1) = (s as f32 / segs as f32, (s + 1) as f32 / segs as f32);
+            op.tube(at(t0), at(t1), 0.012, 0.012, side, 1.0, cord, -1.0, 0.1);
+        }
+        let n = (len / 0.42) as usize;
+        for f in 1..n {
+            let t = f as f32 / n as f32;
+            let w = 0.13 / len;
+            let (p0, p1) = (at((t - w).max(0.0)), at((t + w).min(1.0)));
+            let sway = (time * 2.3 + f as f32 * 0.9 + k as f32).sin() * 0.06;
+            let tip = (p0 + p1) * 0.5 - V3::UP * 0.27 + side * sway;
+            let col = colours[(f + k) % colours.len()];
+            let nrm = (p1 - p0).cross(tip - p0).norm();
+            op.quad([p0, p1, tip, tip], nrm, [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.5, 1.0]], col, flat);
+        }
+    }
+    // ---- pigeons on the fountain's rim, pecking and shuffling along it
+    let fountain = v3(0.0, 0.0, 0.0);
+    if near(fountain, 45.0) {
+        let grey = lin([112, 112, 120]);
+        let dark = lin([64, 66, 78]);
+        let neck = lin([70, 110, 104]);
+        for k in 0..7 {
+            let kf = k as f32;
+            // along the square rim: which side, and where along it (a slow wander)
+            let side = k % 4;
+            let along = ((time * 0.07 + kf * 1.37).sin() * 3.2).clamp(-3.6, 3.6);
+            let (x, z, yaw) = match side {
+                0 => (along, -4.1, 0.0f32),
+                1 => (4.1, along, 1.57),
+                2 => (-along, 4.1, 3.14),
+                _ => (-4.1, -along, -1.57),
+            };
+            let p = v3(x, 0.72, z);
+            let ang = yaw + (time * 0.9 + kf).sin() * 0.6;
+            let rot = M3::rot_y(ang);
+            let fwd = v3(ang.sin(), 0.0, ang.cos());
+            let peck = ((time * 3.0 + kf * 2.1).sin().max(0.0)).powf(4.0);
+            op.ellipsoid(p + v3(0.0, 0.06, 0.0), &rot, v3(0.055, 0.05, 0.09), grey, -1.0, 0.8, 0.0);
+            op.ellipsoid(p + v3(0.0, 0.06, 0.0) - fwd * 0.07, &rot, v3(0.04, 0.02, 0.06), dark, -1.0, 0.8, 0.0);
+            let head = p + v3(0.0, 0.12 - 0.07 * peck, 0.0) + fwd * (0.08 + 0.03 * peck);
+            op.ellipsoid((p + v3(0.0, 0.08, 0.0) + head) * 0.5, &rot, v3(0.03, 0.035, 0.03), neck, -1.0, 0.8, 0.0);
+            op.ellipsoid(head, &rot, v3(0.028, 0.028, 0.032), grey, -1.0, 0.8, 0.0);
+        }
+        // and a few wheeling above it, wings beating
+        for k in 0..4 {
+            let kf = k as f32;
+            let a = time * (0.35 + 0.07 * kf) + kf * 1.6;
+            let r = 7.0 + 2.5 * kf.sin().abs();
+            let p = v3(a.cos() * r, 7.0 + kf * 0.8 + (time * 0.5 + kf).sin() * 0.6, a.sin() * r);
+            let fwd = v3(-a.sin(), 0.0, a.cos());
+            let right = v3(fwd.z, 0.0, -fwd.x);
+            let flap = (time * 9.0 + kf * 2.0).sin();
+            let rot = M3::rot_y(fwd.x.atan2(fwd.z));
+            op.ellipsoid(p, &rot, v3(0.06, 0.05, 0.13), lin([96, 96, 104]), -1.0, 0.8, 0.0);
+            for s in [-1.0f32, 1.0] {
+                let root = p + right * (s * 0.04);
+                let tip = p + right * (s * 0.3) + V3::UP * (flap * 0.16);
+                let back = root - fwd * 0.08;
+                op.quad([root + fwd * 0.05, tip, back, back], V3::UP, [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]], lin([84, 84, 94]), flat);
+            }
+        }
+    }
+    // ---- the worn paths
+    let wear = lina([236, 226, 206], 0.1);
+    let soft = lina([236, 226, 206], 0.05);
+    let mut strip = |a: V3, b: V3, w: f32| {
+        let d = (b - a).flat().norm();
+        let s = v3(d.z, 0.0, -d.x);
+        let y = v3(0.0, 0.012, 0.0);
+        for (half, col) in [(w * 0.5, soft), (w * 0.3, wear)] {
+            al.quad([a + s * half + y, b + s * half + y, b - s * half + y, a - s * half + y], V3::UP, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], col, [-1.0, 3.0, 1.0, 0.0]);
+        }
+    };
+    // round the fountain
+    let ring = 6.4;
+    for k in 0..24 {
+        let (a0, a1) = (k as f32 / 24.0 * std::f32::consts::TAU, (k + 1) as f32 / 24.0 * std::f32::consts::TAU);
+        strip(v3(a0.cos() * ring, 0.0, a0.sin() * ring), v3(a1.cos() * ring, 0.0, a1.sin() * ring), 1.6);
+    }
+    // out from it: south to the arrivals and the tailor's, north to the steps, east to the
+    // Gallery's door, west to the pavilion
+    for (a, b) in [(v3(0.0, 0.0, -ring), v3(0.0, 0.0, -16.0)), (v3(0.0, 0.0, -16.0), v3(-8.0, 0.0, -28.0)), (v3(0.0, 0.0, ring), v3(0.0, 0.0, 12.0)),
+                   (v3(ring, 0.0, 0.0), v3(19.0, 0.0, -4.0)), (v3(19.0, 0.0, -4.0), v3(22.0, 0.0, -30.0)), (v3(-ring, 0.0, 0.0), v3(-20.5, 0.0, -2.0))] {
+        strip(a, b, 1.5);
     }
 }
 
@@ -2387,7 +2499,7 @@ fn decal_into(al: &mut MB, ad: &mut MB, d: &crate::game::Decal) {
         }
     }
 }
-fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, flash: f32, sc: f32) {
+fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &character::Posed, st: &mut CharState, time: f32, lk: &Look, flash: f32, sc: f32, coat_covered: bool) {
     let tint = |c: [u8; 3]| -> [f32; 4] {
         let l = lin(c);
         [l[0] + (1.0 - l[0]) * flash, l[1] + (0.3 - l[1]).max(0.0) * flash, l[2] + (0.3 - l[2]).max(0.0) * flash, 1.0]
@@ -2395,7 +2507,7 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     let dressed = crate::chars::shared().is_some();
     if dressed {
         // the fighters have real hair; the long coat is cloth that swings and drapes
-        if (f.alive || f.death_t < 3.0) && !wears_work_coat(f) {
+        if (f.alive || f.death_t < 3.0) && !wears_work_coat(f) && !coat_covered {
             coat_cloth(mb, p, st, time, lk, sc, f.loadout.body, f.loadout.outfit);
         }
     } else {
@@ -2556,8 +2668,8 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
     if dist > 2.5 && to.dot(cam.fwd) < dist * 0.15 {
         return;
     }
-    // emoting in the hub: hands free
-    if f.hub.emote != 0 && f.hub.pit == 255 {
+    // emoting in the hub, or one of its townsfolk: hands free
+    if (f.hub.emote != 0 && f.hub.pit == 255) || f.hub.townsfolk {
         return;
     }
     // (a Ledger Duels item with its own model is held in place of the kind it fights as; in the
@@ -3657,7 +3769,7 @@ impl Gpu {
         let mut inst_gear: Vec<Vec<u8>> = Vec::new();
         // Afterimage decoys are drawn as their owners (after the real fighters)
         // (and an execution's afterimages, after them)
-        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).chain(g.exec_ghosts()).chain(g.hub_ghosts()).take(MAX_INST - MAX_PLAYERS).collect();
+        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).chain(g.exec_ghosts()).chain(g.hub_ghosts()).chain(g.hub_townsfolk(cam.pos)).take(MAX_INST - MAX_PLAYERS).collect();
         for (i, f) in g.f.iter().enumerate().chain(decoys.iter().enumerate().map(|(k, f)| (MAX_PLAYERS + k, f))) {
             if !f.present || f.spectate {
                 continue;
@@ -3759,8 +3871,13 @@ impl Gpu {
                     }
                     insts.push(data);
                     inst_body.push(f.loadout.body as usize);
+                    // (a worn body, legs or cape piece takes the cloth coat's place)
+                    let covered = wear.iter().any(|&id| {
+                        let s = crate::chars::piece_slot(id);
+                        s == crate::hub::Slot::Body as u32 + 1 || s == crate::hub::Slot::Legs as u32 + 1 || s == crate::hub::Slot::Cape as u32 + 1
+                    });
                     inst_gear.push(wear);
-                    character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash, g.tune.char_scale);
+                    character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash, g.tune.char_scale, covered);
                 }
                 None => fighter_mesh(&mut op, &mut ad, cam, f, pos, g.time),
             }
@@ -3840,7 +3957,7 @@ impl Gpu {
                 ad.billboard(cam, top - v3(0.0, 0.25, 0.0), 0.7, lina(col, 0.25));
             }
         }
-        hub_visuals(&mut op, &mut ad, cam, g);
+        hub_visuals(&mut op, &mut ad, &mut al, cam, g);
         for gr in &g.grenades {
             if gr.kind == 2 {
                 // a throwing star, spinning flat as it flies, with a faint streak behind. Fresh

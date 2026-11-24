@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::boards::{self, AnyMove, Board, CMove, GameKind, Level, Outcome};
-use crate::hub::{self, DuelKind, Emote, HubSave, Outfit, Slot, TableAct, LOOKS, SEAT_NONE, TABLE_SEATS};
+use crate::hub::{self, DuelKind, Emote, HubSave, LookItem, Outfit, Slot, TableAct, LOOKS, SEAT_NONE, TABLE_SEATS};
 use crate::hub_aim::Drill;
 use crate::varrow;
 
@@ -61,6 +61,48 @@ pub struct HubUi {
     /// (picture scenes) everything unlocked, and how many regulars.
     pub unlock_all: bool,
     pub bots: Option<usize>,
+    /// The wardrobe: the slot picked on the left, how far the preview has turned (radians), when
+    /// it was last dragged (game time; it turns by itself after a while), the icons.
+    pub ward_slot: usize,
+    pub spin: f32,
+    pub spun_at: f64,
+    pub icons: Option<egui::TextureHandle>,
+    /// Saved outfits' thumbnails (by the outfit's key), the ones that have none on disk, a
+    /// thumbnail being taken (its key) and the frame it waits for.
+    pub thumbs: std::collections::HashMap<u64, egui::TextureHandle>,
+    pub no_thumb: std::collections::HashSet<u64>,
+    pub thumb_req: Option<u64>,
+    pub thumb_pending: Option<u64>,
+    pub thumb_slot: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<egui::ColorImage>>>>,
+    /// Where the preview is on screen (the thumbnail is cut from there).
+    pub preview: Option<Rect>,
+    /// Turn the view to this heading (the wardrobe turns you to face the room).
+    pub turn_to: Option<f32>,
+}
+
+/// A saved outfit's key (its name and what it is), for its thumbnail file.
+pub fn outfit_key(name: &str, o: &Outfit) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    o.to_text().hash(&mut h);
+    h.finish()
+}
+
+fn thumb_path(key: u64) -> Option<PathBuf> {
+    hub_save_path().and_then(|p| p.parent().map(|d| d.join("outfits").join(format!("{key:016x}.png"))))
+}
+
+/// The wardrobe's icons (tools/blender/build_look_icons.py): one per look, in hub::LOOKS order,
+/// 8 a row.
+const LOOK_ICONS: &[u8] = include_bytes!("../assets/ui/look_icons.png");
+const ICON_COLS: usize = 8;
+
+fn icon_uv(id: u8) -> Option<Rect> {
+    let k = LOOKS.iter().position(|l| l.id == id)?;
+    let rows = LOOKS.len().div_ceil(ICON_COLS) as f32;
+    let (c, r) = ((k % ICON_COLS) as f32, (k / ICON_COLS) as f32);
+    Some(Rect::from_min_max(Pos2::new(c / ICON_COLS as f32, r / rows), Pos2::new((c + 1.0) / ICON_COLS as f32, (r + 1.0) / rows)))
 }
 
 impl HubUi {
@@ -285,6 +327,13 @@ impl App {
             } else if flat_dist(pos, v3(varrow::MIRROR.0, 0.0, varrow::MIRROR.2)) < 3.2 || varrow::WARDROBES.iter().any(|w| flat_dist(pos, v3(w.0, 0.0, w.2)) < 2.0) {
                 ui.panel = Some(HubPanel::Wardrobe);
                 ui.mirror = true;
+                // turn round to face the room: the preview camera stands in front of you
+                let mirror = v3(varrow::MIRROR.0, 0.0, varrow::MIRROR.2);
+                let away = (pos - mirror).flat();
+                let away = if away.len() > 0.1 { away.norm() } else { v3(0.0, 0.0, 1.0) };
+                ui.turn_to = Some(away.x.atan2(away.z));
+                ui.spin = 0.4;
+                ui.spun_at = game.time as f64 + 2.0;
             } else if let Some(k) = varrow::LECTERNS.iter().position(|l| flat_dist(pos, v3(l.0, 0.0, l.2)) < 1.8) {
                 ui.panel = Some(HubPanel::Lectern(k));
             } else if let Some(k) = [varrow::BOARDS[0], varrow::BOARDS[1], varrow::GALLERY_BOARD, varrow::RUN_BOARD].iter().position(|b| flat_dist(pos, v3(b.0, 0.0, b.2)) < 3.0) {
@@ -338,13 +387,20 @@ impl App {
                 ui.painter().text(c, Align2::CENTER_CENTER, "EMOTES", FontId::proportional(18.0 * s), ACCENT);
             });
         }
+        if matches!(ui_state.panel, Some(HubPanel::Wardrobe)) {
+            if wardrobe_screen(ctx, rect, s, game, ui_state) {
+                ui_state.panel = None;
+                ui_state.mirror = false;
+            }
+            return;
+        }
         let Some(panel) = ui_state.panel else {
             // seated at a table: its board
             let seat = game.f[me].hub.seat;
             if seat != SEAT_NONE && seat >= TABLE_SEATS {
                 let t = ((seat - TABLE_SEATS) / 2) as usize;
                 table_panel(ctx, rect, s, game, t, &mut ui_state.sel, true);
-            } else if let Some(t) = varrow::TABLES.iter().position(|tb| flat_dist(game.f[me].pos, v3(tb.0, 0.0, tb.1)) < 2.6) {
+            } else if let Some(t) = varrow::TABLES.iter().position(|tb| flat_dist(game.f[me].pos, v3(tb.0, 0.0, tb.1)) < 2.6 && (game.f[me].pos.y - varrow::DECK).abs() < 1.0) {
                 // standing by one: watch it
                 table_panel(ctx, rect, s, game, t, &mut ui_state.sel, false);
             }
@@ -356,7 +412,7 @@ impl App {
             ui_kit::panel_frame(ui, |ui| {
                 ui.set_width(400.0 * s);
                 egui::ScrollArea::vertical().max_height(rect.height() - 200.0 * s).show(ui, |ui| match panel {
-                    HubPanel::Wardrobe => wardrobe(ui, game, ui_state, s),
+                    HubPanel::Wardrobe => {}
                     HubPanel::Lectern(k) => lectern(ui, game, ui_state, k, &mut close),
                     HubPanel::Board(k) => board(ui, game, k, &mut close),
                     HubPanel::Challenge(t) => challenge(ui, game, t, &mut close),
@@ -380,23 +436,14 @@ impl App {
         let me = g.local;
         let f = &g.f[me];
         let mid = rect.center().x;
-        // names over heads (who you could challenge, what they wear)
-        for (k, o) in g.f.iter().enumerate() {
-            if k == me || !o.present {
-                continue;
-            }
-            let head = o.pos + v3(0.0, 2.15, 0.0);
-            let d = (head - cam.pos).len();
-            if d > 18.0 || !g.world.line_clear(cam.pos, head) {
-                continue;
-            }
-            if let Some(sp) = cam.project(head) {
-                let a = ((18.0 - d) / 6.0).clamp(0.0, 1.0);
-                let col = Color32::from_rgba_unmultiplied(235, 230, 220, (a * 230.0) as u8);
-                text_shadow(p, sp, Align2::CENTER_BOTTOM, &o.name, 15.0 * s, col);
-                if o.hub.emote != 0 {
-                    text_shadow(p, sp + Vec2::new(0.0, 14.0 * s), Align2::CENTER_BOTTOM, Emote::from_u8(o.hub.emote).name(), 12.0 * s, Color32::from_rgba_unmultiplied(255, 200, 140, (a * 200.0) as u8));
-                }
+        // names over heads: nearest first, smaller and fainter further off, and stacked upwards
+        // when they would overlap in a crowd (a name with no room left is left out); an emote's
+        // name shows under it only for its first moments
+        for (sp, size, a, name, emote) in Self::name_tags(g, cam, s) {
+            let col = Color32::from_rgba_unmultiplied(235, 230, 220, (a * 235.0) as u8);
+            text_shadow(p, sp, Align2::CENTER_BOTTOM, &name, size, col);
+            if let Some((e, ea)) = emote {
+                text_shadow(p, sp + Vec2::new(0.0, size * 0.95), Align2::CENTER_BOTTOM, e, size * 0.8, Color32::from_rgba_unmultiplied(255, 200, 140, (a * ea * 210.0) as u8));
             }
         }
         // what E (or F) does here
@@ -510,12 +557,30 @@ impl App {
             return Some(Cam::new(ph.pos, ph.yaw, ph.pitch, self.settings.fov.min(80.0), rect));
         }
         if self.hub_ui.mirror {
-            // as the mirror shows you: in front, at your height, a little to the side
-            let yaw = game.f[me].yaw;
+            // the wardrobe's preview: in front of you (turned as far as it's been dragged), the
+            // whole fighter framed in the free space between the panels
+            let yaw = game.f[me].yaw + self.hub_ui.spin;
             let fwd = look_dir(yaw, 0.0);
-            let pos = body + fwd * 2.6 + v3(0.0, 1.45, 0.0) + v3(fwd.z, 0.0, -fwd.x) * 0.6;
-            let d = (body + v3(0.0, 1.05, 0.0) - pos).norm();
-            return Some(Cam::new(pos, d.x.atan2(d.z), d.y.asin(), 50.0, rect));
+            // (nearer if something stands between: never inside a wall)
+            let mut dist = 3.6;
+            while dist > 1.6 && !game.world.line_clear(body + v3(0.0, 1.1, 0.0), body + fwd * (dist + 0.3) + v3(0.0, 1.2, 0.0)) {
+                dist -= 0.2;
+            }
+            let pos0 = body + fwd * dist + v3(0.0, 1.2, 0.0);
+            let d = (body + v3(0.0, 0.78, 0.0) - pos0).norm();
+            let right = v3(d.z, 0.0, -d.x).norm();
+            // (the field of view is across the picture)
+            let fov: f32 = 62.0;
+            let shift = match self.hub_ui.preview {
+                Some(pr) => {
+                    let dx = (pr.center().x - rect.center().x) / rect.width().max(1.0);
+                    let w = 2.0 * dist * (fov.to_radians() * 0.5).tan();
+                    -dx * w
+                }
+                None => 0.0,
+            };
+            let pos = pos0 + right * shift;
+            return Some(Cam::new(pos, d.x.atan2(d.z), d.y.asin(), fov, rect));
         }
         let seat = game.f[me].hub.seat;
         if seat != SEAT_NONE && seat >= TABLE_SEATS {
@@ -527,6 +592,55 @@ impl App {
             return Some(Cam::new(pos, d.x.atan2(d.z), d.y.asin(), 55.0, rect));
         }
         None
+    }
+
+    /// A saved outfit's picture: the next frame is captured, the wardrobe's preview cut out of
+    /// it, shrunk and kept (in memory, and as a file beside the hub save).
+    pub fn take_outfit_thumb(&mut self, ctx: &egui::Context) {
+        let st = &mut self.hub_ui;
+        if let Some(key) = st.thumb_req.take() {
+            if st.thumb_pending.is_none() && self.screenshot.is_none() {
+                let slot = st.thumb_slot.clone();
+                ctx.request_screenshot(move |img| {
+                    if let Ok(mut s) = slot.lock() {
+                        *s = Some(img);
+                    }
+                });
+                st.thumb_pending = Some(key);
+            }
+        }
+        let Some(key) = st.thumb_pending else { return };
+        let got = st.thumb_slot.lock().ok().and_then(|mut s| s.take());
+        let Some(img) = got else { return };
+        st.thumb_pending = None;
+        let Some(pr) = st.preview else { return };
+        let ppp = ctx.pixels_per_point();
+        let [w, h] = img.size;
+        // a 4:5 picture round the middle of the preview
+        let ph = (pr.height() * ppp).min(h as f32);
+        let pw = (ph * 0.8).min(w as f32);
+        let x0 = ((pr.center().x * ppp - pw / 2.0).max(0.0) as usize).min(w.saturating_sub(1));
+        let y0 = ((pr.top() * ppp).max(0.0) as usize).min(h.saturating_sub(1));
+        let (cw, chh) = ((pw as usize).min(w - x0), (ph as usize).min(h - y0));
+        if cw < 8 || chh < 8 {
+            return;
+        }
+        let mut crop = image::RgbaImage::new(cw as u32, chh as u32);
+        for y in 0..chh {
+            for x in 0..cw {
+                let c = img.pixels[(y0 + y) * w + x0 + x].to_array();
+                crop.put_pixel(x as u32, y as u32, image::Rgba([c[0], c[1], c[2], 255]));
+            }
+        }
+        let small = image::imageops::resize(&crop, 160, 200, image::imageops::FilterType::Triangle);
+        if let Some(path) = thumb_path(key) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = small.save(&path);
+        }
+        st.no_thumb.remove(&key);
+        st.thumbs.insert(key, ctx.load_texture(format!("outfit-{key:x}"), egui::ColorImage::from_rgba_unmultiplied([160, 200], small.as_raw()), egui::TextureOptions::LINEAR));
     }
 
     /// Photo mode: fly the camera (WASD, the mouse, Space and Ctrl).
@@ -652,101 +766,345 @@ fn dye_combo(ui: &mut egui::Ui, id: String, v: &mut u8) -> bool {
     *v != before
 }
 
-/// Fashionscape: every slot, its look and its three dyes; whole sets; ten saved outfits.
-fn wardrobe(ui: &mut egui::Ui, g: &mut Game, st: &mut HubUi, s: f32) {
+/// A tile you can click: a frame (lit when picked or hovered) round whatever `draw` paints.
+fn tile(ui: &mut egui::Ui, size: Vec2, picked: bool, enabled: bool, draw: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(size, if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    let p = ui.painter_at(r.expand(2.0));
+    let hot = resp.hovered() && enabled;
+    let fill = if picked { Color32::from_rgba_unmultiplied(255, 150, 70, 70) } else if hot { Color32::from_rgba_unmultiplied(255, 255, 255, 26) } else { Color32::from_rgba_unmultiplied(10, 9, 18, 170) };
+    p.rect_filled(r, 6.0, fill);
+    p.rect_stroke(r, 6.0, Stroke::new(if picked { 2.0 } else { 1.0 }, if picked { ACCENT } else { Color32::from_gray(if hot { 170 } else { 80 }) }), egui::StrokeKind::Inside);
+    draw(&p, r.shrink(4.0));
+    resp
+}
+
+/// A look's icon (or, with no model, its name) into `r`; greyed when locked.
+fn paint_look(p: &egui::Painter, r: Rect, icons: Option<&egui::TextureHandle>, id: u8, locked: bool) {
+    match (icons, icon_uv(id)) {
+        (Some(t), Some(uv)) => {
+            let tint = if locked { Color32::from_rgba_unmultiplied(90, 90, 90, 150) } else { Color32::WHITE };
+            p.image(t.id(), r, uv, tint);
+        }
+        _ => {
+            let name = hub::look(id).map_or("nothing", |l| l.name);
+            p.text(r.center(), Align2::CENTER_CENTER, name, FontId::proportional(11.0), Color32::from_gray(if locked { 110 } else { 210 }));
+        }
+    }
+    if locked {
+        // a padlock
+        let c = r.right_top() + Vec2::new(-11.0, 12.0);
+        p.circle_stroke(c - Vec2::new(0.0, 4.0), 4.0, Stroke::new(2.0, Color32::from_gray(220)));
+        p.rect_filled(Rect::from_center_size(c + Vec2::new(0.0, 2.0), Vec2::new(12.0, 9.0)), 2.0, Color32::from_gray(220));
+    }
+}
+
+fn dye_color(k: u8) -> Color32 {
+    // (the dyes are linear: shown in sRGB, as the game draws them)
+    let c = crate::gear::dye(k);
+    let to = |v: f32| (v.max(0.0).powf(1.0 / 2.2) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(to(c[0]), to(c[1]), to(c[2]))
+}
+
+/// Fashionscape, the wardrobe: the nine slots down the left (each showing what's in it), your
+/// fighter large in the middle turning slowly (drag to turn it), the chosen slot's looks as a
+/// grid of icons on the right (locked ones greyed, with how to earn them), its three dye zones
+/// as swatches, randomise, copy what someone near you wears, whole sets, and along the bottom
+/// the ten saved outfits, each with its picture. Returns true to close.
+fn wardrobe_screen(ctx: &egui::Context, rect: Rect, s: f32, g: &mut Game, st: &mut HubUi) -> bool {
     let me = g.local;
     let earned = g.hub.as_ref().map(|h| h.earned).unwrap_or_default();
     let mut o = g.f[me].hub.look;
-    title(ui, "THE WARDROBE", s);
-    ui.label(egui::RichText::new("Pick a look for each slot and dye its coat, trim and accent. The mirror shows you.").color(Color32::from_gray(200)));
-    ui.add_space(6.0);
-    for slot in Slot::ALL {
-        let k = slot as usize;
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(slot.name()).strong().size(15.0 * s)).on_hover_text("a slot");
+    let mut close = false;
+    if st.icons.is_none() {
+        if let Ok(img) = image::load_from_memory(LOOK_ICONS) {
+            let img = img.to_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            st.icons = Some(ctx.load_texture("look-icons", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR));
+        }
+    }
+    let icons = st.icons.clone();
+    let slot = Slot::ALL[st.ward_slot.min(hub::SLOT_COUNT - 1)];
+    // ---- the slots, down the left
+    let tile_s = (58.0 * s).min(rect.height() / 11.5);
+    egui::Area::new(egui::Id::new("ward-slots")).fixed_pos(Pos2::new(rect.left() + 16.0 * s, rect.top() + 60.0 * s)).order(egui::Order::Foreground).show(ctx, |ui| {
+        ui_kit::panel_frame(ui, |ui| {
+        ui.set_width(tile_s + 140.0 * s);
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 5.0);
+        for (k, sl) in Slot::ALL.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let id = o.items[k];
+                let resp = tile(ui, Vec2::splat(tile_s), k == st.ward_slot, true, |p, r| {
+                    if id != 0 {
+                        paint_look(p, r, icons.as_ref(), id, false);
+                    }
+                });
+                if resp.clicked() {
+                    st.ward_slot = k;
+                }
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(sl.name()).strong().size(13.0 * s).color(if k == st.ward_slot { ACCENT } else { Color32::from_gray(220) }));
+                    ui.label(egui::RichText::new(hub::look(id).map_or("empty", |l| l.name)).size(11.5 * s).color(Color32::from_gray(215)));
+                });
+            });
+        }
         });
-        ui.horizontal(|ui| {
-            let cur = hub::look(o.items[k]).map_or("(nothing)", |l| l.name);
-            egui::ComboBox::from_id_salt(format!("look{k}")).width(190.0).selected_text(cur).show_ui(ui, |ui| {
-                ui.selectable_value(&mut o.items[k], 0, "(nothing)");
-                for l in LOOKS.iter().filter(|l| l.slot == slot) {
-                    if earned.has(l.unlock) {
-                        ui.selectable_value(&mut o.items[k], l.id, format!("{}  ({})", l.name, l.set));
-                    } else {
-                        ui.add_enabled(false, egui::Button::new(format!("{}  - {}", l.name, l.unlock.text())));
+    });
+    // ---- the chosen slot: its looks, its dyes, and the buttons, on the right
+    let panel_w = 400.0 * s;
+    let right = Pos2::new(rect.right() - panel_w - 24.0 * s, rect.top() + 60.0 * s);
+    let strip_h = 150.0 * s;
+    egui::Area::new(egui::Id::new("ward-panel")).fixed_pos(right).order(egui::Order::Foreground).show(ctx, |ui| {
+        ui_kit::panel_frame(ui, |ui| {
+            ui.set_width(panel_w);
+            egui::ScrollArea::vertical().max_height(rect.height() - strip_h - 110.0 * s).show(ui, |ui| {
+                title(ui, &format!("WARDROBE  ·  {}", slot.name().to_uppercase()), s);
+                let per_row = 5usize;
+                let cell = (panel_w - 24.0) / per_row as f32 - 6.0;
+                let mut choices: Vec<Option<&LookItem>> = vec![None];
+                choices.extend(LOOKS.iter().filter(|l| l.slot == slot).map(Some));
+                for row in choices.chunks(per_row) {
+                    ui.horizontal(|ui| {
+                        for l in row {
+                            let id = l.map_or(0, |l| l.id);
+                            let ok = l.is_none_or(|l| earned.has(l.unlock));
+                            let resp = tile(ui, Vec2::new(cell, cell), o.items[slot as usize] == id, ok, |p, r| {
+                                if id == 0 {
+                                    p.text(r.center(), Align2::CENTER_CENTER, "none", FontId::proportional(13.0 * s), Color32::from_gray(170));
+                                } else {
+                                    paint_look(p, r, icons.as_ref(), id, !ok);
+                                }
+                            });
+                            let tip = match l {
+                                Some(l) if ok => format!("{}\n{}", l.name, l.set),
+                                Some(l) => format!("{}\n{}\nLocked: {}", l.name, l.set, l.unlock.text()),
+                                None => "Nothing in this slot".to_string(),
+                            };
+                            let resp = resp.on_hover_text(tip);
+                            if resp.clicked() && ok {
+                                o.items[slot as usize] = id;
+                                if let Some(l) = l {
+                                    // a look from a set comes in that set's colours
+                                    o.dyes[slot as usize] = hub::set_dyes(l.set);
+                                }
+                            }
+                        }
+                    });
+                }
+                // what the hovered or chosen look is, and how to earn the locked ones
+                let locked: Vec<&LookItem> = LOOKS.iter().filter(|l| l.slot == slot && !earned.has(l.unlock)).collect();
+                if let Some(l) = hub::look(o.items[slot as usize]) {
+                    ui.label(egui::RichText::new(format!("{}  ·  {}", l.name, l.set)).strong().color(Color32::WHITE));
+                }
+                for l in locked.iter().take(3) {
+                    ui.label(egui::RichText::new(format!("Locked: {} - {}", l.name, l.unlock.text())).size(11.5 * s).color(Color32::from_gray(150)));
+                }
+                // the dye zones as swatches
+                let dyed = hub::look(o.items[slot as usize]).is_some_and(|l| l.piece != 0);
+                if dyed {
+                    ui.add_space(6.0);
+                    for (z, zone) in crate::gear::DYE_ZONES.iter().enumerate() {
+                        let cur = o.dyes[slot as usize][z];
+                        ui.label(egui::RichText::new(format!("{zone}: {}", crate::gear::DYES[cur as usize % crate::gear::DYES.len()].0)).size(12.5 * s).color(Color32::from_gray(210)));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                            for (k, (name, _)) in crate::gear::DYES.iter().enumerate() {
+                                let k = k as u8;
+                                let col = dye_color(k);
+                                let resp = tile(ui, Vec2::splat(11.5 * s), cur == k, true, |p, r| {
+                                    p.rect_filled(r.expand(2.0), 3.0, col);
+                                });
+                                if resp.on_hover_text(*name).clicked() {
+                                    o.dyes[slot as usize][z] = k;
+                                }
+                            }
+                        });
                     }
                 }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Randomise").on_hover_text("A random look in every slot from what you've earned, in random dyes").clicked() {
+                        o = randomised(g.time, &earned);
+                    }
+                    if ui.button("Take everything off").clicked() {
+                        o = Outfit::default();
+                    }
+                });
+                // copy what someone near you wears (what you've earned of it)
+                let near: Vec<(usize, String)> = g.f.iter().enumerate().filter(|(k, f)| *k != me && f.present && (f.pos - g.f[me].pos).flat().len() < 25.0).map(|(k, f)| (k, f.name.clone())).collect();
+                ui.horizontal(|ui| {
+                    ui.label("Copy from");
+                    egui::ComboBox::from_id_salt("ward-copy").width(170.0 * s).selected_text("a player near you").show_ui(ui, |ui| {
+                        if near.is_empty() {
+                            ui.label("nobody near");
+                        }
+                        for (k, n) in &near {
+                            if ui.selectable_label(false, n).clicked() {
+                                o = g.f[*k].hub.look.checked(&earned);
+                            }
+                        }
+                    });
+                });
+                ui.label(egui::RichText::new("Whole sets").strong());
+                ui.horizontal_wrapped(|ui| {
+                    for set in hub::sets() {
+                        let ok = LOOKS.iter().filter(|l| l.set == set).all(|l| earned.has(l.unlock));
+                        let resp = ui.add_enabled(ok, egui::Button::new(set));
+                        if resp.clicked() {
+                            o = o.with_set(set);
+                        }
+                        if !ok {
+                            if let Some(l) = LOOKS.iter().find(|l| l.set == set) {
+                                resp.on_disabled_hover_text(format!("To unlock: {}", l.unlock.text()));
+                            }
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                if ui.button("Close (Esc)").clicked() {
+                    close = true;
+                }
             });
-            if o.items[k] != 0 && hub::look(o.items[k]).is_some_and(|l| l.piece != 0) {
-                for z in 0..3 {
-                    dye_combo(ui, format!("dye{k}{z}"), &mut o.dyes[k][z]);
-                }
-            }
         });
-    }
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("Whole sets").strong());
-    ui.horizontal_wrapped(|ui| {
-        for set in hub::sets() {
-            let ok = LOOKS.iter().filter(|l| l.set == set).all(|l| earned.has(l.unlock));
-            let resp = ui.add_enabled(ok, egui::Button::new(set));
-            if resp.clicked() {
-                o = o.with_set(set);
-            }
-            if !ok {
-                if let Some(l) = LOOKS.iter().find(|l| l.set == set) {
-                    resp.on_disabled_hover_text(format!("To unlock: {}", l.unlock.text()));
-                }
-            }
-        }
-        if ui.button("Take everything off").clicked() {
-            o = Outfit::default();
-        }
     });
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new(format!("Saved outfits ({}/{})", st.save.outfits.len(), hub::OUTFIT_SAVES)).strong());
+    // ---- the saved outfits along the bottom, each with its picture
+    let n_slots = hub::OUTFIT_SAVES;
+    let cw = ((rect.width() - 48.0 * s) / n_slots as f32 - 8.0).min(96.0 * s);
+    let ch = cw * 1.25;
+    let strip_x = rect.center().x - (cw + 8.0) * n_slots as f32 / 2.0;
     let mut wear = None;
-    let mut remove = None;
-    for (k, (n, fit)) in st.save.outfits.iter().enumerate() {
+    let mut save_at = None;
+    let mut delete = None;
+    egui::Area::new(egui::Id::new("ward-outfits")).fixed_pos(Pos2::new(strip_x, rect.bottom() - ch - 46.0 * s)).order(egui::Order::Foreground).show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.label(n);
-            if ui.small_button("Wear").clicked() {
-                wear = Some(fit.checked(&earned));
-            }
-            if ui.small_button("Overwrite").clicked() {
-                remove = Some((k, true));
-            }
-            if ui.small_button("Delete").clicked() {
-                remove = Some((k, false));
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
+            for k in 0..n_slots {
+                ui.vertical(|ui| {
+                    let saved = st.save.outfits.get(k).cloned();
+                    let key = saved.as_ref().map(|(n, fit)| outfit_key(n, fit));
+                    if let Some(key) = key {
+                        if !st.thumbs.contains_key(&key) && !st.no_thumb.contains(&key) {
+                            match thumb_path(key).and_then(|p| std::fs::read(p).ok()).and_then(|b| image::load_from_memory(&b).ok()) {
+                                Some(img) => {
+                                    let img = img.to_rgba8();
+                                    let size = [img.width() as usize, img.height() as usize];
+                                    st.thumbs.insert(key, ctx.load_texture(format!("outfit-{key:x}"), egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR));
+                                }
+                                None => {
+                                    st.no_thumb.insert(key);
+                                }
+                            }
+                        }
+                    }
+                    let thumb = key.and_then(|k| st.thumbs.get(&k).cloned());
+                    let resp = tile(ui, Vec2::new(cw, ch), false, true, |p, r| match (&saved, &thumb) {
+                        (Some(_), Some(t)) => {
+                            p.image(t.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                        }
+                        (Some((_, fit)), None) => {
+                            // no picture yet: its body look's icon
+                            let id = fit.items[Slot::Body as usize];
+                            if id != 0 {
+                                paint_look(p, r, icons.as_ref(), id, false);
+                            }
+                        }
+                        _ => {
+                            p.text(r.center(), Align2::CENTER_CENTER, "+\nsave", FontId::proportional(14.0 * s), Color32::from_gray(150));
+                        }
+                    });
+                    let resp = match &saved {
+                        Some((n, _)) => resp.on_hover_text(format!("{n}\nClick to wear it. Right-click to save over it.")),
+                        None => resp.on_hover_text("Save what you're wearing here"),
+                    };
+                    if resp.clicked() {
+                        match &saved {
+                            Some((_, fit)) => wear = Some(fit.checked(&earned)),
+                            None => save_at = Some(k),
+                        }
+                    }
+                    if resp.secondary_clicked() {
+                        save_at = Some(k);
+                    }
+                    let label = saved.as_ref().map_or(format!("Outfit {}", k + 1), |(n, _)| n.clone());
+                    ui.horizontal(|ui| {
+                        ui.set_width(cw);
+                        ui.label(egui::RichText::new(label).size(11.0 * s).color(Color32::from_gray(200)));
+                        if saved.is_some() && ui.small_button("x").on_hover_text("Delete").clicked() {
+                            delete = Some(k);
+                        }
+                    });
+                });
             }
         });
-    }
+    });
     if let Some(w) = wear {
         o = w;
     }
-    if let Some((k, overwrite)) = remove {
-        if overwrite {
-            st.save.outfits[k].1 = o;
-        } else {
-            st.save.outfits.remove(k);
+    if let Some(k) = save_at {
+        let fit = o.checked(&earned);
+        let name = if k < st.save.outfits.len() { st.save.outfits[k].0.clone() } else { format!("Outfit {}", st.save.outfits.len() + 1) };
+        if k < st.save.outfits.len() {
+            st.save.outfits[k].1 = fit;
+        } else if st.save.outfits.len() < hub::OUTFIT_SAVES {
+            st.save.outfits.push((name.clone(), fit));
         }
+        // its picture: the preview as it is now, taken from the next frame
+        st.thumb_req = Some(outfit_key(&name, &fit));
         st.dirty = true;
+        st.save_t = 0.0;
     }
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut st.outfit_name).hint_text("name this outfit").desired_width(160.0));
-        if ui.add_enabled(st.save.outfits.len() < hub::OUTFIT_SAVES, egui::Button::new("Save outfit")).clicked() {
-            let name = if st.outfit_name.trim().is_empty() { format!("Outfit {}", st.save.outfits.len() + 1) } else { st.outfit_name.trim().chars().take(24).collect() };
-            st.save.outfits.push((name, o));
-            st.outfit_name.clear();
+    if let Some(k) = delete {
+        if k < st.save.outfits.len() {
+            st.save.outfits.remove(k);
             st.dirty = true;
-            st.save_t = 0.0;
         }
-    });
-    ui.checkbox(&mut st.mirror, "Mirror view");
+    }
+    // ---- the preview: drag anywhere free to turn your fighter; it turns by itself otherwise
+    let left_edge = rect.left() + 16.0 * s + tile_s + 170.0 * s;
+    let preview = Rect::from_min_max(Pos2::new(left_edge, rect.top() + 40.0 * s), Pos2::new(right.x - 10.0, rect.bottom() - ch - 60.0 * s));
+    st.preview = Some(preview);
+    let (drag, at) = ctx.input(|i| (if i.pointer.primary_down() { i.pointer.delta().x } else { 0.0 }, i.pointer.interact_pos()));
+    if drag != 0.0 && at.is_some_and(|a| preview.contains(a)) {
+        st.spin += drag * 0.012;
+        st.spun_at = g.time as f64;
+    } else if g.time as f64 - st.spun_at > 3.0 {
+        st.spin += 0.35 * ctx.input(|i| i.stable_dt).min(0.1);
+    }
+    st.spin = wrap_angle(st.spin);
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("ward-hint")));
+    p.text(Pos2::new(preview.center().x, preview.bottom() - 6.0), Align2::CENTER_BOTTOM, "drag to turn", FontId::proportional(13.0 * s), Color32::from_gray(200));
     let o = o.checked(&earned);
     if o != g.f[me].hub.look {
         g.hub_wear(o);
     }
+    st.mirror = true;
+    close
+}
+
+/// A random outfit from what's been earned: a look in each slot (now and then none in the
+/// cape, neck and off hand), each in random dyes.
+fn randomised(seed: f32, earned: &hub::Earned) -> Outfit {
+    let mut x = (seed.to_bits() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = |n: usize| -> usize {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x % n.max(1) as u64) as usize
+    };
+    let mut o = Outfit::default();
+    for slot in Slot::ALL {
+        let k = slot as usize;
+        let mut pool: Vec<u8> = LOOKS.iter().filter(|l| l.slot == slot && earned.has(l.unlock)).map(|l| l.id).collect();
+        if matches!(slot, Slot::Cape | Slot::Neck | Slot::Off) {
+            pool.push(0);
+        }
+        if !pool.is_empty() {
+            o.items[k] = pool[next(pool.len())];
+        }
+        for z in 0..3 {
+            o.dyes[k][z] = next(crate::gear::DYES.len()) as u8;
+        }
+    }
+    o.checked(earned)
 }
 
 fn lectern(ui: &mut egui::Ui, g: &mut Game, st: &mut HubUi, lane: usize, close: &mut bool) {
@@ -1087,10 +1445,20 @@ impl App {
         game.hub_wear(fit);
         match scene.as_str() {
             "wardrobe" => {
-                game.f[me].respawn_at(v3(varrow::MIRROR.0, 0.0, varrow::MIRROR.2 + 2.6), std::f32::consts::PI);
-                self.aim_yaw = std::f32::consts::PI;
+                game.f[me].respawn_at(v3(varrow::MIRROR.0, 0.0, varrow::MIRROR.2 + 2.6), 0.0);
+                self.aim_yaw = 0.0;
                 self.hub_ui.panel = Some(HubPanel::Wardrobe);
                 self.hub_ui.mirror = true;
+                // a few outfits saved already, the coat's slot picked
+                self.hub_ui.save.outfits = vec![
+                    ("Court day".into(), Outfit::default().with_set(hub::HERALD)),
+                    ("Night river".into(), Outfit::default().with_set(hub::SMUGGLER)),
+                    ("Ash road".into(), Outfit::default().with_set(hub::PILGRIM)),
+                    ("Rigger".into(), Outfit::default().with_set(hub::RIG)),
+                ];
+                self.hub_ui.ward_slot = Slot::Body as usize;
+                self.hub_ui.spin = 0.5;
+                self.hub_ui.spun_at = 1e9;
             }
             "photo" => {
                 let ((x0, x1), (z0, z1), top) = varrow::PODIUM;
@@ -1180,7 +1548,131 @@ impl App {
         }
     }
 
-    /// The run scene: you run the course yourself (a scripted runner) behind your ghost.
+    /// Where the hub's name tags go: (bottom-centre on screen, text size, opacity, name, the emote's
+/// name and its own opacity while it's fresh). Nearest first; each is moved up past any tag
+/// already placed that it would overlap (at most three steps, else it's left out), fading and
+/// shrinking with distance (gone past 18 m), and never seen through a wall.
+pub fn name_tags(g: &Game, cam: &Cam, s: f32) -> Vec<(Pos2, f32, f32, String, Option<(&'static str, f32)>)> {
+    let me = g.local;
+    let mut cands: Vec<(f32, Pos2, usize)> = Vec::new();
+    for (k, o) in g.f.iter().enumerate() {
+        if k == me || !o.present {
+            continue;
+        }
+        let head = o.pos + v3(0.0, 2.15, 0.0);
+        let d = (head - cam.pos).len();
+        if d > 18.0 || !g.world.line_clear(cam.pos, head) {
+            continue;
+        }
+        if let Some(sp) = cam.project(head) {
+            cands.push((d, sp, k));
+        }
+    }
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut placed: Vec<Rect> = Vec::new();
+    let mut out = Vec::new();
+    for (d, sp, k) in cands {
+        let o = &g.f[k];
+        let size = (15.0 * s * (1.15 - d / 30.0)).clamp(10.0 * s, 16.0 * s);
+        let a = ((18.0 - d) / 7.0).clamp(0.0, 1.0) * (0.55 + 0.45 * (1.0 - d / 18.0).clamp(0.0, 1.0));
+        let w = o.name.chars().count() as f32 * size * 0.55 + 8.0;
+        let h = size * 1.15;
+        let age = g.time - o.hub.emote_t;
+        let emote = (o.hub.emote != 0 && age < 2.5).then(|| (Emote::from_u8(o.hub.emote).name(), (1.0 - (age - 1.8) / 0.7).clamp(0.0, 1.0)));
+        let mut at = sp;
+        let mut ok = false;
+        for _ in 0..4 {
+            let below = if emote.is_some() { h * 0.8 } else { 0.0 };
+            let r = Rect::from_min_max(Pos2::new(at.x - w / 2.0, at.y - h), Pos2::new(at.x + w / 2.0, at.y + below));
+            if let Some(hit) = placed.iter().find(|q| q.intersects(r)) {
+                at.y = hit.top() - 2.0 - below;
+                continue;
+            }
+            placed.push(r);
+            ok = true;
+            break;
+        }
+        if ok {
+            out.push((at, size, a, o.name.clone(), emote));
+        }
+    }
+    out
+}
+
+/// Test switch DUEL_GALLERY=fit:<herald|smuggler|pilgrim|rig>:<idle|back|run|wall|emote|sit>
+/// (with DUEL_HUB=fit): the four fighters, one of each size, in that set and its own colours,
+/// side by side on the plaza and held in that pose (you stand out of sight), to check the
+/// outfits bend with the body without clipping. Run after each game step, before drawing.
+pub fn stage_fit(g: &mut Game, page: &str) {
+    let mut it = page.split(':');
+    let set = match it.next().unwrap_or("herald") {
+        "smuggler" => hub::SMUGGLER,
+        "pilgrim" => hub::PILGRIM,
+        "rig" => hub::RIG,
+        _ => hub::HERALD,
+    };
+    let pose = it.next().unwrap_or("idle");
+    // (then any slots to leave empty, by number: to find which piece something belongs to)
+    let bare: Vec<usize> = it.filter_map(|x| x.parse().ok()).collect();
+    let t = g.time;
+    let me = g.local;
+    g.f[me].pos = v3(0.0, 0.0, -40.0);
+    for i in 1..=4usize {
+        if i >= g.f.len() || !g.f[i].present {
+            continue;
+        }
+        let f = &mut g.f[i];
+        let p = v3(-2.85 + (i - 1) as f32 * 1.9, 0.0, -14.0);
+        let turn = match pose {
+            "back" => std::f32::consts::PI,
+            "run" | "wall" => if i % 2 == 0 { 1.1 } else { -1.1 },
+            _ => if i % 2 == 0 { 0.35 } else { -0.35 },
+        };
+        f.pos = p;
+        f.prev_pos = p;
+        f.net_pos = p;
+        f.yaw = turn;
+        f.pitch = 0.0;
+        f.alive = true;
+        f.loadout.body = (i - 1) as u8;
+        f.hub.look = Outfit::default().with_set(set);
+        for &k in &bare {
+            if k < hub::SLOT_COUNT {
+                f.hub.look.items[k] = 0;
+            }
+        }
+        f.hub.seat = SEAT_NONE;
+        f.hub.emote = 0;
+        f.vel = V3::ZERO;
+        f.on_ground = true;
+        f.wall = None;
+        let fwd = f.fwd();
+        let right = v3(fwd.z, 0.0, -fwd.x);
+        match pose {
+            "run" => f.vel = fwd * RUN_SPEED,
+            "wall" => {
+                f.on_ground = false;
+                f.pos.y = 1.2;
+                f.wall = Some(WallRun { normal: right, dir: fwd, t: 0.3, vertical: false, speed: 10.0 });
+                f.vel = fwd * 10.0;
+            }
+            "emote" => {
+                f.hub.emote = [Emote::Dance, Emote::Cheer, Emote::Bow, Emote::Wave][(i - 1) % 4] as u8;
+                f.hub.emote_t = t - 0.8;
+            }
+            "sit" => {
+                f.hub.emote = Emote::Sit as u8;
+                f.hub.emote_t = t - 1.0;
+            }
+            _ => {}
+        }
+    }
+    for k in 5..g.f.len() {
+        g.f[k].pos = v3(0.0, 0.0, -45.0 - k as f32);
+    }
+}
+
+/// The run scene: you run the course yourself (a scripted runner) behind your ghost.
     pub fn hub_scene_input(&mut self, inp: &mut Input) {
         // the photo scene: the camera stays in front of the fighter, as they face
         if self.hub_ui.drill == 98 {

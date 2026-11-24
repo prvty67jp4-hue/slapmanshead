@@ -54,6 +54,7 @@ assets/env/tex/*.jpg (level materials: colour, OpenGL normal map and roughness, 
     white_sandstone_blocks_02  https://polyhaven.com/a/white_sandstone_blocks_02
     patterned_slate_tiles      https://polyhaven.com/a/patterned_slate_tiles
     stone_pavers               https://polyhaven.com/a/stone_pavers
+    cobblestone_floor_08       https://polyhaven.com/a/cobblestone_floor_08  (Varrow Centre's cobbles)
 assets/env/sky/*.hdr (one sky per map: lighting, reflections and the sky you see, 1k)
   From Poly Haven (polyhaven.com), CC0:
     qwantani_late_afternoon_puresky      (Arena)           https://polyhaven.com/a/qwantani_late_afternoon_puresky

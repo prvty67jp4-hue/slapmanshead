@@ -519,3 +519,42 @@ fn an_aim_room_score_reaches_the_gallery_board() {
     assert!(h.aim_best[0] > 0 && h.boards[0].first().is_some_and(|r| r.0 == "Me"));
     assert!(h.aim_result.is_some());
 }
+
+/// Name tags in a crowd: nearest first, none overlapping another, smaller and fainter further
+/// off; an emote's name shows only for its first moments.
+#[test]
+fn name_tags_stack_and_fade_in_a_crowd() {
+    let mut g = Game::hub("You", 15, Kind::Offline);
+    // everyone bunched up 4-9 m in front of the camera
+    for k in 1..g.f.len() {
+        let x = ((k % 5) as f32 - 2.0) * 0.45;
+        let z = 4.0 + (k / 5) as f32 * 1.6;
+        g.f[k].pos = v3(x, 0.0, -12.0 + z);
+        g.f[k].hub.emote = 0;
+    }
+    g.f[0].pos = v3(0.0, 0.0, -14.0);
+    g.f[3].hub.emote = Emote::Wave as u8;
+    g.f[3].hub.emote_t = g.time - 0.5;
+    g.f[4].hub.emote = Emote::Wave as u8;
+    g.f[4].hub.emote_t = g.time - 10.0;
+    let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::Vec2::new(1280.0, 720.0));
+    let cam = crate::render::Cam::new(v3(0.0, 1.7, -16.0), 0.0, -0.05, 70.0, rect);
+    let tags = crate::App::name_tags(&g, &cam, 1.0);
+    assert!(tags.len() >= 6, "most of the crowd is named: {}", tags.len());
+    let rects: Vec<eframe::egui::Rect> = tags.iter().map(|(p, size, _, name, _)| {
+        let w = name.chars().count() as f32 * size * 0.55 + 8.0;
+        eframe::egui::Rect::from_min_max(eframe::egui::Pos2::new(p.x - w / 2.0, p.y - size * 1.15), eframe::egui::Pos2::new(p.x + w / 2.0, p.y))
+    }).collect();
+    for i in 0..rects.len() {
+        for j in i + 1..rects.len() {
+            assert!(!rects[i].shrink(1.0).intersects(rects[j].shrink(1.0)), "{} and {} overlap", tags[i].3, tags[j].3);
+        }
+    }
+    // further off: never bigger or brighter than nearer ones (the list is nearest first)
+    assert!(tags.first().unwrap().1 >= tags.last().unwrap().1);
+    assert!(tags.first().unwrap().2 >= tags.last().unwrap().2);
+    // a fresh emote is named, a stale one isn't
+    let by = |n: &str| tags.iter().find(|t| t.3 == n).map(|t| t.4.is_some());
+    assert_eq!(by(&g.f[3].name.clone()), Some(true));
+    assert_eq!(by(&g.f[4].name.clone()).unwrap_or(false), false);
+}

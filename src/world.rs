@@ -123,6 +123,15 @@ pub enum PropKind {
     /// A tall mirror against a wall.
     HubMirror,
     HubWardrobe,
+    /// Market stalls (counter, striped awning, goods): fruit and vegetables, cloth, pottery.
+    /// Their fronts face +z at yaw 0.
+    HubStallProduce,
+    HubStallCloth,
+    HubStallPottery,
+    /// A tree in a stone ring.
+    HubTree,
+    /// A long stone planter of shrubs and flowers.
+    HubPlanter,
 }
 
 impl PropKind {
@@ -146,6 +155,9 @@ impl PropKind {
             PropKind::Railing | PropKind::Archway | PropKind::Crane => 0.5,
             PropKind::HubFountain => 4.4,
             PropKind::HubBench | PropKind::HubTable | PropKind::HubWardrobe => 0.6,
+            PropKind::HubStallProduce | PropKind::HubStallCloth | PropKind::HubStallPottery => 1.6,
+            PropKind::HubTree => 1.1,
+            PropKind::HubPlanter => 0.9,
             PropKind::HubLamp | PropKind::HubLectern | PropKind::HubChair | PropKind::HubTargetFrame => 0.3,
             PropKind::HubBoard | PropKind::HubMirror => 0.0,
             PropKind::BannerA | PropKind::BannerB | PropKind::Shield | PropKind::Torch | PropKind::Lantern => 0.0,

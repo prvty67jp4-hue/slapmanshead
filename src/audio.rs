@@ -622,7 +622,121 @@ struct Voice {
     gr: f32,
 }
 
+/// One voice in the crowd: noise through a band-pass at a speaking formant, switched on and off
+/// in syllable-length bursts, panned somewhere round you.
+struct Talker {
+    coef: f32,
+    low: f32,
+    band: f32,
+    env: f32,
+    target: f32,
+    next: f32,
+    pan: f32,
+}
+
+/// The market's ambience, made as it plays (no recording): a murmur of talkers, a low hubbub
+/// under it, and birds chirping now and then (pigeons and sparrows round the fountain).
+struct Ambience {
+    gain: f32,
+    target: f32,
+    talkers: Vec<Talker>,
+    rng: u32,
+    hub_lp: f32,
+    bird_wait: f32,
+    /// A chirp playing: (phase, frequency, its slide per sample, samples left, notes left, pan)
+    chirp: Option<(f32, f32, f32, f32, u32, f32)>,
+    gap: f32,
+}
+
+impl Ambience {
+    fn new() -> Ambience {
+        Ambience { gain: 0.0, target: 0.0, talkers: Vec::new(), rng: 0x9E37_79B9, hub_lp: 0.0, bird_wait: 1.0, chirp: None, gap: 0.0 }
+    }
+    fn rand(&mut self) -> f32 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 17;
+        self.rng ^= self.rng << 5;
+        (self.rng >> 8) as f32 / (1u32 << 24) as f32
+    }
+    /// The next stereo sample.
+    fn next(&mut self, rate: f32) -> (f32, f32) {
+        if self.talkers.is_empty() {
+            for k in 0..7 {
+                let f = 260.0 + 90.0 * k as f32;
+                let pan = (k as f32 / 6.0) * 1.6 - 0.8;
+                self.talkers.push(Talker { coef: 2.0 * (std::f32::consts::PI * f / rate).sin(), low: 0.0, band: 0.0, env: 0.0, target: 0.0, next: 0.0, pan });
+            }
+        }
+        let fade = 1.0 / (1.5 * rate);
+        self.gain += (self.target - self.gain).clamp(-fade, fade);
+        if self.gain <= 0.0001 {
+            return (0.0, 0.0);
+        }
+        let (mut l, mut r) = (0.0f32, 0.0f32);
+        for k in 0..self.talkers.len() {
+            let n = self.rand() * 2.0 - 1.0;
+            let (switch, a, b, c) = (self.talkers[k].next <= 0.0, self.rand(), self.rand(), self.rand());
+            let t = &mut self.talkers[k];
+            if switch {
+                // a syllable, or a pause between words
+                t.target = if a < 0.3 { 0.0 } else { 0.35 + 0.65 * b };
+                t.next = rate * (0.07 + 0.22 * c);
+                if a > 0.97 {
+                    // a new voice drifts in (another formant)
+                    let f = 240.0 + 700.0 * b;
+                    t.coef = 2.0 * (std::f32::consts::PI * f / rate).sin();
+                }
+            }
+            t.next -= 1.0;
+            t.env += (t.target - t.env) * (60.0 / rate);
+            let high = n - t.low - 0.35 * t.band;
+            t.band += t.coef * high;
+            t.low += t.coef * t.band;
+            let s = t.band * t.env * 0.045;
+            l += s * (1.0 - t.pan) * 0.5;
+            r += s * (1.0 + t.pan) * 0.5;
+        }
+        // the hubbub under it
+        let n = self.rand() * 2.0 - 1.0;
+        self.hub_lp += (n - self.hub_lp) * (250.0 / rate);
+        l += self.hub_lp * 0.09;
+        r += self.hub_lp * 0.09;
+        // birds: a run of quick chirps every few seconds
+        self.bird_wait -= 1.0 / rate;
+        if self.chirp.is_none() && self.gap <= 0.0 && self.bird_wait <= 0.0 {
+            let (a, b, c) = (self.rand(), self.rand(), self.rand());
+            let f = 2600.0 + 1800.0 * a;
+            let notes = 2 + (b * 4.0) as u32;
+            self.chirp = Some((0.0, f, (900.0 + 1400.0 * c) / rate / (0.07 * rate), 0.07 * rate, notes, a * 1.6 - 0.8));
+            self.bird_wait = 2.5 + 6.0 * c;
+        }
+        if self.gap > 0.0 {
+            self.gap -= 1.0;
+        }
+        if let Some((ph, f, slide, left, notes, pan)) = self.chirp {
+            let env = (left / (0.07 * rate)).clamp(0.0, 1.0);
+            let env = (env * (1.0 - env) * 4.0).min(1.0);
+            let s = (ph * std::f32::consts::TAU).sin() * env * 0.035;
+            l += s * (1.0 - pan) * 0.5;
+            r += s * (1.0 + pan) * 0.5;
+            let ph = (ph + f / rate).fract();
+            if left <= 1.0 {
+                if notes > 1 {
+                    self.chirp = Some((0.0, f * (0.92 + 0.16 * self.rand()), slide, 0.07 * rate, notes - 1, pan));
+                    self.gap = 0.03 * rate;
+                } else {
+                    self.chirp = None;
+                }
+            } else if self.gap <= 0.0 {
+                self.chirp = Some((ph, f + slide, slide, left - 1.0, notes, pan));
+            }
+        }
+        (l * self.gain, r * self.gain)
+    }
+}
+
 struct Mixer {
+    ambience: Ambience,
     voices: Vec<Voice>,
     volume: f32,
     /// Music: interleaved stereo at the device rate, filled by the music thread.
@@ -737,6 +851,10 @@ fn mix_into(m: &Arc<Mutex<Mixer>>, frames: usize, channels: usize, rate: f32, mu
             }
             v.pos += v.step;
         }
+        // the market's ambience (in the hub)
+        let (al, ar) = mx.ambience.next(rate);
+        l += al;
+        r += ar;
         l *= mx.volume;
         r *= mx.volume;
         // music
@@ -853,7 +971,7 @@ impl Audio {
         let config: cpal::StreamConfig = supported.config();
         let sr = config.sample_rate as f32;
         let channels = config.channels as usize;
-        let mixer = Arc::new(Mutex::new(Mixer { voices: Vec::new(), volume: 0.7, music: VecDeque::new(), music_volume: 0.5, music_gain: 0.0, music_target: 1.0 }));
+        let mixer = Arc::new(Mutex::new(Mixer { ambience: Ambience::new(), voices: Vec::new(), volume: 0.7, music: VecDeque::new(), music_volume: 0.5, music_gain: 0.0, music_target: 1.0 }));
         let m2 = mixer.clone();
         let stream = match format {
             cpal::SampleFormat::F32 => device
@@ -898,6 +1016,13 @@ impl Audio {
     /// Where the ears are: the camera's position, its right and its forward direction.
     pub fn set_listener(&mut self, pos: V3, right: V3, fwd: V3) {
         self.listener = (pos, right, fwd);
+    }
+
+    /// How loud the market's ambience is (0 off; it fades there over a second and a half).
+    pub fn set_ambience(&mut self, level: f32) {
+        if let Ok(mut m) = self.mixer.lock() {
+            m.ambience.target = level.clamp(0.0, 1.0);
+        }
     }
 
     /// Which music to play (None for silence).
@@ -1008,6 +1133,33 @@ mod gunshot_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The market's ambience: a murmur you can hear, never clipping or broken, fading in and out.
+    #[test]
+    fn the_market_murmurs_and_fades() {
+        let rate = 48_000.0;
+        let mut a = Ambience::new();
+        a.target = 0.6;
+        let (mut sum, mut peak, mut n) = (0.0f64, 0.0f32, 0usize);
+        for k in 0..(rate as usize * 4) {
+            let (l, r) = a.next(rate);
+            assert!(l.is_finite() && r.is_finite());
+            if k > rate as usize * 2 {
+                sum += (l * l + r * r) as f64;
+                peak = peak.max(l.abs()).max(r.abs());
+                n += 2;
+            }
+        }
+        let rms = (sum / n as f64).sqrt();
+        assert!(rms > 0.003 && rms < 0.2, "ambience level {rms}");
+        assert!(peak < 0.9, "peak {peak}");
+        a.target = 0.0;
+        for _ in 0..(rate as usize * 2) {
+            a.next(rate);
+        }
+        let (l, r) = a.next(rate);
+        assert!(l.abs() < 1e-6 && r.abs() < 1e-6, "faded out");
+    }
 
     #[test]
     fn every_sound_decodes() {

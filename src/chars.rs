@@ -155,7 +155,9 @@ fn region_hides(c: Covers, jn: &str, p: Vec3, head_of: &dyn Fn(&str) -> Vec3) ->
                 })
         }
         // (anything hanging from the hips or thighs, down to the ground: a long hem)
-        Covers::Legs(top, bot) => p.y < top && (is(&["thigh", "pelvis", "spine_01", "root"]) || (is(&["calf"]) && p.y > bot)),
+        // (and whatever hangs from the waist or back below it: a coat's tails never show under
+        // breeches and a doublet)
+        Covers::Legs(top, bot) => p.y < top && (is(&["thigh", "pelvis", "spine", "root"]) || (is(&["calf"]) && p.y > bot)),
         Covers::Feet(top) => is(&["foot", "ball", "calf"]) && p.y < top,
         Covers::Torso(top, bot, sleeve) => {
             (is(&["spine", "clavicle", "pelvis"]) && p.y < top && p.y > bot)
@@ -177,13 +179,22 @@ fn region_hides(c: Covers, jn: &str, p: Vec3, head_of: &dyn Fn(&str) -> Vec3) ->
 /// A gear material's dye zone (bits 16-17 of the material word): 1 the coat, 2 its trim, 3 the
 /// accent; 0 keeps its own colour.
 pub fn dye_zone(mat: &str) -> u32 {
-    match mat.split("__").next().unwrap_or(mat) {
-        "dye_coat" => 1,
-        "dye_trim" => 2,
-        "dye_accent" | "glow_accent" => 3,
-        _ => 0,
+    // (`dye_coat`, or with its surface: `dye_coat_leather`, `dye_trim_metal`, `dye_accent_fur`...)
+    let m = mat.split("__").next().unwrap_or(mat);
+    if m == "dye_coat" || m.starts_with("dye_coat_") {
+        1
+    } else if m == "dye_trim" || m.starts_with("dye_trim_") {
+        2
+    } else if m == "dye_accent" || m.starts_with("dye_accent_") || m == "glow_accent" {
+        3
+    } else {
+        0
     }
 }
+
+/// Bit 22 of a gear vertex's material word: plain cloth (the shader never takes a pale dyed
+/// cloth for metal by its colour).
+pub const CLOTH_BIT: u32 = 1 << 22;
 
 /// Kinds of surface (bits 1-3 of the material word): picked from the material, or (AUTO) from
 /// the texture's colour in the shader (metal, leather or cloth).
@@ -302,6 +313,21 @@ fn kind_of(mesh: &str, mat: &str) -> u32 {
 /// An accessory material's kind (the palette names from tools/blender).
 fn acc_kind(mat: &str) -> u32 {
     let m = mat.split("__").next().unwrap_or(mat);
+    // a dye zone with its surface named: `dye_<zone>_<cloth|leather|metal|fur>`
+    if m.starts_with("dye_") && m.matches('_').count() >= 2 {
+        return match m.rsplit('_').next().unwrap_or("") {
+            "metal" => KIND_METAL,
+            "leather" => KIND_LEATHER,
+            "fur" => KIND_HAIR,
+            _ => KIND_AUTO,
+        };
+    }
+    if m.starts_with("leather") {
+        return KIND_LEATHER;
+    }
+    if m.starts_with("fur") {
+        return KIND_HAIR;
+    }
     match m {
         "glow" | "glow_accent" => KIND_GLOW,
         "dye_trim" => KIND_METAL,
@@ -1023,8 +1049,12 @@ fn add_gear(glb: &[u8], tex: &str, sk: &Skeleton, joints: &HashMap<&str, usize>,
                 let mat = prim.material().name().unwrap_or("").to_string();
                 // (bits 18-21: the wardrobe slot it's worn in, for its dyes)
                 let slot = piece_slot(id);
-                let word = mat_word(lay, false, acc_kind(&mat), 0.0) | dye_zone(&mat) << 16 | slot << 18;
+                let cloth = if acc_kind(&mat) == KIND_AUTO { CLOTH_BIT } else { 0 };
+                let word = mat_word(lay, false, acc_kind(&mat), 0.0) | dye_zone(&mat) << 16 | slot << 18 | cloth;
                 let (legs, feet, torso, cape) = (crate::hub::Slot::Legs as u32 + 1, crate::hub::Slot::Feet as u32 + 1, crate::hub::Slot::Body as u32 + 1, crate::hub::Slot::Cape as u32 + 1);
+                let head = crate::hub::Slot::Head as u32 + 1;
+                // (the top of the neck: a head piece rides the head above it)
+                let neck_y = at("neck_01").y + 0.05;
                 let base = (verts.len() + new_verts.len()) as u32;
                 let ix: Vec<u32> = match r.read_indices() {
                     Some(ix) => ix.into_u32().collect(),
@@ -1047,9 +1077,15 @@ fn add_gear(glb: &[u8], tex: &str, sk: &Skeleton, joints: &HashMap<&str, usize>,
                 }
                 // (and across its seams: the export splits a tube into strips where its normals
                 // or texture break; the two legs are kept apart, so welding never joins them)
-                let weld = |p: [f32; 3]| [(p[0] * 2000.0).round() as i32, (p[1] * 2000.0).round() as i32, (p[2] * 2000.0).round() as i32];
+                // (never across the middle: a point a hair either side of it belongs to a different leg)
+                let weld = |p: [f32; 3]| [(p[0] * 2000.0).round() as i32 * 2 + (p[0] >= 0.0) as i32, (p[1] * 2000.0).round() as i32, (p[2] * 2000.0).round() as i32];
                 let mut same: HashMap<[i32; 3], usize> = HashMap::new();
                 for k in 0..pos.len() {
+                    // (points on the middle line itself are left alone: which leg they are is a
+                    // rounding error)
+                    if pos[k][0].abs() < 0.003 {
+                        continue;
+                    }
                     let o = *same.entry(weld(pos[k])).or_insert(k);
                     let (a, b) = (root(&mut part, o), root(&mut part, k));
                     part[a] = b;
@@ -1069,7 +1105,7 @@ fn add_gear(glb: &[u8], tex: &str, sk: &Skeleton, joints: &HashMap<&str, usize>,
                     let mut word = word;
                     let (jn, w) = if slot == cape {
                         // a cape hangs from the shoulders down the back (and swings, lower down)
-                        word = mat_word(lay, false, acc_kind(&mat), ((1.3 - p.y) / 0.6).clamp(0.0, 1.0)) | dye_zone(&mat) << 16 | slot << 18;
+                        word = mat_word(lay, false, acc_kind(&mat), ((1.3 - p.y) / 0.6).clamp(0.0, 1.0)) | dye_zone(&mat) << 16 | slot << 18 | cloth;
                         if p.y >= 1.3 {
                             ([j("spine_03"), 0, 0, 0], [1.0, 0.0, 0.0, 0.0])
                         } else if p.y >= 1.0 {
@@ -1093,10 +1129,15 @@ fn add_gear(glb: &[u8], tex: &str, sk: &Skeleton, joints: &HashMap<&str, usize>,
                         }
                     } else if slot == torso && p.y < hip + 0.02 {
                         skirt(p)
+                    } else if slot == head && p.y > neck_y {
+                        // a hat, a hood and its plumes ride the head (blended into the neck just
+                        // above it): nothing on it stretches, however far a plume sticks out
+                        let t = ((p.y - neck_y) / 0.06).clamp(0.0, 1.0);
+                        ([j("Head"), j("neck_01"), 0, 0], [t, 1.0 - t, 0.0, 0.0])
                     } else {
-                        match nearest(p) {
+                        match nearest(p).or_else(|| (0..body_n).min_by(|&a, &b| (Vec3::from(verts[a].pos) - p).length_squared().total_cmp(&(Vec3::from(verts[b].pos) - p).length_squared()))) {
                             Some(n) => (verts[n].joints, verts[n].weights),
-                            None => ([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
+                            None => ([j("spine_03"), 0, 0, 0], [1.0, 0.0, 0.0, 0.0]),
                         }
                     };
                     new_verts.push(SkinVtx { pos: pos[k], nrm: nrm[k], joints: jn, weights: w, mat: word, uv: uv[k], onrm: nrm[k] });
@@ -1331,6 +1372,110 @@ mod tests {
                 assert!((n as usize) < body_n / 2, "{name} hides most of body {b}");
             }
             eprintln!("{line} (of {})", m.verts.len());
+        }
+    }
+
+    /// (a probe) The fighters' own team-coloured pieces below the waist: which bone moves each,
+    /// and how many the Herald's legs hide.
+    #[test]
+    #[ignore]
+    fn probe_coat_tails() {
+        let rig = crate::anim::shared().expect("rig");
+        let names = rig.joint_names();
+        let models = shared().expect("fighters load");
+        let legs = GEAR_PIECES.iter().position(|g| g.0 == "hr_legs").unwrap();
+        for (b, m) in models.iter().enumerate() {
+            let mut by: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
+            for (k, v) in m.verts.iter().enumerate() {
+                if v.mat & 1 == 0 || v.pos[1] > 0.9 || (v.mat >> 8) & 255 == 255 {
+                    continue;
+                }
+                let mut best = 0;
+                for q in 1..4 {
+                    if v.weights[q] > v.weights[best] {
+                        best = q;
+                    }
+                }
+                let jn = names.get(v.joints[best] as usize).cloned().unwrap_or_default();
+                let hidden = m.cover[legs].get(k / 32).is_some_and(|w| (w >> (k % 32)) & 1 == 1);
+                let e = by.entry(jn).or_default();
+                e.0 += 1;
+                e.1 += hidden as u32;
+            }
+            eprintln!("body {b}: {by:?}");
+        }
+    }
+
+    /// No legs or feet piece has a triangle whose corners follow different legs (it would stretch
+    /// from one foot to the other in a stride).
+    #[test]
+    fn no_gear_triangle_spans_both_legs() {
+        let rig = crate::anim::shared().expect("rig");
+        let names = rig.joint_names();
+        let models = shared().expect("fighters load");
+        for m in models.iter() {
+        let side = |v: &SkinVtx| -> char {
+            let mut best = 0;
+            for q in 1..4 {
+                if v.weights[q] > v.weights[best] {
+                    best = q;
+                }
+            }
+            let n = names.get(v.joints[best] as usize).map_or("", |s| s.as_str());
+            if n.ends_with("_l") { 'l' } else if n.ends_with("_r") { 'r' } else { '-' }
+        };
+        for &(id, s, c) in &m.gear {
+            let name = GEAR_PIECES.iter().find(|g| g.1 == id).map_or("?", |g| g.0);
+            let mut bad = 0;
+            let mut first = None;
+            for t in m.indices[s as usize..(s + c) as usize].chunks(3) {
+                let sides: Vec<char> = t.iter().map(|&i| side(&m.verts[i as usize])).collect();
+                if sides.contains(&'l') && sides.contains(&'r') {
+                    bad += 1;
+                    if first.is_none() {
+                        first = Some(t.iter().map(|&i| m.verts[i as usize].pos).collect::<Vec<_>>());
+                    }
+                }
+            }
+            let slot = piece_slot(id);
+            if slot == crate::hub::Slot::Legs as u32 + 1 || slot == crate::hub::Slot::Feet as u32 + 1 {
+                assert_eq!(bad, 0, "{name}: {bad} triangles across both legs, e.g. {first:?}");
+            }
+        }
+        }
+    }
+
+    /// (a probe) What a feet piece hides: by bone, with the height and side ranges.
+    #[test]
+    #[ignore]
+    fn probe_feet_hide() {
+        let rig = crate::anim::shared().expect("rig");
+        let names = rig.joint_names();
+        let models = shared().expect("fighters load");
+        for piece in ["ap_feet", "hr_feet"] {
+            let pi = GEAR_PIECES.iter().position(|g| g.0 == piece).unwrap();
+            for (b, m) in models.iter().enumerate().take(2) {
+                let mut by: std::collections::BTreeMap<String, (u32, f32, f32, f32, f32)> = Default::default();
+                for (k, v) in m.verts.iter().enumerate() {
+                    if !m.cover[pi].get(k / 32).is_some_and(|w| (w >> (k % 32)) & 1 == 1) {
+                        continue;
+                    }
+                    let mut best = 0;
+                    for q in 1..4 {
+                        if v.weights[q] > v.weights[best] {
+                            best = q;
+                        }
+                    }
+                    let jn = names.get(v.joints[best] as usize).cloned().unwrap_or_default();
+                    let e = by.entry(jn).or_insert((0, f32::MAX, f32::MIN, f32::MAX, f32::MIN));
+                    e.0 += 1;
+                    e.1 = e.1.min(v.pos[1]);
+                    e.2 = e.2.max(v.pos[1]);
+                    e.3 = e.3.min(v.pos[0]);
+                    e.4 = e.4.max(v.pos[0]);
+                }
+                eprintln!("{piece} body {b}: {by:?}");
+            }
         }
     }
 

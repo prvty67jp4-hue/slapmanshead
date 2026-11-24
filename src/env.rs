@@ -34,7 +34,9 @@ pub const L_BRIDGE: u32 = 17;
 /// Varrow Centre's props (the hub: fountain, benches, tables, boards...): one baked atlas
 /// (tools/blender/build_hub_props.py).
 pub const L_HUB: u32 = 18;
-pub const LAYERS: u32 = 19;
+/// Varrow Centre's cobbles (Poly Haven cobblestone_floor_08, CC0).
+pub const L_COBBLES: u32 = 19;
+pub const LAYERS: u32 = 20;
 
 /// Where a texture comes from.
 enum Src {
@@ -71,6 +73,7 @@ fn source(layer: u32) -> Src {
         L_BRICK => haven!("white_sandstone_blocks_02", 0.0),
         L_SLATE => haven!("patterned_slate_tiles", 0.0),
         L_BLOCKS => haven!("stone_pavers", 0.0),
+        L_COBBLES => haven!("cobblestone_floor_08", 0.0),
         L_TRIM_CLOTH => Src::Trim { diff: prop_tex!("trim_cloth_diff.jpg"), nor: prop_tex!("trim_cloth_nor.jpg"), orm: prop_tex!("trim_cloth_orm.jpg") },
         L_TRIM_FURNITURE => Src::Trim { diff: prop_tex!("trim_furniture_diff.jpg"), nor: prop_tex!("trim_furniture_nor.jpg"), orm: prop_tex!("trim_furniture_orm.jpg") },
         L_TRIM_METAL => Src::Trim { diff: prop_tex!("trim_metal_diff.jpg"), nor: prop_tex!("trim_metal_nor.jpg"), orm: prop_tex!("trim_metal_orm.jpg") },
@@ -96,6 +99,7 @@ pub fn layer_tile(l: u32) -> f32 {
         L_BRICK => 2.0,        // about 4 blocks across: 50 cm by 20 cm
         L_SLATE => 3.2,        // about 8 setts across: 40 cm
         L_BLOCKS => 1.8,       // 3 blocks across: 60 cm
+        L_COBBLES => 1.7,      // about 9 setts across: 19 cm
         _ => 2.0,
     }
 }
@@ -150,7 +154,7 @@ pub fn surface(map: MapId, m: Mat) -> Surface {
         },
         // Varrow Centre: warm cobbles, limewashed house fronts, dressed sandstone, dark timber
         MapId::Varrow => match m {
-            Mat::Floor => s(L_BLOCKS, [136, 124, 110], 0.22),
+            Mat::Floor => s(L_COBBLES, [150, 136, 118], 0.2),
             Mat::Wall => s(L_BRICK, [182, 164, 136], 0.05),
             Mat::Stone => s(L_SANDSTONE, [158, 138, 112], 0.08),
             Mat::Metal => s(L_IRON, [98, 94, 90], 0.4),
@@ -708,6 +712,11 @@ fn hub_glb(kind: PropKind) -> Option<&'static [u8]> {
         PropKind::HubChair => include_bytes!("../assets/env/props/hub_chair.glb"),
         PropKind::HubMirror => include_bytes!("../assets/env/props/hub_mirror.glb"),
         PropKind::HubWardrobe => include_bytes!("../assets/env/props/hub_wardrobe.glb"),
+        PropKind::HubStallProduce => include_bytes!("../assets/env/props/hub_stall_produce.glb"),
+        PropKind::HubStallCloth => include_bytes!("../assets/env/props/hub_stall_cloth.glb"),
+        PropKind::HubStallPottery => include_bytes!("../assets/env/props/hub_stall_pottery.glb"),
+        PropKind::HubTree => include_bytes!("../assets/env/props/hub_tree.glb"),
+        PropKind::HubPlanter => include_bytes!("../assets/env/props/hub_planter.glb"),
         _ => return None,
     })
 }
@@ -787,7 +796,7 @@ fn load_model(kind: PropKind) -> Vec<PropVert> {
 
 /// A prop's mesh (loaded once).
 pub fn prop_mesh(kind: PropKind) -> &'static [PropVert] {
-    const N: usize = PropKind::HubWardrobe as usize + 1;
+    const N: usize = PropKind::HubPlanter as usize + 1;
     static MESHES: [OnceLock<Vec<PropVert>>; N] = [const { OnceLock::new() }; N];
     MESHES[kind as usize].get_or_init(|| load_model(kind))
 }
