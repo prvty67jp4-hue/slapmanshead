@@ -251,6 +251,7 @@ pub fn map_key(m: MapId) -> &'static str {
         MapId::Courtyard => "old_marble_court",
         MapId::CloseQuarters => "undercroft",
         MapId::Bridgeworks => "bridgeworks",
+        MapId::Varrow => "varrow_centre",
     }
 }
 fn map_fallback(m: MapId) -> &'static str {
@@ -259,6 +260,7 @@ fn map_fallback(m: MapId) -> &'static str {
         MapId::Courtyard => "Old Marble Court",
         MapId::CloseQuarters => "The Undercroft",
         MapId::Bridgeworks => "Varrow Bridgeworks",
+        MapId::Varrow => "Varrow Centre",
     }
 }
 pub fn map_name(m: MapId) -> &'static str {

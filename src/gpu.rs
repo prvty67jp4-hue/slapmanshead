@@ -28,7 +28,8 @@ const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const TEX: u32 = 256;
 const LAYERS: u32 = env::LAYERS;
 const MAX_JOINTS: usize = 72;
-const MAX_INST: usize = 16;
+/// Fighters drawn at once: everyone (up to 16 in the hub) and their afterimages and ghosts.
+const MAX_INST: usize = 24;
 /// Point lights at once (braziers, torches, muzzle flashes).
 const MAX_LIGHTS: usize = 12;
 /// Per character: two tints, the hit flash (three words of joint bits + strength), the joints.
@@ -36,7 +37,7 @@ const MAX_LIGHTS: usize = 12;
 // then the joints
 // then three dye colours (Ledger Duels gear: coat, trim, accent; the accent's w: the set's charm
 // glows)
-const INST_FLOATS: usize = 32 + MAX_JOINTS * 16;
+const INST_FLOATS: usize = 48 + MAX_JOINTS * 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -120,8 +121,23 @@ impl Fx {
 const U_DECL: &str = r#"
 struct U { vp: mat4x4<f32>, cam: vec4<f32>, right: vec4<f32>, up: vec4<f32>, fwd: vec4<f32>, sun: vec4<f32>, sun_col: vec4<f32>, fog: vec4<f32>, params: vec4<f32>, light_vp: mat4x4<f32>, shadow: vec4<f32>, sh: array<vec4<f32>, 9>, lpos: array<vec4<f32>, 12>, lcol: array<vec4<f32>, 12> };
 @group(0) @binding(0) var<uniform> u: U;
-struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, motion: vec4<f32>, dye0: vec4<f32>, dye1: vec4<f32>, dye2: vec4<f32>, joints: array<mat4x4<f32>, 72> };
+struct Inst { tint0: vec4<f32>, tint1: vec4<f32>, flash: vec4<f32>, rim: vec4<f32>, motion: vec4<f32>, dyes: array<vec4<u32>, 2>, dyex: vec4<f32>, hide: vec4<u32>, worn: array<vec4<u32>, 3>, joints: array<mat4x4<f32>, 72> };
 @group(0) @binding(3) var<storage, read> insts: array<Inst>;
+// what worn gear hides of a fighter: each vertex's point on its bone, and per gear piece a bit
+// per vertex (hide: where this fighter's points start, where its bits start, words per piece,
+// how many pieces are worn; worn: their numbers)
+@group(0) @binding(10) var<storage, read> hide_data: array<u32>;
+fn rest_pos(v: SIn, vi: u32, ii: u32) -> vec3<f32> {
+  let h = insts[ii].hide;
+  for (var k = 0u; k < min(h.w, 12u); k = k + 1u) {
+    let p = insts[ii].worn[k / 4u][k % 4u];
+    if (((hide_data[h.y + p * h.z + vi / 32u] >> (vi % 32u)) & 1u) != 0u) {
+      let c = h.x + vi * 3u;
+      return vec3<f32>(bitcast<f32>(hide_data[c]), bitcast<f32>(hide_data[c + 1u]), bitcast<f32>(hide_data[c + 2u]));
+    }
+  }
+  return v.pos;
+}
 struct VIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) col: vec4<f32>, @location(4) ex: vec4<f32> };
 struct SIn { @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) j: vec4<u32>, @location(3) w: vec4<f32>, @location(4) mat: u32, @location(5) uv: vec2<f32>, @location(6) on: vec3<f32> };
 fn skin_matrix(v: SIn, ii: u32) -> mat4x4<f32> {
@@ -144,6 +160,26 @@ fn sway_offset(v: SIn, ii: u32) -> vec3<f32> {
   return (idle + flap + drag) * s;
 }
 "#;
+
+/// What a fighter wears that has a model, with a dye for each zone of each slot, and whether
+/// the Rig's charm glows: their Ledger gear in a Ledger Duel (its three dyes on every piece),
+/// their outfit in the hub (three dyes per slot), nothing otherwise.
+fn worn_of(g: &Game, f: &Fighter) -> (Vec<u8>, [[u8; 3]; crate::hub::SLOT_COUNT], bool) {
+    if let Some(k) = f.kit.as_ref() {
+        return (k.equip.iter().copied().filter(|&id| id != 0).collect(), [k.dyes; crate::hub::SLOT_COUNT], k.charm_glows());
+    }
+    if g.mt.mode == crate::game::Mode::Hub {
+        let o = &f.hub.look;
+        return (o.pieces().iter().map(|p| p.0).collect(), o.dyes, false);
+    }
+    (Vec::new(), [crate::gear::DEFAULT_DYES; crate::hub::SLOT_COUNT], false)
+}
+
+/// The dyes as a shader function (crate::gear::DYES, linear colours).
+fn dye_decl() -> String {
+    let cols: Vec<String> = crate::gear::DYES.iter().map(|(_, c)| format!("vec3<f32>({:.4}, {:.4}, {:.4})", c[0], c[1], c[2])).collect();
+    format!("fn dye_pal(k: u32) -> vec3<f32> {{\n  var p = array<vec3<f32>, {}>({});\n  return p[min(k, {}u)];\n}}\n", cols.len(), cols.join(", "), cols.len() - 1)
+}
 
 const SHADER: &str = r#"
 @group(0) @binding(1) var tex: texture_2d_array<f32>;
@@ -486,9 +522,9 @@ fn shade(i: VOut) -> vec4<f32> {
 // The fighters' outlines: the skinned mesh pushed out along its smoothed normals and drawn
 // inside out (front faces culled), so only a rim shows round the silhouette and the creases.
 // About two pixels wide up close, thinning to one far away (cam.w is the picture's height).
-@vertex fn vs_skin_outline(v: SIn, @builtin(instance_index) ii: u32) -> VOut {
+@vertex fn vs_skin_outline(v: SIn, @builtin(instance_index) ii: u32, @builtin(vertex_index) vi: u32) -> VOut {
   let m = skin_matrix(v, ii);
-  let wp = (m * vec4<f32>(v.pos, 1.0)).xyz + sway_offset(v, ii);
+  let wp = (m * vec4<f32>(rest_pos(v, vi, ii), 1.0)).xyz + sway_offset(v, ii);
   let n = normalize((m * vec4<f32>(v.on, 0.0)).xyz);
   let low = v.mat & 255u;
   let lay = ((v.mat >> 8u) & 255u);
@@ -517,9 +553,9 @@ fn shade(i: VOut) -> vec4<f32> {
   return vec4<f32>(fogit(c, i.wpos), dot(i.wpos - u.cam.xyz, u.fwd.xyz));
 }
 
-@vertex fn vs_skin(v: SIn, @builtin(instance_index) ii: u32) -> VOut {
+@vertex fn vs_skin(v: SIn, @builtin(instance_index) ii: u32, @builtin(vertex_index) vi: u32) -> VOut {
   let m = skin_matrix(v, ii);
-  let wp = (m * vec4<f32>(v.pos, 1.0)).xyz + sway_offset(v, ii);
+  let wp = (m * vec4<f32>(rest_pos(v, vi, ii), 1.0)).xyz + sway_offset(v, ii);
   var o: VOut;
   o.clip = u.vp * vec4<f32>(wp, 1.0);
   o.wpos = wp;
@@ -535,19 +571,25 @@ fn shade(i: VOut) -> vec4<f32> {
     // shoulder guard or tunic), and a red wash when hurt
     let acc = mix(vec3<f32>(1.0, 1.0, 1.0), insts[ii].tint0.rgb * 1.35, 0.62);
     var base = select(vec3<f32>(1.0, 1.0, 1.0), acc, (low & 1u) == 1u);
-    // Ledger Duels gear: a dye zone takes the wearer's dye (its texture is pale and neutral)
+    // gear and outfits: a dye zone takes the dye the wearer picked for that slot (bits 18-21
+    // of the material word say which slot; its texture is pale and neutral)
     let zone = (v.mat >> 16u) & 3u;
-    var dye = insts[ii].dye2;
-    if (zone == 1u) { dye = insts[ii].dye0; } else if (zone == 2u) { dye = insts[ii].dye1; }
-    if (zone > 0u) { base = dye.rgb / 0.6; }
+    var dye = vec3<f32>(1.0, 1.0, 1.0);
+    if (zone > 0u) {
+      let slot = max((v.mat >> 18u) & 15u, 1u) - 1u;
+      let idx = min(slot, 8u) * 3u + zone - 1u;
+      let word = insts[ii].dyes[idx / 16u][(idx / 4u) % 4u];
+      dye = dye_pal((word >> ((idx % 4u) * 8u)) & 255u);
+      base = dye / 0.6;
+    }
     o.col = vec4<f32>(mix(base, vec3<f32>(1.5, 0.35, 0.3), insts[ii].tint1.w), 1.0);
     // (the kind of surface goes to the toon shader in ex.w)
     let kind = (low >> 1u) & 7u;
     ex = vec4<f32>(f32(lay), 0.5, 1.0, f32(kind));
     if (kind == 4u && zone == 3u) {
-      // the Rig's charm: a teal glow, bright while the set's bonus is on (dye2.w)
-      let dc = insts[ii].dye2.rgb;
-      o.col = vec4<f32>(dc / max(max(dc.r, max(dc.g, dc.b)), 0.05) * (0.3 + 2.4 * insts[ii].dye2.w), 1.0);
+      // the Rig's charm: a glow in its accent dye, bright while the set's bonus is on (dyex.x)
+      let dc = dye;
+      o.col = vec4<f32>(dc / max(max(dc.r, max(dc.g, dc.b)), 0.05) * (0.3 + 2.4 * insts[ii].dyex.x), 1.0);
       ex = vec4<f32>(-1.0, 2.0, 1.0, 0.0);
     } else if (kind == 4u) {
       // a glowing trim: unlit, in the player's colour; a soft accent, bright (and blooming) only
@@ -598,8 +640,8 @@ const SHADOW_SHADER: &str = r#"
   if (v.ex.y > 1.5 || (v.ex.x > 11.5 && v.ex.x < 12.5)) { return vec4<f32>(0.0, 0.0, -2.0, 1.0); }
   return u.light_vp * vec4<f32>(v.pos, 1.0);
 }
-@vertex fn vs_skin_shadow(v: SIn, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
-  let wp = (skin_matrix(v, ii) * vec4<f32>(v.pos, 1.0)).xyz + sway_offset(v, ii);
+@vertex fn vs_skin_shadow(v: SIn, @builtin(instance_index) ii: u32, @builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+  let wp = (skin_matrix(v, ii) * vec4<f32>(rest_pos(v, vi, ii), 1.0)).xyz + sway_offset(v, ii);
   return u.light_vp * vec4<f32>(wp, 1.0);
 }
 "#;
@@ -1113,6 +1155,178 @@ impl MB {
     }
 }
 
+/// The hub's moving parts: the pieces on the game tables, the Rooftop Run's rings (the next
+/// one bright), your aim room's targets and sparring post.
+fn hub_visuals(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
+    use crate::boards::Board;
+    let Some(h) = g.hub.as_ref() else { return };
+    let near = |p: V3, r: f32| (p - cam.pos).len() < r;
+    // ---- the tables
+    for (k, t) in h.tables.iter().enumerate() {
+        let (cx, cz, _) = crate::varrow::TABLES[k];
+        let top = crate::varrow::TABLE_TOP + 0.004;
+        let c = v3(cx, top, cz);
+        if !near(c, 30.0) {
+            continue;
+        }
+        let sq = 0.09;
+        // (white, or black in checkers, plays from the west chair: ranks run east)
+        let at = |s: u8| v3(cx - 3.5 * sq + (s / 8) as f32 * sq, top, cz + 3.5 * sq - (s % 8) as f32 * sq);
+        match &t.board {
+            Board::Chess(_) | Board::Checkers(_) => {
+                for s in 0..64u8 {
+                    let p = at(s);
+                    let dark = crate::boards::dark(s);
+                    let col = if dark { lin([58, 40, 28]) } else { lin([196, 170, 128]) };
+                    op.quad([p + v3(-sq * 0.5, 0.0, -sq * 0.5), p + v3(-sq * 0.5, 0.0, sq * 0.5), p + v3(sq * 0.5, 0.0, sq * 0.5), p + v3(sq * 0.5, 0.0, -sq * 0.5)], V3::UP, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], col, [-1.0, 0.0, 1.0, 0.25]);
+                }
+            }
+            Board::Connect4(_) => {}
+        }
+        let ivory = lin([226, 214, 186]);
+        let ebony = lin([36, 32, 36]);
+        let up = M3::I;
+        match &t.board {
+            Board::Chess(b) => {
+                for s in 0..64u8 {
+                    let v = b.sq[s as usize];
+                    if v == 0 {
+                        continue;
+                    }
+                    let col = if v > 0 { ivory } else { ebony };
+                    let p = at(s);
+                    let kind = v.abs();
+                    let hgt = [0.0, 0.05, 0.062, 0.07, 0.06, 0.08, 0.09][kind as usize];
+                    op.tube(p, p + v3(0.0, 0.012, 0.0), 0.03, 0.03, v3(1.0, 0.0, 0.0), 1.0, col, -1.0, 0.6);
+                    op.tube(p + v3(0.0, 0.012, 0.0), p + v3(0.0, hgt, 0.0), 0.022, 0.013, v3(1.0, 0.0, 0.0), 1.0, col, -1.0, 0.6);
+                    let tip = p + v3(0.0, hgt, 0.0);
+                    match kind {
+                        crate::boards::PAWN => op.ellipsoid(tip, &up, v3(0.017, 0.017, 0.017), col, -1.0, 0.6, 0.0),
+                        crate::boards::ROOK => {
+                            op.obox(tip, &up, v3(0.022, 0.01, 0.022), col, -1.0, 0.6);
+                            for (dx, dz) in [(1.0f32, 1.0f32), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+                                op.obox(tip + v3(dx * 0.015, 0.016, dz * 0.015), &up, v3(0.006, 0.007, 0.006), col, -1.0, 0.6);
+                            }
+                        }
+                        crate::boards::KNIGHT => {
+                            // the head looks at the other side
+                            let toward = if v > 0 { 1.0 } else { -1.0 };
+                            let r = M3::rot_y(toward * std::f32::consts::FRAC_PI_2).mul(&M3::rot_x(-0.5));
+                            op.obox(tip + v3(toward * 0.01, 0.008, 0.0), &r, v3(0.012, 0.02, 0.026), col, -1.0, 0.6);
+                        }
+                        crate::boards::BISHOP => {
+                            op.ellipsoid(tip, &up, v3(0.016, 0.026, 0.016), col, -1.0, 0.6, 0.0);
+                            op.ellipsoid(tip + v3(0.0, 0.028, 0.0), &up, v3(0.006, 0.006, 0.006), col, -1.0, 0.6, 0.0);
+                        }
+                        crate::boards::QUEEN => {
+                            op.tube(tip, tip + v3(0.0, 0.014, 0.0), 0.015, 0.022, v3(1.0, 0.0, 0.0), 1.0, col, -1.0, 0.6);
+                            op.ellipsoid(tip + v3(0.0, 0.02, 0.0), &up, v3(0.008, 0.008, 0.008), col, -1.0, 0.6, 0.0);
+                        }
+                        _ => {
+                            op.obox(tip + v3(0.0, 0.012, 0.0), &up, v3(0.004, 0.016, 0.004), col, -1.0, 0.6);
+                            op.obox(tip + v3(0.0, 0.016, 0.0), &up, v3(0.012, 0.004, 0.004), col, -1.0, 0.6);
+                        }
+                    }
+                }
+            }
+            Board::Checkers(b) => {
+                let red = lin([168, 30, 26]);
+                for s in 0..64u8 {
+                    let v = b.sq[s as usize];
+                    if v == 0 {
+                        continue;
+                    }
+                    let col = if v > 0 { red } else { ebony };
+                    let p = at(s);
+                    let n = if v.abs() == 2 { 2 } else { 1 };
+                    for k in 0..n {
+                        let y = 0.014 * k as f32;
+                        op.tube(p + v3(0.0, y, 0.0), p + v3(0.0, y + 0.013, 0.0), 0.034, 0.034, v3(1.0, 0.0, 0.0), 1.0, col, -1.0, 0.7);
+                    }
+                    if n == 2 {
+                        op.ellipsoid(p + v3(0.0, 0.03, 0.0), &up, v3(0.012, 0.003, 0.012), lin([220, 170, 60]), -1.0, 1.0, 0.0);
+                    }
+                }
+            }
+            Board::Connect4(b) => {
+                // the upright frame across the table, discs showing from both sides
+                let blue = lin([38, 70, 150]);
+                let w = 0.075;
+                let base = top + 0.03;
+                op.obox(c + v3(0.0, base + 3.0 * w - top, 0.0), &up, v3(0.008, 3.2 * w, 3.7 * w), blue, -1.0, 0.4);
+                op.obox(c + v3(0.0, 0.012, 0.0), &up, v3(0.05, 0.012, 3.9 * w), lin([70, 46, 30]), -1.0, 0.2);
+                for col in 0..crate::boards::C4_COLS {
+                    for row in 0..crate::boards::C4_ROWS {
+                        let cell = b.cells[col][row];
+                        let p = v3(cx, base + (row as f32 + 0.5) * w, cz + (col as f32 - 3.0) * w);
+                        let colr = match cell {
+                            1 => lin([196, 34, 30]),
+                            2 => lin([236, 196, 40]),
+                            _ => lin([14, 18, 34]),
+                        };
+                        op.tube(p - v3(0.014, 0.0, 0.0), p + v3(0.014, 0.0, 0.0), 0.03, 0.03, V3::UP, 1.0, colr, -1.0, 0.5);
+                    }
+                }
+            }
+        }
+        // the last move, for those watching: a soft glow over the board a moment
+        if g.time - t.moved_t < 1.2 && !t.last.is_empty() {
+            ad.billboard(cam, c + v3(0.0, 0.12, 0.0), 0.12, lina([255, 220, 150], 0.35 * (1.0 - (g.time - t.moved_t) / 1.2)));
+        }
+    }
+    // ---- the Rooftop Run's rings
+    let rings = crate::varrow::RUN_RINGS;
+    let next = if h.run.running { h.run.next } else { 0 };
+    for (k, &(x, y, z)) in rings.iter().enumerate() {
+        let c = v3(x, y, z);
+        if !near(c, 60.0) {
+            continue;
+        }
+        let toward = if k + 1 < rings.len() { v3(rings[k + 1].0, rings[k + 1].1, rings[k + 1].2) - c } else { c - v3(rings[k - 1].0, rings[k - 1].1, rings[k - 1].2) };
+        let n = toward.flat().norm();
+        let side = v3(n.z, 0.0, -n.x);
+        let (col, a) = if k == next {
+            ([90, 230, 255], 0.9)
+        } else if k == 0 || k + 1 == rings.len() {
+            ([255, 200, 90], 0.45)
+        } else if h.run.running && k < next {
+            ([120, 255, 160], 0.2)
+        } else {
+            ([255, 200, 90], 0.25)
+        };
+        let r = crate::varrow::RING_RADIUS * 0.8;
+        let pts: Vec<V3> = (0..=24).map(|i| {
+            let t = i as f32 / 24.0 * std::f32::consts::TAU;
+            c + side * (t.cos() * r) + V3::UP * (t.sin() * r)
+        }).collect();
+        for w in pts.windows(2) {
+            ad.beam(cam, w[0], w[1], 0.05, lina(col, a));
+        }
+    }
+    // ---- your aim room: the targets, the sparring post
+    if let Some(run) = h.aim.as_ref().filter(|a| !a.done) {
+        if let Some(t) = run.target {
+            op.ellipsoid(t.pos, &M3::I, v3(t.r, t.r, t.r), lin([200, 40, 34]), -1.0, 0.6, 0.0);
+            ad.billboard(cam, t.pos, t.r * 1.4, lina([255, 90, 60], 0.35));
+            ad.billboard(cam, t.pos, t.r * 0.45, lina([255, 245, 230], 0.9));
+        }
+        if run.drill == crate::hub_aim::Drill::Parry {
+            let (base, k) = run.post();
+            let wood = lin([92, 64, 40]);
+            op.tube(base, base + v3(0.0, 1.7, 0.0), 0.11, 0.09, v3(1.0, 0.0, 0.0), 1.0, wood, -1.0, 0.2);
+            op.ellipsoid(base + v3(0.0, 1.85, 0.0), &M3::I, v3(0.13, 0.15, 0.13), wood, -1.0, 0.2, 0.0);
+            // the arm: raised back on the tell, down on you at the blow
+            let ang = 1.9 - 2.6 * k;
+            let shoulder = base + v3(0.0, 1.45, 0.0);
+            let tip = shoulder + v3(0.25, ang.sin() * 0.9, -ang.cos() * 0.9);
+            op.tube(shoulder, tip, 0.05, 0.035, v3(1.0, 0.0, 0.0), 1.0, lin([150, 150, 160]), -1.0, 1.5);
+            if k > 0.0 && k < 1.0 {
+                ad.billboard(cam, tip, 0.25 + 0.2 * k, lina([255, 170, 60], 0.5 * k));
+            }
+        }
+    }
+}
+
 /// A prop placed in the level, its triangles moved into place.
 fn prop_into(mb: &mut MB, p: &crate::world::Prop, map: MapId) {
     let (s, c) = p.yaw.sin_cos();
@@ -1483,7 +1697,7 @@ fn trim_surface(map: MapId, own: Mat, t: Trim) -> (env::Surface, f32) {
             MapId::Arena => (env::surface(map, Mat::Trim), 1.0),
             MapId::CloseQuarters => (env::surface(map, Mat::Trim), 1.0),
             MapId::Courtyard => (env::surface(map, Mat::Stone), 1.0),
-            MapId::Bridgeworks => (env::surface(map, Mat::Trim), 1.0),
+            MapId::Bridgeworks | MapId::Varrow => (env::surface(map, Mat::Trim), 1.0),
         },
         _ => (env::surface(map, own), 0.84),
     }
@@ -2206,7 +2420,8 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
     let anchor = p.grip;
     weapon_mesh(mb, add_mb, cam, f, anchor, &p.weapon, time);
     // Ledger Duels: an off-hand pistol in the left hand, pointing where the forearm does (level)
-    if f.alive && f.kit.as_ref().is_some_and(|k| k.equip[crate::gear::Slot::Off as usize] == crate::gear::SNUB) {
+    let snub_look = f.kit.is_none() && f.hub.pit == 255 && f.hub.emote == 0 && f.hub.look.held(crate::hub::Slot::Off) == crate::gear::SNUB;
+    if f.alive && (snub_look || f.kit.as_ref().is_some_and(|k| k.equip[crate::gear::Slot::Off as usize] == crate::gear::SNUB)) {
         let far = (anchor - cam.pos).len() > crate::weapons::FAR;
         if let Some(m) = crate::weapons::item_model(crate::gear::SNUB, far) {
             let fwd = f.fwd();
@@ -2341,8 +2556,14 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
     if dist > 2.5 && to.dot(cam.fwd) < dist * 0.15 {
         return;
     }
-    // (a Ledger Duels item with its own model is held in place of the kind it fights as)
-    let own = f.kit.as_ref().and_then(|k| k.main()).and_then(|it| crate::weapons::item_model(it.id, dist > crate::weapons::FAR));
+    // emoting in the hub: hands free
+    if f.hub.emote != 0 && f.hub.pit == 255 {
+        return;
+    }
+    // (a Ledger Duels item with its own model is held in place of the kind it fights as; in the
+    // hub, the main-hand look's own model)
+    let held = f.kit.as_ref().and_then(|k| k.main()).map(|it| it.id).or_else(|| Some(f.hub.look.held(crate::hub::Slot::Main)).filter(|&id| id != 0 && f.kit.is_none() && f.hub.pit == 255));
+    let own = held.and_then(|id| crate::weapons::item_model(id, dist > crate::weapons::FAR));
     let m = own.or_else(|| if dist > crate::weapons::FAR { crate::weapons::model_far(f.weapon) } else { crate::weapons::model(f.weapon) });
     if let Some(m) = m {
         mb.v.reserve(m.parts.iter().map(|p| p.tris.len()).sum());
@@ -2612,6 +2833,10 @@ pub struct Gpu {
     /// The fighters' outlines (an inside-out shell).
     pipe_outline: wgpu::RenderPipeline,
     inst_buf: wgpu::Buffer,
+    /// What worn gear hides of each fighter (see the shader's rest_pos), and per body where its
+    /// part starts: its points on the bones, its cover bits, words per piece.
+    hide_buf: wgpu::Buffer,
+    hide_meta: Vec<[u32; 3]>,
     skin: Option<Skin>,
     chars: Vec<CharState>,
     /// For each body part, which skin joints belong to it (bits, three words).
@@ -2996,13 +3221,14 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sky_sampler) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self.shadow_view) },
                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&self.shadow_sampler) },
+                wgpu::BindGroupEntry { binding: 10, resource: self.hide_buf.as_entire_binding() },
             ],
         })
     }
 
     pub fn new(rs: &RenderState, world: &World) -> Gpu {
         let device = &rs.device;
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("duel shader"), source: wgpu::ShaderSource::Wgsl(format!("{U_DECL}{SHADER}").into()) });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("duel shader"), source: wgpu::ShaderSource::Wgsl(format!("{U_DECL}{}{SHADER}", dye_decl()).into()) });
 
         // the level's materials (colour, and normal + roughness + metalness)
         let (cols, surfs) = build_world_layers();
@@ -3064,6 +3290,7 @@ impl Gpu {
         };
         let ubuf_entry = wgpu::BindGroupLayoutEntry { binding: 0, visibility: both, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None };
         let inst_entry = wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let hide_entry = wgpu::BindGroupLayoutEntry { binding: 10, ..inst_entry };
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("duel bgl"),
             entries: &[
@@ -3077,6 +3304,7 @@ impl Gpu {
                 wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
                 wgpu::BindGroupLayoutEntry { binding: 8, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 9, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
+                hide_entry,
             ],
         });
         let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3088,14 +3316,34 @@ impl Gpu {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("duel layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let [pipe_opaque, pipe_alpha, pipe_add, pipe_sky, pipe_skin, pipe_outline] = make_pipelines(device, &layout, &module, MSAA);
         // the sun's view: its own small layout (uniforms and the fighters' joints)
-        let sbgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("duel shadow bgl"), entries: &[ubuf_entry, inst_entry] });
+        let sbgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("duel shadow bgl"), entries: &[ubuf_entry, inst_entry, hide_entry] });
+        // what worn gear hides of each fighter (chars::Model::cores and cover), one buffer for all
+        let (hide_buf, hide_meta) = {
+            use wgpu::util::DeviceExt;
+            let mut data: Vec<u32> = Vec::new();
+            let mut meta = Vec::new();
+            for m in crate::chars::shared().map(|v| v.as_slice()).unwrap_or(&[]) {
+                let core_off = data.len() as u32;
+                data.extend(m.cores.iter().flat_map(|c| c.map(f32::to_bits)));
+                let cover_off = data.len() as u32;
+                for p in 0..crate::chars::GEAR_PIECES.len() {
+                    match m.cover.get(p) {
+                        Some(b) if b.len() == m.cover_words => data.extend_from_slice(b),
+                        _ => data.extend(std::iter::repeat_n(0, m.cover_words)),
+                    }
+                }
+                meta.push([core_off, cover_off, m.cover_words as u32]);
+            }
+            data.resize(data.len().max(4), 0);
+            (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gear hides"), contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::STORAGE }), meta)
+        };
         let sh_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("duel shadow shader"), source: wgpu::ShaderSource::Wgsl(format!("{U_DECL}{SHADOW_SHADER}").into()) });
         let sh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("duel shadow layout"), bind_group_layouts: &[Some(&sbgl)], immediate_size: 0 });
         let (pipe_shadow, pipe_skin_shadow) = make_shadow_pipelines(device, &sh_layout, &sh_module);
         let shadow_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("duel shadow bind"),
             layout: &sbgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 10, resource: hide_buf.as_entire_binding() }],
         });
         // the animated character (CC0 Quaternius mannequin)
         let skin = match Rig::load() {
@@ -3140,7 +3388,7 @@ impl Gpu {
         let placeholder = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("duel placeholder"),
             layout: &sbgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 3, resource: inst_buf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 10, resource: hide_buf.as_entire_binding() }],
         });
         let mut g = Gpu {
             pipe_opaque,
@@ -3159,6 +3407,8 @@ impl Gpu {
             pipe_skin,
             pipe_outline,
             inst_buf,
+            hide_buf,
+            hide_meta,
             skin,
             chars: (0..MAX_INST).map(|_| CharState::new()).collect(),
             part_masks,
@@ -3407,7 +3657,7 @@ impl Gpu {
         let mut inst_gear: Vec<Vec<u8>> = Vec::new();
         // Afterimage decoys are drawn as their owners (after the real fighters)
         // (and an execution's afterimages, after them)
-        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).chain(g.exec_ghosts()).take(MAX_INST - MAX_PLAYERS).collect();
+        let decoys: Vec<Fighter> = g.decoys.iter().filter_map(|d| g.decoy_fighter(d)).chain(g.exec_ghosts()).chain(g.hub_ghosts()).take(MAX_INST - MAX_PLAYERS).collect();
         for (i, f) in g.f.iter().enumerate().chain(decoys.iter().enumerate().map(|(k, f)| (MAX_PLAYERS + k, f))) {
             if !f.present || f.spectate {
                 continue;
@@ -3485,19 +3735,31 @@ impl Gpu {
                     data.extend_from_slice(&[rc[0] / top * rk, rc[1] / top * rk, rc[2] / top * rk, g.tune.rim_width.max(0.5)]);
                     // how it moves (for the sway of hair, scarves and aprons), and its own phase
                     data.extend_from_slice(&[f.vel.x, f.vel.y, f.vel.z, i as f32 * 1.7]);
-                    // gear dyes (and the Rig's charm glow)
-                    let (dyes, glow) = f.kit.as_ref().map_or((crate::gear::DEFAULT_DYES, false), |k| (k.dyes, k.charm_glows()));
-                    for (z, &d) in dyes.iter().enumerate() {
-                        let c = crate::gear::dye(d);
-                        data.extend_from_slice(&[c[0], c[1], c[2], if z == 2 && glow { 1.0 } else { 0.0 }]);
+                    // what they wear: Ledger gear (its three dyes on every piece, the charm's
+                    // glow), or in the hub their outfit (three dyes per slot)
+                    let (wear, dyes9, glow) = worn_of(g, f);
+                    let mut packed = [0u32; 8];
+                    for (k, d) in dyes9.iter().flatten().enumerate() {
+                        packed[k / 4] |= (*d as u32) << ((k % 4) * 8);
                     }
+                    data.extend(packed.iter().map(|&x| f32::from_bits(x)));
+                    data.extend_from_slice(&[if glow { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]);
+                    // the worn gear pieces that hide what's under them
+                    let worn: Vec<u32> = wear.iter().filter_map(|&id| crate::chars::GEAR_PIECES.iter().position(|g| g.1 == id && id != 0)).map(|p| p as u32).take(12).collect();
+                    let meta = self.hide_meta.get(f.loadout.body as usize).copied();
+                    let head = match meta {
+                        Some(m) if !worn.is_empty() => [m[0], m[1], m[2], worn.len() as u32],
+                        _ => [0; 4],
+                    };
+                    data.extend(head.iter().map(|&x| f32::from_bits(x)));
+                    data.extend((0..12).map(|k| f32::from_bits(worn.get(k).copied().unwrap_or(0))));
                     for j in 0..MAX_JOINTS {
                         let m = p.palette.get(j).copied().unwrap_or(glam::Mat4::IDENTITY);
                         data.extend_from_slice(&m.to_cols_array());
                     }
                     insts.push(data);
                     inst_body.push(f.loadout.body as usize);
-                    inst_gear.push(f.kit.as_ref().map(|k| k.equip.iter().copied().filter(|&id| id != 0).collect()).unwrap_or_default());
+                    inst_gear.push(wear);
                     character_extras(&mut op, &mut ad, cam, f, &p, &mut self.chars[i], g.time, &lk, flash, g.tune.char_scale);
                 }
                 None => fighter_mesh(&mut op, &mut ad, cam, f, pos, g.time),
@@ -3578,6 +3840,7 @@ impl Gpu {
                 ad.billboard(cam, top - v3(0.0, 0.25, 0.0), 0.7, lina(col, 0.25));
             }
         }
+        hub_visuals(&mut op, &mut ad, cam, g);
         for gr in &g.grenades {
             if gr.kind == 2 {
                 // a throwing star, spinning flat as it flies, with a faint streak behind. Fresh
@@ -4226,6 +4489,7 @@ mod final_kill_tests {
     /// part of that, since the Deck's processor is slower than a desktop's.
     #[test]
     fn a_full_lobby_frame_fits_a_steam_deck_budget() {
+        let _quiet = crate::heavy();
         let mut g = Game::offline("P", 7, 0.8, Mode::Ffa, 200);
         g.f[0].ready = true;
         let n = g.f.len();
@@ -4248,6 +4512,44 @@ mod final_kill_tests {
         eprintln!("full lobby frame: average {avg:.2} ms, 99th percentile {p99:.2} ms");
         assert!(avg < 3.0, "average {avg:.2} ms (budget 3 ms here, about 6 on a Deck)");
         assert!(p99 < 6.0, "99th percentile {p99:.2} ms");
+    }
+
+    /// The Steam Deck check for Varrow Centre: 16 people in the square (you and 15 regulars
+    /// walking, sitting, playing at the tables, emoting), every fighter animated each frame.
+    #[test]
+    fn a_full_varrow_centre_frame_fits_a_steam_deck_budget() {
+        let _quiet = crate::heavy();
+        let g = Game::hub("P", 15, crate::game::Kind::Offline);
+        let n = g.f.len();
+        assert_eq!(g.f.iter().filter(|f| f.present).count(), 16, "16 in the square");
+        let mut run = Run { g, acc: 0.0, chars: (0..n).map(|_| CharState::new()).collect(), career: Career::default(), label: "Varrow Centre".into() };
+        let mut inp = Input::default();
+        for _ in 0..(5.0 / FRAME) as usize {
+            run.frame(&mut inp);
+        }
+        // (the other tests share the processor: the quietest of three 2-second windows counts)
+        let (mut avg, mut p99) = (f64::MAX, f64::MAX);
+        for _ in 0..3 {
+            let mut times = Vec::new();
+            for _ in 0..(2.0 / FRAME) as usize {
+                inp = Input { yaw: run.g.f[0].yaw, fwd: 1.0, ..Default::default() };
+                let t0 = Instant::now();
+                run.frame(&mut inp);
+                times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            let a = times.iter().sum::<f64>() / times.len() as f64;
+            avg = avg.min(a);
+            p99 = p99.min(times[times.len() * 99 / 100]);
+            if avg < 2.0 {
+                break;
+            }
+        }
+        // twice the fighters of a full lobby, twice its budget: 6 ms here, about 12 on a Deck,
+        // inside 60 fps (alone on this computer it takes about 1.1 ms)
+        eprintln!("Varrow Centre frame (16 players): average {avg:.2} ms, 99th percentile {p99:.2} ms");
+        assert!(avg < 6.0, "average {avg:.2} ms (budget 6 ms here, about 12 on a Deck)");
+        assert!(p99 < 12.0, "99th percentile {p99:.2} ms");
     }
 
     #[test]

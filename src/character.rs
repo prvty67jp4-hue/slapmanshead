@@ -592,6 +592,14 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     // (looking a blade over is its hero pose)
     let hero = (hero || f.inspect_t > 0.0) && show && melee && f.alive && f.on_ground && f.stun_t <= 0.0 && speed < 0.6 && f.slash_t <= 0.0 && f.fin == 0 && !f.guard;
     let mut target_yaw = 0.0;
+    // the hub's emotes (standing still, on your feet or on a seat)
+    use crate::hub::Emote;
+    let emote = if f.alive && f.stun_t <= 0.0 && f.slash_t <= 0.0 && (f.on_ground || f.hub.seat != crate::hub::SEAT_NONE) && (speed < 0.8 || f.hub.seat != crate::hub::SEAT_NONE) {
+        Emote::from_u8(f.hub.emote)
+    } else {
+        Emote::None
+    };
+    let et = (now - f.hub.emote_t).max(0.0);
     let want: Play = if !f.alive {
         Play::new("Death01", 1.0, false)
     } else if f.stun_t > 0.0 {
@@ -613,6 +621,14 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
         Play::new("Roll", 2.0, false)
     } else if !f.on_ground {
         if f.vel.y > 1.5 { Play::new("Jump_Start", 1.0, false) } else { Play::new("Jump_Loop", 1.0, true) }
+    } else if emote != Emote::None {
+        match emote {
+            Emote::Dance => Play::new("Dance_Loop", 1.0, true),
+            Emote::Sit if f.hub.seat != crate::hub::SEAT_NONE => Play::new("Sitting_Idle_Loop", 1.0, true),
+            Emote::Sit => Play::new("Crouch_Idle_Loop", 0.6, true),
+            Emote::Laugh => Play::new("Idle_Talking_Loop", 1.3, true),
+            _ => Play::new("Idle_Loop", 1.0, true),
+        }
     } else if speed > 0.6 {
         let a = local_v.x.atan2(local_v.z);
         let back = a.abs() > 1.85;
@@ -677,7 +693,7 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
         st.scratch2 = tmp;
     }
 
-    let alive_upper = f.alive && f.stun_t <= 0.0;
+    let alive_upper = f.alive && f.stun_t <= 0.0 && emote == Emote::None;
     // ---- upper body layers
     if alive_upper {
         if !melee {
@@ -914,7 +930,7 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
 
     // ---- the picture's grip: fists closed, and the sword hand turned so the blade leaves the fist
     // where the swing (or the stance) wants it; the greatsword's other hand joins on the handle
-    if show && melee && f.alive {
+    if show && melee && f.alive && emote == Emote::None {
         let hero_blade = if hero { hero_pose(rig, &b, &mut pose, f, now) } else { None };
         close_fists(rig, &mut pose, &mut st.scratch2);
         // in a clip-driven swing the clip's hand is the grip; otherwise aim the hand
@@ -966,6 +982,59 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
     }
     // the dagger on the move: held reversed
     let reverse = show && melee && f.alive && f.weapon == Weapon::Dagger && st.carry.is_some_and(|c| c.reverse > 0.5);
+
+    // ---- the hub's emotes: the arms (and a bow's back) on top of the clip
+    if emote != Emote::None {
+        // in and out over the first and last third of a second
+        let len = emote.length().unwrap_or(f32::MAX);
+        let k = smooth01(et / 0.3).min(smooth01((len - et) / 0.3));
+        let sh_r = gpos(&pose, b.up_r);
+        let sh_l = gpos(&pose, b.up_l);
+        let chest = (sh_r + sh_l) * 0.5;
+        let head = gpos(&pose, b.head);
+        let v = Vec3::new;
+        let ik = |pose: &mut Vec<Trs>, right: bool, target: Vec3, pole: Vec3| {
+            let (up, lo, hand, sh) = if right { (b.up_r, b.lo_r, b.hand_r, sh_r) } else { (b.up_l, b.lo_l, b.hand_l, sh_l) };
+            let now_at = gpos(pose, hand);
+            rig.two_bone_ik(pose, up, lo, hand, to_model(now_at.lerp(target, k)), to_model(sh + pole));
+        };
+        let turn = |pose: &mut Vec<Trs>, bone: usize, axis: Vec3, a: f32| {
+            let g = rig.globals(pose);
+            rig.rotate_global(pose, &g, bone, ours(rig, axis, a));
+        };
+        match emote {
+            Emote::Wave => {
+                let sway = (et * 7.0).sin() * 0.14;
+                ik(&mut pose, true, sh_r + v(0.22 + sway, 0.42, 0.12), v(0.5, -0.2, -0.3));
+            }
+            Emote::Salute => ik(&mut pose, true, head + v(0.07, 0.07, 0.11), v(0.5, -0.1, 0.1)),
+            Emote::Cheer => {
+                let bounce = (et * 9.0).sin().abs() * 0.06;
+                ik(&mut pose, true, sh_r + v(0.14, 0.52 + bounce, 0.06), v(0.4, 0.0, -0.3));
+                ik(&mut pose, false, sh_l + v(-0.14, 0.52 + bounce, 0.06), v(-0.4, 0.0, -0.3));
+            }
+            Emote::Clap => {
+                let open = (et * 8.0).sin().abs() * 0.1;
+                ik(&mut pose, true, chest + v(0.03 + open, -0.08, 0.34), v(0.5, -0.5, -0.2));
+                ik(&mut pose, false, chest + v(-0.03 - open, -0.08, 0.34), v(-0.5, -0.5, -0.2));
+            }
+            Emote::Bow => {
+                for bone in [b.spine2, b.spine3] {
+                    turn(&mut pose, bone, Vec3::X, 0.38 * k);
+                }
+                turn(&mut pose, b.head, Vec3::X, 0.2 * k);
+                ik(&mut pose, false, chest + v(0.02, -0.12, 0.2), v(-0.5, -0.5, 0.0));
+                ik(&mut pose, true, sh_r + v(0.42, -0.2, 0.18), v(0.4, -0.5, -0.3));
+            }
+            Emote::Laugh => {
+                turn(&mut pose, b.spine3, Vec3::X, -0.12 * k + (et * 15.0).sin() * 0.04 * k);
+                turn(&mut pose, b.head, Vec3::X, -0.22 * k);
+                ik(&mut pose, true, chest + v(0.1, -0.3, 0.24), v(0.5, -0.4, -0.2));
+                ik(&mut pose, false, chest + v(-0.1, -0.3, 0.24), v(-0.5, -0.4, -0.2));
+            }
+            _ => {}
+        }
+    }
 
     // ---- a grenade being wound up: the throwing arm pulls back behind the shoulder
     if f.alive && f.stun_t <= 0.0 && f.nade_wind > 0.0 {

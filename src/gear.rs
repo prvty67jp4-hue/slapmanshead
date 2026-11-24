@@ -512,7 +512,7 @@ impl Rules {
 // ---------------------------------------------------------------- loadouts
 
 /// Dyes for gear with dye zones (the coat, its trim, an accent): name and colour (linear).
-pub const DYES: [(&str, [f32; 3]); 12] = [
+pub const DYES: [(&str, [f32; 3]); 24] = [
     ("Oiled Brown", [0.20, 0.11, 0.05]),
     ("Brass", [0.62, 0.42, 0.14]),
     ("Teal", [0.03, 0.42, 0.40]),
@@ -525,6 +525,19 @@ pub const DYES: [(&str, [f32; 3]); 12] = [
     ("Silver", [0.60, 0.62, 0.66]),
     ("Ember Orange", [0.80, 0.30, 0.05]),
     ("Ivory", [0.75, 0.70, 0.58]),
+    // the wardrobe's wider range (Fashionscape)
+    ("Crimson", [0.50, 0.03, 0.06]),
+    ("Rose", [0.70, 0.28, 0.36]),
+    ("Plum", [0.24, 0.06, 0.22]),
+    ("Lilac", [0.42, 0.32, 0.62]),
+    ("Navy", [0.02, 0.04, 0.15]),
+    ("Sky", [0.25, 0.48, 0.75]),
+    ("Mint", [0.30, 0.62, 0.46]),
+    ("Forest", [0.03, 0.14, 0.05]),
+    ("Saffron", [0.85, 0.56, 0.06]),
+    ("Sand", [0.55, 0.45, 0.30]),
+    ("Charcoal", [0.08, 0.08, 0.09]),
+    ("Chalk White", [0.85, 0.84, 0.80]),
 ];
 /// The dye zones, and the Rig's own colours: oiled brown canvas, brass trim, a teal accent.
 pub const DYE_ZONES: [&str; 3] = ["Coat", "Trim", "Accent"];

@@ -27,12 +27,27 @@ mod world;
 mod zones;
 mod lore;
 mod gear;
+mod boards;
+mod varrow;
+mod hub;
+mod hub_aim;
+mod hub_bots;
 #[cfg(test)]
 mod tactics_tests;
 #[cfg(test)]
 mod story_tests;
 #[cfg(test)]
 mod ledger_tests;
+mod hub_tests;
+mod hub_ui;
+
+/// (tests) Held by the timing test and the busiest tests, so they never run at once.
+#[cfg(test)]
+pub static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, Stroke, Vec2, ViewportCommand};
 use game::*;
@@ -860,6 +875,12 @@ struct App {
     pad_tab: i32,
     /// Dynamic resolution (holds the frame rate).
     dynres: gpu::DynRes,
+    /// The Varrow Hub: its panels and save (crate::hub_ui), the hub kept while the menu is open,
+    /// the picture scene's scripted runner, and an Esc the hub already used this frame.
+    hub_ui: hub_ui::HubUi,
+    hub_keep: Option<(Game, Option<Net>)>,
+    runner_state: Option<hub_bots::Runner>,
+    esc_eaten: bool,
 }
 
 /// Controller movement and held buttons, merged into the game input.
@@ -884,6 +905,10 @@ impl App {
             eprintln!("audio device: {}", if audio.is_some() { "ok" } else { "none" });
         }
         let mut app = App {
+            hub_ui: hub_ui::HubUi::default(),
+            hub_keep: None,
+            runner_state: None,
+            esc_eaten: false,
             screen: Screen::Menu(Page::Main),
             demo,
             gpu: None,
@@ -1214,10 +1239,61 @@ impl App {
                 app.screen = Screen::Lobby { net: n, waiting_since: 0.0 };
             }
         }
+        // the Varrow Hub: you load into the town square (the menu is one key away). Picture and
+        // test switches that set up something else keep the menu; DUEL_MENU=1 does too.
+        app.hub_scene();
+        let set_up = ["DUEL_PAGE", "DUEL_MENU", "DUEL_AUTOPLAY", "DUEL_EXEC", "DUEL_TRAIN", "DUEL_AUTOHOST", "DUEL_AUTOJOIN", "DUEL_BENCH", "DUEL_GALLERY", "DUEL_STEAM_SELFTEST", "DUEL_REPORT_TEST", "DUEL_CRASH_TEST", "DUEL_UPDATE_NOW", "DUEL_AUDIO_TEST"].iter().any(|k| std::env::var_os(k).is_some());
+        if matches!(app.screen, Screen::Menu(Page::Main)) && !set_up && app.screenshot.is_none() {
+            app.start_hub(false);
+        }
         app
     }
 
+    /// Esc in the hub on this computer: the menu, with the hub kept to come back to.
+    fn hub_to_menu(&mut self) {
+        self.write_hub_save();
+        let old = std::mem::replace(&mut self.screen, Screen::Menu(Page::Main));
+        if let Screen::Play { game, net } = old {
+            self.hub_keep = Some((game, net));
+        }
+        self.hub_ui.panel = None;
+        self.hub_ui.mirror = false;
+        self.hub_ui.wheel = false;
+        self.hub_ui.photo = None;
+    }
+
+    /// Back into the hub from the menu (or after a match).
+    fn back_to_hub(&mut self) -> bool {
+        match self.hub_keep.take() {
+            Some((game, net)) => {
+                let l = game.local;
+                self.aim_yaw = game.f[l].yaw;
+                self.aim_pitch = 0.0;
+                self.acc = 0.0;
+                self.latch = Latch::default();
+                self.paused = false;
+                self.disconnected = None;
+                self.screen = Screen::Play { game, net };
+                true
+            }
+            None => false,
+        }
+    }
+
     fn start_game(&mut self, mut game: Game, net: Option<Net>) {
+        // leaving the hub for a match: it's kept (on this computer) to come back to
+        if !game.in_hub() {
+            if let Screen::Play { game: old, .. } = &self.screen {
+                if old.in_hub() {
+                    self.hub_to_menu();
+                }
+            }
+            if self.hub_keep.as_ref().is_some_and(|k| k.1.is_some()) {
+                if let Some((_, Some(mut n))) = self.hub_keep.take() {
+                    n.send_bye();
+                }
+            }
+        }
         // Ledger Duels: the gear you bring, and (as challenger) your rules and the best-of
         game.my_kit = self.ledger.current().clone();
         if game.mt.mode == Mode::Ledger && game.kind != Kind::Client {
@@ -1299,6 +1375,11 @@ impl App {
     }
 
     fn leave_to_menu(&mut self) {
+        let was_hub = matches!(&self.screen, Screen::Play { game, .. } if game.in_hub());
+        if was_hub {
+            self.write_hub_save();
+            self.hub_keep = None;
+        }
         if let Screen::Play { net: Some(net), .. } | Screen::Lobby { net, .. } = &mut self.screen {
             net.send_bye();
         }
@@ -1310,6 +1391,10 @@ impl App {
         self.disconnected = None;
         self.quick_host = false;
         self.news = load_news();
+        // after a match, back to the hub you came from
+        if !was_hub {
+            self.back_to_hub();
+        }
     }
 
     fn set_capture(&mut self, ctx: &egui::Context, on: bool) {
@@ -2575,6 +2660,7 @@ impl eframe::App for App {
         self.frame_dt = dt;
         self.wall_t += dt;
         self.handle_screenshot(&ctx);
+        self.take_photo(&ctx);
 
         self.watchdog.stage("Steam");
         self.steam_frame(dt);
@@ -2595,17 +2681,34 @@ impl eframe::App for App {
                 Screen::Play { game, .. } => game.mt.phase == Phase::Loadout && !game.f[game.local].ready,
                 _ => false,
             };
-            let want_capture = !self.paused && !self.match_over() && self.disconnected.is_none() && !self.autoplay && !choosing && !self.show_tuning;
+            let want_capture = !self.paused && !self.match_over() && self.disconnected.is_none() && !self.autoplay && !choosing && !self.show_tuning && !self.hub_ui.blocks();
             self.set_capture(&ctx, want_capture);
             if want_capture && platform::mouse_hold() == platform::MouseHold::Confined {
                 ctx.send_viewport_cmd(ViewportCommand::CursorPosition(rect.center()));
             }
             self.watchdog.stage("reading input");
             sample_keys(&ctx, &self.settings.binds);
-            self.read_play_input(&ctx);
+            // the hub's own keys first (they may use Esc)
+            let hk = self.hub_keys(&ctx);
+            self.esc_eaten = hk != 0;
+            if hk == 2 {
+                self.hub_to_menu();
+            }
+            let look = (self.aim_yaw, self.aim_pitch);
+            if matches!(self.screen, Screen::Play { .. }) {
+                self.read_play_input(&ctx);
+            }
+            if self.hub_ui.photo.is_some() {
+                // photo mode: the mouse flies the camera, not your fighter
+                (self.aim_yaw, self.aim_pitch) = look;
+                self.photo_fly(&ctx, dt);
+            }
             let t_sim = std::time::Instant::now();
-            self.step_play(dt);
-            self.ledger_after_match();
+            if matches!(self.screen, Screen::Play { .. }) {
+                self.step_play(dt);
+                self.ledger_after_match();
+                self.hub_frame(dt);
+            }
             self.sim_ms = t_sim.elapsed().as_secs_f32() * 1000.0;
         } else {
             self.set_capture(&ctx, false);
@@ -3045,6 +3148,46 @@ impl App {
         s
     }
 
+    /// Photo mode's Enter: the picture goes to Pictures/Duel Arena (or the save folder).
+    fn take_photo(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.hub_ui.photo_req) && self.screenshot.is_none() {
+            let slot = self.shot_slot.clone();
+            ctx.request_screenshot(move |img| {
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some(img);
+                }
+            });
+            self.hub_ui.photo_pending = true;
+        }
+        if !self.hub_ui.photo_pending {
+            return;
+        }
+        let got = self.shot_slot.lock().ok().and_then(|mut s| s.take());
+        if let Some(img) = got {
+            self.hub_ui.photo_pending = false;
+            let [w, h] = img.size;
+            let mut bytes = Vec::with_capacity(w * h * 4);
+            for c in &img.pixels {
+                let [r, g, b, _] = c.to_array();
+                bytes.extend_from_slice(&[r, g, b, 255]);
+            }
+            let dir = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(|h| PathBuf::from(h).join("Pictures").join("Duel Arena")).or_else(|| hub_ui::hub_save_path().and_then(|p| p.parent().map(|d| d.join("photos"))));
+            if let Some(dir) = dir {
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(format!("varrow_{}.png", now_secs()));
+                let ok = image::save_buffer(&path, &bytes, w as u32, h as u32, image::ColorType::Rgba8).is_ok();
+                if let Screen::Play { game, .. } = &mut self.screen {
+                    if let Some(hb) = game.hub.as_mut() {
+                        hb.toast(if ok { format!("Photo saved: {}", path.display()) } else { "Couldn't save the photo".into() });
+                    }
+                }
+            }
+            if let Some(ph) = self.hub_ui.photo.as_mut() {
+                ph.flash = 1.0;
+            }
+        }
+    }
+
     fn handle_screenshot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.screenshot.clone() else { return };
         let mut shot_frame: u32 = std::env::var("DUEL_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
@@ -3110,7 +3253,7 @@ impl App {
             if self.chat_open {
                 return; // typing: the chat box has the keyboard
             }
-            if i.key_pressed(Key::Escape) && self.rebinding.is_none() {
+            if i.key_pressed(Key::Escape) && self.rebinding.is_none() && !self.esc_eaten {
                 toggle_pause = true;
             }
             self.show_scores = b[A_SCORES].down(i);
@@ -3492,9 +3635,10 @@ impl App {
         self.ping_frame(dt, keys.ping);
         self.inv_frame(dt, keys.pack);
         let mut inp = self.current_input(&keys);
-        if self.chat_open {
+        if self.chat_open || self.hub_ui.photo.is_some() || self.hub_ui.blocks() {
             inp = Input { yaw: self.aim_yaw, pitch: self.aim_pitch, ..Default::default() };
         }
+        self.hub_scene_input(&mut inp);
         let mut chat_send = self.chat_send.take();
         if self.autoplay && !self.test_chat_done {
             if let Some(text) = std::env::var("DUEL_CHAT").ok() {
@@ -3867,6 +4011,9 @@ impl App {
         let f = &game.f[l];
         let alpha = (self.acc / TICK).clamp(0.0, 1.0);
         let body = f.prev_pos.lerp(f.pos, alpha);
+        if let Some(c) = self.hub_camera(game, rect, body) {
+            return (c, body);
+        }
         // test switch: DUEL_VIEW=x,y,z,yaw,pitch[,fov] puts the camera there (before / after pictures)
         if let Some(v) = test_view() {
             return (Cam::new(v3(v[0], v[1], v[2]), v[3], v[4], v[5], rect), body);
@@ -4662,6 +4809,10 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
     }
     g.local = m.you;
     g.set_map(MapId::from_u8(m.map));
+    if m.mode == Mode::Hub && g.hub.is_none() {
+        g.mt.mode = Mode::Hub;
+        g.hub = Some(Box::new(hub::Hub::new()));
+    }
     for e in &m.roster {
         let s = e.slot;
         if !g.f[s].present || g.f[s].name != e.name {
@@ -4699,7 +4850,7 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
         g.f[l].ap = m.you_ap;
     }
     for s in 0..g.f.len() {
-        if g.f[s].present && s != g.local && !m.roster.iter().any(|e| e.slot == s) {
+        if m.roster_full && g.f[s].present && s != g.local && !m.roster.iter().any(|e| e.slot == s) {
             g.remove_player(s);
         }
     }
@@ -4803,6 +4954,28 @@ fn text_shadow(p: &egui::Painter, pos: Pos2, align: Align2, s: &str, size: f32, 
     let font = FontId::proportional(size);
     p.text(pos + Vec2::new(2.0, 2.0), align, s, font.clone(), Color32::from_black_alpha(170));
     p.text(pos, align, s, font, color);
+}
+
+/// The chat, above the health panel (`left`), wrapped to its own column, newest at the bottom.
+fn draw_chat(p: &egui::Painter, rect: Rect, g: &Game, left: Rect, s: f32) {
+    let chat_w = (rect.width() * 0.42).max(left.width());
+    let mut cy = left.top() - 8.0 * s;
+    for line in g.chat.iter().rev() {
+        let a = (line.life.min(1.0) * 255.0) as u8;
+        let pc = player_color(line.color);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&format!("{}: ", line.name), 0.0, egui::TextFormat { font_id: FontId::proportional(15.0 * s), color: Color32::from_rgba_unmultiplied(pc.r(), pc.g(), pc.b(), a), ..Default::default() });
+        job.append(&line.text, 0.0, egui::TextFormat { font_id: FontId::proportional(15.0 * s), color: Color32::from_rgba_unmultiplied(240, 240, 240, a), ..Default::default() });
+        job.wrap.max_width = chat_w - 16.0 * s;
+        let gal = p.layout_job(job);
+        let h = gal.size().y;
+        cy -= h + 6.0 * s;
+        if cy < rect.top() + rect.height() * 0.4 {
+            break;
+        }
+        p.rect_filled(Rect::from_min_size(Pos2::new(left.left(), cy - 3.0 * s), Vec2::new(gal.size().x + 16.0 * s, h + 6.0 * s)), 4.0, Color32::from_black_alpha((a as f32 * 0.5) as u8));
+        p.galley(Pos2::new(left.left() + 8.0 * s, cy), gal, Color32::WHITE);
+    }
 }
 
 /// Draw text from the left, shrinking it (and finally cutting it with "…") so it fits `max_w`.
@@ -5468,6 +5641,23 @@ impl App {
         if test_view().is_some() {
             return; // a clean picture of the map
         }
+        // the hub: its own HUD (none at all in photo mode with the HUD hidden)
+        if g.in_hub() {
+            if let Some(ph) = self.hub_ui.photo {
+                if ph.flash > 0.0 {
+                    p.rect_filled(rect, 0.0, Color32::from_white_alpha((ph.flash * 200.0) as u8));
+                }
+                if !ph.hud {
+                    return;
+                }
+                text_shadow(p, Pos2::new(rect.center().x, rect.bottom() - 40.0), Align2::CENTER_CENTER, "PHOTO MODE  ·  WASD + mouse fly  ·  Space / Ctrl up, down  ·  1-8 pose  ·  H hide  ·  Enter take  ·  P leave", 15.0, Color32::WHITE);
+                return;
+            }
+            self.hub_hud(p, rect, cam, g);
+            if self.hub_ui.mirror || self.hub_ui.panel.is_some() {
+                return;
+            }
+        }
         if (self.loadout_open(g) && !g.f[g.local].is_bot) || (self.paused && self.loadout_edit) {
             return; // the loadout screen covers it
         }
@@ -5562,11 +5752,17 @@ impl App {
 
         // flashes, smoke, pings, the minimap and the ping wheel
         self.draw_tactics(p, rect, cam, g, s);
+        // the hub, out of the pits: no match HUD (names, prompts and the hub's lines are its own);
+        // the aim rooms keep the weapon panel
+        let calm = g.in_hub() && g.hub.as_ref().is_none_or(|h| h.pit_of(g.local).is_none());
+        let aiming = g.hub.as_ref().is_some_and(|h| h.aim.is_some());
         // the story: a duel's intro card, the map's card, voice lines and the announcer
-        self.draw_story(p, rect, cam, g, s);
+        if !calm {
+            self.draw_story(p, rect, cam, g, s);
+        }
 
         // name tags over everyone you can see
-        for other in g.f.iter().filter(|o| o.present && !o.spectate && o.slot != g.local && o.invis_t <= 0.0) {
+        for other in g.f.iter().filter(|o| !calm && o.present && !o.spectate && o.slot != g.local && o.invis_t <= 0.0) {
             if !(other.alive || other.death_t < 2.0) {
                 continue;
             }
@@ -6062,6 +6258,10 @@ impl App {
         let pw = 270.0 * s;
         let ph = 84.0 * s;
         let left = Rect::from_min_size(Pos2::new(rect.left() + margin, rect.bottom() - margin - ph), Vec2::new(pw, ph));
+        if calm && !aiming {
+            draw_chat(p, rect, g, left, s);
+            return;
+        }
         let hud_fill = Color32::from_rgba_unmultiplied(10, 9, 18, 175);
         p.rect_filled(left, 6.0 * s, hud_fill);
         ui_kit::edge_marks(p, left, s, false);
@@ -6245,23 +6445,10 @@ impl App {
         }
 
         // ---- chat, above the health panel, wrapped to its own column
-        let chat_w = (rect.width() * 0.42).max(pw);
-        let mut cy = left.top() - 8.0 * s;
-        for line in g.chat.iter().rev() {
-            let a = (line.life.min(1.0) * 255.0) as u8;
-            let pc = player_color(line.color);
-            let mut job = egui::text::LayoutJob::default();
-            job.append(&format!("{}: ", line.name), 0.0, egui::TextFormat { font_id: FontId::proportional(15.0 * s), color: Color32::from_rgba_unmultiplied(pc.r(), pc.g(), pc.b(), a), ..Default::default() });
-            job.append(&line.text, 0.0, egui::TextFormat { font_id: FontId::proportional(15.0 * s), color: Color32::from_rgba_unmultiplied(240, 240, 240, a), ..Default::default() });
-            job.wrap.max_width = chat_w - 16.0 * s;
-            let gal = p.layout_job(job);
-            let h = gal.size().y;
-            cy -= h + 6.0 * s;
-            if cy < rect.top() + rect.height() * 0.4 {
-                break;
-            }
-            p.rect_filled(Rect::from_min_size(Pos2::new(left.left(), cy - 3.0 * s), Vec2::new(gal.size().x + 16.0 * s, h + 6.0 * s)), 4.0, Color32::from_black_alpha((a as f32 * 0.5) as u8));
-            p.galley(Pos2::new(left.left() + 8.0 * s, cy), gal, Color32::WHITE);
+        draw_chat(p, rect, g, left, s);
+        // (the hub has its own lines at the top: no scores, banners or kill feed)
+        if g.in_hub() {
+            return;
         }
 
         // ---- top: the training lesson, or scores and timer
@@ -7741,6 +7928,8 @@ impl App {
             }
         }
 
+        // the Varrow Hub's panels (the wardrobe, the tables, the lecterns, the boards...)
+        self.hub_panels(ctx, rect);
         // Ledger Duels before the bell: the Court's terms (both sides accept them), then the gear
         let ledger = match &self.screen {
             Screen::Play { game, .. } if game.ledger_on() => {
@@ -8383,6 +8572,16 @@ impl App {
                 *next = Some(MAIN_PLAY_PAGE);
             }
             ui.add_space(10.0);
+            if self.hub_keep.is_some() {
+                if Self::big_button_h(ui, "Back to Varrow Centre", 42.0) {
+                    self.hub_ui.scene_done = true;
+                }
+            } else if Self::big_button_h(ui, "Varrow Centre", 42.0) {
+                self.hub_ui.drill = 98;
+            }
+            if Self::big_button_h(ui, "Host Varrow Centre (friends join)", 42.0) {
+                self.hub_ui.drill = 97;
+            }
             if Self::big_button_h(ui, "Loadout", 42.0) {
                 self.menu_loadout = true;
             }
@@ -8409,6 +8608,22 @@ impl App {
             }
         });
         self.news_panel(ctx, rect);
+        // (acted on after the menu: these change the screen)
+        if std::mem::take(&mut self.hub_ui.scene_done) {
+            self.back_to_hub();
+        }
+        match self.hub_ui.drill {
+            98 => {
+                self.hub_ui.drill = 0;
+                self.start_hub(false);
+            }
+            97 => {
+                self.hub_ui.drill = 0;
+                self.hub_keep = None;
+                self.start_hub(true);
+            }
+            _ => {}
+        }
     }
 
     /// Your name, level and XP under the menu fighter.

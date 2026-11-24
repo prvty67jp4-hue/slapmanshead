@@ -111,7 +111,9 @@ pub const SNEAK_SPEED: f32 = 2.6;
 pub const MAX_HP: f32 = 100.0;
 pub const MAX_AP: f32 = 50.0;
 pub const TICK: f32 = 1.0 / 120.0;
-pub const MAX_PLAYERS: usize = 8;
+/// Fighters a game holds: a match takes up to MATCH_PLAYERS of them, the hub all of them.
+pub const MAX_PLAYERS: usize = 16;
+pub const MATCH_PLAYERS: usize = 8;
 pub const RESPAWN_TIME: f32 = 3.0;
 pub const SPAWN_PROT: f32 = 1.5;
 /// A match lasts at most six minutes.
@@ -1405,8 +1407,8 @@ pub struct Fighter {
     pub grapple_t: f32,
     pub shield_t: f32,
     pub invis_t: f32,
-    flow_fade: f32,
-    still_t: f32,
+    pub(crate) flow_fade: f32,
+    pub(crate) still_t: f32,
     /// Sliding time left (0 = not sliding).
     pub sliding: f32,
     /// Sneaking (a quiet walk) this tick.
@@ -1418,7 +1420,7 @@ pub struct Fighter {
     /// Looking the weapon over (seconds left; the picture only).
     pub inspect_t: f32,
     /// (the picture only) reloading last tick (to drop the magazine as one begins).
-    was_reloading: bool,
+    pub(crate) was_reloading: bool,
     /// "Perfect" timing pop on screen.
     pub perfect_t: f32,
     /// Health still to come back after a kill.
@@ -1427,22 +1429,22 @@ pub struct Fighter {
     pub scope_t: f32,
     /// Crouching before a ground dash (time left), and the dash waiting to go.
     pub dash_wind: f32,
-    dash_dir: Option<V3>,
-    dash_perfect: bool,
+    pub(crate) dash_dir: Option<V3>,
+    pub(crate) dash_perfect: bool,
     /// Guard meter (0..GUARD_MAX), time since it last took a hit, and a flash after it breaks.
     pub guard_hp: f32,
-    guard_rest: f32,
+    pub(crate) guard_rest: f32,
     pub guard_broke: f32,
     /// Kicking (time left), cooldown, and whether this kick has landed its blow.
     pub kick_t: f32,
-    kick_cd: f32,
-    kick_done: bool,
+    pub(crate) kick_cd: f32,
+    pub(crate) kick_done: bool,
     /// Holding attack: how long, and whether the heavy is ready.
     pub charge_t: f32,
     pub charged: bool,
     /// Katana dash-through: time left and who it has already cut.
     pub through_t: f32,
-    through_hit: u32,
+    pub(crate) through_hit: u32,
     /// Greatsword: plunging down for a ground slam.
     pub slam: bool,
     /// Doing an execution (see crate::exec): its number + 1 (0 = none), how far in, on whom,
@@ -1450,13 +1452,13 @@ pub struct Fighter {
     pub fin: u8,
     pub fin_t: f32,
     pub fin_target: usize,
-    fin_hit: bool,
+    pub(crate) fin_hit: bool,
     pub fin_dir: V3,
     /// (the picture only) an afterimage copy, this strong (0 = the fighter themselves); the
     /// execution cues played so far; the execution being done to this fighter and how far in.
     pub ghost: f32,
-    exec_seen: f32,
-    exec_seen_kind: u8,
+    pub(crate) exec_seen: f32,
+    pub(crate) exec_seen_kind: u8,
     pub exec_pose: Option<(u8, f32)>,
     /// Caught in someone's finisher: by whom (and for how much longer at most).
     pub held_by: Option<usize>,
@@ -1467,18 +1469,18 @@ pub struct Fighter {
     pub slash_lock: f32,
     /// Throwing stars: stars left in this burst, time to the next, right button last tick.
     pub burst_left: u8,
-    burst_t: f32,
-    alt_was: bool,
+    pub(crate) burst_t: f32,
+    pub(crate) alt_was: bool,
     /// The throwing motion (time left), and whether it's the wide fan sweep.
     pub throw_t: f32,
     pub throw_fan: bool,
     /// No second sharp-turn slowdown until this runs out.
-    turn_cd: f32,
+    pub(crate) turn_cd: f32,
     /// How hard the last landing was (0..1, fades), for the camera dip.
     pub land_impact: f32,
     /// Speed on the last tick (skid dust when it drops fast).
-    prev_speed: f32,
-    skid_dust: f32,
+    pub(crate) prev_speed: f32,
+    pub(crate) skid_dust: f32,
     /// Whether the last hit taken was a headshot (for the kill feed).
     pub last_head: bool,
     pub last_attacker: Option<usize>,
@@ -1511,6 +1513,8 @@ pub struct Fighter {
     pub walljumps: u8,
     /// Ledger Duels: their gear (see crate::gear).
     pub kit: Option<Box<crate::gear::Kit>>,
+    /// The Varrow Hub: their look, emote, seat and pit (crate::hub).
+    pub hub: crate::hub::FighterHub,
 }
 
 impl Fighter {
@@ -1671,6 +1675,7 @@ impl Fighter {
             shield_t: 0.0,
             invis_t: 0.0,
             kit: None,
+            hub: crate::hub::FighterHub::default(),
         }
     }
 
@@ -1695,6 +1700,8 @@ impl Fighter {
             fresh.no_sets = k.no_sets;
             Box::new(fresh)
         });
+        // the hub: what they wear stays on (sitting and emoting stop)
+        n.hub = crate::hub::FighterHub { look: self.hub.look, pit: self.hub.pit, ..Default::default() };
         n.equip();
         n.alive = true;
         n.spawn_prot = SPAWN_PROT;
@@ -1885,6 +1892,8 @@ pub enum Mode {
     /// Ledger Duels: 1v1 Ashen Court duels with gear, sets, switches, specials and food, under
     /// the challenger's rules (see crate::gear).
     Ledger = 8,
+    /// The Varrow Hub: the town square (crate::hub). Not a match: nobody scores.
+    Hub = 9,
 }
 
 impl Mode {
@@ -1899,6 +1908,7 @@ impl Mode {
             6 => Mode::Gauntlet,
             7 => Mode::Rounds,
             8 => Mode::Ledger,
+            9 => Mode::Hub,
             _ => Mode::Ffa,
         }
     }
@@ -1913,6 +1923,7 @@ impl Mode {
             Mode::Gauntlet => "Gauntlet",
             Mode::Rounds => "Team Rounds",
             Mode::Ledger => "Ledger Duels",
+            Mode::Hub => "Varrow Hub",
         }
     }
     pub fn blurb(self) -> &'static str {
@@ -1926,6 +1937,7 @@ impl Mode {
             Mode::Gauntlet => "solo: survive waves of ever better bots for a high score",
             Mode::Rounds => "Red vs Blue rounds, one life each: plan, smoke, flash and take space",
             Mode::Ledger => "1v1 Ashen Court duels: gear, sets, switches, specials and food, under the challenger's rules",
+            Mode::Hub => "the town square: fashion, challenges, aim rooms, the rooftop run and the game tables",
         }
     }
     pub fn teams(self) -> bool {
@@ -1947,6 +1959,7 @@ impl Mode {
             Mode::Duel | Mode::Lms | Mode::Rounds | Mode::Ledger => "round wins",
             Mode::Ctf => "captures",
             Mode::Gauntlet => "score",
+            Mode::Hub => "nothing",
             _ => "kills",
         }
     }
@@ -2242,6 +2255,8 @@ pub enum Ev {
     Grenade { p: V3, v: V3, kind: u8 },
     /// Only the host (or the game on this computer) decides deaths.
     Died { victim: u8, killer: u8, w: u8, head: bool },
+    /// The Varrow Hub's messages (crate::hub).
+    Hub(crate::hub::HubEv),
     Chat { text: String },
     /// Used a medkit (0) or armor kit (1).
     Item { kind: u8 },
@@ -2281,11 +2296,13 @@ pub struct Game {
     pub host_slot: usize,
     /// Gauntlet (solo waves), when that's the mode.
     pub gauntlet: Option<Gauntlet>,
+    /// The Varrow Hub's shared state, when that's the mode (crate::hub).
+    pub hub: Option<Box<crate::hub::Hub>>,
     /// Things for the career stats since the menu side last looked.
     pub career: Vec<CareerEv>,
     /// Our last finisher's style (the kill can be confirmed after it has finished playing).
     pub last_finisher: u8,
-    duel_loser: Option<usize>,
+    pub(crate) duel_loser: Option<usize>,
     pub grenades: Vec<Grenade>,
     pub particles: Vec<Particle>,
     pub tracers: Vec<Tracer>,
@@ -2317,7 +2334,7 @@ pub struct Game {
     pub marks: Vec<Mark>,
     pub decoys: Vec<Decoy>,
     /// (host) when each player last used their ability (to throw out uses still on cooldown).
-    ab_uses: Vec<Vec<f32>>,
+    pub(crate) ab_uses: Vec<Vec<f32>>,
     /// When each fighter's scope came up (-1: not scoped), for the sniper glint.
     pub scoped_since: Vec<f32>,
     /// Kills since their last death, for everyone (a Writ at WRIT_STREAK).
@@ -2329,7 +2346,7 @@ pub struct Game {
     /// (online) the network's clock now (what snapshots are stamped with), and recent pairs of
     /// it with the game's clock, to turn a moment on one into the other.
     pub net_clock: f32,
-    clock_map: VecDeque<(f32, f32)>,
+    pub(crate) clock_map: VecDeque<(f32, f32)>,
     /// What the last hit marker was: 0 a body hit, 1 a headshot, 2 a kill.
     pub hit_kind: u8,
     /// This life: damage we dealt each fighter, and each dealt us (the death recap).
@@ -2348,7 +2365,7 @@ pub struct Game {
     /// (online, a player) waiting for the host's answer to an execution we asked for.
     pub exec_ask_t: f32,
     /// (host) a target just given to someone's execution, until their computer reports it.
-    exec_reserved: [f32; MAX_PLAYERS],
+    pub(crate) exec_reserved: [f32; MAX_PLAYERS],
     /// The execution's impact frame (a brief high-contrast flash, seconds left) and the
     /// announcer's line on screen (which execution, seconds shown).
     pub impact_t: f32,
@@ -2356,27 +2373,27 @@ pub struct Game {
     /// Play of the Match: the last few seconds kept (frames), the best moment so far waiting for
     /// its tail (score, who, what, when), the one picked, and its playback after the match.
     pub rec: VecDeque<RecFrame>,
-    rec_acc: f32,
-    hl_pending: Option<(f32, usize, String, f32)>,
+    pub(crate) rec_acc: f32,
+    pub(crate) hl_pending: Option<(f32, usize, String, f32)>,
     pub potm: Option<Highlight>,
     pub potm_t: Option<f32>,
     pub potm_done: bool,
-    potm_stash: Option<(Vec<Fighter>, Vec<Tracer>, Vec<Particle>, f32)>,
-    flow_noted: Vec<bool>,
+    pub(crate) potm_stash: Option<(Vec<Fighter>, Vec<Tracer>, Vec<Particle>, f32)>,
+    pub(crate) flow_noted: Vec<bool>,
     /// The phase last tick (to notice a match ending on every computer).
-    seen_phase: Phase,
+    pub(crate) seen_phase: Phase,
     /// (host) seconds since this round started, whether it can end yet (everyone back in, or 3 s
     /// passed), and the last round that was finished (each finishes once).
-    round_since: f32,
-    round_armed: bool,
-    round_finished: (u32, u32),
+    pub(crate) round_since: f32,
+    pub(crate) round_armed: bool,
+    pub(crate) round_finished: (u32, u32),
     /// Each player's stats this life and this match (accuracy, headshots, damage, parries...).
     pub life_stats: Vec<CombatStats>,
     pub match_stats: Vec<CombatStats>,
     /// What killed you, shown for a moment after you die.
     pub recap: Option<Recap>,
     /// The shot being fired: did it hit anyone, and was it a headshot (for accuracy).
-    shot_track: Option<(bool, bool)>,
+    pub(crate) shot_track: Option<(bool, bool)>,
     /// Inputs given from outside per fighter (the balance benchmark drives both sides).
     pub ext_input: Vec<Option<Input>>,
     pub hitmarker: f32,
@@ -2386,7 +2403,7 @@ pub struct Game {
     pub kill_t: f32,
     pub kill_name: String,
     pub streak: u32,
-    last_kill_time: f32,
+    pub(crate) last_kill_time: f32,
     pub headshot_t: f32,
     pub hurt_flash: f32,
     pub shake: f32,
@@ -2395,27 +2412,27 @@ pub struct Game {
     /// Lines being spoken (fighters' voice lines and the announcer's, from assets/lore.txt), shown
     /// as subtitles and speech bubbles.
     pub voice: Vec<Voice>,
-    voice_seed: u64,
+    pub(crate) voice_seed: u64,
     /// A round was over last tick (to call each round's end once, on every computer).
-    seen_round_end: bool,
+    pub(crate) seen_round_end: bool,
     /// Sounds to play: where they happened (None = not in the world, e.g. a hit marker).
     pub sounds: Vec<(Sfx, Option<V3>, f32)>,
     /// When each kind of sound last played (to keep a shotgun's pellets from stacking up).
-    sfx_last: [f32; SFX_SLOTS],
+    pub(crate) sfx_last: [f32; SFX_SLOTS],
     /// When each player's last gunshot sound played (remote shots arrive once per pellet).
-    shot_last: [f32; MAX_PLAYERS],
+    pub(crate) shot_last: [f32; MAX_PLAYERS],
     /// Training room state (only in Training).
     pub train: Option<Training>,
     /// (player) after healing ourselves, ignore the host's older health figure for this long.
     pub hp_hold: f32,
     /// Each fighter's animation as the game sees it, and the hit shapes it gives.
-    anim: Vec<crate::character::CharState>,
+    pub(crate) anim: Vec<crate::character::CharState>,
     pub hit_poses: Vec<Option<HitPose>>,
     /// (host) recent hit shapes, to check hits against the past.
-    pose_history: Vec<VecDeque<(f32, HitPose)>>,
+    pub(crate) pose_history: Vec<VecDeque<(f32, HitPose)>>,
     /// Hits in a row (their tick climbs in pitch) and when the last one landed.
-    hit_chain: u32,
-    hit_chain_t: f32,
+    pub(crate) hit_chain: u32,
+    pub(crate) hit_chain_t: f32,
     /// Hit marker details: headshot, and whether it was a kill.
     pub hit_head: bool,
     /// A white flash on screen after a perfect parry.
@@ -2441,9 +2458,9 @@ pub struct Game {
     /// How far between the last two ticks the last picture was drawn; hit shapes are placed
     /// where everyone was shown.
     pub view_alpha: f32,
-    seen_pos: Vec<V3>,
+    pub(crate) seen_pos: Vec<V3>,
     /// Where a shot's tracer and flash start (the gun), when that isn't where the shot starts.
-    tracer_from: Option<V3>,
+    pub(crate) tracer_from: Option<V3>,
 }
 
 /// Moves the player has pulled off in the training room.
@@ -2810,6 +2827,7 @@ impl Game {
             queue: VecDeque::new(),
             host_slot: 0,
             gauntlet: None,
+            hub: None,
             career: Vec::new(),
             last_finisher: 0,
             duel_loser: None,
@@ -3611,6 +3629,9 @@ impl Game {
             // the waves are all against you, never each other
             return a != b && self.f[b].present && !self.f[b].spectate && ((a == self.local) != (b == self.local));
         }
+        if self.mt.mode == Mode::Hub {
+            return self.hub_enemies(a, b) && self.f[b].present;
+        }
         a != b && self.f[b].present && !self.f[b].spectate && (!self.mt.mode.teams() || self.f[a].team != self.f[b].team)
     }
 
@@ -3635,6 +3656,9 @@ impl Game {
 
     /// The spawn point furthest from enemies (on your team's side in Team Deathmatch).
     pub fn pick_spawn(&mut self, slot: usize) -> (V3, f32) {
+        if self.mt.mode == Mode::Hub {
+            return self.hub_spawn(slot);
+        }
         if self.mt.mode.duel_like() && self.mt.phase == Phase::Fight {
             if let Some(side) = self.duel_side(slot) {
                 let n = self.world.spawn_points.len();
@@ -3960,8 +3984,11 @@ impl Game {
                     }
                 }
             }
+            let hub_bot = self.f[i].is_bot && self.in_hub() && self.hub.as_ref().is_some_and(|h| h.pit_of(i).is_none());
             let input = if let Some(inp) = self.ext_input.get(i).copied().flatten() {
                 inp // driven from outside (the balance benchmark)
+            } else if hub_bot {
+                crate::hub_bots::input(self, i)
             } else if self.f[i].is_bot {
                 let mut bot = self.bots[i].take();
                 let inp = match bot.as_mut() {
@@ -3977,14 +4004,21 @@ impl Game {
             // a Ledger Duel: the bots decide about their gear; everyone's gear has its say on
             // what they can do this tick
             let mut input = input;
-            if self.ledger_on() {
+            if self.in_hub() {
+                input = self.hub_input(i, input);
+            }
+            if self.ledger_for(i) {
+                if self.f[i].kit.is_none() {
+                    self.ensure_kit(i);
+                }
                 if self.f[i].is_bot {
                     self.ledger_bot(i, &mut input);
                 }
                 input = self.ledger_pre(i, &input, dt);
             }
-            let acts = self.step_fighter(i, &input, dt, frozen);
-            if self.ledger_on() {
+            let frozen_i = frozen || self.hub_frozen(i);
+            let acts = self.step_fighter(i, &input, dt, frozen_i);
+            if self.ledger_for(i) {
                 self.ledger_post(i, &acts);
             }
             if self.f[i].invis_t > 0.0 {
@@ -4037,7 +4071,8 @@ impl Game {
 
         // deaths are decided here only on the host (or a game on this computer)
         if self.is_authority() {
-            let rounds = self.mt.mode.rounds() && self.mt.phase == Phase::Fight;
+            // (in the hub only a pit duellist falls, and their pit brings them back)
+            let rounds = (self.mt.mode.rounds() && self.mt.phase == Phase::Fight) || self.mt.mode == Mode::Hub;
             for i in 0..self.f.len() {
                 let ff = &mut self.f[i];
                 if !ff.present {
@@ -4172,6 +4207,7 @@ impl Game {
             self.mt.timer = (self.mt.timer - dt).max(0.0);
         }
         self.record(dt);
+        self.hub_tick(dt);
         self.voice_watch(dt);
         self.ledger_watch();
         if self.mt.phase == Phase::MatchOver && self.seen_phase != Phase::MatchOver {
@@ -4535,6 +4571,7 @@ impl Game {
             Mode::Tdm | Mode::Ctf | Mode::Rounds => self.mt.team_score.iter().any(|&s| s as i32 >= t),
             Mode::Duel | Mode::Lms | Mode::Ledger => self.f.iter().any(|f| f.present && f.wins >= t),
             Mode::Gauntlet => false, // it ends when you fall
+            Mode::Hub => false,
         };
         if won {
             self.end_match();
@@ -4909,6 +4946,11 @@ impl Game {
     }
 
     fn update_match(&mut self, dt: f32) {
+        if self.mt.mode == Mode::Hub {
+            // the hub never ends; nothing to count down
+            self.mt.phase = Phase::Fight;
+            return;
+        }
         match self.mt.phase {
             Phase::Warmup => {}
             Phase::Loadout => {
@@ -5449,7 +5491,7 @@ impl Game {
         let mut sounds: Vec<Sfx> = Vec::new();
         let mut tn = self.tune;
         // a Ledger Duel: gear (weight, boots, sets, a tonic) sets how fast you move
-        if self.ledger_on() {
+        if self.ledger_for(i) {
             if let Some(k) = &self.f[i].kit {
                 tn.run_speed *= k.stats(&self.mt.rules).move_mult();
             }
@@ -7642,9 +7684,9 @@ impl Game {
         }
         // a Ledger Duel special the attacker's hit carries (decided on their computer, checked by
         // the host against their weapon)
-        let spec = if self.ledger_on() { self.f[attacker].kit.as_ref().and_then(|k| k.hit_spec()).map_or(0, |s| s as u8) } else { 0 };
+        let spec = if self.ledger_for(attacker) { self.f[attacker].kit.as_ref().and_then(|k| k.hit_spec()).map_or(0, |s| s as u8) } else { 0 };
         // the Bridgewright's Rig: a blade hit and a gun hit close together pay special bar
-        if self.ledger_on() && amount > 0.0 && attacker != victim && self.f[attacker].owned {
+        if self.ledger_for(attacker) && amount > 0.0 && attacker != victim && self.f[attacker].owned {
             let (now, rules) = (self.time, self.mt.rules);
             let blade = w < 3 || w == KICK_TOOL;
             let paid = self.f[attacker].kit.as_mut().is_some_and(|k| k.landed(blade, now, &rules));
@@ -7683,7 +7725,7 @@ impl Game {
     pub fn authority_hit_s(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8, guard: f32, spec: u8) {
         let before = self.f.get(victim).map(|f| (f.hp.max(0.0), f.ap.max(0.0), f.alive));
         // a Ledger Duel: the gear on both sides decides how much it does
-        let amount = if self.ledger_on() && amount > 0.0 { self.ledger_scale(attacker, victim, amount, w, spec) } else { amount };
+        let amount = if self.ledger_for(victim) && amount > 0.0 { self.ledger_scale(attacker, victim, amount, w, spec) } else { amount };
         self.authority_hit_inner(victim, attacker, amount, knock, stun, head, w, guard);
         if let (Some((hp0, ap0, true)), Some(a)) = (before, attacker) {
             if a != victim && a < self.f.len() {
@@ -8968,6 +9010,14 @@ impl Game {
 
     pub fn handle_remote_event(&mut self, from: usize, ev: Ev) {
         match ev {
+            Ev::Hub(e) => {
+                if self.is_authority() {
+                    self.hub_remote(from, e);
+                } else {
+                    // the host speaks for everyone; a relayed player message names its player
+                    self.hub_remote(from, e);
+                }
+            }
             Ev::Shot { o, e, spark, .. } if spark == 10 => {
                 // a deflected bullet flying back
                 self.tracers.push(Tracer::shot(o, e, Weapon::Revolver, [150, 220, 255]));
@@ -9027,7 +9077,7 @@ impl Game {
                                 dmg /= gs.head.max(1.0);
                             }
                             // a special only counts with the weapon that has it, when specials are on
-                            let spec = if self.ledger_on() && !self.mt.rules.no_specs && self.f[from].kit.as_ref().and_then(|k| k.main()).and_then(|m| m.spec).map(|s| s as u8) == Some(spec) { spec } else { 0 };
+                            let spec = if self.ledger_for(from) && !self.mt.rules.no_specs && self.f[from].kit.as_ref().and_then(|k| k.main()).and_then(|m| m.spec).map(|s| s as u8) == Some(spec) { spec } else { 0 };
                             self.authority_hit_s(v, Some(from), dmg, knock, stun, head && chk.head_ok, w, guard.clamp(0.0, GUARD_MAX), spec);
                         }
                     }
@@ -9153,7 +9203,7 @@ impl Game {
             }
             Ev::Eat { item } => {
                 // a player ate: their health comes back here too (the host keeps health)
-                if self.kind == Kind::Host && from < self.f.len() && self.f[from].alive && self.ledger_on() && !self.mt.rules.no_food {
+                if self.kind == Kind::Host && from < self.f.len() && self.f[from].alive && self.ledger_for(from) && !self.mt.rules.no_food {
                     if let Some(it) = crate::gear::item(item).filter(|it| it.heal > 0) {
                         let f = &mut self.f[from];
                         f.hp = (f.hp + it.heal as f32).min(MAX_HP);
@@ -9516,7 +9566,7 @@ impl Game {
     /// (every computer) A special's wind-up or a swap starting on someone else's fighter is
     /// heard where they stand: the tells the other side reacts to.
     fn ledger_watch(&mut self) {
-        if !self.ledger_on() {
+        if !self.ledger_on() && !self.hub.as_ref().is_some_and(|h| h.pits.iter().flatten().any(|d| d.kind == crate::hub::DuelKind::Ledger)) {
             return;
         }
         // no armour in a Ledger Duel (a copy of a player on another computer is reset with it

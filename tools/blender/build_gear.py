@@ -98,6 +98,29 @@ def ring_around(body, centre, axis, side, n, out, rmin, rmax, smooth=True, own_s
     return pts
 
 
+def fair_rows(rows, centres, roundness=0.8, passes=3):
+    """Even out a sleeve's rings (each round its centre) so it reads as one padded, blocky
+    shell instead of following every buckle and pad of the outfit under it: each ring is pushed
+    out towards round (`roundness` of its widest), every point is at least as far out as the
+    rings either side of it (no dents between them), then smoothed round and down. The fighter
+    under it is hidden in the game, so it only has to enclose it."""
+    n = len(rows[0])
+    dirs, rs = [], []
+    for ring, c in zip(rows, centres):
+        d = [(p - c) for p in ring]
+        rs.append([v.length for v in d])
+        dirs.append([v.normalized() if v.length > 1e-6 else Vector((1, 0, 0)) for v in d])
+    for r in rs:
+        top = max(r)
+        for k in range(n):
+            r[k] = max(r[k], top * roundness)
+    rs = [[max(rs[j][k] for j in range(max(0, i - 1), min(len(rs), i + 2))) for k in range(n)] for i in range(len(rs))]
+    for _ in range(passes):
+        rs = [[(r[k - 1] + 2 * r[k] + r[(k + 1) % n]) / 4 for k in range(n)] for r in rs]
+        rs = [[(rs[max(i - 1, 0)][k] + 2 * rs[i][k] + rs[min(i + 1, len(rs) - 1)][k]) / 4 for k in range(n)] for i in range(len(rs))]
+    return [[c + dirs[i][k] * rs[i][k] for k in range(n)] for i, c in enumerate(centres)]
+
+
 def tube_shell(name, rows, mat, thick, cap=None):
     """A closed sleeve through rings of points (each the same length), thickened inward."""
     ob = A.grid(name, rows, mat, closed=True)
@@ -185,8 +208,11 @@ def body_piece(body):
     rows = []
     ys = [1.43, 1.38, 1.31, 1.24, 1.17, 1.10, 1.03, 0.97]
     depth = body.a["spine_02"].y  # (Blender y: the body's front-back middle)
+    centres = []
     for y in ys:
-        rows.append(ring_around(body, Vector((0.0, depth, y)), UP, FWD, 28, 0.05, 0.09, 0.24))
+        centres.append(Vector((0.0, depth, y)))
+        rows.append(ring_around(body, centres[-1], UP, FWD, 28, 0.05, 0.09, 0.24))
+    rows = fair_rows(rows, centres, 0.75, 2)
     # the skirt hangs from the hips, flaring a little
     hip = rows[-1]
     hc = sum(hip, Vector()) / len(hip)
@@ -194,6 +220,22 @@ def body_piece(body):
         flare = 1.0 + 0.07 * (k + 1)
         rows.append([hc + (p - hc) * flare - UP * drop for p in hip])
     coat = A.grid("coat", rows, "dye_coat", closed=True)
+    # a yoke over the tops of the shoulders, from the coat's top edge in to the neck
+    neck = body.a["neck_01"]
+    ny = min(max(neck.z + 0.02, 1.48), 1.56)
+    c0 = centres[0]
+    yrows = [list(rows[0])]
+    yrows.append([Vector((c0.x + (p.x - c0.x) * 0.92, neck.y + (p.y - neck.y) * 0.8, 1.475)) for p in rows[0]])
+    n = len(rows[0])
+    neck_ring = []
+    for k in range(n):
+        d = (rows[0][k] - c0)
+        d = Vector((d.x, d.y, 0.0)).normalized()
+        neck_ring.append(Vector((neck.x + d.x * 0.095, neck.y + d.y * 0.085, ny)))
+    yrows.append(neck_ring)
+    yoke = A.grid("coat_yoke", yrows, "dye_coat", closed=True)
+    A.solidify(yoke, 0.016, -1.0)
+    parts.append(yoke)
     # open the skirt at the front (a coat, not a dress)
     bm = bmesh.new()
     bm.from_mesh(coat.data)
@@ -203,6 +245,21 @@ def body_piece(body):
     bm.free()
     A.solidify(coat, 0.016, -1.0)
     parts.append(coat)
+    # short canvas sleeves over the tops of the arms, an iron pad on each shoulder
+    for s in (1, -1):
+        ua = body.a["upperarm_l" if s > 0 else "upperarm_r"]
+        la = body.a["lowerarm_l" if s > 0 else "lowerarm_r"]
+        axis = (la - ua).normalized()
+        cs = [ua + axis * t for t in (-0.04, 0.04, 0.12, 0.19)]
+        srows = [ring_around(body, c, axis, UP, 16, 0.022, 0.045, 0.06) for c in cs]
+        sleeve = tube_shell(f"coat_sleeve_{s}", fair_rows(srows, cs, 0.9, 2), "dye_coat", 0.014)
+        parts.append(sleeve)
+        hit = body.outer(ua + axis * 0.03, UP, 0.05)
+        if hit is not None:
+            pad = A.dome(f"shoulder_pad_{s}", hit - UP * 0.03, (0.085, 0.075, 0.05), "iron", 0.0, keep=-0.2)
+            A.solidify(pad, 0.012, 1.0)
+            parts.append(pad)
+            parts.append(rivet(f"pad_rivet_{s}", hit + UP * 0.02, UP, "dye_trim", 0.01))
     # the teal collar
     collar = ring_around(body, Vector((0.0, 0.0, 1.445)), UP, FWD, 26, 0.04, 0.07, 0.2)
     parts.append(W.tube_path("collar", [(p.x, p.y, p.z) for p in collar], 0.022, "dye_accent", sides=8, closed=True))
@@ -272,9 +329,8 @@ def body_piece(body):
         r.rotation_euler = (0, 0, math.radians(8 * (k - 1)))
         parts.append(r)
     parts.append(W.box("rope_tie", (0.03, 0.05, 0.12), (bp.x, bp.y + 0.03, bp.z + 0.0), "leather", bevel=0.006))
-    for ob in parts:
-        if ob.name.startswith("coat"):
-            A.wrap_outside(ob, body, 0.045, above=0.97)
+    # (no shrinkwrap: the faired coat already encloses the fighter, who is hidden under it in
+    # the game; fitting it to every pad and buckle is what made it ragged)
     return W.bake(parts, "bw_body")
 
 
@@ -283,19 +339,34 @@ def legs(body):
     for s in (1, -1):
         thigh = body.a["thigh_l" if s > 0 else "thigh_r"]
         calf = body.a["calf_l" if s > 0 else "calf_r"]
-        rows = []
+        rows, centres = [], []
         for y in [0.93, 0.86, 0.78, 0.70, 0.62, 0.55, 0.48, 0.40, 0.32, 0.25, 0.20]:
             t = (thigh.z - y) / max(thigh.z - calf.z, 0.01)
             cx = thigh.x + (calf.x - thigh.x) * min(max(t, 0.0), 1.0)
             cy = thigh.y + (calf.y - thigh.y) * min(max(t, 0.0), 1.0)
             # a leg alone (not the other one): rays from close in
-            rows.append(ring_around(body, Vector((cx, cy, y)), UP, FWD, 20, 0.035, 0.045, 0.12, own_side=True))
+            centres.append(Vector((cx, cy, y)))
+            # a padded, tapering tube round the leg's own bones (the fighter's legs and whatever
+            # hangs round them are hidden under it in the game)
+            table = ((0.93, 0.100), (0.78, 0.092), (0.62, 0.082), (0.50, 0.076), (0.40, 0.069), (0.25, 0.066), (0.0, 0.066))
+            r = next(rr for (yy, rr) in table if y >= yy) if y < 0.93 else 0.100
+            for (ya, ra), (yb, rb) in zip(table, table[1:]):
+                if yb <= y <= ya:
+                    r = rb + (ra - rb) * (y - yb) / (ya - yb)
+            ring = []
+            for k in range(20):
+                a = 2 * math.pi * k / 20
+                ring.append(centres[-1] + FWD * (math.cos(a) * r * 0.92) + LEFT * (math.sin(a) * r))
+            rows.append(ring)
+        # (and never over the middle, where the other leg is)
+        rows = [[Vector((p.x if s * p.x > 0.004 else s * 0.004, p.y, p.z)) for p in r] for r in rows]
         leg = tube_shell(f"trouser_{s}", rows, "dye_coat", 0.014)
         A.smooth(leg, 1)
-        A.wrap_outside(leg, body, 0.03)
         parts.append(leg)
-        # the iron knee cap, a brass rivet in it
-        h = body.front(calf.x, calf.z + 0.02, 0.05)
+        # the iron knee cap on the front of the trouser leg, a brass rivet in it
+        knee = min(range(len(centres)), key=lambda i: abs(centres[i].z - (calf.z + 0.02)))
+        front = min(rows[knee], key=lambda p: p.y)
+        h = (front + FWD * 0.012, FWD)
         if h:
             p, n = h
             cap = A.dome(f"knee_{s}", p, (0.06, 0.05, 0.035), "iron", 0.0)
@@ -303,7 +374,8 @@ def legs(body):
             parts.append(cap)
             parts.append(rivet(f"knee_rivet_{s}", p + n * 0.035, n, "dye_trim", 0.011))
         # a teal stitched band below the knee
-        band = ring_around(body, Vector((calf.x, calf.y, calf.z - 0.10)), UP, FWD, 18, 0.03, 0.04, 0.11, own_side=True)
+        bi = min(range(len(centres)), key=lambda i: abs(centres[i].z - (calf.z - 0.10)))
+        band = [centres[bi] + (p - centres[bi]) * 1.05 for p in rows[bi]]
         parts.append(W.tube_path(f"leg_band_{s}", [(p.x, p.y, p.z) for p in band], 0.007, "dye_accent", sides=5, closed=True))
     # the waistband joins the two legs under the coat
     waist = ring_around(body, Vector((0.0, body.a["pelvis"].y, 0.97)), UP, FWD, 26, 0.02, 0.1, 0.22)
@@ -352,17 +424,19 @@ def feet(body):
         foot = body.a["foot_l" if s > 0 else "foot_r"]
         ball = body.a["ball_l" if s > 0 else "ball_r"]
         mid = (foot + ball) / 2
-        rows = []
+        rows, centres = [], []
         for y in (0.30, 0.25, 0.20, 0.15, 0.11, 0.075, 0.045, 0.02):
             c = Vector((foot.x, mid.y if y < 0.13 else foot.y, y))
+            centres.append(c)
             rows.append(ring_around(body, c, UP, FWD, 20, 0.03, 0.045, 0.16, own_side=True))
+        rows = fair_rows(rows, centres, 0.7)
+        rows = [[Vector((p.x if s * p.x > 0.006 else s * 0.006, p.y, p.z)) for p in r] for r in rows]
         # the sole: a little wider, closing the bottom
         last = rows[-1]
         lc = sum(last, Vector()) / len(last)
         rows.append([lc + (p - lc) * 1.06 - UP * 0.018 for p in last])
         rows.append([lc - UP * 0.02 + (p - lc) * 0.2 for p in last])
         boot = tube_shell(f"boot_{s}", rows, "dye_coat", 0.012)
-        A.wrap_outside(boot, body, 0.025)
         parts.append(boot)
         # iron ankle guards on both sides, hobnails round the sole
         for side in (1, -1):

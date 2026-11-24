@@ -274,6 +274,18 @@ impl Rig {
         self.inv_bind.get(k).copied().unwrap_or(Mat4::IDENTITY)
     }
 
+    /// The skin joint a joint hangs from (its nearest ancestor that is a joint).
+    pub fn joint_parent(&self, j: usize) -> Option<usize> {
+        let mut n = *self.joints.get(j)?;
+        while let Some(p) = self.parent[n] {
+            if let Some(k) = self.joints.iter().position(|&x| x == p) {
+                return Some(k);
+            }
+            n = p;
+        }
+        None
+    }
+
     /// Names of the skin joints, in the order bone matrices are given to the GPU.
     pub fn joint_names(&self) -> Vec<String> {
         self.joints.iter().map(|&n| self.node_names[n].clone()).collect()

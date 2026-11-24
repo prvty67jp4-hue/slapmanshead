@@ -31,7 +31,10 @@ pub const L_BLOCKS: u32 = 16;
 /// Varrow Bridgeworks' props (railings, archways, the crane, cargo, lanterns): one baked atlas
 /// (tools/blender/build_props.py).
 pub const L_BRIDGE: u32 = 17;
-pub const LAYERS: u32 = 18;
+/// Varrow Centre's props (the hub: fountain, benches, tables, boards...): one baked atlas
+/// (tools/blender/build_hub_props.py).
+pub const L_HUB: u32 = 18;
+pub const LAYERS: u32 = 19;
 
 /// Where a texture comes from.
 enum Src {
@@ -75,6 +78,7 @@ fn source(layer: u32) -> Src {
         L_LEAVES => Src::Plain { diff: prop_tex!("leaves.png"), rough: 0.7 },
         L_ROCKS => Src::Plain { diff: prop_tex!("rocks_diff.jpg"), rough: 0.85 },
         L_BRIDGE => Src::Plain { diff: prop_tex!("varrow_props.png"), rough: 0.75 },
+        L_HUB => Src::Plain { diff: prop_tex!("varrow_hub.png"), rough: 0.75 },
         _ => Src::Procedural,
     }
 }
@@ -143,6 +147,14 @@ pub fn surface(map: MapId, m: Mat) -> Surface {
             Mat::Wall => s(L_BRICK, [168, 153, 126], 0.05),
             Mat::Stone | Mat::Metal => s(L_MARBLE, [172, 170, 162], 0.3),
             Mat::Trim | Mat::Crate | Mat::Hidden => s(L_SANDSTONE, [160, 146, 120], 0.08),
+        },
+        // Varrow Centre: warm cobbles, limewashed house fronts, dressed sandstone, dark timber
+        MapId::Varrow => match m {
+            Mat::Floor => s(L_BLOCKS, [136, 124, 110], 0.22),
+            Mat::Wall => s(L_BRICK, [182, 164, 136], 0.05),
+            Mat::Stone => s(L_SANDSTONE, [158, 138, 112], 0.08),
+            Mat::Metal => s(L_IRON, [98, 94, 90], 0.4),
+            Mat::Trim | Mat::Crate | Mat::Hidden => s(L_WOOD, [104, 76, 56], 0.1),
         },
     }
 }
@@ -345,6 +357,8 @@ fn sky_src(map: MapId) -> SkySrc {
             fog_density: 0.0018,
             grade: Grade { lift: [0.0, 0.004, 0.01], gamma: [1.0, 1.0, 1.01], gain: [1.0, 0.99, 0.98], saturation: 1.02, contrast: 1.07, exposure: 0.84 },
         },
+        // Varrow Centre: the same golden late afternoon as Sunfall Keep, a softer grade
+        MapId::Varrow => SkySrc { sun_azimuth: 0.2, ..sky_src(MapId::Arena) },
     }
 }
 
@@ -600,7 +614,7 @@ fn build_sky(map: MapId) -> Sky {
 
 /// A map's sky (worked out once, the first time it's needed).
 pub fn sky(map: MapId) -> &'static Sky {
-    static SKIES: [OnceLock<Sky>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static SKIES: [OnceLock<Sky>; 5] = [const { OnceLock::new() }; 5];
     SKIES[map as usize].get_or_init(|| build_sky(map))
 }
 
@@ -681,7 +695,28 @@ fn bridge_glb(kind: PropKind) -> Option<&'static [u8]> {
     })
 }
 
+/// Varrow Centre's props (tools/blender/build_hub_props.py), from the L_HUB atlas.
+fn hub_glb(kind: PropKind) -> Option<&'static [u8]> {
+    Some(match kind {
+        PropKind::HubFountain => include_bytes!("../assets/env/props/hub_fountain.glb"),
+        PropKind::HubBench => include_bytes!("../assets/env/props/hub_bench.glb"),
+        PropKind::HubLamp => include_bytes!("../assets/env/props/hub_lamp.glb"),
+        PropKind::HubBoard => include_bytes!("../assets/env/props/hub_board.glb"),
+        PropKind::HubLectern => include_bytes!("../assets/env/props/hub_lectern.glb"),
+        PropKind::HubTargetFrame => include_bytes!("../assets/env/props/hub_target.glb"),
+        PropKind::HubTable => include_bytes!("../assets/env/props/hub_table.glb"),
+        PropKind::HubChair => include_bytes!("../assets/env/props/hub_chair.glb"),
+        PropKind::HubMirror => include_bytes!("../assets/env/props/hub_mirror.glb"),
+        PropKind::HubWardrobe => include_bytes!("../assets/env/props/hub_wardrobe.glb"),
+        _ => return None,
+    })
+}
+
 fn load_glb(bytes: &[u8]) -> Vec<PropVert> {
+    load_glb_as(bytes, L_BRIDGE)
+}
+
+fn load_glb_as(bytes: &[u8], layer: u32) -> Vec<PropVert> {
     let Ok(g) = gltf::Gltf::from_slice(bytes) else { return Vec::new() };
     let Some(blob) = g.blob.clone() else { return Vec::new() };
     let get = |_b: gltf::Buffer| Some(blob.as_slice());
@@ -702,7 +737,7 @@ fn load_glb(bytes: &[u8]) -> Vec<PropVert> {
                 }
                 let p = pos[i];
                 let n = nrm.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
-                out.push(PropVert { pos: v3(p[0], p[1], p[2]), nrm: v3(n[0], n[1], n[2]), uv: uv.get(i).copied().unwrap_or([0.0, 0.0]), layer: L_BRIDGE, cloth: false, glow, tint: [1.0, 1.0, 1.0] });
+                out.push(PropVert { pos: v3(p[0], p[1], p[2]), nrm: v3(n[0], n[1], n[2]), uv: uv.get(i).copied().unwrap_or([0.0, 0.0]), layer, cloth: false, glow, tint: [1.0, 1.0, 1.0] });
             }
         }
     }
@@ -712,6 +747,9 @@ fn load_glb(bytes: &[u8]) -> Vec<PropVert> {
 fn load_model(kind: PropKind) -> Vec<PropVert> {
     if let Some(b) = bridge_glb(kind) {
         return load_glb(b);
+    }
+    if let Some(b) = hub_glb(kind) {
+        return load_glb_as(b, L_HUB);
     }
     let src = model_src(kind);
     let Ok(g) = gltf::Gltf::from_slice(src.json.as_bytes()) else { return Vec::new() };
@@ -749,7 +787,7 @@ fn load_model(kind: PropKind) -> Vec<PropVert> {
 
 /// A prop's mesh (loaded once).
 pub fn prop_mesh(kind: PropKind) -> &'static [PropVert] {
-    const N: usize = 16;
+    const N: usize = PropKind::HubWardrobe as usize + 1;
     static MESHES: [OnceLock<Vec<PropVert>>; N] = [const { OnceLock::new() }; N];
     MESHES[kind as usize].get_or_init(|| load_model(kind))
 }

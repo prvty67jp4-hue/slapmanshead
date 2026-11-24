@@ -77,6 +77,19 @@ const BRIDGEWORKS: [Zone; 28] = [
     zone("Plaza", (-20.0, 13.0), (-16.5, 16.5), Map),
 ];
 
+/// Varrow Centre (the hub): its places (see crate::varrow).
+const VARROW: [Zone; 9] = [
+    zone("West Court Pit", (-22.0, -6.0), (22.6, 36.0), Map),
+    zone("East Court Pit", (6.0, 22.0), (22.6, 36.0), Map),
+    zone("The Gallery", (24.0, 36.0), (-36.0, 36.0), Map),
+    zone("Tables Pavilion", (-36.0, -20.5), (-12.5, 8.5), Map),
+    zone("The Tailor's", (-14.5, -1.5), (-36.0, -28.0), Map),
+    zone("The Catwalk", (2.5, 9.5), (-36.0, -17.5), Map),
+    zone("Challenge Boards", (-24.0, 24.0), (14.0, 36.0), Map),
+    zone("The Fountain", (-5.0, 5.0), (-5.0, 5.0), Map),
+    zone("Varrow Centre", (-36.0, 24.0), (-36.0, 36.0), Map),
+];
+
 /// The Arena: point-symmetric, a spawn balcony at each end.
 const ARENA: [Zone; 10] = [
     zone("Tower", (-2.5, 2.5), (-2.5, 2.5), Map),
@@ -125,6 +138,7 @@ pub fn zones(map: MapId) -> &'static [Zone] {
         MapId::Arena => &ARENA,
         MapId::Courtyard => &COURTYARD,
         MapId::CloseQuarters => &CLOSE_QUARTERS,
+        MapId::Varrow => &VARROW,
     }
 }
 

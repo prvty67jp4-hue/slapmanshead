@@ -18,9 +18,9 @@ const MAGIC: [u8; 4] = *b"DRB2";
 /// fighter's state carries) or anything both sides must agree on does: map layouts, the hit
 /// rules and the game's tuning. The `match_fingerprint` test notices most such changes and fails
 /// until it's bumped.
-pub const NET_PROTOCOL: u32 = 12;
+pub const NET_PROTOCOL: u32 = 13;
 /// The same as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA12";
+pub const PROTOCOL: &str = "DRA13";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
@@ -173,13 +173,16 @@ pub struct FState {
     pub spec: u8,
     pub gbits: u8,
     pub dyes: [u8; 3],
+    /// The Varrow Hub: their emote and seat (crate::hub).
+    pub emote: u8,
+    pub seat: u16,
 }
 
 #[cfg(test)]
 impl FState {
     /// A living, running fighter at `pos` (for tests).
     pub fn test_state(pos: V3, vel: V3) -> FState {
-        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, flags4: 0, ab: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes(), gear: [0; crate::gear::SLOTS], spec: 0, gbits: 0, dyes: crate::gear::DEFAULT_DYES }
+        FState { pos, vel, yaw: 0.0, pitch: 0.0, hp: MAX_HP, ap: 0.0, weapon: 1, flags: 1 | 2, flags2: 0, flags3: 0, flags4: 0, ab: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n: V3::ZERO, loadout: Loadout::default().to_bytes(), gear: [0; crate::gear::SLOTS], spec: 0, gbits: 0, dyes: crate::gear::DEFAULT_DYES, emote: 0, seat: crate::hub::SEAT_NONE }
     }
 }
 
@@ -222,6 +225,58 @@ fn write_fstate(w: &mut W, f: &Fighter) {
             }
         }
     }
+    w.u8(f.hub.emote);
+    w.u16(f.hub.seat);
+}
+
+/// (the hub) A fighter as the host sends them to everyone: in full for a pit duellist, else
+/// just what the picture needs (31 bytes instead of about 100, so sixteen fit in a packet).
+fn write_fstate_hub(w: &mut W, f: &Fighter, room: bool) {
+    if f.hub.pit != 255 && room {
+        w.u8(0);
+        write_fstate(w, f);
+        return;
+    }
+    // (a duellist sent short, when the packet is full: their health isn't in it)
+    w.u8(if f.hub.pit != 255 { 2 } else { 1 });
+    w.v(f.pos);
+    for c in [f.vel.x, f.vel.y, f.vel.z] {
+        w.i16((c * 100.0).round().clamp(-32000.0, 32000.0) as i16);
+    }
+    w.u16((wrap_angle(f.yaw).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65535.0).round() as u16);
+    w.i16((f.pitch.clamp(-1.6, 1.6) * 10000.0).round() as i16);
+    w.u8(f.weapon as u8);
+    w.u8(f.flags());
+    w.u8(if f.sliding > 0.0 { 4 } else { 0 });
+    let n = f.wall.map_or(V3::ZERO, |wr| wr.normal);
+    for c in [n.x, n.y, n.z] {
+        w.u8(((c.clamp(-1.0, 1.0) * 127.0).round() as i8) as u8);
+    }
+    for b in f.loadout.to_bytes() {
+        w.u8(b);
+    }
+    w.u8(f.hub.emote);
+    w.u16(f.hub.seat);
+}
+
+fn read_fstate_hub(r: &mut R) -> Option<FState> {
+    let kind = r.u8()?;
+    if kind == 0 {
+        return read_fstate(r);
+    }
+    let pos = r.v()?;
+    let vel = v3(r.i16()? as f32 / 100.0, r.i16()? as f32 / 100.0, r.i16()? as f32 / 100.0);
+    let yaw = r.u16()? as f32 / 65535.0 * std::f32::consts::TAU;
+    let pitch = r.i16()? as f32 / 10000.0;
+    let weapon = r.u8()?;
+    let flags = r.u8()?;
+    let flags2 = r.u8()?;
+    let wall_n = v3(r.u8()? as i8 as f32 / 127.0, r.u8()? as i8 as f32 / 127.0, r.u8()? as i8 as f32 / 127.0);
+    let loadout = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+    let emote = r.u8()?.min(8);
+    let seat = r.u16()?;
+    let hp = if kind == 2 { -1.0 } else { MAX_HP };
+    Some(FState { pos, vel, yaw, pitch, hp, ap: 0.0, weapon, flags, flags2, flags3: 0, flags4: 0, ab: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n, loadout, gear: [0; crate::gear::SLOTS], spec: 0, gbits: 0, dyes: crate::gear::DEFAULT_DYES, emote, seat })
 }
 
 /// (tests) An event written and read back.
@@ -238,6 +293,14 @@ pub fn fstate_round_trip(f: &Fighter) -> Option<FState> {
     let mut w = W(Vec::new());
     write_fstate(&mut w, f);
     read_fstate(&mut R { b: &w.0, i: 0 })
+}
+
+/// (tests) A fighter's state as the hub's host sends it, read back.
+#[cfg(test)]
+pub fn fstate_hub_round_trip(f: &Fighter) -> Option<FState> {
+    let mut w = W(Vec::new());
+    write_fstate_hub(&mut w, f, true);
+    read_fstate_hub(&mut R { b: &w.0, i: 0 })
 }
 
 fn read_fstate(r: &mut R) -> Option<FState> {
@@ -274,6 +337,8 @@ fn read_fstate(r: &mut R) -> Option<FState> {
             let n = crate::gear::DYES.len() as u8 - 1;
             [r.u8()?.min(n), r.u8()?.min(n), r.u8()?.min(n)]
         },
+        emote: r.u8()?.min(8),
+        seat: r.u16()?,
     })
 }
 
@@ -371,6 +436,12 @@ fn write_ev(w: &mut W, ev: &Ev) {
             w.u8(*target);
             w.u8(*kind);
         }
+        Ev::Hub(h) => {
+            let b = h.to_bytes();
+            w.u8(17);
+            w.u16(b.len().min(1000) as u16);
+            w.0.extend_from_slice(&b[..b.len().min(1000)]);
+        }
     }
 }
 
@@ -395,6 +466,10 @@ fn read_ev(r: &mut R) -> Option<Ev> {
         10 => Ev::ExecAsk { target: r.u8()?.min(MAX_PLAYERS as u8 - 1), open: r.u8()? & 0b1111 },
         15 => Ev::Ping { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.min(crate::game::PINGS.len() as u8 - 1), p: clamp_v(r.v()?, 500.0) },
         14 => Ev::Exec { who: r.u8()?.min(MAX_PLAYERS as u8 - 1), target: r.u8()?.min(MAX_PLAYERS as u8 - 1), kind: r.u8()?.clamp(1, crate::exec::COUNT as u8) },
+        17 => {
+            let n = r.u16()? as usize;
+            Ev::Hub(crate::hub::HubEv::from_bytes(r.take(n)?)?)
+        }
         _ => return None,
     })
 }
@@ -445,6 +520,8 @@ pub struct HostMsg {
     pub you_ap: f32,
     pub you_alive: bool,
     pub roster: Vec<RosterEntry>,
+    /// Whether the player list came with this update (in the hub it comes every third one).
+    pub roster_full: bool,
     pub fighters: Vec<(usize, FState)>,
     pub events: Vec<(usize, Ev)>,
     /// The host's clock when it sent this.
@@ -635,6 +712,9 @@ pub struct Net {
     bye_seen: bool,
     /// (host) slots our bots are in: a joining player gets a free slot first, else a bot's.
     pub soft: Vec<usize>,
+    /// (host) how many players this game takes (a match: 8; the hub: 16).
+    pub cap: usize,
+    roster_tick: u32,
 }
 
 impl Net {
@@ -712,6 +792,8 @@ impl Net {
             rejoin_left: 0.0,
             bye_seen: false,
             soft: Vec::new(),
+            cap: MATCH_PLAYERS,
+            roster_tick: 0,
         }
         .seeded()
     }
@@ -801,7 +883,8 @@ impl Net {
     fn free_slot(&self) -> Option<usize> {
         // (after a takeover the host isn't in slot 0, and slot 0 may be free again)
         let open = |s: &usize| *s != self.my_slot && !self.peers.iter().any(|p| p.slot == *s);
-        (0..MAX_PLAYERS).find(|s| open(s) && !self.soft.contains(s)).or_else(|| (0..MAX_PLAYERS).find(open))
+        let cap = self.cap.clamp(2, MAX_PLAYERS);
+        (0..cap).find(|s| open(s) && !self.soft.contains(s)).or_else(|| (0..cap).find(open))
     }
 
     fn rand(&mut self) -> f32 {
@@ -1065,7 +1148,13 @@ impl Net {
                     if id > self.last_in[slot] {
                         self.last_in[slot] = id;
                         // pass on what others need to see; hit claims stay here until checked
-                        if matches!(ev, Ev::Shot { .. } | Ev::Grenade { .. } | Ev::Chat { .. }) {
+                        let relay = match &ev {
+                            Ev::Shot { .. } | Ev::Grenade { .. } | Ev::Chat { .. } => true,
+                            // a player's look and emote go straight on (named as theirs)
+                            Ev::Hub(h) => h.relayed(),
+                            _ => false,
+                        };
+                        if relay {
                             self.out.push_back((slot as u8, id, Instant::now(), ev.clone()));
                         }
                         fresh_evs.push(ev);
@@ -1112,7 +1201,7 @@ impl Net {
         let mode_byte = r.u8()?;
         let classic = mode_byte & 0x80 != 0;
         let mode = Mode::from_u8(mode_byte & 0x7f);
-        let map = r.u8()?.min(crate::world::MapId::ALL.len() as u8 - 1);
+        let map = r.u8()?.min(crate::world::MapId::Varrow as u8);
         let phase = Phase::from_u8(r.u8()?);
         let timer = r.f()?;
         let target = r.u16()?;
@@ -1125,6 +1214,7 @@ impl Net {
             let bits = r.u8()?;
             crate::gear::Rules::from_bits(bits, r.u8()?)
         };
+        let roster_full = r.u8()? != 0;
         let mut flags = [Flag { state: 0, carrier: 255, pos: V3::ZERO, timer: 0.0 }; 2];
         for fl in flags.iter_mut() {
             fl.state = r.u8()?.min(2);
@@ -1147,7 +1237,7 @@ impl Net {
             let map_vote = r.u8()?;
             roster.push(RosterEntry { slot, name, team, kills, deaths, ping, loss, ready: bits & 1 != 0, vote: bits & 2 != 0, spectate: bits & 4 != 0, wins, map_vote });
         }
-        if !stale {
+        if !stale && roster_full {
             // a slot taken by someone new starts its event count again
             for e in &roster {
                 if self.roster_names[e.slot] != e.name {
@@ -1166,7 +1256,7 @@ impl Net {
         let mut fighters = Vec::new();
         for _ in 0..nf.min(MAX_PLAYERS) {
             let slot = (r.u8()? as usize).min(MAX_PLAYERS - 1);
-            let st = read_fstate(r)?;
+            let st = if mode == Mode::Hub { read_fstate_hub(r)? } else { read_fstate(r)? };
             fighters.push((slot, st));
         }
         let ne = r.u8()? as usize;
@@ -1185,7 +1275,7 @@ impl Net {
                 events.push((origin, ev));
             }
         }
-        Some(HostMsg { you, mode, classic, map, phase, timer, target, team_score, number, round, round_end, duel, flags, rules, you_hp, you_ap, you_alive, roster, fighters, events, sent, stale })
+        Some(HostMsg { you, mode, classic, map, phase, timer, target, team_score, number, round, round_end, duel, flags, rules, you_hp, you_ap, you_alive, roster, roster_full, fighters, events, sent, stale })
     }
 
     pub fn send_hello(&mut self, name: &str, dt: f32) {
@@ -1294,6 +1384,10 @@ impl Net {
                 w.u8(g.mt.duel[1]);
                 w.u8(g.mt.rules.bits());
                 w.u8(g.mt.rules.best_of);
+                // (the hub: the player list goes in every third update, to leave room for 16)
+                let hub = g.mt.mode == Mode::Hub;
+                let with_roster = !hub || self.roster_tick % 3 == 0;
+                w.u8(with_roster as u8);
                 for fl in &g.mt.flags {
                     w.u8(fl.state);
                     w.u8(fl.carrier);
@@ -1301,8 +1395,9 @@ impl Net {
                     w.f(fl.timer);
                 }
                 let present = g.present();
-                w.u8(present.len() as u8);
-                for &s in &present {
+                let listed: &[usize] = if with_roster { &present } else { &[] };
+                w.u8(listed.len() as u8);
+                for &s in listed {
                     let f = &g.f[s];
                     w.u8(s as u8);
                     w.s(&f.name);
@@ -1318,9 +1413,16 @@ impl Net {
                 }
                 let others: Vec<usize> = present.iter().copied().filter(|&s| s != slot).collect();
                 w.u8(others.len() as u8);
-                for s in others {
+                let total = others.len();
+                for (k, s) in others.into_iter().enumerate() {
                     w.u8(s as u8);
-                    write_fstate(&mut w, &g.f[s]);
+                    if hub {
+                        // in full when it fits with a short one for everyone still to come
+                        let room = w.0.len() + 110 + (total - k - 1) * 38 + 8 <= MAX_PACKET;
+                        write_fstate_hub(&mut w, &g.f[s], room);
+                    } else {
+                        write_fstate(&mut w, &g.f[s]);
+                    }
                 }
                 // as many events as fit (the important ones first; the rest go in the next update)
                 let evs = self.pick_events(Some(slot));
@@ -1344,6 +1446,7 @@ impl Net {
             for (d, a) in packets {
                 self.send_to(d, a);
             }
+            self.roster_tick = self.roster_tick.wrapping_add(1);
         } else if let Some(h) = self.host_addr {
             if self.rejoin_left > 0.0 {
                 // a new host: tell them who we are (several times: the first may not get through
@@ -1443,6 +1546,12 @@ pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool, sent: f32, now
     }
     f.vel = s.vel;
     f.weapon = Weapon::from_u8(s.weapon);
+    // the hub: their emote and seat as they say
+    if s.emote != f.hub.emote {
+        f.hub.emote = s.emote;
+        f.hub.emote_t = now;
+    }
+    f.hub.seat = s.seat;
     let lo = Loadout::from_bytes(s.loadout);
     if lo != f.loadout {
         f.loadout = lo;
@@ -1478,8 +1587,11 @@ pub fn apply_remote(f: &mut Fighter, s: &FState, authority: bool, sent: f32, now
             false
         }
     } else {
-        f.hp = s.hp;
-        f.ap = s.ap;
+        // (a duellist sent short in the hub says nothing about health)
+        if s.hp >= 0.0 {
+            f.hp = s.hp;
+            f.ap = s.ap;
+        }
         reported
     };
     if f.alive && !alive {
@@ -1610,17 +1722,30 @@ mod public_ip_tests {
 mod packet_size_tests {
     use super::*;
 
-    /// A full lobby in the middle of a firefight still sends packets that fit the internet's size.
+    /// A full lobby in the middle of a firefight still sends packets that fit the internet's size:
+    /// a match of 8, and a hub of 16 (with two duels on in the pits, sent in full).
     #[test]
     fn host_packets_fit_under_the_limit() {
-        let mut g = Game::new(Kind::Host, 0, Mode::Ctf, 5);
-        for s in 0..MAX_PLAYERS {
+        for (mode, players) in [(Mode::Ctf, MATCH_PLAYERS), (Mode::Hub, MAX_PLAYERS)] {
+            host_packets_fit(mode, players);
+        }
+    }
+
+    fn host_packets_fit(mode: Mode, players: usize) {
+        let mut g = Game::new(Kind::Host, 0, mode, 5);
+        for s in 0..players {
             g.add_player(s, "LongPlayerName16", s == 0, None, (s % 2) as u8);
         }
+        if mode == Mode::Hub {
+            for s in 1..5 {
+                g.f[s].hub.pit = (s / 3) as u8;
+            }
+        }
         let mut n = Net::host(0).expect("socket");
+        n.cap = players;
         // hold everything back so it can be measured
         n.sim = Some(NetSim { lag_ms: 600_000.0, loss: 0.0 });
-        for s in 1..MAX_PLAYERS {
+        for s in 1..players {
             let addr: SocketAddr = format!("127.0.0.1:{}", 40000 + s).parse().unwrap();
             n.peers.push(Peer { addr, slot: s, last_recv: Instant::now(), ping: 0.05, link: Link::new(), seq_out: 0 });
         }
@@ -1629,11 +1754,14 @@ mod packet_size_tests {
             n.out.push_back(((k % 8) as u8, k + 1, Instant::now(), Ev::Shot { o, e: o + v3(0.0, 0.0, 20.0), w: 3, spark: 1 }));
             n.out.push_back(((k % 8) as u8, k + 1000, Instant::now(), Ev::Chat { text: "a fairly long chat line to fill the packet up".into() }));
         }
-        n.send(&g, 1.0);
-        assert_eq!(n.out_q.len(), MAX_PLAYERS - 1, "one update per player");
+        // (three updates: the hub sends its player list in every third)
+        for _ in 0..3 {
+            n.send(&g, 1.0);
+        }
+        assert_eq!(n.out_q.len(), (players - 1) * 3, "one update per player each time");
         for (_, data, _) in &n.out_q {
-            assert!(data.len() <= MAX_PACKET, "packet of {} bytes", data.len());
-            assert!(data.len() > 600, "still carries the match ({} bytes)", data.len());
+            assert!(data.len() <= MAX_PACKET, "{mode:?}: packet of {} bytes", data.len());
+            assert!(data.len() > 600, "{mode:?}: still carries the match ({} bytes)", data.len());
         }
     }
 }
@@ -1858,7 +1986,7 @@ mod migration_tests {
         for b in bytes {
             hsh = (hsh ^ b as u64).wrapping_mul(0x0100_0000_01b3);
         }
-        let recorded: (u32, u64) = (12, 10804328520971619681);
+        let recorded: (u32, u64) = (13, 10911351392787391105);
         assert_eq!((NET_PROTOCOL, hsh), recorded, "what both sides of a match must agree on changed: bump NET_PROTOCOL and PROTOCOL, then record the new value here");
     }
 

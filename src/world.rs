@@ -31,6 +31,8 @@ pub enum MapId {
     /// 60 x 60 m, 4v4 team map at dusk: two mirrored bases across a river, three lanes (a long
     /// riverside quay, a stone bridge and plaza, covered workshops), three height levels.
     Bridgeworks = 3,
+    /// Varrow Centre, the town square you load into (the hub, crate::varrow). Not a match map.
+    Varrow = 4,
 }
 
 impl MapId {
@@ -40,6 +42,7 @@ impl MapId {
             1 => MapId::Courtyard,
             2 => MapId::CloseQuarters,
             3 => MapId::Bridgeworks,
+            4 => MapId::Varrow,
             _ => MapId::Arena,
         }
     }
@@ -54,11 +57,12 @@ impl MapId {
             MapId::Courtyard => "big and open: long sight lines around a central dais",
             MapId::CloseQuarters => "small and vertical: tight wall-run corridors, three levels, gaps to dash across",
             MapId::Bridgeworks => "4v4 at dusk: two bases across a river, a sniper quay, a stone bridge plaza and covered workshops",
+            MapId::Varrow => "the town square: duels, fashion, aim rooms, the rooftop run and the game tables",
         }
     }
     /// The team map is for team modes only; the duel maps suit every mode.
     pub fn fits(self, teams: bool) -> bool {
-        teams || self != MapId::Bridgeworks
+        self != MapId::Varrow && (teams || self != MapId::Bridgeworks)
     }
     /// What a mode starts on: the team map for team modes, the Arena otherwise.
     pub fn default_for(teams: bool) -> MapId {
@@ -106,6 +110,19 @@ pub enum PropKind {
     CrateStack,
     /// A lantern on a wall bracket (it lights the wall: see World::torches).
     Lantern,
+    // Varrow Centre's pieces (the hub; tools/blender/build_hub_props.py)
+    HubFountain,
+    HubBench,
+    HubLamp,
+    /// A notice board (its origin on the wall face).
+    HubBoard,
+    HubLectern,
+    HubTargetFrame,
+    HubTable,
+    HubChair,
+    /// A tall mirror against a wall.
+    HubMirror,
+    HubWardrobe,
 }
 
 impl PropKind {
@@ -127,6 +144,10 @@ impl PropKind {
             PropKind::Plant => 0.5,
             PropKind::CrateStack => 0.9,
             PropKind::Railing | PropKind::Archway | PropKind::Crane => 0.5,
+            PropKind::HubFountain => 4.4,
+            PropKind::HubBench | PropKind::HubTable | PropKind::HubWardrobe => 0.6,
+            PropKind::HubLamp | PropKind::HubLectern | PropKind::HubChair | PropKind::HubTargetFrame => 0.3,
+            PropKind::HubBoard | PropKind::HubMirror => 0.0,
             PropKind::BannerA | PropKind::BannerB | PropKind::Shield | PropKind::Torch | PropKind::Lantern => 0.0,
         }
     }
@@ -304,6 +325,7 @@ impl World {
             MapId::Courtyard => World::courtyard(),
             MapId::CloseQuarters => World::close_quarters(),
             MapId::Bridgeworks => World::bridgeworks(),
+            MapId::Varrow => crate::varrow::world(),
         }
     }
 
