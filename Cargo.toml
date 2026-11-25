@@ -7,6 +7,8 @@ edition = "2024"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 cpal = "0.18.2"
 eframe = "0.37.0"
+# replays are deflated (already in the build through zip)
+flate2 = "1"
 gilrs = "0.11"
 glam = "0.34.3"
 gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }

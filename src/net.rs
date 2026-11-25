@@ -18,9 +18,9 @@ const MAGIC: [u8; 4] = *b"DRB2";
 /// fighter's state carries) or anything both sides must agree on does: map layouts, the hit
 /// rules and the game's tuning. The `match_fingerprint` test notices most such changes and fails
 /// until it's bumped.
-pub const NET_PROTOCOL: u32 = 15;
+pub const NET_PROTOCOL: u32 = 16;
 /// The same as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA15";
+pub const PROTOCOL: &str = "DRA16";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
@@ -144,6 +144,7 @@ impl<'a> R<'a> {
 }
 
 /// One fighter's body as sent over the network.
+#[derive(Clone, Debug)]
 pub struct FState {
     pub pos: V3,
     pub vel: V3,
@@ -279,6 +280,21 @@ fn read_fstate_hub(r: &mut R) -> Option<FState> {
     let seat = r.u16()?;
     let hp = if kind == 2 { -1.0 } else { MAX_HP };
     Some(FState { pos, vel, yaw, pitch, hp, ap: 0.0, weapon, flags, flags2, flags3: 0, flags4: 0, ab: 0, fin: 0, slash_t: 0.0, slash_idx: 0, hurt_t: 0.0, recoil: 0.0, wall_n, loadout, gear: [0; crate::gear::SLOTS], spec: 0, gbits: 0, dyes: crate::gear::DEFAULT_DYES, emote, seat })
+}
+
+/// A fighter's state as the network writes it (replays keep it the same way).
+pub fn encode_fstate(out: &mut Vec<u8>, f: &Fighter) {
+    let mut w = W(std::mem::take(out));
+    write_fstate(&mut w, f);
+    *out = w.0;
+}
+
+/// A fighter's state read back from  at t (moved past it).
+pub fn decode_fstate(b: &[u8], at: &mut usize) -> Option<FState> {
+    let mut r = R { b, i: *at };
+    let s = read_fstate(&mut r)?;
+    *at = r.i;
+    Some(s)
 }
 
 /// (tests) An event written and read back.
@@ -496,6 +512,10 @@ pub struct RosterEntry {
     pub wins: i32,
     /// Their vote for the next map (255: none).
     pub map_vote: u8,
+    /// Their ranked 1v1 rank (crate::ranked::Rank as a byte; 0 unranked) and hidden rating.
+    pub rank: u8,
+    pub rating: u16,
+    pub rd: u16,
 }
 
 /// Everything the host tells a player each update.
@@ -537,6 +557,9 @@ pub enum Incoming {
     Join { slot: usize, name: String },
     /// (host) a player left or went quiet
     Leave { slot: usize },
+    /// (host) someone came in to watch: a spectator, with no player's place (their slot is above
+    /// the lobby's size and never fights)
+    Watch { slot: usize, name: String },
     /// (host) a player's fighter and events
     PeerState { slot: usize, st: FState, events: Vec<Ev>, sent: f32, stale: bool },
     /// (player) the host's update
@@ -665,6 +688,9 @@ fn read_addr(r: &mut R) -> Option<SocketAddr> {
 struct Peer {
     addr: SocketAddr,
     slot: usize,
+    /// Only watching (a spectator), and their rank as they say (rank byte, rating, deviation).
+    watch: bool,
+    rank: (u8, u16, u16),
     last_recv: Instant,
     ping: f32,
     link: Link,
@@ -719,6 +745,9 @@ pub struct Net {
     roster_tick: u32,
     /// (host) addresses removed by an admin, kept out until then.
     banned: Vec<(SocketAddr, Instant)>,
+    /// (player) join only to watch (a spectator), and the rank we tell the host.
+    pub watch: bool,
+    pub my_rank: (u8, u16, u16),
 }
 
 impl Net {
@@ -818,6 +847,8 @@ impl Net {
             cap: MATCH_PLAYERS,
             roster_tick: 0,
             banned: Vec::new(),
+            watch: false,
+            my_rank: (0, 1500, 350),
         }
         .seeded()
     }
@@ -847,7 +878,7 @@ impl Net {
                 .peers
                 .iter()
                 .filter(|p| p.slot != self.my_slot && p.slot != s.host_slot)
-                .map(|p| Peer { addr: p.addr, slot: p.slot, last_recv: Instant::now(), ping: p.ping as f32 / 1000.0, link: Link::new(), seq_out: 0 })
+                .map(|p| Peer { addr: p.addr, slot: p.slot, watch: false, rank: (0, 1500, 350), last_recv: Instant::now(), ping: p.ping as f32 / 1000.0, link: Link::new(), seq_out: 0 })
                 .collect();
         } else {
             let addr = s.peers.iter().find(|p| p.slot == next)?.addr;
@@ -909,6 +940,23 @@ impl Net {
         let open = |s: &usize| *s != self.my_slot && !self.peers.iter().any(|p| p.slot == *s);
         let cap = self.cap.clamp(2, MAX_PLAYERS);
         (0..cap).find(|s| open(s) && !self.soft.contains(s)).or_else(|| (0..cap).find(open))
+    }
+
+    /// (host) A place for a spectator: above the lobby's size, so they never take a player's.
+    fn watch_slot(&self) -> Option<usize> {
+        let open = |s: &usize| *s != self.my_slot && !self.peers.iter().any(|p| p.slot == *s);
+        let cap = self.cap.clamp(2, MAX_PLAYERS);
+        (cap..MAX_PLAYERS).rev().find(open)
+    }
+
+    /// (host) What a player told us of their rank (rank byte, rating, deviation).
+    pub fn peer_rank(&self, slot: usize) -> Option<(u8, u16, u16)> {
+        self.peers.iter().find(|p| p.slot == slot && !p.watch).map(|p| p.rank)
+    }
+
+    /// (host) How many are watching.
+    pub fn watchers(&self) -> usize {
+        self.peers.iter().filter(|p| p.watch).count()
     }
 
     fn rand(&mut self) -> f32 {
@@ -1131,6 +1179,9 @@ impl Net {
                 // before the protocol number: different builds can't): say which we are instead
                 let build = r.u32().unwrap_or(0);
                 let proto = r.u32();
+                // (protocol 16) watching only, and their rank
+                let watch = r.u8().unwrap_or(0) == 1;
+                let rank = (r.u8().unwrap_or(0), r.u16().unwrap_or(1500), r.u16().unwrap_or(350));
                 if !crate::update::can_play_together(self.build, self.proto, build, proto) {
                     let mut w = self.head(K_BUILD, from);
                     w.u32(self.build);
@@ -1141,25 +1192,29 @@ impl Net {
                 if let Some(i) = idx {
                     self.peers[i].last_recv = Instant::now();
                     self.peers[i].link.see(seq);
+                    self.peers[i].rank = rank;
                     return;
                 }
-                let Some(slot) = self.free_slot() else {
+                let slot = if watch { self.watch_slot() } else { self.free_slot() };
+                let Some(slot) = slot else {
                     let w = self.head(K_FULL, from);
                     self.send_to(w.0, from);
                     return;
                 };
                 let mut link = Link::new();
                 link.see(seq);
-                self.peers.push(Peer { addr: from, slot, last_recv: Instant::now(), ping: 0.05, link, seq_out: 0 });
+                self.peers.push(Peer { addr: from, slot, watch, rank, last_recv: Instant::now(), ping: 0.05, link, seq_out: 0 });
                 self.last_in[slot] = 0;
                 self.out.retain(|e| e.0 as usize != slot);
-                out.push(Incoming::Join { slot, name });
+                out.push(if watch { Incoming::Watch { slot, name } } else { Incoming::Join { slot, name } });
             }
             K_STATE => {
                 let Some(i) = idx else { return };
                 self.peers[i].last_recv = Instant::now();
                 let fresh = self.peers[i].link.see(seq);
                 let slot = self.peers[i].slot;
+                // (a spectator's own fighter means nothing: only their clock matters)
+                let watching = self.peers[i].watch;
                 let Some(echo) = r.f() else { return };
                 if echo > 0.0 && fresh {
                     let rtt = (self.start.elapsed().as_secs_f32() - echo).clamp(0.0, 2.0);
@@ -1174,6 +1229,9 @@ impl Net {
                     }
                 }
                 pairs.sort_by_key(|p| p.0);
+                if watching {
+                    return;
+                }
                 let mut fresh_evs = Vec::new();
                 for (id, ev) in pairs {
                     if id > self.last_in[slot] {
@@ -1215,7 +1273,7 @@ impl Net {
                         self.peers.retain(|p| p.addr != from);
                         let mut link = Link::new();
                         link.see(seq);
-                        self.peers.push(Peer { addr: from, slot, last_recv: Instant::now(), ping: 0.05, link, seq_out: 0 });
+                        self.peers.push(Peer { addr: from, slot, watch: false, rank: (0, 1500, 350), last_recv: Instant::now(), ping: 0.05, link, seq_out: 0 });
                         out.push(Incoming::Join { slot, name });
                     }
                 }
@@ -1266,7 +1324,9 @@ impl Net {
             let bits = r.u8()?;
             let wins = r.i16()? as i32;
             let map_vote = r.u8()?;
-            roster.push(RosterEntry { slot, name, team, kills, deaths, ping, loss, ready: bits & 1 != 0, vote: bits & 2 != 0, spectate: bits & 4 != 0, wins, map_vote });
+            let rank = r.u8()?;
+            let (rating, rd) = if mode == Mode::Hub { (1500, 350) } else { (r.u16()?, r.u16()?) };
+            roster.push(RosterEntry { slot, name, team, kills, deaths, ping, loss, ready: bits & 1 != 0, vote: bits & 2 != 0, spectate: bits & 4 != 0, wins, map_vote, rank, rating, rd });
         }
         if !stale && roster_full {
             // a slot taken by someone new starts its event count again
@@ -1321,6 +1381,10 @@ impl Net {
             w.s(name);
             w.u32(self.build);
             w.u32(self.proto);
+            w.u8(self.watch as u8);
+            w.u8(self.my_rank.0);
+            w.u16(self.my_rank.1);
+            w.u16(self.my_rank.2);
             self.send_to(w.0, h);
         }
     }
@@ -1441,6 +1505,12 @@ impl Net {
                     w.u8((f.ready as u8) | ((f.vote as u8) << 1) | ((f.spectate as u8) << 2));
                     w.i16(f.wins.clamp(-999, 9999) as i16);
                     w.u8(f.map_vote);
+                    // (the hub shows only the badge; a match needs the rating for ranked)
+                    w.u8(f.rank);
+                    if !hub {
+                        w.u16(f.rating);
+                        w.u16(f.rating_rd);
+                    }
                 }
                 let others: Vec<usize> = present.iter().copied().filter(|&s| s != slot).collect();
                 w.u8(others.len() as u8);
@@ -1778,7 +1848,7 @@ mod packet_size_tests {
         n.sim = Some(NetSim { lag_ms: 600_000.0, loss: 0.0 });
         for s in 1..players {
             let addr: SocketAddr = format!("127.0.0.1:{}", 40000 + s).parse().unwrap();
-            n.peers.push(Peer { addr, slot: s, last_recv: Instant::now(), ping: 0.05, link: Link::new(), seq_out: 0 });
+            n.peers.push(Peer { addr, slot: s, watch: false, rank: (0, 1500, 350), last_recv: Instant::now(), ping: 0.05, link: Link::new(), seq_out: 0 });
         }
         for k in 0..60u32 {
             let o = v3(k as f32, 1.0, 0.0);
@@ -2017,7 +2087,7 @@ mod migration_tests {
         for b in bytes {
             hsh = (hsh ^ b as u64).wrapping_mul(0x0100_0000_01b3);
         }
-        let recorded: (u32, u64) = (15, 10911351392787391105);
+        let recorded: (u32, u64) = (16, 10911351392787391105);
         assert_eq!((NET_PROTOCOL, hsh), recorded, "what both sides of a match must agree on changed: bump NET_PROTOCOL and PROTOCOL, then record the new value here");
     }
 
@@ -2188,5 +2258,94 @@ mod finisher_net_tests {
         let mut w = W(Vec::new());
         write_fstate(&mut w, &f);
         assert_eq!(read_fstate(&mut R { b: &w.0, i: 0 }).unwrap().fin, 7);
+    }
+}
+#[cfg(test)]
+mod spectator_tests {
+    use super::*;
+
+    /// A spectator joins a 1v1 (two players' places) with no player's place of their own: they
+    /// get a slot above the lobby's size, never become a fighter on the host, see both duellists
+    /// where the host has them (with their ranks), and what they send about themselves is ignored.
+    #[test]
+    fn spectators_watch_in_sync_without_a_slot() {
+        let mut hn = Net::host(0).expect("host");
+        hn.cap = 2;
+        let port = hn.sock.local_addr().unwrap().port();
+        let mut hg = Game::new(Kind::Host, 0, Mode::Duel, 3);
+        hg.add_player(0, "Host", true, None, 0);
+        hg.f[0].rank = 13;
+        hg.mt.phase = Phase::Fight;
+        hg.mt.timer = 300.0;
+        let mut pn = Net::join(&format!("127.0.0.1:{port}")).unwrap();
+        pn.my_rank = (10, 1480, 90);
+        let mut sn = Net::join(&format!("127.0.0.1:{port}")).unwrap();
+        sn.watch = true;
+        let (mut pg, mut sg): (Option<Game>, Option<Game>) = (None, None);
+        let mut watch_slot = None;
+        let mut spec_states = 0;
+        let dt = 1.0 / 60.0;
+        for frame in 0..240 {
+            // the host moves its fighter about; the player stands still
+            hg.f[0].pos = v3((frame as f32 * 0.05).sin() * 4.0, 0.0, 2.0);
+            for m in hn.poll() {
+                match m {
+                    Incoming::Join { slot, name } => {
+                        hg.add_player(slot, &name, false, None, 0);
+                    }
+                    Incoming::Watch { slot, .. } => watch_slot = Some(slot),
+                    Incoming::PeerState { slot, st, sent, .. } => {
+                        if Some(slot) == watch_slot {
+                            spec_states += 1;
+                        }
+                        if hg.f[slot].present {
+                            let now = hg.time;
+                            apply_remote(&mut hg.f[slot], &st, true, sent, now);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for s in 0..hg.f.len() {
+                if let Some(r) = hn.peer_rank(s) {
+                    hg.f[s].rank = r.0;
+                    hg.f[s].rating = r.1;
+                }
+            }
+            hn.send(&hg, dt);
+            for (n, g, name) in [(&mut pn, &mut pg, "Pat"), (&mut sn, &mut sg, "Viewer")] {
+                if g.is_none() {
+                    n.send_hello(name, dt);
+                }
+                for m in n.poll() {
+                    if let Incoming::Host(msg) = m {
+                        let gg = g.get_or_insert_with(|| Game::new(Kind::Client, msg.you, msg.mode, msg.target));
+                        crate::apply_host_msg(gg, msg);
+                    }
+                }
+                if let Some(gg) = g.as_ref() {
+                    n.send(gg, dt);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        let ws = watch_slot.expect("the spectator was let in to watch");
+        assert!(ws >= 2, "a spectator never takes a player's place (slot {ws})");
+        assert!(!hg.f[ws].present, "they're no fighter on the host");
+        assert_eq!(hg.present().len(), 2, "the duel is still one against one");
+        assert_eq!(spec_states, 0, "what a spectator sends about themselves is ignored");
+        assert_eq!(hn.watchers(), 1);
+        let sg = sg.expect("the spectator follows the match");
+        assert_eq!(sg.local, ws);
+        assert!(!sg.f[ws].present, "watching, with no fighter of their own");
+        let players: Vec<usize> = (0..sg.f.len()).filter(|&s| sg.f[s].present).collect();
+        assert_eq!(players.len(), 2, "both duellists are seen: {players:?}");
+        assert!((sg.f[0].net_pos - hg.f[0].pos).len() < 0.6, "in sync with the host: {:?} vs {:?}", sg.f[0].net_pos, hg.f[0].pos);
+        let p = players.into_iter().find(|&s| s != 0).unwrap();
+        assert_eq!(sg.f[p].rank, 10, "the player's rank reaches the spectator");
+        assert_eq!(sg.f[0].rank, 13, "and the host's");
+        assert_eq!(sg.mt.mode, Mode::Duel);
+        let pg = pg.expect("the player joined");
+        assert!(pg.local < 2, "the player has a player's place");
     }
 }

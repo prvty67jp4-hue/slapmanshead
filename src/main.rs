@@ -23,6 +23,9 @@ mod ui_kit;
 mod update;
 mod weapons;
 mod bosses;
+mod ranked;
+mod replay;
+mod competitive;
 mod watchdog;
 mod world;
 mod zones;
@@ -631,6 +634,7 @@ const BOT_LEVELS: [(&str, f32); 4] = [("Easy", 0.2), ("Normal", 0.5), ("Hard", 0
 /// A card in the PLAY picker.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PlayPick {
+    Ranked,
     Quick,
     Host,
     Find,
@@ -644,6 +648,7 @@ impl PlayPick {
     /// The menu page the card opens (None: it starts a match straight away).
     fn page(self) -> Option<Page> {
         match self {
+            PlayPick::Ranked => Some(Page::Ranked),
             PlayPick::Host => Some(Page::Host),
             PlayPick::Find => Some(Page::Browse),
             PlayPick::JoinIp => Some(Page::Join),
@@ -657,6 +662,7 @@ impl PlayPick {
 /// whether it can be picked. Join by IP is always on, with or without Steam.
 fn play_cards(steam: bool, gauntlet_best: u32) -> Vec<(PlayPick, &'static str, String, bool)> {
     vec![
+        (PlayPick::Ranked, "Ranked 1v1", (if steam { "Your rank on the line: matched by rating and region" } else { "Needs Steam running" }).into(), true),
         (PlayPick::Quick, "Quick Play", (if steam { "Join an open online game, or open one" } else { "Straight into a match against bots" }).into(), true),
         (PlayPick::Host, "Host Lobby", "Open a lobby friends can join".into(), true),
         (PlayPick::Find, "Find Games", (if steam { "Browse open lobbies on Steam" } else { "Needs Steam running" }).into(), steam),
@@ -700,6 +706,10 @@ enum Page {
     Mastery,
     /// The story: the world, each fighter's entries (opening with mastery), the places.
     Lore,
+    /// Ranked 1v1: your rank and the queue (crate::competitive, crate::ranked).
+    Ranked,
+    /// The match history and the replay viewer (crate::replay).
+    Replays,
 }
 
 enum Screen {
@@ -906,6 +916,23 @@ struct App {
     hub_keep: Option<(Game, Option<Net>)>,
     runner_state: Option<hub_bots::Runner>,
     esc_eaten: bool,
+    /// Ranked 1v1 (crate::competitive): this account's record, the queue, the match being played,
+    /// and the last result (with its animation's clock) and a note for the Ranked page.
+    ranked: ranked::Profile,
+    ranked_account: u64,
+    ranked_q: Option<competitive::RankedQueue>,
+    ranked_match: Option<competitive::RankedMatch>,
+    ranked_change: Option<(ranked::Change, f32)>,
+    ranked_note: Option<String>,
+    /// Replays: the history (read when the page opens), the viewer, and the last match's file.
+    replay_list: Option<Vec<(PathBuf, replay::Info)>>,
+    replay_view: Option<Box<replay::Viewer>>,
+    last_replay: Option<PathBuf>,
+    /// The next game joined is only to watch (a spectator), and how we're watching.
+    watch_next: bool,
+    spec: competitive::SpecCam,
+    /// Leaving the match opens its replay.
+    replay_after: bool,
 }
 
 /// Controller movement and held buttons, merged into the game input.
@@ -937,6 +964,18 @@ impl App {
             hub_keep: None,
             runner_state: None,
             esc_eaten: false,
+            ranked: ranked::Profile::default(),
+            ranked_account: 0,
+            ranked_q: None,
+            ranked_match: None,
+            ranked_change: None,
+            ranked_note: None,
+            replay_list: None,
+            replay_view: None,
+            last_replay: None,
+            watch_next: false,
+            spec: competitive::SpecCam::default(),
+            replay_after: false,
             screen: Screen::Menu(Page::Main),
             demo,
             gpu: None,
@@ -1071,6 +1110,10 @@ impl App {
                 }
             }
         }
+        // the ranked record for this account (a match left mid-way last time counts as lost now)
+        if app.screenshot.is_none() && !app.autoplay {
+            app.load_ranked();
+        }
         // test switches: DUEL_BODY=0..3 picks the fighter, DUEL_MELEE=0..2 the blade
         if let Some(b) = std::env::var("DUEL_BODY").ok().and_then(|v| v.parse::<u8>().ok()) {
             app.settings.loadout.body = b.min(chars::COUNT as u8 - 1);
@@ -1151,6 +1194,10 @@ impl App {
             } else if pg == "loadout" {
                 app.menu_loadout = true;
                 app.menu_fx = 0.80;
+            } else if pg == "ranked" {
+                app.screen = Screen::Menu(Page::Ranked);
+            } else if pg == "replays" {
+                app.screen = Screen::Menu(Page::Replays);
             }
         }
         // test switches for Ledger Duels pictures (menus and matches): DUEL_LEDGER_RULES=<rule
@@ -1268,10 +1315,18 @@ impl App {
                 app.screen = Screen::Lobby { net: n, waiting_since: 0.0 };
             }
         }
+        // test switches for the competitive pictures (crate::competitive): DUEL_COMP=<page>, and
+        // DUEL_REPLAY_DEMO=<seconds>: a match against a bot recorded and opened in the viewer
+        if let Ok(pg) = std::env::var("DUEL_COMP") {
+            app.comp_setup(&pg);
+        }
+        if std::env::var_os("DUEL_REPLAY_DEMO").is_some() {
+            app.replay_demo();
+        }
         // the Varrow Hub: you load into the town square (the menu is one key away). Picture and
         // test switches that set up something else keep the menu; DUEL_MENU=1 does too.
         app.hub_scene();
-        let set_up = ["DUEL_PAGE", "DUEL_MENU", "DUEL_AUTOPLAY", "DUEL_EXEC", "DUEL_TRAIN", "DUEL_AUTOHOST", "DUEL_AUTOJOIN", "DUEL_BENCH", "DUEL_GALLERY", "DUEL_STEAM_SELFTEST", "DUEL_REPORT_TEST", "DUEL_CRASH_TEST", "DUEL_UPDATE_NOW", "DUEL_AUDIO_TEST"].iter().any(|k| std::env::var_os(k).is_some());
+        let set_up = ["DUEL_PAGE", "DUEL_COMP", "DUEL_REPLAY_DEMO", "DUEL_MENU", "DUEL_AUTOPLAY", "DUEL_EXEC", "DUEL_TRAIN", "DUEL_AUTOHOST", "DUEL_AUTOJOIN", "DUEL_BENCH", "DUEL_GALLERY", "DUEL_STEAM_SELFTEST", "DUEL_REPORT_TEST", "DUEL_CRASH_TEST", "DUEL_UPDATE_NOW", "DUEL_AUDIO_TEST"].iter().any(|k| std::env::var_os(k).is_some());
         if matches!(app.screen, Screen::Menu(Page::Main)) && !set_up && app.screenshot.is_none() {
             app.start_hub(false);
         }
@@ -1404,6 +1459,10 @@ impl App {
     }
 
     fn leave_to_menu(&mut self) {
+        // (a ranked match left before its end is a loss; watching ends)
+        self.ranked_leave();
+        self.ranked_match = None;
+        self.spec = competitive::SpecCam::default();
         let was_hub = matches!(&self.screen, Screen::Play { game, .. } if game.in_hub());
         if was_hub {
             self.write_hub_save();
@@ -1420,7 +1479,13 @@ impl App {
         self.disconnected = None;
         self.quick_host = false;
         self.news = load_news();
-        // after a match, back to the hub you came from
+        // after a match, back to the hub you came from (or into its replay)
+        if std::mem::take(&mut self.replay_after) {
+            if let Some(p) = self.last_replay.clone() {
+                self.open_replay(&p);
+                return;
+            }
+        }
         if !was_hub {
             self.back_to_hub();
         }
@@ -1559,8 +1624,12 @@ impl App {
                         Screen::Play { game, net } => (game.mt.mode as u8, net.as_ref().map_or(1, |n| n.player_count())),
                         _ => (self.settings.mode, 1),
                     };
+                    let ranked_r = self.ranked_q.as_ref().filter(|q| q.hosting).map(|_| self.ranked.rating.r.round() as i32);
                     if let Some(st) = self.steam.as_mut() {
                         st.lobby_created(id, mode, players);
+                        if let Some(r) = ranked_r {
+                            st.mark_ranked(r);
+                        }
                     }
                     if let Screen::Play { game, .. } = &mut self.screen {
                         game.say("Steam lobby open: friends can join from their friends list or Find Games".into());
@@ -1577,7 +1646,9 @@ impl App {
                     let client = self.steam.as_ref().map(|s| s.client.clone());
                     match (host, client) {
                         (Some(h), Some(cl)) => match Net::join_steam(cl, h) {
-                            Ok(n) => {
+                            Ok(mut n) => {
+                                n.watch = std::mem::take(&mut self.watch_next);
+                                n.my_rank = self.my_rank_tuple(self.ranked_q.is_some() && !n.watch);
                                 self.menu_msg = None;
                                 self.screen = Screen::Lobby { net: n, waiting_since: 0.0 };
                             }
@@ -1587,8 +1658,13 @@ impl App {
                     }
                 }
                 steam::SteamEvent::Entered(Err(())) => {
-                    self.menu_msg = Some("Couldn't join that Steam lobby: it may be full or closed.".into());
-                    self.screen = Screen::Menu(Page::Browse);
+                    if let Some(q) = self.ranked_q.as_mut() {
+                        // (the ranked queue carries on looking)
+                        q.joining = false;
+                    } else {
+                        self.menu_msg = Some("Couldn't join that Steam lobby: it may be full or closed.".into());
+                        self.screen = Screen::Menu(Page::Browse);
+                    }
                 }
                 steam::SteamEvent::LobbyList(_) => {}
                 steam::SteamEvent::Direct { from, bytes } => {
@@ -1596,7 +1672,12 @@ impl App {
                         commands::on_direct(game, from, &bytes);
                     }
                 }
-                steam::SteamEvent::Board { rank, top } => {
+                steam::SteamEvent::Board { which: 1, rank, .. } => {
+                    // the ranked leaderboard: our place (the top hundred are the Ledger of Champions)
+                    self.ranked.board = rank.max(0) as u32;
+                    ranked::save(&self.ranked, self.ranked_account);
+                }
+                steam::SteamEvent::Board { rank, top, .. } => {
                     if let Screen::Play { game, .. } = &mut self.screen {
                         if let Some(gt) = game.gauntlet.as_mut() {
                             gt.rank = rank;
@@ -2046,7 +2127,10 @@ impl App {
     fn join_server(&mut self, addr: &str) {
         self.settings.join_addr = addr.to_string();
         match Net::join(addr) {
-            Ok(n) => {
+            Ok(mut n) => {
+                // (joined by address: never ranked; maybe only to watch)
+                n.watch = std::mem::take(&mut self.watch_next);
+                n.my_rank = self.my_rank_tuple(false);
                 self.settings.save();
                 self.menu_msg = None;
                 self.screen = Screen::Lobby { net: n, waiting_since: 0.0 };
@@ -2708,6 +2792,10 @@ impl eframe::App for App {
 
         self.watchdog.stage("Steam");
         self.steam_frame(dt);
+        self.ranked_queue_tick(dt);
+        if let Some((_, t)) = self.ranked_change.as_mut() {
+            *t += dt;
+        }
         // network + simulation
         let mut go_menu = false;
         if let Screen::Lobby { .. } = self.screen {
@@ -2766,10 +2854,23 @@ impl eframe::App for App {
                     }
                     self.boss_intro.set(it);
                 }
+                // the competitive side: watching, ranked, replays, the killcam's skip
+                self.stands_frame(&ctx);
+                self.spectator_input(&ctx, dt);
+                self.ranked_frame();
+                self.save_finished_replay();
+                self.comp_frame();
+                if let Screen::Play { game, .. } = &mut self.screen {
+                    if game.deathcam.is_some() && ctx.input(|i| i.key_pressed(Key::Space)) {
+                        game.skip_deathcam();
+                    }
+                }
             }
             self.sim_ms = t_sim.elapsed().as_secs_f32() * 1000.0;
         } else {
             self.set_capture(&ctx, false);
+            self.esc_eaten = false;
+            self.replay_frame(&ctx, dt);
             // the menu's showcase: your fighter, standing on the map
             self.demo_t += dt;
             if self.demo.world.map as u8 != self.settings.map.min(MapId::ALL.len() as u8 - 1) {
@@ -2861,7 +2962,7 @@ impl eframe::App for App {
         let mut ears = None;
         // the Play of the Match: its moment stands in for the live one while it's drawn
         let potm_view = match &mut self.screen {
-            Screen::Play { game, .. } => game.potm_view_begin(),
+            Screen::Play { game, .. } => game.potm_view_begin() || game.deathcam_view_begin(),
             _ => false,
         };
         match &self.screen {
@@ -2880,6 +2981,19 @@ impl eframe::App for App {
                 self.draw_hud(&painter, rect, &cam, game);
                 if let Screen::Play { net, .. } = &self.screen {
                     self.draw_net_overlay(&painter, rect, game, net.as_ref());
+                }
+            }
+            // a replay open: the recorded match, drawn like a live one
+            Screen::Menu(Page::Replays) if self.replay_view.is_some() => {
+                if let (Some(v), Some(g3), Some(rs)) = (self.replay_view.as_ref(), gpu.as_mut(), frame.wgpu_render_state()) {
+                    let (pos, look, fov) = v.camera();
+                    let d = (look - pos).norm();
+                    let cam = Cam::new(pos, d.x.atan2(d.z), d.y.clamp(-1.0, 1.0).asin(), fov, rect);
+                    ears = Some((cam.pos, cam.right, cam.fwd));
+                    g3.dof = [0.0, 0.0];
+                    if let Some(id) = g3.render(rs, &v.game, &cam, rect, ppp, 1.0, None) {
+                        painter.image(id, rect, full_uv, Color32::WHITE);
+                    }
                 }
             }
             _ => {
@@ -3697,7 +3811,8 @@ impl App {
         self.ping_frame(dt, keys.ping);
         self.inv_frame(dt, keys.pack);
         let mut inp = self.current_input(&keys);
-        if self.chat_open || self.hub_ui.photo.is_some() || self.hub_ui.blocks() {
+        let watching = self.spec.pit.is_some() || matches!(&self.screen, Screen::Play { game, .. } if game.watcher);
+        if self.chat_open || self.hub_ui.photo.is_some() || self.hub_ui.blocks() || watching {
             inp = Input { yaw: self.aim_yaw, pitch: self.aim_pitch, ..Default::default() };
         }
         self.hub_scene_input(&mut inp);
@@ -3719,7 +3834,8 @@ impl App {
         let autostart = self.autostart;
         let train_step = std::mem::take(&mut self.train_step);
         let sim = self.net_sim();
-        let fill_bots = if self.quick_host { self.settings.fill_bots.max(4) } else { self.settings.fill_bots };
+        // (a ranked lobby is one against one: never bots)
+        let fill_bots = if self.ranked_match.is_some() || self.ranked_q.is_some() { 0 } else if self.quick_host { self.settings.fill_bots.max(4) } else { self.settings.fill_bots };
         let fill_skill = BOT_LEVELS[self.settings.bot_level.min(BOT_LEVELS.len() - 1)].1;
         self.watchdog.stage("Gauntlet leaderboard");
         self.gauntlet_frame();
@@ -3764,6 +3880,10 @@ impl App {
                         game.add_player(slot, &name, false, None, team);
                         let t = if game.mt.mode.teams() { format!(" ({} team)", TEAM_NAMES[team as usize]) } else { String::new() };
                         game.say(format!("{name} joined{t}"));
+                    }
+                    Incoming::Watch { name, .. } => {
+                        let name = clean_name(&name, 0);
+                        game.say(format!("{name} is watching"));
                     }
                     Incoming::Leave { slot } => {
                         if game.f[slot].present {
@@ -4039,11 +4159,22 @@ impl App {
         }
         if let Some(h) = first {
             let Screen::Lobby { net, .. } = std::mem::replace(&mut self.screen, Screen::Menu(Page::Main)) else { return };
+            let watching = net.watch;
             let mut g = Game::new(Kind::Client, h.you, h.mode, h.target);
             g.mt.classic = h.classic;
             g.mt.number = h.number;
             let you = h.you;
             apply_host_msg(&mut g, h);
+            if watching {
+                // a spectator: no fighter of our own, the caster's view
+                g.watcher = true;
+                g.f[you].present = false;
+                g.f[you].alive = false;
+                self.spec = competitive::SpecCam::default();
+            } else if self.ranked_q.take().is_some() {
+                // joined from the ranked queue: a ranked match
+                self.ranked_match = Some(competitive::RankedMatch::default());
+            }
             if self.autoplay {
                 g.f[you].is_bot = true;
                 g.bots[you] = Some(bot::Bot::new(0.8, 11 + you as u64));
@@ -4077,6 +4208,10 @@ impl App {
         let f = &game.f[l];
         let alpha = (self.acc / TICK).clamp(0.0, 1.0);
         let body = f.prev_pos.lerp(f.pos, alpha);
+        // watching (a spectator, or from the pits' stands): the caster's cameras
+        if let Some(c) = self.spectator_camera(game, rect) {
+            return (c, body);
+        }
         if let Some(c) = self.hub_camera(game, rect, body) {
             return (c, body);
         }
@@ -4088,6 +4223,12 @@ impl App {
         if let Some((pos, look, fov)) = crate::raid_ui::intro_cam(&self.boss_intro.get(), game) {
             let d = (look - pos).norm();
             return (Cam::new(pos, d.x.atan2(d.z), d.y.clamp(-1.0, 1.0).asin(), fov, rect), body);
+        }
+        // the killcam: your killer's view of the moment (the recorded frame is in place)
+        if let Some(dc) = &game.deathcam {
+            let k = &game.f[dc.killer.min(game.f.len() - 1)];
+            let (pivot, dir, md) = game.camera_rig(k.pos, k.yaw, k.pitch * 0.6);
+            return (Cam::new(pivot - dir * md, k.yaw, k.pitch * 0.6, self.settings.fov, rect), body);
         }
         // the Play of the Match: behind its player, as they played it
         if let (Some(_), Some(h)) = (game.potm_t, game.potm.as_ref()) {
@@ -4918,6 +5059,11 @@ fn apply_host_msg(g: &mut Game, m: net::HostMsg) {
         g.f[s].loss_pct = e.loss;
         g.f[s].wins = e.wins;
         g.f[s].spectate = e.spectate;
+        if s != g.local {
+            g.f[s].rank = e.rank;
+            g.f[s].rating = e.rating;
+            g.f[s].rating_rd = e.rd;
+        }
         if e.spectate && s == g.local {
             g.f[s].alive = false; // watching this round
             g.f[s].respawn_t = 1e9;
@@ -5760,6 +5906,17 @@ impl App {
             return; // a clean picture of the map
         }
         bank_ui::admin_hud(p, rect, g);
+        // the killcam's titles, and the caster's HUD when watching, instead of your own HUD
+        if g.deathcam.is_some() {
+            let s = self.hud_scale(rect);
+            self.draw_deathcam(p, rect, cam, g, s);
+            return;
+        }
+        if g.watcher || self.spec.pit.is_some() {
+            let s = self.hud_scale(rect);
+            self.draw_caster(p, rect, g, s);
+            return;
+        }
         // the hub: its own HUD (none at all in photo mode with the HUD hidden)
         if g.in_hub() {
             if let Some(ph) = self.hub_ui.photo {
@@ -5900,6 +6057,11 @@ impl App {
             let col = player_color(other.color_idx);
             let label = if enemy { other.name.clone() } else { format!("{} (ally)", other.name) };
             text_shadow(p, sp + Vec2::new(0.0, -12.0 * s), Align2::CENTER_BOTTOM, &label, 15.0 * s, col);
+            // their ranked 1v1 badge, before the name
+            if other.rank & 0x7f != 0 {
+                let w = p.layout_no_wrap(label.clone(), FontId::proportional(15.0 * s), col).size().x;
+                competitive::draw_rank_badge(p, sp + Vec2::new(-w * 0.5 - 11.0 * s, -21.0 * s), 15.0 * s, other.rank, 255);
+            }
             let r = Rect::from_center_size(sp, Vec2::new(70.0 * s, 8.0 * s));
             bar(p, r, other.hp / MAX_HP, if enemy { Color32::from_rgb(230, 60, 60) } else { Color32::from_rgb(80, 200, 110) });
             // an enemy's ability within 15 m: ready, or how long until it is (plan around it)
@@ -7540,6 +7702,11 @@ impl App {
         if matches!(page, Page::Main | Page::Play) {
             self.draw_profile(ctx, rect);
         }
+        // a replay open: only its own controls over the match
+        if page == Page::Replays && self.replay_view.is_some() {
+            self.replay_hud(ctx, rect);
+            return false;
+        }
         let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("title")));
         // game icon beside the title
         if self.icon_tex.is_none() {
@@ -7598,7 +7765,7 @@ impl App {
         let msg = self.menu_msg.clone();
         let mut quit = false;
         // Esc (or B on a controller) steps back to the main page
-        if page != Page::Main && self.rebinding.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        if page != Page::Main && self.rebinding.is_none() && self.replay_view.is_none() && !self.esc_eaten && ctx.input(|i| i.key_pressed(Key::Escape)) {
             if page == Page::Settings {
                 self.settings.save();
             }
@@ -7608,11 +7775,15 @@ impl App {
             next = Some(Page::Main);
         }
         let width = match page {
-            Page::Settings | Page::Mastery | Page::Lore => 600.0,
+            Page::Settings | Page::Mastery | Page::Lore | Page::Replays => 600.0,
+            Page::Ranked => 520.0,
             Page::Play => 520.0,
             _ => 380.0,
         };
-        if page == Page::Main {
+        if page == Page::Replays && self.replay_view.is_some() {
+            // a replay open: its own controls instead of the menu
+            self.replay_hud(ctx, rect);
+        } else if page == Page::Main {
             self.main_page(ctx, rect, &mut next, &mut quit);
         } else {
         panel(ctx, "menu", pos, width, |ui| {
@@ -7651,7 +7822,7 @@ impl App {
                             self.browse_asked = false;
                             next = PlayPick::Find.page();
                         }
-                        Some(p @ (PlayPick::Host | PlayPick::JoinIp | PlayPick::Practice)) => next = p.page(),
+                        Some(p @ (PlayPick::Ranked | PlayPick::Host | PlayPick::JoinIp | PlayPick::Practice)) => next = p.page(),
                         Some(PlayPick::Gauntlet) => {
                             action = Some(Box::new(|app: &mut App| {
                                 let name = clean_name(&app.settings.name, 0);
@@ -7794,6 +7965,13 @@ impl App {
                             g.set_map(MapId::from_u8(app.settings.map));
                             app.settings.save();
                             app.start_game(g, None);
+                            // the replay of a match against bots can be re-simulated exactly
+                            if let Screen::Play { game, .. } = &mut app.screen {
+                                if mode != Mode::Ledger {
+                                    let s = replay::Setup { name: name.clone(), bots: bots as u8, skill: lvl, mode: mode as u8, target: game.mt.target, map: game.world.map as u8, seed: game.rng.0, loadout: game.my_loadout.to_bytes(), classic: game.mt.classic, fin_locks: game.fin_locks };
+                                    game.replay_rec = Some(Box::new(replay::Recorder::new(Some(s))));
+                                }
+                            }
                         }));
                     }
                     if Self::big_button(ui, "Back") {
@@ -7866,15 +8044,35 @@ impl App {
                         next = Some(Page::Main);
                     }
                 }
+                Page::Ranked => {
+                    let (n, a) = self.ranked_page(ui);
+                    if n.is_some() {
+                        next = n;
+                    }
+                    if a.is_some() {
+                        action = a;
+                    }
+                }
+                Page::Replays => {
+                    if let Some(n) = self.replays_page(ui) {
+                        next = Some(n);
+                    }
+                }
                 Page::Browse => {
                     ui.heading("Find Games");
+                    ui.checkbox(&mut self.watch_next, "Join to watch (a spectator: no player's place; ranked matches too)");
                     if let Some(id) = self.browser_ui(ui) {
-                        action = Some(Box::new(move |app: &mut App| {
-                            if let Some(st) = app.steam.as_mut() {
-                                st.join_lobby(id);
-                                app.menu_msg = Some("Joining through Steam...".into());
-                            }
-                        }));
+                        let ranked_row = self.steam.as_ref().is_some_and(|st| st.rows.iter().any(|r| r.id == id && r.ranked));
+                        if ranked_row && !self.watch_next {
+                            self.menu_msg = Some("That's a ranked match: play ranked from Ranked 1v1, or tick Join to watch to spectate it.".into());
+                        } else {
+                            action = Some(Box::new(move |app: &mut App| {
+                                if let Some(st) = app.steam.as_mut() {
+                                    st.join_lobby(id);
+                                    app.menu_msg = Some(if app.watch_next { "Joining to watch through Steam..." } else { "Joining through Steam..." }.into());
+                                }
+                            }));
+                        }
                     }
                     // joining by address works with or without Steam
                     if Self::big_button(ui, "Join by IP") {
@@ -7892,6 +8090,13 @@ impl App {
                     if Self::big_button(ui, "Connect") {
                         action = Some(Box::new(|app: &mut App| {
                             let a = app.settings.join_addr.trim().to_string();
+                            app.join_server(&a);
+                        }));
+                    }
+                    if Self::big_button(ui, "Watch (spectate)") {
+                        action = Some(Box::new(|app: &mut App| {
+                            let a = app.settings.join_addr.trim().to_string();
+                            app.watch_next = true;
                             app.join_server(&a);
                         }));
                     }
@@ -8170,6 +8375,13 @@ impl App {
                 _ => (None, false),
             };
             let match_xp = self.match_xp;
+            // your best moment this match, and its replay (saved a moment after the end)
+            let best = match &self.screen {
+                Screen::Play { game, .. } => game.my_best.as_ref().map(|b| b.1.clone()),
+                _ => None,
+            };
+            let replay_ready = self.last_replay.as_ref().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok()).is_some_and(|t| t.elapsed().map_or(false, |e| e.as_secs() < 600));
+            let mut watch_replay = false;
             // how you played: what to work on
             let ms = match &self.screen {
                 Screen::Play { game, .. } => game.match_stats.get(game.local).copied().unwrap_or_default(),
@@ -8193,8 +8405,29 @@ impl App {
                         ui.label(egui::RichText::new(l).size(13.0).color(Color32::from_gray(215)));
                     }
                     ui.add_space(2.0);
-                    ui.label(egui::RichText::new(format!("Accuracy {:.0}%   Headshots {:.0}%   ({} of {} shots hit)", ms.accuracy() * 100.0, ms.headshot_rate() * 100.0, ms.hits, ms.shots)).size(13.0).color(Color32::from_gray(225)));
-                    ui.label(egui::RichText::new(format!("Parries {}   Whiffs {}   Counter-strafe stops {}", ms.parries, ms.whiffs, ms.cs_stops)).size(13.0).color(Color32::from_gray(225)));
+                    // ranked: the rating's change (and the rank-up, animated)
+                    self.ranked_result_ui(ui);
+                    egui::Grid::new("post-stats").num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
+                        let cell = |ui: &mut egui::Ui, k: &str, v: String| {
+                            ui.label(egui::RichText::new(k).size(12.0).color(Color32::from_gray(165)));
+                            ui.label(egui::RichText::new(v).font(ui_kit::display(17.0)).color(Color32::from_rgb(245, 238, 228)));
+                        };
+                        cell(ui, "Accuracy", format!("{:.0}%", ms.accuracy() * 100.0));
+                        cell(ui, "Headshots", format!("{} ({:.0}%)", ms.heads, ms.headshot_rate() * 100.0));
+                        ui.end_row();
+                        cell(ui, "Damage dealt", format!("{:.0}", ms.dealt));
+                        cell(ui, "Damage taken", format!("{:.0}", ms.taken));
+                        ui.end_row();
+                        cell(ui, "Parries", format!("{}", ms.parries));
+                        cell(ui, "Shots hit", format!("{} / {}", ms.hits, ms.shots));
+                        ui.end_row();
+                    });
+                    if let Some(b) = &best {
+                        ui.label(egui::RichText::new(format!("Your best moment: {}", b.to_lowercase())).size(13.0).color(Color32::from_rgb(255, 205, 130)));
+                    }
+                    if replay_ready && ui.button("▶ Watch the replay").on_hover_text("Every match is kept in Replays").clicked() {
+                        watch_replay = true;
+                    }
                     if tally.len() > 1 {
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("Next map: vote (the most votes wins)").size(13.5).color(Color32::from_gray(235)));
@@ -8259,6 +8492,10 @@ impl App {
             }
             if map_pick.is_some() {
                 self.map_vote_request = map_pick;
+            }
+            if watch_replay {
+                self.replay_after = true;
+                leave = true;
             }
             return leave;
         }
@@ -8747,6 +8984,12 @@ impl App {
             }
             if Self::big_button_h(ui, "Stats", 42.0) {
                 *next = Some(Page::Stats);
+            }
+            if Self::big_button_h(ui, "Ranked 1v1", 42.0) {
+                *next = Some(Page::Ranked);
+            }
+            if Self::big_button_h(ui, "Replays", 42.0) {
+                *next = Some(Page::Replays);
             }
             if Self::big_button_h(ui, "How to Play", 42.0) {
                 *next = Some(Page::HowTo);

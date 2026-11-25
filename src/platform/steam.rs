@@ -25,7 +25,7 @@ pub enum SteamEvent {
     LobbyList(Vec<u64>),
     /// The Gauntlet leaderboard after sending a score: our global rank (0 if unknown) and the
     /// top entries (name, score, rank).
-    Board { rank: i32, top: Vec<(String, i32, i32)> },
+    Board { which: u8, rank: i32, top: Vec<(String, i32, i32)> },
     /// An admin message straight from a Steam user (crate::commands::Direct): Steam proves the
     /// sender.
     Direct { from: u64, bytes: Vec<u8> },
@@ -43,6 +43,9 @@ pub struct LobbyRow {
     pub max: usize,
     /// Round trip to the host through Steam, once measured.
     pub ping: Option<u32>,
+    /// A ranked 1v1 lobby (joined from the ranked queue; others may watch), and its host's rating.
+    pub ranked: bool,
+    pub rating: i32,
 }
 
 /// The Gauntlet leaderboard's steps, each reported by Steam's callback and acted on afterwards in
@@ -50,10 +53,10 @@ pub struct LobbyRow {
 /// runs, so asking it for another call result there waits forever. That froze the game when a
 /// Gauntlet run ended).
 enum BoardStep {
-    Found(steamworks::Leaderboard, i32),
-    Uploaded(steamworks::Leaderboard, i32),
-    Entries(i32, Vec<(SteamId, i32, i32)>),
-    Failed,
+    Found(u8, steamworks::Leaderboard, i32),
+    Uploaded(u8, steamworks::Leaderboard, i32),
+    Entries(u8, i32, Vec<(SteamId, i32, i32)>),
+    Failed(u8),
 }
 
 pub struct Steam {
@@ -210,12 +213,22 @@ impl Steam {
     /// Three steps (find the board, upload, download the top), each started from `update` once
     /// the one before has reported back.
     pub fn submit_gauntlet(&self, score: i32) {
+        self.submit_board(0, "Gauntlet", score);
+    }
+
+    /// Put a ranked rating on its leaderboard (the latest is kept: it can go down) and learn our
+    /// place (the Ledger of Champions is the top hundred).
+    pub fn submit_ranked(&self, rating: i32) {
+        self.submit_board(1, "Ranked 1v1", rating);
+    }
+
+    fn submit_board(&self, which: u8, name: &str, score: i32) {
         use steamworks::{LeaderboardDisplayType, LeaderboardSortMethod};
         let board = self.board.clone();
-        self.client.user_stats().find_or_create_leaderboard("Gauntlet", LeaderboardSortMethod::Descending, LeaderboardDisplayType::Numeric, move |r| {
+        self.client.user_stats().find_or_create_leaderboard(name, LeaderboardSortMethod::Descending, LeaderboardDisplayType::Numeric, move |r| {
             let step = match r {
-                Ok(Some(lb)) => BoardStep::Found(lb, score),
-                _ => BoardStep::Failed,
+                Ok(Some(lb)) => BoardStep::Found(which, lb, score),
+                _ => BoardStep::Failed(which),
             };
             if let Ok(mut b) = board.lock() {
                 b.push(step);
@@ -228,30 +241,32 @@ impl Steam {
         use steamworks::{LeaderboardDataRequest, UploadScoreMethod};
         let board = self.board.clone();
         match step {
-            BoardStep::Found(lb, score) => {
+            BoardStep::Found(which, lb, score) => {
                 let next = lb.clone();
-                self.client.user_stats().upload_leaderboard_score(&lb, UploadScoreMethod::KeepBest, score, &[], move |u| {
+                // (a ranked rating can fall: the latest counts, not the best)
+                let how = if which == 1 { UploadScoreMethod::ForceUpdate } else { UploadScoreMethod::KeepBest };
+                self.client.user_stats().upload_leaderboard_score(&lb, how, score, &[], move |u| {
                     let rank = u.ok().flatten().map_or(0, |x| x.global_rank_new);
                     if let Ok(mut b) = board.lock() {
-                        b.push(BoardStep::Uploaded(next, rank));
+                        b.push(BoardStep::Uploaded(which, next, rank));
                     }
                 });
             }
-            BoardStep::Uploaded(lb, rank) => {
+            BoardStep::Uploaded(which, lb, rank) => {
                 self.client.user_stats().download_leaderboard_entries(&lb, LeaderboardDataRequest::Global, 1, 5, 0, move |d| {
                     let top = d.map(|v| v.into_iter().map(|e| (e.user, e.score, e.global_rank)).collect()).unwrap_or_default();
                     if let Ok(mut b) = board.lock() {
-                        b.push(BoardStep::Entries(rank, top));
+                        b.push(BoardStep::Entries(which, rank, top));
                     }
                 });
             }
-            BoardStep::Entries(rank, top) => {
+            BoardStep::Entries(which, rank, top) => {
                 // names looked up here too, not inside the callback
                 let friends = self.client.friends();
                 let top = top.into_iter().map(|(id, score, r)| (friends.get_friend(id).name(), score, r)).collect();
-                self.push_event(SteamEvent::Board { rank, top });
+                self.push_event(SteamEvent::Board { which, rank, top });
             }
-            BoardStep::Failed => self.push_event(SteamEvent::Board { rank: 0, top: Vec::new() }),
+            BoardStep::Failed(which) => self.push_event(SteamEvent::Board { which, rank: 0, top: Vec::new() }),
         }
     }
 
@@ -272,6 +287,43 @@ impl Steam {
         mm.set_lobby_data(l, "map", &self.map_name);
         self.update_lobby(mode, players);
         self.set_presence(id);
+    }
+
+    /// Our lobby is a ranked 1v1: marked so the ranked queue finds it (with our rating).
+    pub fn mark_ranked(&self, rating: i32) {
+        if let (Some(id), true) = (self.lobby, self.hosting) {
+            let mm = self.client.matchmaking();
+            let l = LobbyId::from_raw(id);
+            mm.set_lobby_data(l, "ranked", "1");
+            mm.set_lobby_data(l, "rating", &rating.to_string());
+        }
+    }
+
+    /// The ranked queue: open ranked lobbies within window points of our rating, at most this far
+    /// away (0 close, 1 our region, 2 far, 3 worldwide), nearest in rating first.
+    pub fn refresh_ranked(&mut self, rating: i32, window: i32, distance: u8) {
+        use steamworks::{ComparisonFilter, NearFilter, NumberFilter};
+        self.refreshing = true;
+        let mm = self.client.matchmaking();
+        mm.add_request_lobby_list_string_filter(StringFilter(LobbyKey::new("game"), GAME_TAG, StringFilterKind::Equal));
+        mm.add_request_lobby_list_string_filter(StringFilter(LobbyKey::new("ver"), net::PROTOCOL, StringFilterKind::Equal));
+        mm.add_request_lobby_list_string_filter(StringFilter(LobbyKey::new("ranked"), "1", StringFilterKind::Equal));
+        mm.add_request_lobby_list_numerical_filter(NumberFilter(LobbyKey::new("rating"), rating - window, ComparisonFilter::GreaterThanEqualTo));
+        mm.add_request_lobby_list_numerical_filter(NumberFilter(LobbyKey::new("rating"), rating + window, ComparisonFilter::LessThanEqualTo));
+        mm.add_request_lobby_list_near_value_filter(NearFilter(LobbyKey::new("rating"), rating));
+        mm.set_request_lobby_list_distance_filter(match distance {
+            0 => DistanceFilter::Close,
+            1 => DistanceFilter::Default,
+            2 => DistanceFilter::Far,
+            _ => DistanceFilter::Worldwide,
+        });
+        mm.set_request_lobby_list_result_count_filter(20);
+        let ev = self.events.clone();
+        mm.request_lobby_list(move |r| {
+            if let Ok(mut e) = ev.lock() {
+                e.push(SteamEvent::LobbyList(r.map(|v| v.into_iter().map(|l| l.raw()).collect()).unwrap_or_default()));
+            }
+        });
     }
 
     /// Keep the lobby's mode and head count current (shown in the browser).
@@ -365,6 +417,8 @@ impl Steam {
                     players: data("players").parse().unwrap_or_else(|_| mm.lobby_member_count(l)),
                     max: mm.lobby_member_limit(l).unwrap_or(crate::game::MAX_PLAYERS),
                     ping: self.pings.get(&host).copied(),
+                    ranked: data("ranked") == "1",
+                    rating: data("rating").parse().unwrap_or(1500),
                 }
             })
             .collect();
@@ -436,7 +490,7 @@ mod tests {
 
     #[test]
     fn browser_filters() {
-        let row = |mode, players, ping| LobbyRow { id: 1, host: 2, name: "x".into(), mode, map: "Arena".into(), players, max: 8, ping };
+        let row = |mode, players, ping| LobbyRow { id: 1, host: 2, name: "x".into(), mode, map: "Arena".into(), players, max: 8, ping, ranked: false, rating: 1500 };
         let f = BrowserFilter { mode: Some(1), map: None, max_ping: 120, hide_full: true, hide_empty: true };
         assert!(f.keep(&row(1, 3, Some(60))));
         assert!(!f.keep(&row(0, 3, Some(60))), "other mode");

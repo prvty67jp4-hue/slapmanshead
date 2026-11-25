@@ -541,7 +541,7 @@ fn name_tags_stack_and_fade_in_a_crowd() {
     let cam = crate::render::Cam::new(v3(0.0, 1.7, -16.0), 0.0, -0.05, 70.0, rect);
     let tags = crate::App::name_tags(&g, &cam, 1.0);
     assert!(tags.len() >= 6, "most of the crowd is named: {}", tags.len());
-    let rects: Vec<eframe::egui::Rect> = tags.iter().map(|(p, size, _, name, _, _)| {
+    let rects: Vec<eframe::egui::Rect> = tags.iter().map(|(p, size, _, name, _, _, _)| {
         let w = name.chars().count() as f32 * size * 0.55 + 8.0;
         eframe::egui::Rect::from_min_max(eframe::egui::Pos2::new(p.x - w / 2.0, p.y - size * 1.15), eframe::egui::Pos2::new(p.x + w / 2.0, p.y))
     }).collect();

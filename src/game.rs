@@ -1302,6 +1302,11 @@ pub struct Fighter {
     pub team: u8,
     /// Watching instead of playing (Duel queue, or waiting for the next round).
     pub spectate: bool,
+    /// Their ranked 1v1 rank (crate::ranked::Rank as a byte; 0 unranked or in placement), and the
+    /// hidden rating and its deviation (for matchmaking and a ranked result).
+    pub rank: u8,
+    pub rating: u16,
+    pub rating_rd: u16,
     /// Rounds won (Duel, Last Man Standing).
     pub wins: i32,
     pub kills: i32,
@@ -1527,6 +1532,9 @@ impl Fighter {
             present: false,
             team: 0,
             spectate: false,
+            rank: 0,
+            rating: 1500,
+            rating_rd: 350,
             wins: 0,
             kills: 0,
             deaths: 0,
@@ -2161,6 +2169,8 @@ pub struct RecFrame {
     pub f: Vec<Fighter>,
     pub tracers: Vec<Tracer>,
     pub particles: Vec<Particle>,
+    /// The damage numbers in the air (ours, and the hits we took): the killcam shows them.
+    pub nums: Vec<DmgNum>,
 }
 
 /// The Play of the Match: whose, what it was, how good, and the frames to replay.
@@ -2194,6 +2204,20 @@ pub struct KillCam {
 }
 
 pub const KILLCAM_TIME: f32 = 3.4;
+
+/// After you die: your killer's view of the moments before it, replayed (Space skips it).
+#[derive(Clone, Debug)]
+pub struct DeathCam {
+    pub killer: usize,
+    pub tool: &'static str,
+    pub head: bool,
+    pub frames: Vec<RecFrame>,
+    pub t: f32,
+}
+
+/// How long the killcam plays (it shows the last DEATHCAM_TIME seconds, then holds the blow).
+pub const DEATHCAM_TIME: f32 = 4.0;
+pub const DEATHCAM_HOLD: f32 = 0.5;
 
 #[derive(Clone, Debug)]
 pub struct DmgNum {
@@ -2320,6 +2344,17 @@ pub struct Game {
     /// Slow motion left (real seconds).
     pub slowmo: f32,
     pub killcam: Option<KillCam>,
+    /// The killcam after you die (DeathCam), and the hits you took lately (as damage numbers, so
+    /// the killcam can show your killer's).
+    pub deathcam: Option<DeathCam>,
+    pub taken_nums: Vec<DmgNum>,
+    pub(crate) deathcam_nums: Option<Vec<DmgNum>>,
+    /// This computer only watches (a spectator: no fighter of its own).
+    pub watcher: bool,
+    /// The local player's best moment this match (its score and what it was).
+    pub my_best: Option<(f32, String)>,
+    /// Every match recorded for the Replays menu (crate::replay), while one is being played.
+    pub replay_rec: Option<Box<crate::replay::Recorder>>,
     pub last_kill: Option<(usize, Option<usize>, u8, bool)>,
     pub rng: Rng,
     pub bots: Vec<Option<Bot>>,
@@ -2848,6 +2883,12 @@ impl Game {
             hitstop: 0.0,
             slowmo: 0.0,
             killcam: None,
+            deathcam: None,
+            taken_nums: Vec::new(),
+            deathcam_nums: None,
+            watcher: false,
+            my_best: None,
+            replay_rec: None,
             last_kill: None,
             rng: Rng(0x9E3779B97F4A7C15 ^ (local_slot as u64 + 1).wrapping_mul(7919)),
             bots,
@@ -3949,7 +3990,25 @@ impl Game {
     }
 
     /// Advance one fixed tick. `local_input` drives the local human fighter.
+    /// One step of the game. A match being played is recorded (crate::replay).
     pub fn tick(&mut self, local_input: &Input) {
+        if let Some(r) = self.replay_rec.as_mut() {
+            r.input(local_input);
+        }
+        self.tick_inner(local_input);
+        // a match begins: record it (the rest of each match's frames, and its file at the end)
+        let playing = matches!(self.mt.phase, Phase::Countdown | Phase::Fight);
+        let can = self.kind != Kind::Demo && self.train.is_none() && self.preview.is_none() && self.mt.mode != Mode::Hub && self.hub.is_none();
+        if self.replay_rec.is_none() && can && playing {
+            self.replay_rec = Some(Box::new(crate::replay::Recorder::new(None)));
+        }
+        if let Some(mut r) = self.replay_rec.take() {
+            r.after_tick(self, TICK);
+            self.replay_rec = Some(r);
+        }
+    }
+
+    fn tick_inner(&mut self, local_input: &Input) {
         set_windups(&self.tune);
         let dt = TICK;
         self.time += dt;
@@ -3965,6 +4024,19 @@ impl Game {
             ff.flash_t = (ff.flash_t - dt).max(0.0);
         }
         self.parry_flash = (self.parry_flash - dt).max(0.0);
+        for d in self.taken_nums.iter_mut() {
+            d.life -= dt;
+            d.pos.y += dt * 0.6;
+        }
+        self.taken_nums.retain(|d| d.life > 0.0);
+        // the killcam plays out (back in the fight, or the match over: it's done)
+        if let Some(dc) = self.deathcam.as_mut() {
+            dc.t += dt;
+            let back = self.f.get(self.local).is_some_and(|f| f.alive) && dc.t > 0.3;
+            if dc.t >= DEATHCAM_TIME + DEATHCAM_HOLD || back || self.mt.phase == Phase::MatchOver {
+                self.deathcam = None;
+            }
+        }
         if let Some(r) = self.recap.as_mut() {
             r.t -= dt;
             if r.t <= 0.0 {
@@ -3983,7 +4055,9 @@ impl Game {
             // respawning
             if !self.f[i].alive {
                 self.f[i].respawn_t -= dt;
-                if self.f[i].respawn_t <= 0.0 && self.mt.phase != Phase::MatchOver && !self.f[i].spectate {
+                // (our own respawn waits for the killcam to finish, or to be skipped)
+                let watching_cam = i == self.local && self.deathcam.is_some();
+                if self.f[i].respawn_t <= 0.0 && self.mt.phase != Phase::MatchOver && !self.f[i].spectate && !watching_cam {
                     let (p, y) = self.pick_spawn(i);
                     if i == self.local && !self.f[i].is_bot {
                         self.f[i].loadout = self.my_loadout;
@@ -4460,6 +4534,21 @@ impl Game {
                 stats: s,
                 t: RECAP_TIME,
             });
+            // the killcam: the killer's view of the last few seconds (not for the last kill of a
+            // match, which has its own)
+            if let Some(kk) = k {
+                if self.kind != Kind::Demo && self.train.is_none() && self.mt.phase == Phase::Fight && !self.watcher {
+                    let from = self.time - DEATHCAM_TIME;
+                    let mut frames: Vec<RecFrame> = self.rec.iter().filter(|fr| fr.t >= from).cloned().collect();
+                    // (and this very moment: the blow that did it, its number in the air)
+                    let me = self.local as u8;
+                    let nums = self.dmg_nums.iter().filter(|d| d.victim != me).chain(self.taken_nums.iter()).cloned().collect();
+                    frames.push(RecFrame { t: self.time + 1e-3, f: self.f.clone(), tracers: self.tracers.clone(), particles: self.particles.clone(), nums });
+                    if frames.len() >= 4 {
+                        self.deathcam = Some(DeathCam { killer: kk, tool: kill_tool(w), head, frames, t: 0.0 });
+                    }
+                }
+            }
         }
         let kname = k.map(|k| (self.f[k].name.clone(), self.f[k].color_idx));
         self.feed.push(FeedLine { killer: kname, victim: vname, tool: kill_tool(w), head, text: None, life: 6.0 });
@@ -4804,6 +4893,9 @@ impl Game {
         if self.kind == Kind::Demo || self.train.is_some() || self.mt.phase != Phase::Fight {
             return;
         }
+        if player == self.local && self.my_best.as_ref().is_none_or(|b| score > b.0) {
+            self.my_best = Some((score, what.clone()));
+        }
         let best = self.potm.as_ref().map_or(0.0, |h| h.score).max(self.hl_pending.as_ref().map_or(0.0, |p| p.0));
         if score > best {
             self.hl_pending = Some((score, player, what, self.time));
@@ -4829,7 +4921,9 @@ impl Game {
         self.rec_acc += dt;
         if self.rec_acc >= REC_DT {
             self.rec_acc -= REC_DT;
-            self.rec.push_back(RecFrame { t: self.time, f: self.f.clone(), tracers: self.tracers.clone(), particles: self.particles.clone() });
+            let me = self.local as u8;
+            let nums = self.dmg_nums.iter().filter(|d| d.victim != me).chain(self.taken_nums.iter()).cloned().collect();
+            self.rec.push_back(RecFrame { t: self.time, f: self.f.clone(), tracers: self.tracers.clone(), particles: self.particles.clone(), nums });
             let keep = POTM_BEFORE + POTM_AFTER + 0.5;
             while self.rec.front().is_some_and(|fr| fr.t < self.time - keep) {
                 self.rec.pop_front();
@@ -4916,7 +5010,49 @@ impl Game {
         true
     }
 
+    /// While the killcam plays: put its moment in place of the live one (as the Play of the Match
+    /// does); true if it did. Undo with potm_view_end.
+    pub fn deathcam_view_begin(&mut self) -> bool {
+        let Some(dc) = self.deathcam.as_ref() else { return false };
+        if self.potm_stash.is_some() || dc.frames.len() < 2 {
+            return false;
+        }
+        let t0 = dc.frames[0].t + dc.t.min(DEATHCAM_TIME);
+        let n = dc.frames.len();
+        let k = dc.frames.iter().position(|fr| fr.t > t0).unwrap_or(n - 1).max(1).min(n - 1);
+        let (a, b) = (&dc.frames[k - 1], &dc.frames[k]);
+        let w = ((t0 - a.t) / (b.t - a.t).max(1e-4)).clamp(0.0, 1.0);
+        let mut f = a.f.clone();
+        for (x, y) in f.iter_mut().zip(b.f.iter()) {
+            if (y.pos - x.pos).len() < 3.0 {
+                x.pos = x.pos.lerp(y.pos, w);
+                x.yaw += crate::math::wrap_angle(y.yaw - x.yaw) * w;
+                x.pitch += (y.pitch - x.pitch) * w;
+                x.vel = x.vel.lerp(y.vel, w);
+            }
+            x.prev_pos = x.pos;
+        }
+        let fr = if w < 0.5 { a } else { b };
+        let (tracers, particles) = (fr.tracers.clone(), fr.particles.clone());
+        let time = a.t + (b.t - a.t) * w;
+        let live_f = std::mem::replace(&mut self.f, f);
+        let live_tr = std::mem::replace(&mut self.tracers, tracers);
+        let live_pa = std::mem::replace(&mut self.particles, particles);
+        let live_time = std::mem::replace(&mut self.time, time);
+        self.deathcam_nums = Some(std::mem::replace(&mut self.dmg_nums, fr.nums.clone()));
+        self.potm_stash = Some((live_f, live_tr, live_pa, live_time));
+        true
+    }
+
+    /// Skip the killcam (our respawn goes ahead).
+    pub fn skip_deathcam(&mut self) {
+        self.deathcam = None;
+    }
+
     pub fn potm_view_end(&mut self) {
+        if let Some(n) = self.deathcam_nums.take() {
+            self.dmg_nums = n;
+        }
         if let Some((f, tr, pa, time)) = self.potm_stash.take() {
             self.f = f;
             self.tracers = tr;
@@ -5309,6 +5445,8 @@ impl Game {
         self.streaks = vec![0; MAX_PLAYERS];
         self.kill_chain = vec![(0, -10.0); MAX_PLAYERS];
         self.killcam = None;
+        self.deathcam = None;
+        self.my_best = None;
         self.slowmo = 0.0;
         self.last_kill = None;
         self.mt.phase = Phase::Loadout;
@@ -8113,6 +8251,9 @@ impl Game {
 
     /// You confirmed your loadout (in the loadout phase).
     pub fn set_ready(&mut self, lo: Loadout) {
+        if let Some(r) = self.replay_rec.as_mut() {
+            r.ready(lo);
+        }
         self.my_loadout = lo;
         let l = self.local;
         self.f[l].loadout = lo;
@@ -8303,6 +8444,13 @@ impl Game {
             });
             if let Some(a) = who {
                 self.life_taken[a] += amount.min(200.0);
+            }
+            // the hit as a number over us (the killcam shows your killer's damage)
+            let chest = self.f[victim].chest() + v3(0.0, 0.35, 0.0);
+            let lost = (a + self.f[victim].hp.min(0.0)).max(0.0);
+            self.taken_nums.push(DmgNum { pos: chest, amount: lost.round() as i32, life: 0.9, head, victim: victim as u8, confirmed: true, armour: if amount >= LETHAL { 0 } else { (amount - a).max(0.0).round() as i32 }, exact: a, exact_ap: 0.0, conf_t: 0.0 });
+            if self.taken_nums.len() > 8 {
+                self.taken_nums.remove(0);
             }
             if (from - me).flat().len() > 0.3 {
                 self.hurt_dirs.push((from, 1.2));

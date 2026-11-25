@@ -538,7 +538,7 @@ impl App {
         // names over heads: nearest first, smaller and fainter further off, and stacked upwards
         // when they would overlap in a crowd (a name with no room left is left out); an emote's
         // name shows under it only for its first moments
-        for (sp, size, a, name, emote, role) in Self::name_tags(g, cam, s) {
+        for (sp, size, a, name, emote, role, rank) in Self::name_tags(g, cam, s) {
             let col = Color32::from_rgba_unmultiplied(235, 230, 220, (a * 235.0) as u8);
             text_shadow(p, sp, Align2::CENTER_BOTTOM, &name, size, col);
             // the owner's gold crown, an admin's silver one, before the name
@@ -546,9 +546,18 @@ impl App {
                 let w = p.layout_no_wrap(name.clone(), FontId::proportional(size), col).size().x;
                 draw_crown(p, Pos2::new(sp.x - w / 2.0 - size * 0.95, sp.y - size * 0.6), size * 0.62, role, (a * 255.0) as u8);
             }
+            // their ranked 1v1 badge after the name
+            if rank & 0x7f != 0 {
+                let w = p.layout_no_wrap(name.clone(), FontId::proportional(size), col).size().x;
+                crate::competitive::draw_rank_badge(p, Pos2::new(sp.x + w / 2.0 + size * 0.95, sp.y - size * 0.62), size * 1.3, rank, (a * 255.0) as u8);
+            }
             if let Some((e, ea)) = emote {
                 text_shadow(p, sp + Vec2::new(0.0, size * 0.95), Align2::CENTER_BOTTOM, e, size * 0.8, Color32::from_rgba_unmultiplied(255, 200, 140, (a * ea * 210.0) as u8));
             }
+        }
+        // the Court Pits' walkway: watch the duel below
+        if crate::App::stands_pit(g).is_some() && self.spec.pit.is_none() {
+            text_shadow(p, Pos2::new(mid, rect.bottom() - 200.0 * s), Align2::CENTER_CENTER, "R watch the duel from the stands (caster view)", 17.0 * s, Color32::from_rgb(255, 205, 140));
         }
         // what E (or F) does here
         let prompt = hub_prompt(g, me, &self.hub_ui);
@@ -1736,7 +1745,7 @@ impl App {
 /// name and its own opacity while it's fresh). Nearest first; each is moved up past any tag
 /// already placed that it would overlap (at most three steps, else it's left out), fading and
 /// shrinking with distance (gone past 18 m), and never seen through a wall.
-pub fn name_tags(g: &Game, cam: &Cam, s: f32) -> Vec<(Pos2, f32, f32, String, Option<(&'static str, f32)>, u8)> {
+pub fn name_tags(g: &Game, cam: &Cam, s: f32) -> Vec<(Pos2, f32, f32, String, Option<(&'static str, f32)>, u8, u8)> {
     let me = g.local;
     let mut cands: Vec<(f32, Pos2, usize)> = Vec::new();
     for (k, o) in g.f.iter().enumerate() {
@@ -1777,7 +1786,7 @@ pub fn name_tags(g: &Game, cam: &Cam, s: f32) -> Vec<(Pos2, f32, f32, String, Op
             break;
         }
         if ok {
-            out.push((at, size, a, o.name.clone(), emote, g.role_of(k) as u8));
+            out.push((at, size, a, o.name.clone(), emote, g.role_of(k) as u8, o.rank));
         }
     }
     out

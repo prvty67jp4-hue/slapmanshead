@@ -919,6 +919,7 @@ dependencies = [
  "bytemuck",
  "cpal",
  "eframe",
+ "flate2",
  "gilrs",
  "glam",
  "gltf",
