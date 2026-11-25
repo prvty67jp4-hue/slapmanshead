@@ -28,6 +28,11 @@ pub enum HubPanel {
     Gate,
     RaidBoard,
     RaidLeave,
+    /// The Bank (crate::bank_ui), a gift being made (to this slot; usize::MAX: pick), and what
+    /// you can do with a player you right-clicked.
+    Bank,
+    Gift(usize),
+    Player(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -101,7 +106,7 @@ fn thumb_path(key: u64) -> Option<PathBuf> {
 
 /// The wardrobe's icons (tools/blender/build_look_icons.py): one per look, in hub::LOOKS order,
 /// 8 a row.
-const LOOK_ICONS: &[u8] = include_bytes!("../assets/ui/look_icons.png");
+pub(crate) const LOOK_ICONS: &[u8] = include_bytes!("../assets/ui/look_icons.png");
 const ICON_COLS: usize = 8;
 
 fn icon_uv(id: u8) -> Option<Rect> {
@@ -127,7 +132,7 @@ fn load_save() -> HubSave {
 }
 
 /// Where a point is relative to the local fighter (distance on the ground).
-fn flat_dist(a: V3, b: V3) -> f32 {
+pub(crate) fn flat_dist(a: V3, b: V3) -> f32 {
     (a - b).flat().len()
 }
 
@@ -183,12 +188,18 @@ impl App {
         let mut earned = self.hub_ui.save.earned;
         earned.mastery = (0..chars::COUNT as u8).map(|b| self.career.mastery_level(b)).max().unwrap_or(1);
         if self.hub_ui.unlock_all || std::env::var_os("DUEL_UNLOCK_ALL").is_some() {
-            earned = hub::Earned { rooftop: true, table_hard: true, pit_wins: 99, mastery: 99, raid: Default::default() };
+            earned = hub::Earned { rooftop: true, table_hard: true, pit_wins: 99, mastery: 99, ..Default::default() };
         }
         let me = g.local;
+        // the bank (crate::items): what's owned, and the progress it was made from
+        let bank = self.load_bank(&mut earned);
         g.f[me].hub.look = self.hub_ui.save.look.checked(&earned);
         if let Some(h) = g.hub.as_mut() {
+            h.bank = bank;
             h.earned = earned;
+            if let Some(t) = self.pending_toast.take() {
+                h.toast(t);
+            }
             h.ghost = self.hub_ui.save.ghost.clone();
             h.run_best = self.hub_ui.save.run_best;
             h.aim_best = self.hub_ui.save.aim_best;
@@ -208,7 +219,7 @@ impl App {
         }
         let e = hub::Earned { mastery: 0, ..h.earned };
         let old = hub::Earned { mastery: 0, ..s.earned };
-        if e.rooftop && !old.rooftop || e.table_hard && !old.table_hard || e.pit_wins > old.pit_wins {
+        if e.rooftop && !old.rooftop || e.table_hard && !old.table_hard || e.pit_wins > old.pit_wins || e.raid != old.raid {
             let mut raid = old.raid;
             raid.items |= e.raid.items;
             raid.cleared |= e.raid.cleared;
@@ -218,7 +229,7 @@ impl App {
                     raid.best[k] = e.raid.best[k];
                 }
             }
-            s.earned = hub::Earned { rooftop: e.rooftop || old.rooftop, table_hard: e.table_hard || old.table_hard, pit_wins: e.pit_wins.max(old.pit_wins), mastery: 0, raid };
+            s.earned = hub::Earned { rooftop: e.rooftop || old.rooftop, table_hard: e.table_hard || old.table_hard, pit_wins: e.pit_wins.max(old.pit_wins), mastery: 0, raid, ..Default::default() };
             changed = true;
         }
         if h.run_best != 0 && (s.run_best == 0 || h.run_best < s.run_best) {
@@ -353,6 +364,17 @@ impl App {
             ui.panel = Some(HubPanel::RaidBoard);
             return 0;
         }
+        if e && ui.panel.is_none() && crate::bank_ui::at_bank(game) {
+            ui.panel = Some(HubPanel::Bank);
+            return 0;
+        }
+        // right-click a player: what you can do with them (challenge, gift, and for admins more)
+        if ui.panel.is_none() && ctx.input(|i| i.pointer.secondary_clicked()) {
+            if let Some(t) = looked_at(game, me, 6.0) {
+                ui.panel = Some(HubPanel::Player(t));
+                return 0;
+            }
+        }
         if e && ui.panel.is_none() {
             let pos = game.f[me].pos;
             if game.f[me].hub.seat != SEAT_NONE {
@@ -393,6 +415,39 @@ impl App {
         let Screen::Play { game, .. } = &mut self.screen else { return };
         if !game.in_hub() {
             return;
+        }
+        // the bank is a screen of its own; a gift and a player's menu go in the side panel
+        match self.hub_ui.panel {
+            Some(HubPanel::Bank) => {
+                if self.bank_screen(ctx, rect) {
+                    self.hub_ui.panel = None;
+                }
+                return;
+            }
+            Some(p @ (HubPanel::Gift(_) | HubPanel::Player(_))) => {
+                let s = (rect.height() / 900.0).clamp(0.75, 1.6);
+                let pos = Pos2::new(rect.right() - 470.0 * s, rect.top() + 90.0 * s);
+                let mut close = false;
+                egui::Area::new(egui::Id::new("hub-side")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui_kit::panel_frame(ui, |ui| {
+                        ui.set_width(400.0 * s);
+                        match p {
+                            HubPanel::Gift(t) => self.gift_panel(ui, t, &mut close),
+                            HubPanel::Player(t) => self.player_menu(ui, t, &mut close),
+                            _ => {}
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("Close (Esc)").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if close {
+                    self.hub_ui.panel = None;
+                }
+                return;
+            }
+            _ => {}
         }
         let ui_state = &mut self.hub_ui;
         if ui_state.photo.is_some() {
@@ -451,6 +506,7 @@ impl App {
                     HubPanel::Challenge(t) => challenge(ui, game, t, &mut close),
                     HubPanel::Gate => crate::raid_ui::gate_panel(ui, game, &mut ui_state.raid_bots, &mut close),
                     HubPanel::RaidBoard => crate::raid_ui::board_panel(ui, game),
+                    HubPanel::Bank | HubPanel::Gift(_) | HubPanel::Player(_) => {}
                     HubPanel::RaidLeave => {
                         title(ui, "LEAVE THE VAULT?", 1.0);
                         ui.label("You go back to the Vault Gate; your party carries on without you (you can't rejoin this run).");
@@ -482,9 +538,14 @@ impl App {
         // names over heads: nearest first, smaller and fainter further off, and stacked upwards
         // when they would overlap in a crowd (a name with no room left is left out); an emote's
         // name shows under it only for its first moments
-        for (sp, size, a, name, emote) in Self::name_tags(g, cam, s) {
+        for (sp, size, a, name, emote, role) in Self::name_tags(g, cam, s) {
             let col = Color32::from_rgba_unmultiplied(235, 230, 220, (a * 235.0) as u8);
             text_shadow(p, sp, Align2::CENTER_BOTTOM, &name, size, col);
+            // the owner's gold crown, an admin's silver one, before the name
+            if role > 0 {
+                let w = p.layout_no_wrap(name.clone(), FontId::proportional(size), col).size().x;
+                draw_crown(p, Pos2::new(sp.x - w / 2.0 - size * 0.95, sp.y - size * 0.6), size * 0.62, role, (a * 255.0) as u8);
+            }
             if let Some((e, ea)) = emote {
                 text_shadow(p, sp + Vec2::new(0.0, size * 0.95), Align2::CENTER_BOTTOM, e, size * 0.8, Color32::from_rgba_unmultiplied(255, 200, 140, (a * ea * 210.0) as u8));
             }
@@ -730,7 +791,7 @@ impl App {
 }
 
 /// The player in front of you (looked at, within reach).
-fn looked_at(g: &Game, me: usize, reach: f32) -> Option<usize> {
+pub(crate) fn looked_at(g: &Game, me: usize, reach: f32) -> Option<usize> {
     let f = &g.f[me];
     let eye = f.eye();
     let dir = look_dir(f.yaw, f.pitch);
@@ -759,6 +820,9 @@ fn hub_prompt(g: &Game, me: usize, ui: &HubUi) -> Option<String> {
     if let Some(t) = crate::raid_ui::prompt(g) {
         return Some(t);
     }
+    if crate::bank_ui::at_bank(g) {
+        return Some("E the Bank of Varrow (Banker Odo)  ·  everything you own".into());
+    }
     let f = &g.f[me];
     let pos = f.pos;
     if f.hub.pit != 255 {
@@ -780,7 +844,7 @@ fn hub_prompt(g: &Game, me: usize, ui: &HubUi) -> Option<String> {
         return Some(if k < 2 { "E read the Challenge Board".into() } else { "E read the scoreboard".into() });
     }
     if let Some(t) = looked_at(g, me, 4.5) {
-        return Some(format!("F challenge {}  ·  G emotes  ·  P photo mode", g.f[t].name));
+        return Some(format!("F challenge {}  ·  right-click: gift and more  ·  G emotes", g.f[t].name));
     }
     if hub::free_seat_near(g, pos, 1.6, me).is_some() {
         return Some("E sit".into());
@@ -794,7 +858,7 @@ fn hub_prompt(g: &Game, me: usize, ui: &HubUi) -> Option<String> {
 
 // ================================================================================== panels
 
-fn title(ui: &mut egui::Ui, t: &str, s: f32) {
+pub(crate) fn title(ui: &mut egui::Ui, t: &str, s: f32) {
     ui.label(egui::RichText::new(t).size(22.0 * s).color(ACCENT).strong());
 }
 
@@ -814,7 +878,7 @@ fn dye_combo(ui: &mut egui::Ui, id: String, v: &mut u8) -> bool {
 }
 
 /// A tile you can click: a frame (lit when picked or hovered) round whatever `draw` paints.
-fn tile(ui: &mut egui::Ui, size: Vec2, picked: bool, enabled: bool, draw: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
+pub(crate) fn tile(ui: &mut egui::Ui, size: Vec2, picked: bool, enabled: bool, draw: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(size, if enabled { egui::Sense::click() } else { egui::Sense::hover() });
     let p = ui.painter_at(r.expand(2.0));
     let hot = resp.hovered() && enabled;
@@ -826,7 +890,7 @@ fn tile(ui: &mut egui::Ui, size: Vec2, picked: bool, enabled: bool, draw: impl F
 }
 
 /// A look's icon (or, with no model, its name) into `r`; greyed when locked.
-fn paint_look(p: &egui::Painter, r: Rect, icons: Option<&egui::TextureHandle>, id: u8, locked: bool) {
+pub(crate) fn paint_look(p: &egui::Painter, r: Rect, icons: Option<&egui::TextureHandle>, id: u8, locked: bool) {
     match (icons, icon_uv(id)) {
         (Some(t), Some(uv)) => {
             let tint = if locked { Color32::from_rgba_unmultiplied(90, 90, 90, 150) } else { Color32::WHITE };
@@ -913,7 +977,7 @@ fn wardrobe_screen(ctx: &egui::Context, rect: Rect, s: f32, g: &mut Game, st: &m
                     ui.horizontal(|ui| {
                         for l in row {
                             let id = l.map_or(0, |l| l.id);
-                            let ok = l.is_none_or(|l| earned.has(l.unlock));
+                            let ok = l.is_none_or(|l| earned.look_owned(l));
                             let resp = tile(ui, Vec2::new(cell, cell), o.items[slot as usize] == id, ok, |p, r| {
                                 if id == 0 {
                                     p.text(r.center(), Align2::CENTER_CENTER, "none", FontId::proportional(13.0 * s), Color32::from_gray(170));
@@ -938,7 +1002,7 @@ fn wardrobe_screen(ctx: &egui::Context, rect: Rect, s: f32, g: &mut Game, st: &m
                     });
                 }
                 // what the hovered or chosen look is, and how to earn the locked ones
-                let locked: Vec<&LookItem> = LOOKS.iter().filter(|l| l.slot == slot && !earned.has(l.unlock)).collect();
+                let locked: Vec<&LookItem> = LOOKS.iter().filter(|l| l.slot == slot && !earned.look_owned(l)).collect();
                 if let Some(l) = hub::look(o.items[slot as usize]) {
                     ui.label(egui::RichText::new(format!("{}  ·  {}", l.name, l.set)).strong().color(Color32::WHITE));
                 }
@@ -994,7 +1058,7 @@ fn wardrobe_screen(ctx: &egui::Context, rect: Rect, s: f32, g: &mut Game, st: &m
                 ui.label(egui::RichText::new("Whole sets").strong());
                 ui.horizontal_wrapped(|ui| {
                     for set in hub::sets() {
-                        let ok = LOOKS.iter().filter(|l| l.set == set).all(|l| earned.has(l.unlock));
+                        let ok = LOOKS.iter().filter(|l| l.set == set).all(|l| earned.look_owned(l));
                         let resp = ui.add_enabled(ok, egui::Button::new(set));
                         if resp.clicked() {
                             o = o.with_set(set);
@@ -1140,7 +1204,7 @@ fn randomised(seed: f32, earned: &hub::Earned) -> Outfit {
     let mut o = Outfit::default();
     for slot in Slot::ALL {
         let k = slot as usize;
-        let mut pool: Vec<u8> = LOOKS.iter().filter(|l| l.slot == slot && earned.has(l.unlock)).map(|l| l.id).collect();
+        let mut pool: Vec<u8> = LOOKS.iter().filter(|l| l.slot == slot && earned.look_owned(l)).map(|l| l.id).collect();
         if matches!(slot, Slot::Cape | Slot::Neck | Slot::Off) {
             pool.push(0);
         }
@@ -1588,6 +1652,53 @@ impl App {
                 game.f[me].respawn_at(v3(-15.5, 0.0, -20.5), -0.6);
                 self.hub_ui.drill = 99;
             }
+            "admin" => {
+                // the bank, the ::help list, a gift offered to you, badges over names
+                // (crate::bank_ui::stage holds the rest each frame)
+                let page = std::env::var("DUEL_GALLERY").unwrap_or_default();
+                self.aim_yaw = 0.0;
+                let (kx, _, kz) = varrow::BANK;
+                match page.as_str() {
+                    "admin:bank" => {
+                        game.f[me].respawn_at(v3(kx - 1.0, 0.0, kz), std::f32::consts::FRAC_PI_2);
+                        if let Some(h) = game.hub.as_mut() {
+                            let b = &mut h.bank;
+                            let vault = b.add_tab("Vault drops").unwrap_or(0);
+                            let favs = b.add_tab("Favourites").unwrap_or(1);
+                            for k in crate::items::catalogue().into_iter().filter(|k| k.loot().is_some()) {
+                                b.file(k, Some(vault), None);
+                            }
+                            for k in [crate::items::ItemKey::Look(84), crate::items::ItemKey::Look(23), crate::items::ItemKey::Dye(26)] {
+                                b.file(k, Some(favs), None);
+                            }
+                            for k in [crate::items::ItemKey::Look(94), crate::items::ItemKey::Pet(1), crate::items::ItemKey::Dye(25), crate::items::ItemKey::Look(81), crate::items::ItemKey::Title(21)] {
+                                b.carry(k);
+                            }
+                            crate::items::ItemStore::grant(b, crate::items::ItemKey::Dye(26), 2, "a gift from Mira");
+                            crate::items::ItemStore::grant(b, crate::items::ItemKey::Look(84), 1, "a gift from Oskar");
+                        }
+                        self.bank_ui.selected = Some(crate::items::ItemKey::Look(84));
+                        self.hub_ui.panel = Some(HubPanel::Bank);
+                    }
+                    "admin:help" => {
+                        game.f[me].respawn_at(v3(0.0, 0.0, -6.0), 0.0);
+                        game.admin.show_help = true;
+                        self.chat_open = true;
+                        self.chat_text = "::gi".into();
+                    }
+                    "admin:gift" => {
+                        game.f[me].respawn_at(v3(2.0, 0.0, -4.0), 3.0);
+                        if let Some(h) = game.hub.as_mut() {
+                            h.gifts.incoming = Some(crate::gifts::Offer { gid: 7, from: 1, to: me as u8, item: crate::items::ItemKey::Look(84), n: 1, create: false });
+                        }
+                    }
+                    _ => {
+                        // badges: the owner and an admin in front of you
+                        game.f[me].respawn_at(v3(0.0, 0.0, -8.0), 0.0);
+                        self.pending_toast = None;
+                    }
+                }
+            }
             "raid" => {
                 // the vault's pictures (raid_ui::stage holds the rest): the gate's and the
                 // leaderboard's panels open
@@ -1625,7 +1736,7 @@ impl App {
 /// name and its own opacity while it's fresh). Nearest first; each is moved up past any tag
 /// already placed that it would overlap (at most three steps, else it's left out), fading and
 /// shrinking with distance (gone past 18 m), and never seen through a wall.
-pub fn name_tags(g: &Game, cam: &Cam, s: f32) -> Vec<(Pos2, f32, f32, String, Option<(&'static str, f32)>)> {
+pub fn name_tags(g: &Game, cam: &Cam, s: f32) -> Vec<(Pos2, f32, f32, String, Option<(&'static str, f32)>, u8)> {
     let me = g.local;
     let mut cands: Vec<(f32, Pos2, usize)> = Vec::new();
     for (k, o) in g.f.iter().enumerate() {
@@ -1666,7 +1777,7 @@ pub fn name_tags(g: &Game, cam: &Cam, s: f32) -> Vec<(Pos2, f32, f32, String, Op
             break;
         }
         if ok {
-            out.push((at, size, a, o.name.clone(), emote));
+            out.push((at, size, a, o.name.clone(), emote, g.role_of(k) as u8));
         }
     }
     out

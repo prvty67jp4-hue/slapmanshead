@@ -2274,6 +2274,8 @@ pub struct ChatLine {
     pub color: u8,
     pub text: String,
     pub life: f32,
+    /// The speaker's role as this computer sees it (crate::roles: 1 admin, 2 owner): a badge.
+    pub role: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2300,6 +2302,8 @@ pub struct Game {
     pub hub: Option<Box<crate::hub::Hub>>,
     /// The Ashen Vault, while a party is in it (crate::raid).
     pub raid: Option<Box<crate::raid::Raid>>,
+    /// Roles, admin commands and this session's admin state (crate::roles, crate::commands).
+    pub admin: crate::roles::Session,
     /// Things for the career stats since the menu side last looked.
     pub career: Vec<CareerEv>,
     /// Our last finisher's style (the kill can be confirmed after it has finished playing).
@@ -2831,6 +2835,7 @@ impl Game {
             gauntlet: None,
             hub: None,
             raid: None,
+            admin: crate::roles::Session::default(),
             career: Vec::new(),
             last_finisher: 0,
             duel_loser: None,
@@ -5509,6 +5514,10 @@ impl Game {
                 tn.run_speed *= k.stats(&self.mt.rules).move_mult();
             }
         }
+        // (an admin's ::speed)
+        if i < MAX_PLAYERS {
+            tn.run_speed *= self.admin.speed[i];
+        }
         let tn = tn;
         let run = tn.run_speed;
 
@@ -8074,7 +8083,8 @@ impl Game {
             return;
         }
         let (name, color) = if slot < self.f.len() && self.f[slot].present { (self.f[slot].name.clone(), self.f[slot].color_idx) } else { ("?".into(), 0) };
-        self.chat.push(ChatLine { name, color, text, life: 12.0 });
+        let role = if slot < self.f.len() && self.f[slot].present { self.role_of(slot) as u8 } else { 0 };
+        self.chat.push(ChatLine { name, color, text, life: 12.0, role });
         if self.chat.len() > 8 {
             self.chat.remove(0);
         }
@@ -8083,6 +8093,18 @@ impl Game {
     /// Something you typed: shown here and sent to everyone.
     pub fn say_chat(&mut self, text: &str) {
         let l = self.local;
+        // admin commands (crate::commands) never go out as chat
+        if crate::commands::is_command(text) {
+            crate::commands::run(self, text);
+            for r in std::mem::take(&mut self.admin.replies) {
+                self.admin_line(r);
+            }
+            return;
+        }
+        if !crate::commands::may_chat(self, l) {
+            self.say("You're muted for now.".into());
+            return;
+        }
         self.add_chat(l, text);
         if self.kind == Kind::Host || self.kind == Kind::Client {
             self.out_events.push(Ev::Chat { text: text.chars().take(100).collect() });
@@ -8154,7 +8176,7 @@ impl Game {
     pub fn apply_hit_g(&mut self, victim: usize, attacker: Option<usize>, amount: f32, knock: V3, stun: f32, head: bool, w: u8, src: Option<V3>, guard: f32) {
         {
             let ff = &self.f[victim];
-            if !ff.alive || !ff.present || ff.spawn_prot > 0.0 || self.mt.phase == Phase::Countdown || self.mt.phase == Phase::MatchOver {
+            if !ff.alive || !ff.present || ff.spawn_prot > 0.0 || self.mt.phase == Phase::Countdown || self.mt.phase == Phase::MatchOver || self.admin.is_god(victim) {
                 return;
             }
         }
@@ -9229,7 +9251,10 @@ impl Game {
                 }
             }
             Ev::Chat { text } => {
-                self.add_chat(from, &text);
+                // (a muted player's lines are dropped everywhere, and a command typed by mistake)
+                if crate::commands::may_chat(self, from) && !crate::commands::is_command(&text) {
+                    self.add_chat(from, &text);
+                }
             }
             Ev::Eat { item } => {
                 // a player ate: their health comes back here too (the host keeps health)
@@ -10284,6 +10309,8 @@ mod hitbox_tests {
         for i in 0..8 {
             g.f[i].spawn_prot = 0.0;
         }
+        // (the first call loads the fighters' models and outfits once: not a tick's cost)
+        g.update_hit_poses();
         let t0 = std::time::Instant::now();
         for _ in 0..120 {
             g.update_hit_poses();

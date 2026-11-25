@@ -74,6 +74,9 @@ pub const DECK: f32 = 0.2;
 
 /// The tailor's: the mirror (on the back wall, facing north) and the wardrobe chests.
 pub const MIRROR: (f32, f32, f32) = (-8.0, 1.6, -35.55);
+/// The Bank's booth: the middle of its counter (players stand on its west side, x - 1.1; the
+/// Banker behind it, x + 1.3, facing west).
+pub const BANK: (f32, f32, f32) = (22.0, 0.0, -12.5);
 pub const WARDROBES: [(f32, f32, f32); 2] = [(-12.6, 0.0, -33.0), (-3.4, 0.0, -33.0)];
 /// The catwalk (x, z ranges, its top) and the podium at its end.
 pub const CATWALK: ((f32, f32), (f32, f32), f32) = ((4.5, 7.5), (-30.0, -18.0), 0.6);
@@ -348,6 +351,22 @@ pub fn world() -> World {
     let (bx_, by_, bz_) = crate::vault::GATE_BOARD;
     props.push(Prop { kind: PropKind::HubBoard, pos: v3(bx_, by_, bz_), yaw: std::f32::consts::FRAC_PI_2, scale: 1.0, team: 255 });
     torches.push(v3(gx, 1.0, gz));
+    // the Bank: a booth against the east pits' wall, a counter with the Banker behind it
+    let (kx, _, kz) = BANK;
+    v.push(bx(kx - 0.3, 0.0, kz - 1.7, kx + 0.3, 1.05, kz + 1.7, Mat::Crate));
+    v.push(bx(kx + 2.2, 0.0, kz - 2.0, kx + 2.55, 2.9, kz + 2.0, Mat::Trim));
+    v.push(bx(kx - 0.35, 0.0, kz - 2.05, kx + 2.55, 2.9, kz - 1.85, Mat::Trim));
+    v.push(bx(kx - 0.35, 0.0, kz + 1.85, kx + 2.55, 2.9, kz + 2.05, Mat::Trim));
+    deco.push(bx(kx - 0.4, 1.05, kz - 1.75, kx + 0.4, 1.12, kz + 1.75, Mat::Trim));
+    for z in [kz - 1.95, kz + 1.95] {
+        deco.push(bx(kx - 0.45, 0.0, z - 0.12, kx - 0.25, 3.2, z + 0.12, Mat::Trim));
+    }
+    deco.push(bx(kx - 0.75, 3.2, kz - 2.25, kx + 2.7, 3.42, kz + 2.25, Mat::Stone));
+    deco.push(bx(kx + 1.9, 0.0, kz - 1.7, kx + 2.2, 2.2, kz + 1.7, Mat::Crate));
+    for z in [kz - 1.6, kz + 1.6] {
+        props.push(Prop { kind: PropKind::Lantern, pos: v3(kx - 0.6, 2.5, z), yaw: -std::f32::consts::FRAC_PI_2, scale: 0.9, team: 255 });
+        torches.push(v3(kx - 0.9, 2.2, z));
+    }
     // the vault itself, 40 m down (its floor tiles are the last blocks: see crate::vault)
     crate::vault::build(&mut v, &mut deco, &mut props, &mut torches);
     // ivy

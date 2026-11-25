@@ -65,6 +65,9 @@ fn tele_col(c: Cause) -> [u8; 3] {
 /// Everything the vault adds to the scene.
 pub fn draw(op: &mut MB, ad: &mut MB, al: &mut MB, cam: &Cam, g: &Game) {
     gate(ad, al, cam, g);
+    bank_booth(op, ad, cam, g);
+    pets(op, ad, cam, g);
+    weather(ad, al, cam, g);
     let Some(r) = g.raid.as_ref() else { return };
     if crate::raid::night(g, cam.pos) > 0.0 {
         night(op, ad, al, cam, g);
@@ -567,4 +570,102 @@ fn night(op: &mut MB, ad: &mut MB, al: &mut MB, cam: &Cam, g: &Game) {
             }
         }
     }
+}
+
+/// The bank's booth: coin stacks and a ledger on the counter, strongboxes behind, a hanging
+/// sign with a gold coin.
+fn bank_booth(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
+    if g.hub.is_none() {
+        return;
+    }
+    let (kx, _, kz) = crate::varrow::BANK;
+    let c = v3(kx, 0.0, kz);
+    if (c - cam.pos).len() > 40.0 {
+        return;
+    }
+    let gold = lin([226, 170, 60]);
+    let top = 1.12;
+    // coin stacks
+    for (k, (dz, h)) in [(-1.1f32, 5), (-0.85, 3), (0.9, 6), (1.15, 2)].iter().enumerate() {
+        for q in 0..*h {
+            let p = c + v3(-0.05 + (k % 2) as f32 * 0.08, top + 0.012 + q as f32 * 0.022, *dz);
+            op.tube(p, p + v3(0.0, 0.018, 0.0), 0.05, 0.05, v3(1.0, 0.0, 0.0), 1.0, gold, -1.0, 2.0);
+        }
+    }
+    // the ledger, open, with a quill
+    let m = M3::rot_y(0.3);
+    op.obox(c + v3(0.0, top + 0.02, 0.1), &m, v3(0.2, 0.015, 0.28), lin([70, 26, 20]), -1.0, 0.3);
+    op.obox(c + v3(0.0, top + 0.04, 0.1), &m, v3(0.18, 0.008, 0.26), lin([232, 222, 196]), -1.0, 0.1);
+    op.tube(c + v3(0.05, top + 0.05, 0.25), c + v3(0.2, top + 0.3, 0.38), 0.006, 0.002, v3(1.0, 0.0, 0.0), 1.0, lin([240, 236, 226]), -1.0, 0.2);
+    // strongboxes behind the counter, banded in brass
+    for (k, z) in [-1.2f32, 1.2].iter().enumerate() {
+        let p = c + v3(1.75, 0.3 + k as f32 * 0.0, *z);
+        op.obox(p, &M3::I, v3(0.3, 0.3, 0.42), lin([60, 40, 26]), -1.0, 0.3);
+        for dz in [-0.3f32, 0.3] {
+            op.obox(p + v3(0.0, 0.0, dz), &M3::I, v3(0.31, 0.31, 0.03), gold, -1.0, 2.0);
+        }
+        op.obox(p + v3(-0.31, 0.08, 0.0), &M3::I, v3(0.02, 0.06, 0.05), gold, -1.0, 2.0);
+    }
+    // the hanging sign: a dark board on two chains, a gold coin on it
+    let sign = c + v3(-0.62, 2.75, 0.0);
+    for dz in [-0.45f32, 0.45] {
+        op.tube(sign + v3(0.0, 0.3, dz), sign + v3(0.0, 0.62, dz), 0.012, 0.012, v3(1.0, 0.0, 0.0), 1.0, lin([60, 60, 66]), -1.0, 1.5);
+    }
+    op.obox(sign, &M3::I, v3(0.04, 0.3, 0.62), lin([34, 50, 34]), -1.0, 0.3);
+    op.obox(sign, &M3::I, v3(0.045, 0.32, 0.64), lin([200, 150, 50]), -1.0, 1.5);
+    let coin_at = sign + v3(-0.06, 0.0, 0.0);
+    op.tube(coin_at, coin_at + v3(-0.03, 0.0, 0.0), 0.22, 0.22, v3(0.0, 1.0, 0.0), 1.0, gold, -1.0, 2.2);
+    op.tube(coin_at + v3(-0.03, 0.0, 0.0), coin_at + v3(-0.045, 0.0, 0.0), 0.15, 0.15, v3(0.0, 1.0, 0.0), 1.0, lin([250, 210, 100]), -1.0, 2.2);
+    let shine = 0.5 + 0.5 * (g.time * 1.5).sin();
+    ad.billboard(cam, coin_at + v3(-0.08, 0.0, 0.0), 0.35 + 0.05 * shine, lina([255, 210, 110], 0.25));
+}
+
+/// Pets: the Cinder Wisp follows whoever wears it, bobbing over their shoulder.
+fn pets(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
+    if g.hub.is_none() {
+        return;
+    }
+    for (i, f) in g.f.iter().enumerate() {
+        if !f.present || f.hub.look.pet == 0 || f.hub.townsfolk {
+            continue;
+        }
+        let t = g.time + i as f32 * 1.3;
+        let back = yaw_fwd(f.yaw) * -0.7 + yaw_right(f.yaw) * 0.55;
+        let p = f.pos + back + v3((t * 1.1).sin() * 0.12, 1.75 + (t * 2.3).sin() * 0.1, (t * 0.9).cos() * 0.12);
+        if (p - cam.pos).len() > 40.0 {
+            continue;
+        }
+        // an ember core, a soft glow, a trail of sparks, two dark eyes looking ahead
+        op.ellipsoid(p, &M3::rot_y(f.yaw), v3(0.11, 0.13, 0.11), lin([255, 150, 40]), -1.0, 0.0, 0.0);
+        ad.billboard(cam, p, 0.32, lina([255, 120, 30], 0.55));
+        ad.billboard(cam, p + v3(0.0, 0.1, 0.0), 0.16, lina([255, 230, 150], 0.8));
+        for k in 0..4 {
+            let ph = (t * 0.8 + k as f32 * 0.25).fract();
+            let q = p - yaw_fwd(f.yaw) * (0.1 + ph * 0.4) + v3((k as f32 * 2.1 + t).sin() * 0.05, -ph * 0.25, 0.0);
+            ad.billboard(cam, q, 0.05 * (1.0 - ph), lina([255, 140, 40], 1.0 - ph));
+        }
+        let fw = yaw_fwd(f.yaw);
+        for s in [-1.0f32, 1.0] {
+            op.ellipsoid(p + fw * 0.1 + yaw_right(f.yaw) * (0.04 * s) + v3(0.0, 0.02, 0.0), &M3::I, v3(0.018, 0.026, 0.018), lin([40, 14, 8]), -1.0, 0.0, 0.0);
+        }
+    }
+}
+
+/// The hub's weather an admin set (crate::roles): rain falling round the camera.
+fn weather(ad: &mut MB, al: &mut MB, cam: &Cam, g: &Game) {
+    if g.hub.is_none() || g.admin.weather != 1 || cam.pos.y < -10.0 {
+        return;
+    }
+    let t = g.time;
+    for k in 0..260u32 {
+        let x = hash(k) * 30.0 - 15.0;
+        let z = hash(k + 1000) * 30.0 - 15.0;
+        let fall = ((t * 1.4 + hash(k + 2000)).fract()) * 12.0;
+        let p = v3((cam.pos.x / 30.0).floor() * 0.0 + cam.pos.x + x, cam.pos.y + 7.0 - fall, cam.pos.z + z);
+        if p.y < 0.0 {
+            continue;
+        }
+        al.beam(cam, p, p - v3(0.15, 0.6, 0.0), 0.008, lina([180, 195, 215], 0.35));
+    }
+    let _ = ad;
 }

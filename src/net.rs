@@ -18,12 +18,14 @@ const MAGIC: [u8; 4] = *b"DRB2";
 /// fighter's state carries) or anything both sides must agree on does: map layouts, the hit
 /// rules and the game's tuning. The `match_fingerprint` test notices most such changes and fails
 /// until it's bumped.
-pub const NET_PROTOCOL: u32 = 14;
+pub const NET_PROTOCOL: u32 = 15;
 /// The same as text (Steam lobbies only list games that speak the same one).
-pub const PROTOCOL: &str = "DRA14";
+pub const PROTOCOL: &str = "DRA15";
 /// Steam message channels: game packets, and lobby-browser ping probes.
 pub const STEAM_GAME_CHANNEL: u32 = 0;
 pub const STEAM_PING_CHANNEL: u32 = 1;
+/// Admin messages straight between players (crate::commands::Direct).
+pub const STEAM_ADMIN_CHANNEL: u32 = 2;
 
 /// Steam players have no IP address here; each gets a made-up one built from their Steam ID
 /// (in a private IPv6 range), so the rest of the netcode treats them like anyone else.
@@ -715,6 +717,8 @@ pub struct Net {
     /// (host) how many players this game takes (a match: 8; the hub: 16).
     pub cap: usize,
     roster_tick: u32,
+    /// (host) addresses removed by an admin, kept out until then.
+    banned: Vec<(SocketAddr, Instant)>,
 }
 
 impl Net {
@@ -722,6 +726,25 @@ impl Net {
     #[cfg(test)]
     pub fn local_port(&self) -> u16 {
         self.sock.local_addr().map(|a| a.port()).unwrap_or(0)
+    }
+
+    /// (host) The Steam ID a player is connected from (Steam vouches for it), if through Steam.
+    pub fn peer_steam(&self, slot: usize) -> Option<u64> {
+        self.peers.iter().find(|p| p.slot == slot).and_then(|p| addr_steam(&p.addr))
+    }
+
+    /// (player) The host's Steam ID, from our own connection to it.
+    pub fn host_steam(&self) -> Option<u64> {
+        self.host_addr.as_ref().and_then(addr_steam)
+    }
+
+    /// (host) Remove a player (an admin's ::kick): they're kept out for ten minutes.
+    pub fn drop_slot(&mut self, slot: usize) {
+        if let Some(i) = self.peers.iter().position(|p| p.slot == slot) {
+            let p = self.peers.remove(i);
+            self.banned.push((p.addr, Instant::now() + Duration::from_secs(600)));
+            self.out.retain(|e| e.0 as usize != slot);
+        }
     }
 
     pub fn host(port: u16) -> Result<Net, String> {
@@ -794,6 +817,7 @@ impl Net {
             soft: Vec::new(),
             cap: MATCH_PLAYERS,
             roster_tick: 0,
+            banned: Vec::new(),
         }
         .seeded()
     }
@@ -1095,6 +1119,13 @@ impl Net {
         let idx = self.peers.iter().position(|p| p.addr == from);
         match kind {
             K_HELLO => {
+                // (removed by an admin: kept out for a while)
+                self.banned.retain(|b| b.1 > Instant::now());
+                if self.banned.iter().any(|b| b.0 == from) {
+                    let w = self.head(K_FULL, from);
+                    self.send_to(w.0, from);
+                    return;
+                }
                 let name = r.s().unwrap_or_default();
                 // copies that speak different network protocols can't play together (players from
                 // before the protocol number: different builds can't): say which we are instead
@@ -1986,7 +2017,7 @@ mod migration_tests {
         for b in bytes {
             hsh = (hsh ^ b as u64).wrapping_mul(0x0100_0000_01b3);
         }
-        let recorded: (u32, u64) = (14, 10911351392787391105);
+        let recorded: (u32, u64) = (15, 10911351392787391105);
         assert_eq!((NET_PROTOCOL, hsh), recorded, "what both sides of a match must agree on changed: bump NET_PROTOCOL and PROTOCOL, then record the new value here");
     }
 

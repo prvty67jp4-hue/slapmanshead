@@ -1,0 +1,5 @@
+# Duel Rush owners and admins (edit me). One line each: "owner <SteamID64>" or "admin <SteamID64>".
+# Owners can promote admins in game with ::admin <player> (and ::unadmin); those are written here.
+# Each computer checks roles against its own copy of this file, so nobody can make themselves
+# admin by editing theirs or by hosting.
+owner 76561198977576140

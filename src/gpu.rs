@@ -3702,6 +3702,43 @@ impl Gpu {
             for c in sky_sh.iter_mut() {
                 *c = [c[0] * 0.3, c[1] * 0.12, c[2] * 0.16];
             }
+        } else if g.in_hub() {
+            // the hub's time of day and weather (an admin's ::time, ::weather)
+            match g.admin.time_of_day {
+                1 => {
+                    sun_power *= 0.55;
+                    sun_col = [1.0, 0.55, 0.32];
+                    fog = [0.42, 0.26, 0.2];
+                    for c in sky_sh.iter_mut() {
+                        *c = [c[0] * 0.75, c[1] * 0.52, c[2] * 0.45];
+                    }
+                }
+                2 => {
+                    sun_power *= 0.1;
+                    sun_col = [0.55, 0.65, 1.0];
+                    fog = [0.02, 0.03, 0.06];
+                    for c in sky_sh.iter_mut() {
+                        *c = [c[0] * 0.14, c[1] * 0.16, c[2] * 0.26];
+                    }
+                }
+                _ => {}
+            }
+            match g.admin.weather {
+                1 => {
+                    sun_power *= 0.45;
+                    fog = [fog[0] * 0.6 + 0.12, fog[1] * 0.6 + 0.13, fog[2] * 0.6 + 0.15];
+                    fog_density = fog_density.max(0.012) * 1.8;
+                    for c in sky_sh.iter_mut() {
+                        *c = [c[0] * 0.7, c[1] * 0.72, c[2] * 0.78];
+                    }
+                }
+                2 => {
+                    sun_power *= 0.6;
+                    fog = [0.62, 0.63, 0.64];
+                    fog_density = 0.05;
+                }
+                _ => {}
+            }
         }
         let sun = sky.sun_dir;
         let light_vp = light_matrix(&g.world, sun);
@@ -3764,7 +3801,17 @@ impl Gpu {
             }
             None => (0.5, 0.5, 0.0),
         };
-        let gr = sky.grade;
+        let mut gr = sky.grade;
+        // (the hub at dusk and at night: the sky picture dims with the light)
+        if g.in_hub() && crate::raid::night(g, cam.pos) == 0.0 {
+            gr.exposure *= match (g.admin.time_of_day, g.admin.weather) {
+                (2, _) => 0.42,
+                (1, _) => 0.8,
+                (_, 1) => 0.82,
+                _ => 1.0,
+            };
+        }
+        let gr = gr;
         let fx = self.fx;
         let pu = PostU {
             size: [1.0 / w as f32, 1.0 / h as f32, w as f32, h as f32],

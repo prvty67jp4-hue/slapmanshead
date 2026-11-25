@@ -345,6 +345,13 @@ impl Career {
         1 + self.xp / XP_PER_LEVEL
     }
 
+    /// Every fighter's mastery to the top (an admin's ::max).
+    pub fn max_mastery(&mut self) {
+        for m in self.mastery.iter_mut() {
+            *m = (*m).max(MASTERY_XP * MASTERY_MAX);
+        }
+    }
+
     /// Share of the way to the next level.
     pub fn level_progress(&self) -> f32 {
         (self.xp % XP_PER_LEVEL) as f32 / XP_PER_LEVEL as f32

@@ -40,10 +40,16 @@ mod story_tests;
 mod ledger_tests;
 mod hub_tests;
 mod raid_tests;
+mod admin_tests;
 mod hub_ui;
 mod raid;
 mod raid_bots;
 mod raid_ui;
+mod roles;
+mod commands;
+mod items;
+mod gifts;
+mod bank_ui;
 mod vault;
 
 /// (tests) Held by the timing test and the busiest tests, so they never run at once.
@@ -883,6 +889,12 @@ struct App {
     /// The Varrow Hub: its panels and save (crate::hub_ui), the hub kept while the menu is open,
     /// the picture scene's scripted runner, and an Esc the hub already used this frame.
     hub_ui: hub_ui::HubUi,
+    /// The bank and gifts on screen, and the admin side (crate::bank_ui).
+    bank_ui: bank_ui::BankUi,
+    /// This run of the game used ::max, ::god, ::speed or ::give to yourself: no records.
+    session_gated: bool,
+    /// A line to show once the hub is up (the bank file had been tampered with).
+    pending_toast: Option<String>,
     hub_keep: Option<(Game, Option<Net>)>,
     runner_state: Option<hub_bots::Runner>,
     esc_eaten: bool,
@@ -911,6 +923,9 @@ impl App {
         }
         let mut app = App {
             hub_ui: hub_ui::HubUi::default(),
+            bank_ui: bank_ui::BankUi::default(),
+            session_gated: false,
+            pending_toast: None,
             hub_keep: None,
             runner_state: None,
             esc_eaten: false,
@@ -1477,6 +1492,10 @@ impl App {
         if evs.is_empty() {
             return;
         }
+        // (a session that used admin commands earns nothing: crate::roles)
+        if game.admin.gated || self.session_gated {
+            return;
+        }
         let level = self.career.level();
         let day = career::today();
         for ev in evs {
@@ -1506,6 +1525,11 @@ impl App {
         }
         gt.submitted = true;
         let score = gt.score;
+        // (not from a session that used admin commands: no best, no leaderboard)
+        if game.admin.gated || self.session_gated {
+            game.say("Not recorded or sent to the leaderboard: this session used admin commands.".into());
+            return;
+        }
         if score > self.settings.gauntlet_best {
             self.settings.gauntlet_best = score;
             self.settings.save();
@@ -1558,6 +1582,11 @@ impl App {
                     self.screen = Screen::Menu(Page::Browse);
                 }
                 steam::SteamEvent::LobbyList(_) => {}
+                steam::SteamEvent::Direct { from, bytes } => {
+                    if let Screen::Play { game, .. } = &mut self.screen {
+                        commands::on_direct(game, from, &bytes);
+                    }
+                }
                 steam::SteamEvent::Board { rank, top } => {
                     if let Screen::Play { game, .. } = &mut self.screen {
                         if let Some(gt) = game.gauntlet.as_mut() {
@@ -2717,6 +2746,7 @@ impl eframe::App for App {
                 self.step_play(dt);
                 self.ledger_after_match();
                 self.hub_frame(dt);
+                self.admin_frame(dt);
             }
             self.sim_ms = t_sim.elapsed().as_secs_f32() * 1000.0;
         } else {
@@ -4555,6 +4585,11 @@ fn gallery_pose(g: &mut Game, page: &str) {
         raid_ui::stage(g, rest);
         return;
     }
+    // admin pages (with DUEL_HUB=admin): roles, badges and the chat for pictures
+    if let Some(rest) = page.strip_prefix("admin:") {
+        bank_ui::stage(g, rest);
+        return;
+    }
     let page2 = page == "2";
     // melee pages: 3 = each blow at its contact frame, 4 = mid wind-up, 5 = follow-through
     let melee_at = match page {
@@ -4979,6 +5014,33 @@ fn text_shadow(p: &egui::Painter, pos: Pos2, align: Align2, s: &str, size: f32, 
     p.text(pos, align, s, font, color);
 }
 
+/// A role's badge: a gold crown (the owner) or a silver one (an admin), centred at `c`.
+pub(crate) fn draw_crown(p: &egui::Painter, c: Pos2, r: f32, role: u8, alpha: u8) {
+    if role == 0 {
+        return;
+    }
+    let (fill, edge) = if role >= 2 { ([250, 196, 50], [140, 90, 10]) } else { ([214, 220, 230], [90, 96, 110]) };
+    let f = Color32::from_rgba_unmultiplied(fill[0], fill[1], fill[2], alpha);
+    let e = Color32::from_rgba_unmultiplied(edge[0], edge[1], edge[2], alpha);
+    // a band with three points
+    let pts = vec![
+        c + Vec2::new(-r, r * 0.6),
+        c + Vec2::new(-r, -r * 0.55),
+        c + Vec2::new(-r * 0.5, 0.0),
+        c + Vec2::new(0.0, -r * 0.9),
+        c + Vec2::new(r * 0.5, 0.0),
+        c + Vec2::new(r, -r * 0.55),
+        c + Vec2::new(r, r * 0.6),
+    ];
+    p.add(egui::Shape::convex_polygon(vec![pts[0], pts[1], pts[2], pts[4], pts[5], pts[6]], f, Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(vec![pts[2], pts[3], pts[4]], f, Stroke::NONE));
+    p.add(egui::Shape::closed_line(pts.clone(), Stroke::new((r * 0.18).max(1.0), e)));
+    for k in [1usize, 3, 5] {
+        p.circle_filled(pts[k], r * 0.2, Color32::from_rgba_unmultiplied(255, 250, 230, alpha));
+    }
+    p.circle_filled(c + Vec2::new(0.0, r * 0.25), r * 0.18, if role >= 2 { Color32::from_rgba_unmultiplied(200, 30, 40, alpha) } else { Color32::from_rgba_unmultiplied(60, 120, 220, alpha) });
+}
+
 /// The chat, above the health panel (`left`), wrapped to its own column, newest at the bottom.
 fn draw_chat(p: &egui::Painter, rect: Rect, g: &Game, left: Rect, s: f32) {
     let chat_w = (rect.width() * 0.42).max(left.width());
@@ -4996,8 +5058,13 @@ fn draw_chat(p: &egui::Painter, rect: Rect, g: &Game, left: Rect, s: f32) {
         if cy < rect.top() + rect.height() * 0.4 {
             break;
         }
-        p.rect_filled(Rect::from_min_size(Pos2::new(left.left(), cy - 3.0 * s), Vec2::new(gal.size().x + 16.0 * s, h + 6.0 * s)), 4.0, Color32::from_black_alpha((a as f32 * 0.5) as u8));
-        p.galley(Pos2::new(left.left() + 8.0 * s, cy), gal, Color32::WHITE);
+        // (the owner and admins: a crown before the name)
+        let badge = if line.role > 0 { 20.0 * s } else { 0.0 };
+        p.rect_filled(Rect::from_min_size(Pos2::new(left.left(), cy - 3.0 * s), Vec2::new(gal.size().x + 16.0 * s + badge, h + 6.0 * s)), 4.0, Color32::from_black_alpha((a as f32 * 0.5) as u8));
+        if line.role > 0 {
+            draw_crown(p, Pos2::new(left.left() + 16.0 * s, cy + 8.5 * s), 7.0 * s, line.role, a);
+        }
+        p.galley(Pos2::new(left.left() + 8.0 * s + badge, cy), gal, Color32::WHITE);
     }
 }
 
@@ -5661,9 +5728,10 @@ impl App {
         }
     }
     fn draw_hud(&self, p: &egui::Painter, rect: Rect, cam: &Cam, g: &Game) {
-        if test_view().is_some() && !std::env::var("DUEL_GALLERY").is_ok_and(|p| p.starts_with("raid:")) {
+        if test_view().is_some() && !std::env::var("DUEL_GALLERY").is_ok_and(|p| p.starts_with("raid:") || p.starts_with("admin:")) {
             return; // a clean picture of the map
         }
+        bank_ui::admin_hud(p, rect, g);
         // the hub: its own HUD (none at all in photo mode with the HUD hidden)
         if g.in_hub() {
             if let Some(ph) = self.hub_ui.photo {
@@ -7924,12 +7992,35 @@ impl App {
             let pos = Pos2::new(rect.left() + 14.0, rect.bottom() - 150.0);
             let mut send = false;
             let mut close = false;
+            // admin commands: Tab completes (crate::commands); what fits is listed under the box
+            let tab = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
+            let mut completed = false;
+            let mut hints = Vec::new();
+            if let Screen::Play { game, .. } = &self.screen {
+                if tab {
+                    if let Some(c) = commands::complete(game, &self.chat_text) {
+                        self.chat_text = c;
+                        completed = true;
+                    }
+                }
+                hints = commands::suggestions(game, &self.chat_text);
+            }
             egui::Area::new(egui::Id::unique("chatbox")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
                 egui::Frame::new().fill(Color32::from_rgba_unmultiplied(10, 8, 20, 220)).corner_radius(6.0).inner_margin(8.0).show(ui, |ui| {
+                    for h in &hints {
+                        ui.label(egui::RichText::new(h).monospace().size(12.5).color(Color32::from_rgb(240, 200, 120)));
+                    }
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Say:").color(ACCENT));
-                        let r = ui.add(egui::TextEdit::singleline(&mut self.chat_text).char_limit(100).desired_width(360.0).hint_text("Enter to send, Esc to cancel"));
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.chat_text).char_limit(200).desired_width(360.0).hint_text("Enter to send, Esc to cancel  ·  :: for admin commands"));
                         r.request_focus();
+                        if completed {
+                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), r.id) {
+                                let end = egui::text::CCursor::new(self.chat_text.chars().count());
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+                                st.store(ui.ctx(), r.id);
+                            }
+                        }
                         if ui.input(|i| i.key_pressed(Key::Enter)) {
                             send = true;
                         }
@@ -7953,6 +8044,9 @@ impl App {
 
         // the Varrow Hub's panels (the wardrobe, the tables, the lecterns, the boards...)
         self.hub_panels(ctx, rect);
+        // a gift offered to you; the admin commands' list
+        self.gift_incoming(ctx, rect);
+        self.help_panel(ctx, rect);
         // Ledger Duels before the bell: the Court's terms (both sides accept them), then the gear
         let ledger = match &self.screen {
             Screen::Play { game, .. } if game.ledger_on() => {

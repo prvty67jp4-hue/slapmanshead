@@ -1326,7 +1326,7 @@ pub fn hurt(g: &mut Game, slot: usize, dmg: f32, cause: Cause) {
     let room = r.room as u8;
     let hard = r.hard;
     let Some(m) = r.members.iter_mut().find(|m| m.slot as usize == slot) else { return };
-    if m.downed || slot >= g.f.len() {
+    if m.downed || slot >= g.f.len() || g.admin.is_god(slot) {
         return;
     }
     m.calm = 0.0;
@@ -2915,6 +2915,7 @@ fn got_loot(g: &mut Game, slot: usize, item: u8, rare: bool) {
     }
     if let Some(h) = g.hub.as_mut() {
         h.earned.raid.give(item);
+        h.refresh_bank();
     }
     if let Some(r) = g.raid.as_mut() {
         r.mine.push((item, rare));
@@ -2928,6 +2929,14 @@ fn got_loot(g: &mut Game, slot: usize, item: u8, rare: bool) {
 fn finished_here(g: &mut Game, size: usize, ms: u32, hard: bool) {
     let me = g.local;
     if !g.in_raid(me) {
+        return;
+    }
+    // (a session with changed stats or unlocks sets no records: crate::roles)
+    if !g.counts_for_records(me) {
+        if let Some(r) = g.raid.as_mut() {
+            r.result_ms = ms;
+            r.note("THE VAULT IS BROKEN  ·  not recorded (this session used admin commands)");
+        }
         return;
     }
     if let Some(h) = g.hub.as_mut() {
@@ -2951,6 +2960,10 @@ fn finished_here(g: &mut Game, size: usize, ms: u32, hard: bool) {
 
 /// (host) The leaderboard for this party size: the names, the time.
 fn post_board(g: &mut Game, size: usize, ms: u32) {
+    // (not when anyone in the party used admin commands this session)
+    if g.raid.as_ref().is_some_and(|r| r.members.iter().any(|m| !m.bot && !g.counts_for_records(m.slot as usize))) {
+        return;
+    }
     let names: Vec<String> = g.raid.as_ref().map(|r| r.members.iter().map(|m| m.name.clone()).collect()).unwrap_or_default();
     let row = names.join(", ");
     let board = crate::hub::BOARD_RAID + (size.clamp(2, 4) - 2) as u8;

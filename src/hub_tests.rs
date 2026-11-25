@@ -460,7 +460,7 @@ fn outfits_keep_only_what_is_earned_and_in_its_slot() {
     let ok = o.checked(&earned);
     assert_eq!(ok.items[Slot::Head as usize], 1, "the Rig's helm is always yours");
     assert_eq!(ok.items[Slot::Cape as usize], 0, "the herald's cape needs mastery 5");
-    let rich = Earned { mastery: 5, rooftop: true, table_hard: true, pit_wins: 0, raid: Default::default() };
+    let rich = Earned { mastery: 5, rooftop: true, table_hard: true, pit_wins: 0, ..Default::default() };
     let all = Outfit::default().with_set(HERALD).checked(&rich);
     assert!(all.items.iter().filter(|&&i| i != 0).count() >= 7);
     // a look in the wrong slot is taken off
@@ -541,7 +541,7 @@ fn name_tags_stack_and_fade_in_a_crowd() {
     let cam = crate::render::Cam::new(v3(0.0, 1.7, -16.0), 0.0, -0.05, 70.0, rect);
     let tags = crate::App::name_tags(&g, &cam, 1.0);
     assert!(tags.len() >= 6, "most of the crowd is named: {}", tags.len());
-    let rects: Vec<eframe::egui::Rect> = tags.iter().map(|(p, size, _, name, _)| {
+    let rects: Vec<eframe::egui::Rect> = tags.iter().map(|(p, size, _, name, _, _)| {
         let w = name.chars().count() as f32 * size * 0.55 + 8.0;
         eframe::egui::Rect::from_min_max(eframe::egui::Pos2::new(p.x - w / 2.0, p.y - size * 1.15), eframe::egui::Pos2::new(p.x + w / 2.0, p.y))
     }).collect();

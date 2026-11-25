@@ -26,6 +26,9 @@ pub enum SteamEvent {
     /// The Gauntlet leaderboard after sending a score: our global rank (0 if unknown) and the
     /// top entries (name, score, rank).
     Board { rank: i32, top: Vec<(String, i32, i32)> },
+    /// An admin message straight from a Steam user (crate::commands::Direct): Steam proves the
+    /// sender.
+    Direct { from: u64, bytes: Vec<u8> },
 }
 
 /// One row of the lobby browser.
@@ -149,6 +152,13 @@ impl Steam {
                 _ => {}
             }
         }
+        // admin messages straight from a player (their sender is Steam's own word)
+        let mut direct = Vec::new();
+        for m in self.client.networking_messages().receive_messages_on_channel(net::STEAM_ADMIN_CHANNEL, 32) {
+            if let Some(from) = m.identity_peer().steam_id() {
+                direct.push(SteamEvent::Direct { from: from.raw(), bytes: m.data().to_vec() });
+            }
+        }
         for r in self.rows.iter_mut() {
             if let Some(p) = self.pings.get(&r.host) {
                 r.ping = Some(*p);
@@ -167,7 +177,22 @@ impl Steam {
             }
         }
         out.retain(|e| !matches!(e, SteamEvent::LobbyList(_)));
+        out.extend(direct);
         out
+    }
+
+    /// Send an admin message straight to a Steam user (reliable).
+    pub fn send_direct(&self, to: u64, bytes: &[u8]) {
+        let who = NetworkingIdentity::new_steam_id(SteamId::from_raw(to));
+        let _ = self.client.networking_messages().send_message_to_user(who, SendFlags::RELIABLE, bytes, net::STEAM_ADMIN_CHANNEL);
+    }
+
+    /// The Steam IDs in our lobby, as Steam itself lists them.
+    pub fn lobby_members(&self) -> Vec<u64> {
+        match self.lobby {
+            Some(l) => self.client.matchmaking().lobby_members(LobbyId::from_raw(l)).iter().map(|m| m.raw()).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Open a lobby for our hosted game (public, or friends only).

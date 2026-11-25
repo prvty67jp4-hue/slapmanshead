@@ -231,6 +231,11 @@ pub struct Earned {
     pub mastery: u32,
     /// What the Ashen Vault has given.
     pub raid: crate::raid::RaidEarned,
+    /// What the bank holds (crate::items): once it's on, the wardrobe goes by what's owned
+    /// (a look bit per LOOKS id, a bit per vault loot id), not by what's been earned.
+    pub bank_on: bool,
+    pub own_looks: u128,
+    pub own_loot: u64,
 }
 
 impl Earned {
@@ -243,6 +248,17 @@ impl Earned {
             Unlock::PitWins(n) => self.pit_wins >= n,
             Unlock::Raid(l) => self.raid.has(l),
         }
+    }
+    /// A look can be worn: everyone's, or owned.
+    pub fn look_owned(&self, l: &LookItem) -> bool {
+        if l.unlock == Unlock::Always {
+            return true;
+        }
+        if self.bank_on { l.id < 128 && self.own_looks & (1u128 << l.id) != 0 } else { self.has(l.unlock) }
+    }
+    /// A vault drop (dye, title, pet) is owned.
+    pub fn loot_owned(&self, l: u8) -> bool {
+        if self.bank_on { l < 64 && self.own_loot & (1u64 << l) != 0 } else { self.raid.has(l) }
     }
 }
 
@@ -267,7 +283,7 @@ pub const OUTFIT_BYTES: usize = SLOT_COUNT * 4 + 2;
 
 /// The dyes the vault gives (locked until found).
 pub fn dye_locked(d: u8, earned: &Earned) -> bool {
-    crate::raid::loot_of_dye(d).is_some_and(|l| !earned.raid.has(l))
+    crate::raid::loot_of_dye(d).is_some_and(|l| !earned.loot_owned(l))
 }
 
 /// A title's words (a crate::raid::LOOT id).
@@ -288,7 +304,7 @@ impl Outfit {
     pub fn checked(mut self, earned: &Earned) -> Outfit {
         for (k, id) in self.items.iter_mut().enumerate() {
             if let Some(l) = look(*id) {
-                if l.slot as usize != k || !earned.has(l.unlock) {
+                if l.slot as usize != k || !earned.look_owned(l) {
                     *id = 0;
                 }
             } else {
@@ -305,10 +321,10 @@ impl Outfit {
             }
             let _ = k;
         }
-        if self.pet != 0 && !earned.raid.has(crate::raid::L_PET) {
+        if self.pet != 0 && !earned.loot_owned(crate::raid::L_PET) {
             self.pet = 0;
         }
-        if title_text(self.title).is_none() || !earned.raid.has(self.title) {
+        if title_text(self.title).is_none() || !earned.loot_owned(self.title) {
             self.title = 0;
         }
         self
@@ -761,6 +777,27 @@ pub enum HubEv {
     Note { text: String },
     /// The Ashen Vault's messages (crate::raid::RaidMsg).
     Raid(Vec<u8>),
+    /// (player to host) an admin command for the host to carry out (crate::commands); (host to
+    /// player) its answer.
+    Cmd { who: u8, text: String },
+    Reply { to: u8, text: String },
+    /// (host) the players' Steam IDs as the host sees them (crate::roles: only "reported").
+    Ids { list: Vec<(u8, u64)> },
+    /// (host) a banner for everyone; the hub's time of day and weather.
+    Announce { text: String },
+    World { time: u8, weather: u8 },
+    /// (host) move to this spot (::tp, ::bring); muted for this long (0: unmuted); removed.
+    Move { who: u8, pos: V3 },
+    Mute { who: u8, secs: u16 },
+    Kicked { who: u8, reason: String },
+    /// (player to host) I take no damage now (::god); my session no longer counts for records.
+    God { who: u8, on: bool },
+    Gated { who: u8 },
+    /// Gifts (crate::gifts): an offer (player to host, host to the receiver), the answer, and
+    /// the host's word that it's done (or not, and why).
+    GiftOffer { gid: u32, from: u8, to: u8, item: [u8; 2], n: u16, create: bool },
+    GiftAnswer { gid: u32, by: u8, accept: bool },
+    GiftDone { gid: u32, from: u8, to: u8, item: [u8; 2], n: u16, ok: bool, why: String },
 }
 
 /// Scoreboards: one per aim drill, then the Rooftop Run (lower is better there), then recent duels.
@@ -768,6 +805,13 @@ pub const BOARD_RUN: u8 = crate::hub_aim::DRILLS as u8;
 /// The Ashen Vault's boards (fastest clears) for parties of 2, 3 and 4: after the run's.
 pub const BOARD_RAID: u8 = BOARD_RUN + 1;
 pub const BOARD_LAST: u8 = BOARD_RAID + 2;
+
+fn wb_long(b: &mut Vec<u8>, s: &str) {
+    let s = s.as_bytes();
+    let n = s.len().min(200);
+    b.push(n as u8);
+    b.extend_from_slice(&s[..n]);
+}
 
 fn wb_s(b: &mut Vec<u8>, s: &str) {
     let s = s.as_bytes();
@@ -805,6 +849,13 @@ impl<'a> Rd<'a> {
     fn s(&mut self) -> Option<String> {
         let n = self.u8()? as usize;
         Some(String::from_utf8_lossy(self.bytes(n)?).chars().take(40).collect())
+    }
+    fn long(&mut self) -> Option<String> {
+        let n = self.u8()? as usize;
+        Some(String::from_utf8_lossy(self.bytes(n)?).chars().take(200).collect())
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.bytes(8)?.try_into().ok()?))
     }
 }
 
@@ -914,6 +965,62 @@ impl HubEv {
                 b.extend_from_slice(&(bytes.len().min(4000) as u16).to_le_bytes());
                 b.extend(bytes.iter().take(4000));
             }
+            HubEv::Cmd { who, text } => {
+                b.extend_from_slice(&[16, *who]);
+                wb_long(&mut b, text);
+            }
+            HubEv::Reply { to, text } => {
+                b.extend_from_slice(&[17, *to]);
+                wb_long(&mut b, text);
+            }
+            HubEv::Ids { list } => {
+                b.extend_from_slice(&[18, list.len().min(HUB_PLAYERS) as u8]);
+                for (s, id) in list.iter().take(HUB_PLAYERS) {
+                    b.push(*s);
+                    b.extend_from_slice(&id.to_le_bytes());
+                }
+            }
+            HubEv::Announce { text } => {
+                b.push(19);
+                wb_long(&mut b, text);
+            }
+            HubEv::World { time, weather } => b.extend_from_slice(&[20, *time, *weather]),
+            HubEv::Move { who, pos } => {
+                b.extend_from_slice(&[21, *who]);
+                for v in [pos.x, pos.y, pos.z] {
+                    b.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+            }
+            HubEv::Mute { who, secs } => {
+                b.extend_from_slice(&[22, *who]);
+                b.extend_from_slice(&secs.to_le_bytes());
+            }
+            HubEv::Kicked { who, reason } => {
+                b.extend_from_slice(&[23, *who]);
+                wb_long(&mut b, reason);
+            }
+            HubEv::God { who, on } => b.extend_from_slice(&[24, *who, *on as u8]),
+            HubEv::Gated { who } => b.extend_from_slice(&[25, *who]),
+            HubEv::GiftOffer { gid, from, to, item, n, create } => {
+                b.push(26);
+                b.extend_from_slice(&gid.to_le_bytes());
+                b.extend_from_slice(&[*from, *to, item[0], item[1]]);
+                b.extend_from_slice(&n.to_le_bytes());
+                b.push(*create as u8);
+            }
+            HubEv::GiftAnswer { gid, by, accept } => {
+                b.push(27);
+                b.extend_from_slice(&gid.to_le_bytes());
+                b.extend_from_slice(&[*by, *accept as u8]);
+            }
+            HubEv::GiftDone { gid, from, to, item, n, ok, why } => {
+                b.push(28);
+                b.extend_from_slice(&gid.to_le_bytes());
+                b.extend_from_slice(&[*from, *to, item[0], item[1]]);
+                b.extend_from_slice(&n.to_le_bytes());
+                b.push(*ok as u8);
+                wb_long(&mut b, why);
+            }
         }
         b
     }
@@ -983,6 +1090,26 @@ impl HubEv {
                 let n = r.u16()? as usize;
                 HubEv::Raid(r.bytes(n)?.to_vec())
             }
+            16 => HubEv::Cmd { who: who(r.u8()?), text: r.long()? },
+            17 => HubEv::Reply { to: who(r.u8()?), text: r.long()? },
+            18 => {
+                let n = r.u8()?.min(HUB_PLAYERS as u8);
+                let mut list = Vec::new();
+                for _ in 0..n {
+                    list.push((who(r.u8()?), r.u64()?));
+                }
+                HubEv::Ids { list }
+            }
+            19 => HubEv::Announce { text: r.long()? },
+            20 => HubEv::World { time: r.u8()?.min(2), weather: r.u8()?.min(2) },
+            21 => HubEv::Move { who: who(r.u8()?), pos: v3(r.f()?, r.f()?, r.f()?) },
+            22 => HubEv::Mute { who: who(r.u8()?), secs: r.u16()? },
+            23 => HubEv::Kicked { who: who(r.u8()?), reason: r.long()? },
+            24 => HubEv::God { who: who(r.u8()?), on: r.u8()? == 1 },
+            25 => HubEv::Gated { who: who(r.u8()?) },
+            26 => HubEv::GiftOffer { gid: r.u32()?, from: who(r.u8()?), to: who(r.u8()?), item: [r.u8()?, r.u8()?], n: r.u16()?, create: r.u8()? == 1 },
+            27 => HubEv::GiftAnswer { gid: r.u32()?, by: who(r.u8()?), accept: r.u8()? == 1 },
+            28 => HubEv::GiftDone { gid: r.u32()?, from: who(r.u8()?), to: who(r.u8()?), item: [r.u8()?, r.u8()?], n: r.u16()?, ok: r.u8()? == 1, why: r.long()? },
             _ => return None,
         })
     }
@@ -1029,6 +1156,9 @@ pub struct Hub {
     pub fade: Option<(f32, String)>,
     /// (this computer) the last aim room's result, shown a while.
     pub aim_result: Option<(String, f32)>,
+    /// (this computer) what this player owns (crate::items), and the gifts in flight.
+    pub bank: crate::items::LocalBank,
+    pub gifts: crate::gifts::Gifts,
 }
 
 impl Hub {
@@ -1055,7 +1185,16 @@ impl Hub {
             look_t: 0.0,
             fade: None,
             aim_result: None,
+            bank: crate::items::LocalBank::default(),
+            gifts: crate::gifts::Gifts::default(),
         }
+    }
+
+    /// Put anything newly earned in the bank, and let the wardrobe see what's owned.
+    pub fn refresh_bank(&mut self) {
+        let e = self.earned;
+        self.bank.sync(&e);
+        self.bank.apply_to(&mut self.earned);
     }
 
     pub fn toast(&mut self, s: impl Into<String>) {
@@ -1202,7 +1341,7 @@ impl Game {
     }
 
     /// The host tells everyone (and acts on it itself).
-    fn hub_broadcast(&mut self, e: HubEv) {
+    pub(crate) fn hub_broadcast(&mut self, e: HubEv) {
         if self.kind == Kind::Host {
             self.out_events.push(Ev::Hub(e.clone()));
         }
@@ -1304,6 +1443,14 @@ impl Game {
             crate::raid::on_msg(self, from, b);
             return;
         }
+        if matches!(e, HubEv::Cmd { .. } | HubEv::Reply { .. } | HubEv::Ids { .. } | HubEv::Announce { .. } | HubEv::World { .. } | HubEv::Move { .. } | HubEv::Mute { .. } | HubEv::Kicked { .. } | HubEv::God { .. } | HubEv::Gated { .. }) {
+            crate::commands::on_hub(self, from, e);
+            return;
+        }
+        if matches!(e, HubEv::GiftOffer { .. } | HubEv::GiftAnswer { .. } | HubEv::GiftDone { .. }) {
+            crate::gifts::on_hub(self, from, e);
+            return;
+        }
         match e {
             HubEv::Look { who, look } => {
                 // (a player only speaks for themselves)
@@ -1324,6 +1471,8 @@ impl Game {
             HubEv::Challenge { to, kind, .. } if auth => self.host_challenge(from, to, DuelKind::from_u8(kind)),
             HubEv::Answer { id, accept, .. } if auth => self.host_answer(from, id, accept),
             HubEv::Table { table, act, .. } if auth => self.host_table(from, table as usize, act),
+            // (a session with changed stats or unlocks counts for no board: crate::roles)
+            HubEv::Score { .. } if auth && !self.counts_for_records(from) => {}
             HubEv::Score { board, value, .. } if auth => {
                 let name = self.f.get(from).map(|f| f.name.clone()).unwrap_or_default();
                 if self.hub.as_mut().is_some_and(|h| h.post(board, &name, value)) {
@@ -1358,6 +1507,12 @@ impl Game {
 
     /// What the host says (or what this computer decided itself).
     fn hub_apply(&mut self, e: HubEv) {
+        // (the admin events the host broadcasts act here too: crate::commands)
+        if matches!(e, HubEv::Announce { .. } | HubEv::World { .. } | HubEv::Move { .. } | HubEv::Mute { .. } | HubEv::Reply { .. }) {
+            let me = self.local;
+            crate::commands::on_hub(self, me, e);
+            return;
+        }
         let me = self.local;
         let now = self.time;
         let Some(h) = self.hub.as_mut() else { return };
@@ -1862,6 +2017,8 @@ impl Game {
         if !self.in_hub() {
             return;
         }
+        crate::commands::tick(self, dt);
+        crate::gifts::tick(self, dt);
         let me = self.local;
         // emotes end on their own, or when you move; a seat is left by walking off
         for k in 0..self.f.len() {
@@ -2167,6 +2324,38 @@ impl Game {
                     f.hub.emote = if k % 2 == 0 { Emote::Laugh as u8 } else { Emote::Wave as u8 };
                     f.hub.emote_t = t - cycle;
                 }
+            }
+            out.push(f);
+        }
+        // the Banker behind the bank's counter (crate::bank_ui), in green and gold
+        let (kx, _, kz) = crate::varrow::BANK;
+        let bp = v3(kx + 1.3, 0.0, kz);
+        if (bp - cam).len() < 45.0 {
+            let mut f = Fighter::new("Banker Odo", MAX_PLAYERS + 15, false);
+            f.present = true;
+            f.alive = true;
+            f.is_bot = true;
+            f.loadout.body = 2;
+            f.color_idx = 2;
+            f.pos = bp;
+            f.prev_pos = bp;
+            f.net_pos = bp;
+            f.yaw = -std::f32::consts::FRAC_PI_2;
+            f.on_ground = true;
+            f.cur = 0;
+            f.weapon = Weapon::Dagger;
+            let mut o = Outfit::default();
+            for (slot, id) in [(Slot::Head, 20), (Slot::Body, 23), (Slot::Legs, 24), (Slot::Feet, 26), (Slot::Neck, 22)] {
+                o.items[slot as usize] = id;
+                o.dyes[slot as usize] = [19, 1, 23];
+            }
+            f.hub.look = o;
+            f.hub.townsfolk = true;
+            // a nod now and then
+            let cycle = t % 11.0;
+            if cycle < 2.0 {
+                f.hub.emote = Emote::Bow as u8;
+                f.hub.emote_t = t - cycle;
             }
             out.push(f);
         }
