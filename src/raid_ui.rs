@@ -333,6 +333,143 @@ fn recap(p: &egui::Painter, at: Pos2, r: &raid::Raid, s: f32, n: usize) {
     }
 }
 
+// ================================================================== a boss's introduction
+
+/// A hall's boss introduced as its fight begins: the camera sweeps in from high by the door to
+/// look up at the boss while its name card shows, between black bars. It plays the first time a
+/// hall begins in a raid (not after a wipe); a boss met before (saved in Settings) can be skipped
+/// with Space.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Intro {
+    pub room: u8,
+    pub on: bool,
+    pub t: f32,
+    pub skippable: bool,
+    pub skipped: bool,
+    /// Halls introduced in this raid (one bit each).
+    pub shown: u8,
+}
+
+/// How long an introduction runs (the hall's Intro stage).
+pub const INTRO_TIME: f32 = 3.5;
+
+fn ease(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Move the introduction on by a frame. `seen` says which halls' bosses were met before; returns
+/// a hall to remember as met (once most of its introduction has played).
+pub fn intro_step(it: &mut Intro, g: &Game, dt: f32, seen: u8, skip: bool) -> Option<u8> {
+    let Some(r) = g.my_raid() else {
+        *it = Intro::default();
+        return None;
+    };
+    let room = r.room.min(7) as u8;
+    if r.stage == Stage::Intro && it.shown & (1 << room) == 0 && !it.on {
+        *it = Intro { room, on: true, t: 0.0, skippable: seen & (1 << room) != 0, skipped: false, shown: it.shown | (1 << room) };
+    }
+    let mut met = None;
+    if it.on {
+        it.t += dt;
+        if skip && it.skippable && it.t > 0.15 {
+            it.skipped = true;
+        }
+        if it.t > 1.5 && seen & (1 << it.room) == 0 {
+            met = Some(it.room);
+        }
+        if it.skipped || it.t >= INTRO_TIME + 0.5 || room != it.room {
+            it.on = false;
+        }
+    }
+    met
+}
+
+/// What the introduction's camera sees: (position, the point it looks at, field of view).
+pub fn intro_cam(it: &Intro, g: &Game) -> Option<(V3, V3, f32)> {
+    if !it.on || it.skipped {
+        return None;
+    }
+    let r = g.my_raid()?;
+    let b = r.boss()?;
+    let pos_of = |f: &raid::Foe| if g.is_authority() { f.pos } else { f.shown };
+    // (the twins: frame them both)
+    let twins: Vec<V3> = r.foes.iter().filter(|f| matches!(f.kind, FoeKind::Tally | FoeKind::Seal)).map(pos_of).collect();
+    let focus = if twins.len() == 2 { (twins[0] + twins[1]) * 0.5 } else { pos_of(b) };
+    let (head, size) = match b.kind {
+        FoeKind::Warden => (4.3, 1.0),
+        FoeKind::Tally | FoeKind::Seal => (2.6, 1.3),
+        FoeKind::Ledger => (3.3, 0.95),
+        FoeKind::Magistrate => (3.2, 0.9),
+        _ => (2.0, 0.65),
+    };
+    let k = ease(0.0, INTRO_TIME, it.t);
+    // (the twins: from square in front of the pair, so both are in the picture)
+    let a = if twins.len() == 2 {
+        // (out towards the middle of the court, where there's room to stand back)
+        let c = ROOMS[(it.room as usize).min(ROOMS.len() - 1)].centre();
+        let mut d = (v3(c.x, focus.y, c.z) - focus).flat();
+        if d.len() < 1.0 {
+            d = yaw_fwd(b.yaw);
+        }
+        d.x.atan2(d.z) + 0.45 - 0.45 * k
+    } else {
+        b.yaw + 1.25 - 0.95 * k
+    };
+    let dist = (13.0 - 6.2 * k) * size;
+    let h = (7.0 - 5.4 * k) * size.max(0.8);
+    let rm = ROOMS[(it.room as usize).min(ROOMS.len() - 1)];
+    let mut pos = focus + yaw_fwd(a) * dist;
+    pos.x = pos.x.clamp(rm.x.0 + 0.8, rm.x.1 - 0.8);
+    pos.z = pos.z.clamp(rm.z.0 + 0.8, rm.z.1 - 0.8);
+    pos.y = focus.y + h;
+    let look = focus + V3::UP * (head * (0.5 + 0.45 * k));
+    Some((pos, look, 62.0 - 10.0 * k))
+}
+
+/// Each hall's boss: its name and a line under it.
+fn intro_title(room: u8) -> (&'static str, &'static str) {
+    match room {
+        0 => ("THE WARDEN OF WAX", "Keeper of the Candle Halls"),
+        1 => ("THE TWIN ASSESSORS", "Tally, the Gilded  ·  Seal, the Grey"),
+        2 => ("THE CHAINED LEDGER", "Every debt, written in ink"),
+        3 => ("LORD VESPER KAEL", "The Ashblood Regent"),
+        _ => ("THE ASHEN MAGISTRATE", "Judge of the Last Appeal"),
+    }
+}
+
+/// The name card over the introduction: black bars, the hall's name, the boss's name large with a
+/// rule under it and its line, and (for a boss met before) how to skip.
+pub fn intro_card(p: &egui::Painter, rect: Rect, it: &Intro) {
+    if !it.on || it.skipped {
+        return;
+    }
+    let s = (rect.height() / 900.0).clamp(0.75, 1.6);
+    let t = it.t;
+    let bars = ease(0.0, 0.35, t) * (1.0 - ease(INTRO_TIME, INTRO_TIME + 0.45, t));
+    let bh = rect.height() * 0.11 * bars;
+    p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width(), bh)), 0.0, Color32::BLACK);
+    p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - bh), Vec2::new(rect.width(), bh)), 0.0, Color32::BLACK);
+    let a = ease(0.45, 1.0, t) * (1.0 - ease(INTRO_TIME - 0.35, INTRO_TIME + 0.2, t));
+    if a <= 0.01 {
+        return;
+    }
+    let (name, line) = intro_title(it.room);
+    let hall = ROOMS[(it.room as usize).min(ROOMS.len() - 1)].name;
+    let al = |c: [u8; 3], k: f32| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (255.0 * k * a) as u8);
+    let x = rect.left() + rect.width() * 0.08;
+    let y = rect.bottom() - rect.height() * 0.11 - 150.0 * s;
+    let slide = (1.0 - ease(0.45, 1.2, t)) * 40.0 * s;
+    text_shadow(p, Pos2::new(x + slide, y), Align2::LEFT_CENTER, &hall.to_uppercase(), 15.0 * s, al([220, 190, 150], 0.9));
+    text_shadow(p, Pos2::new(x + slide * 0.6, y + 46.0 * s), Align2::LEFT_CENTER, name, 52.0 * s, al([255, 236, 210], 1.0));
+    let w = 520.0 * s * ease(0.6, 1.4, t);
+    p.rect_filled(Rect::from_min_size(Pos2::new(x, y + 80.0 * s), Vec2::new(w, 2.5 * s)), 0.0, al([230, 120, 50], 0.95));
+    text_shadow(p, Pos2::new(x + slide * 0.3, y + 104.0 * s), Align2::LEFT_CENTER, line, 20.0 * s, al([230, 215, 195], 0.9));
+    if it.skippable {
+        text_shadow(p, Pos2::new(rect.right() - 30.0 * s, rect.bottom() - bh * 0.5), Align2::RIGHT_CENTER, "SPACE  skip", 14.0 * s, al([200, 200, 200], 0.8));
+    }
+}
+
 // ================================================================== pictures (DUEL_GALLERY=raid:...)
 
 /// Test switch DUEL_GALLERY=raid:<page> (with DUEL_HUB=raid): a vault mechanic held in the middle
@@ -370,7 +507,9 @@ pub fn stage(g: &mut Game, page: &str) {
         g.f[me].respawn_at(v3(gx, 0.0, gz), 0.0);
         raid::gate_start(g, me, false, 3);
     }
-    let room = match page {
+    // (pages: <boss>[_<variant>], and intro_<boss> for a hall's introduction)
+    let base = page.trim_start_matches("intro_");
+    let room = match base.split('_').next().unwrap_or("") {
         "warden" => 0,
         "twins" => 1,
         "ledger" => 2,
@@ -384,9 +523,28 @@ pub fn stage(g: &mut Game, page: &str) {
         r.setup_room();
         r.place = r.place.wrapping_add(1);
     }
+    if page == "magistrate_gavel" || page == "magistrate_fall" {
+        raid::set_floor(g, false);
+    }
     let slots: Vec<usize> = g.raid.as_ref().map_or(Vec::new(), |r| r.members.iter().map(|m| m.slot as usize).collect());
     let time = g.time;
+    // (a dying page: the boss stands half a second, then falls)
+    thread_local!(static START: std::cell::Cell<f32> = const { std::cell::Cell::new(-1.0) });
+    let start = START.with(|s| {
+        if s.get() < 0.0 || s.get() > time {
+            s.set(time);
+        }
+        s.get()
+    });
+    let fallen = page.ends_with("_fall") && time - start > 0.5;
     let Some(r) = g.raid.as_mut() else { return };
+    if page.starts_with("intro_") {
+        // the hall's fight about to begin: its introduction plays (App::boss_intro)
+        r.stage = Stage::Intro;
+        r.stage_t = 3.0;
+        r.teles.clear();
+        return;
+    }
     r.stage = Stage::Fight;
     r.stage_t = 0.0;
     r.cd = [99.0; 8];
@@ -399,28 +557,57 @@ pub fn stage(g: &mut Game, page: &str) {
     let yaw_to = |a: V3, b: V3| (b.x - a.x).atan2(b.z - a.z);
     // where everyone stands (x, z), and the boss
     let mut spots: Vec<(f32, f32)> = Vec::new();
-    match page {
-        "warden" => {
+    match base {
+        "warden" | "warden_slam" | "warden_idle" | "warden_fall" => {
             let c = ROOMS[0].centre();
             let b = v3(c.x + 1.0, VY, c.z + 1.0);
             r.foes[0].pos = b;
+            r.foes[0].shown = b;
             r.foes[0].hp = r.foes[0].max * 0.62;
+            r.foes[0].alive = !fallen;
             spots = vec![(c.x - 2.5, c.z - 2.0), (vault::PLATES[0].0, vault::PLATES[0].1), (vault::PLATES[1].0, vault::PLATES[1].1), (vault::PLATES[2].0, vault::PLATES[2].1)];
             let tank = v3(spots[0].0, VY, spots[0].1);
             r.foes[0].yaw = yaw_to(b, tank);
-            r.foes[0].state = 1;
-            r.teles.push(tele(TeleKind::Cone, b, r.foes[0].yaw, 6.0, 1.0, 0.55, Cause::Cleave));
+            match base {
+                "warden" => {
+                    r.foes[0].state = 1;
+                    r.foes[0].t = 1.3 * (1.0 - 0.55);
+                    r.teles.push(tele(TeleKind::Cone, b, r.foes[0].yaw, 6.0, 1.0, 0.55, Cause::Cleave));
+                }
+                "warden_slam" => {
+                    r.foes[0].state = 2;
+                    r.foes[0].t = 1.7 * (1.0 - 0.62);
+                    r.teles.push(tele(TeleKind::Circle, b, 0.0, 4.6, 0.0, 0.62, Cause::Slam));
+                    spots[0] = (c.x - 4.5, c.z - 3.5);
+                }
+                _ => {
+                    r.foes[0].state = 0;
+                    r.foes[0].t = 0.0;
+                }
+            }
             r.plates = [1.0, 1.0, 0.7, 0.0];
             r.flood = 0.3;
             if r.pools.is_empty() {
                 r.pools.push(Pool { kind: 0, pos: v3(c.x - 4.0, VY, c.z + 4.0), r: 2.4, max: 3.2, life: 99.0 });
             }
         }
-        "twins" => {
-            r.foes[0].pos = v3(-5.0, VY + 0.3, -25.0);
-            r.foes[1].pos = v3(2.5, VY + 0.3, -26.5);
+        "twins" | "twins_apart" | "twins_fall" => {
+            // (close: bound, their chain glowing; apart: Tally throws, Seal stamps)
+            let apart = base != "twins";
+            r.foes[0].pos = if apart { v3(-6.0, VY, -25.0) } else { v3(-3.0, VY, -25.0) };
+            r.foes[1].pos = if apart { v3(5.0, VY, -27.0) } else { v3(2.5, VY, -26.5) };
             for f in r.foes.iter_mut() {
                 f.hp = f.max * 0.7;
+                f.shown = f.pos;
+                f.yaw = yaw_to(f.pos, v3(0.0, VY, -21.0));
+            }
+            r.foes[0].state = 1;
+            r.foes[0].t = 0.5 * (1.0 - 0.2);
+            r.foes[1].state = if apart { 1 } else { 0 };
+            r.foes[1].t = 1.0 * (1.0 - 0.5);
+            if base == "twins_fall" {
+                r.foes[1].alive = !fallen;
+                r.foes[1].state = 0;
             }
             spots = vec![(-1.0, -31.0), (-6.0, -19.0), (6.0, -30.0), (2.0, -20.0)];
             r.teles.push(tele(TeleKind::Circle, v3(6.0, VY, -30.0), 0.0, 2.6, 0.0, 0.6, Cause::Seal));
@@ -432,11 +619,13 @@ pub fn stage(g: &mut Game, page: &str) {
                 r.shots.push(Shot { kind: 0, pos: v3(-5.0, VY + 1.8, -25.0) + v3(a.sin(), -0.03, a.cos()) * d, vel: v3(a.sin(), 0.0, a.cos()) * 15.0, dmg: 0.0, life: 9.0 });
             }
         }
-        "ledger" => {
+        "ledger" | "ledger_storm" | "ledger_fall" => {
             let c = ROOMS[2].centre();
             r.foes.retain(|f| f.kind == FoeKind::Ledger);
             r.foes[0].hp = r.foes[0].max * 0.55;
-            r.foes[0].state = 1;
+            r.foes[0].alive = !fallen;
+            r.foes[0].state = if base == "ledger" { 1 } else { 0 };
+            r.foes[0].t = 1.5 * (1.0 - 0.62);
             for k in 0..3 {
                 let mut t = r.foes[0];
                 t.kind = FoeKind::Thrall;
@@ -451,7 +640,33 @@ pub fn stage(g: &mut Game, page: &str) {
                 r.tethers = vec![(slots[0] as u8, slots[1] as u8, 9.0, 0.0)];
             }
             let tgt = v3(spots[2].0, VY, spots[2].1);
-            r.teles.push(tele(TeleKind::Line, c, yaw_to(c, tgt), 1.3, 20.0, 0.5, Cause::InkBeam));
+            match base {
+                "ledger" => r.teles.push(tele(TeleKind::Line, c, yaw_to(c, tgt), 1.3, 20.0, 0.5, Cause::InkBeam)),
+                "ledger_storm" => r.teles.push(tele(TeleKind::Circle, c, 0.0, 6.0, 0.0, 0.55, Cause::PageStorm)),
+                _ => {}
+            }
+        }
+        "magistrate_gavel" | "magistrate_fall" => {
+            let k = r.foes.iter().position(|f| f.kind == FoeKind::Magistrate).unwrap_or(0);
+            r.foes[k].hp = r.foes[k].max * 0.8;
+            r.phase = 1;
+            r.floor_down = false;
+            r.pools.clear();
+            let c = ROOMS[4].centre();
+            let b = v3(c.x, VY, c.z);
+            r.foes[k].pos = b;
+            r.foes[k].shown = b;
+            r.foes[k].alive = !fallen;
+            spots = vec![(c.x - 3.0, c.z - 6.0), (c.x + 5.0, c.z - 4.0), (c.x - 6.0, c.z + 2.0), (c.x + 4.0, c.z + 5.0)];
+            let tgt = v3(spots[0].0, VY, spots[0].1);
+            r.foes[k].yaw = yaw_to(b, tgt);
+            if base == "magistrate_gavel" {
+                r.foes[k].state = 1;
+                r.foes[k].t = 1.5 * (1.0 - 0.6);
+                r.teles.push(tele(TeleKind::Circle, tgt, 0.0, 3.6, 0.0, 0.6, Cause::Gavel));
+            } else {
+                r.foes[k].state = 0;
+            }
         }
         "magistrate" => {
             let k = r.foes.iter().position(|f| f.kind == FoeKind::Magistrate).unwrap_or(0);
@@ -463,7 +678,9 @@ pub fn stage(g: &mut Game, page: &str) {
             spots = vec![(vault::ISLANDS[4].0, vault::ISLANDS[4].1), (vault::ISLANDS[1].0, vault::ISLANDS[1].1), (vault::ISLANDS[2].0, vault::ISLANDS[2].1), (vault::ISLANDS[3].0 + 1.0, vault::ISLANDS[3].1)];
             let tgt = v3(spots[1].0, VY, spots[1].1);
             r.foes[k].yaw = yaw_to(r.foes[k].pos, tgt);
+            r.foes[k].shown = r.foes[k].pos;
             r.foes[k].state = 2;
+            r.foes[k].t = 1.15 * (1.0 - 0.6);
             r.teles.push(tele(TeleKind::Line, r.foes[k].pos, r.foes[k].yaw, 0.75, 30.0, 0.6, Cause::Verdict));
             r.condemned = Some((3, 1.5));
             if r.pools.is_empty() {

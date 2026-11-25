@@ -2516,6 +2516,10 @@ fn character_extras(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, p: &ch
         [l[0] + (1.0 - l[0]) * flash, l[1] + (0.3 - l[1]).max(0.0) * flash, l[2] + (0.3 - l[2]).max(0.0) * flash, 1.0]
     };
     let dressed = crate::chars::shared().is_some();
+    // the Ashblood Regent: his crown and high mantle over his coat
+    if f.hub.boss == 1 && f.alive {
+        raid_draw::regalia(mb, add_mb, cam, f, p, sc, time);
+    }
     if dressed {
         // the fighters have real hair; the long coat is cloth that swings and drapes
         if (f.alive || f.death_t < 3.0) && !wears_work_coat(f) && !coat_covered {
@@ -3363,6 +3367,9 @@ impl Gpu {
         debug_assert_eq!(cdata.len(), crate::weapons::first_layer());
         if CHAR_TEX == crate::weapons::LAYER {
             cdata.extend(crate::weapons::texture_layers());
+            // then the vault's bosses (crate::bosses), one layer each
+            debug_assert_eq!(cdata.len(), crate::bosses::first_layer());
+            cdata.extend(crate::bosses::texture_layers());
         }
         let ctex_view = upload_array(rs, "fighter textures", CHAR_TEX, wgpu::TextureFormat::Rgba8UnormSrgb, &cdata);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -3701,6 +3708,16 @@ impl Gpu {
             sun_col = [1.0, 0.32, 0.3];
             for c in sky_sh.iter_mut() {
                 *c = [c[0] * 0.3, c[1] * 0.12, c[2] * 0.16];
+            }
+        } else if crate::raid::indoors(g, cam.pos) {
+            // down in the vault's halls: dim and cool, so the bosses' fires and the windows'
+            // cold shafts model them and the telegraphs (drawn unlit) stand out on the floor
+            sun_power *= 0.6;
+            sun_col = [0.78, 0.84, 1.0];
+            fog = [0.05, 0.045, 0.06];
+            fog_density = fog_density.max(0.008);
+            for c in sky_sh.iter_mut() {
+                *c = [c[0] * 0.66, c[1] * 0.66, c[2] * 0.74];
             }
         } else if g.in_hub() {
             // the hub's time of day and weather (an admin's ::time, ::weather)

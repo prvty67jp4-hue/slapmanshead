@@ -158,6 +158,11 @@ pub fn first_layer() -> usize {
     crate::chars::TEXTURES.len()
 }
 
+/// How many texture layers the weapons take.
+pub fn layer_count() -> usize {
+    FILES.len().div_ceil(4)
+}
+
 /// Weapon `i`'s texture: its layer and the corner of its quarter.
 fn slot(i: usize) -> (f32, [f32; 2]) {
     let q = i % 4;

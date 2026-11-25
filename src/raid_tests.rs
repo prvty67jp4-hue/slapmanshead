@@ -473,3 +473,58 @@ fn bots_clear_the_vault_on_normal() {
     let (room, wipes) = g.raid.as_ref().map_or((5, 0), |r| (r.room, r.wipes));
     assert_eq!(rooms, vec![0, 1, 2, 3, 4], "bots clear every room (stuck in room {room} after {wipes} wipes)");
 }
+
+/// Each hall's boss is introduced once in a raid (a camera sweep and its name card), not again
+/// after a wipe; a boss met before can be skipped, one never met can't; the Magistrate is drawn
+/// from its own model now (not as a fighter) and is huge; each boss and hall lights itself.
+#[test]
+fn boss_introductions_and_lights() {
+    use crate::raid_ui::{intro_cam, intro_step, Intro, INTRO_TIME};
+    let mut g = in_vault(3, 3, false);
+    let mut it = Intro::default();
+    assert_eq!(g.raid.as_ref().unwrap().stage, Stage::Intro);
+    // never met: it plays, Space doesn't skip it, the camera sweeps in, and it's remembered
+    let mut met = None;
+    let mut cams = Vec::new();
+    for k in 0..30 {
+        if let Some(m) = intro_step(&mut it, &g, 0.1, 0, k == 5) {
+            met = Some(m);
+        }
+        if let Some((pos, look, _)) = intro_cam(&it, &g) {
+            cams.push((pos, look));
+        }
+    }
+    assert!(it.on && !it.skipped && !it.skippable, "the first introduction plays through");
+    assert_eq!(met, Some(0), "the Warden is remembered as met");
+    let boss = g.raid.as_ref().unwrap().foes[0].pos;
+    let (first, last) = (cams[0], cams[cams.len() - 1]);
+    assert!((last.0 - boss).flat().len() < (first.0 - boss).flat().len(), "the camera closes in");
+    assert!(last.0.y < first.0.y, "and comes down to look up at it");
+    assert!(ROOMS[0].contains(last.0, 0.0), "inside its hall");
+    for _ in 0..((INTRO_TIME + 1.0) / 0.1) as usize {
+        intro_step(&mut it, &g, 0.1, 1, false);
+    }
+    assert!(!it.on, "it ends");
+    // a wipe sends the hall back to its Intro stage: no second introduction
+    intro_step(&mut it, &g, 0.1, 1, false);
+    assert!(!it.on, "once a raid");
+    // the next hall, its boss met before: Space skips it
+    to_room(&mut g, 1);
+    g.raid.as_mut().unwrap().stage = Stage::Intro;
+    intro_step(&mut it, &g, 0.1, 0b10, false);
+    assert!(it.on && it.skippable);
+    intro_step(&mut it, &g, 0.1, 0b10, true);
+    intro_step(&mut it, &g, 0.1, 0b10, false);
+    assert!(!it.on && intro_cam(&it, &g).is_none(), "skipped");
+    // the Magistrate: its own model, not a fighter; huge
+    to_room(&mut g, 4);
+    assert!(raid::fighters(&g).is_empty(), "no stand-in fighter for the Magistrate");
+    assert!(FoeKind::Magistrate.size().1 > 3.0);
+    // lights: the boss's own and the hall's cold windows
+    let lights = raid::lights(&g);
+    assert!(lights.len() >= 3, "{} lights in the pit", lights.len());
+    to_room(&mut g, 0);
+    let lights = raid::lights(&g);
+    assert!(lights.iter().any(|l| l.2[2] > l.2[0] * 1.5), "a cold window light");
+    assert!(lights.iter().any(|l| l.2[0] > l.2[2] * 2.0), "the Warden's warm fire");
+}

@@ -22,6 +22,7 @@ mod reports;
 mod ui_kit;
 mod update;
 mod weapons;
+mod bosses;
 mod watchdog;
 mod world;
 mod zones;
@@ -143,6 +144,8 @@ struct Settings {
     abilities: bool,
     /// Look for a new build on start and offer it (Settings, on by default).
     auto_update: bool,
+    /// The vault's boss introductions already watched (one bit per hall): those can be skipped.
+    boss_intros: u8,
 }
 
 /// Interface sizes: (name, zoom).
@@ -398,6 +401,7 @@ impl Default for Settings {
             outfits: [0; 4],
             abilities: true,
             auto_update: true,
+            boss_intros: 0,
         }
     }
 }
@@ -507,6 +511,7 @@ impl Settings {
                             "steam_name" => s.steam_name = v != "0",
                             "abilities" => s.abilities = v != "0",
             "auto_update" => s.auto_update = v != "0",
+                            "boss_intros" => s.boss_intros = v.parse().unwrap_or(0),
                             "outfits" => {
                                 for (slot, x) in s.outfits.iter_mut().zip(v.split(',')) {
                                     *slot = x.trim().parse::<u8>().unwrap_or(0).min(3);
@@ -603,7 +608,7 @@ impl Settings {
                 "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\nviolence={}\naim_v=3\n",
                 self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8, self.violence
             );
-            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\nabilities={}\nauto_update={}\noutfits={},{},{},{}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8, self.abilities as u8, self.auto_update as u8, self.outfits[0], self.outfits[1], self.outfits[2], self.outfits[3]);
+            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\nabilities={}\nauto_update={}\nboss_intros={}\noutfits={},{},{},{}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8, self.abilities as u8, self.auto_update as u8, self.boss_intros, self.outfits[0], self.outfits[1], self.outfits[2], self.outfits[3]);
             let f = self.post;
             text += &format!(
                 "fx_soft_shadows={}\nfx_ssao={}\nfx_bloom={}\nfx_rays={}\nfx_grading={}\nfx_vignette={}\n",
@@ -827,6 +832,9 @@ struct App {
     autoplay: bool,
     last_tap: Option<(Key, f64)>,
     cam_dist: std::cell::Cell<f32>,
+    /// The vault's boss introduction playing (raid_ui::Intro): which hall, when it began,
+    /// skipped or not, and the halls already introduced in this raid.
+    boss_intro: std::cell::Cell<crate::raid_ui::Intro>,
     frame_dt: f32,
     fov_kick: std::cell::Cell<f32>,
     /// The crosshair's drawn spread (pixels), eased toward the real one.
@@ -1009,6 +1017,7 @@ impl App {
             autoplay: false,
             last_tap: None,
             cam_dist: std::cell::Cell::new(5.0),
+            boss_intro: std::cell::Cell::new(crate::raid_ui::Intro::default()),
             frame_dt: 0.016,
             fov_kick: std::cell::Cell::new(0.0),
             cross_gap: std::cell::Cell::new(0.0),
@@ -2747,6 +2756,16 @@ impl eframe::App for App {
                 self.ledger_after_match();
                 self.hub_frame(dt);
                 self.admin_frame(dt);
+                // the vault's boss introductions (Space skips one already met)
+                if let Screen::Play { game, .. } = &self.screen {
+                    let mut it = self.boss_intro.get();
+                    let skip = ctx.input(|i| i.key_pressed(egui::Key::Space));
+                    if let Some(room) = crate::raid_ui::intro_step(&mut it, game, dt, self.settings.boss_intros, skip) {
+                        self.settings.boss_intros |= 1 << room;
+                        self.settings.save();
+                    }
+                    self.boss_intro.set(it);
+                }
             }
             self.sim_ms = t_sim.elapsed().as_secs_f32() * 1000.0;
         } else {
@@ -4046,6 +4065,10 @@ impl App {
         if let (Some(v), true) = (test_view(), std::env::var_os("DUEL_GALLERY").is_some()) {
             return (Cam::new(v3(v[0], v[1], v[2]), v[3], v[4], v[5], rect), game.f[game.local].pos);
         }
+        if let (Some((pos, look, fov)), true) = (crate::raid_ui::intro_cam(&self.boss_intro.get(), game), std::env::var_os("DUEL_GALLERY").is_some()) {
+            let d = (look - pos).norm();
+            return (Cam::new(pos, d.x.atan2(d.z), d.y.clamp(-1.0, 1.0).asin(), fov, rect), game.f[game.local].pos);
+        }
         if std::env::var_os("DUEL_GALLERY").is_some() {
             let l = game.local;
             return (Cam::new(v3(0.0, 2.0, 5.2), 0.0, -0.08, 96.0, rect), game.f[l].pos);
@@ -4060,6 +4083,11 @@ impl App {
         // test switch: DUEL_VIEW=x,y,z,yaw,pitch[,fov] puts the camera there (before / after pictures)
         if let Some(v) = test_view() {
             return (Cam::new(v3(v[0], v[1], v[2]), v[3], v[4], v[5], rect), body);
+        }
+        // a vault boss's introduction: the camera sweeps in to it
+        if let Some((pos, look, fov)) = crate::raid_ui::intro_cam(&self.boss_intro.get(), game) {
+            let d = (look - pos).norm();
+            return (Cam::new(pos, d.x.atan2(d.z), d.y.clamp(-1.0, 1.0).asin(), fov, rect), body);
         }
         // the Play of the Match: behind its player, as they played it
         if let (Some(_), Some(h)) = (game.potm_t, game.potm.as_ref()) {
@@ -5742,6 +5770,12 @@ impl App {
                     return;
                 }
                 text_shadow(p, Pos2::new(rect.center().x, rect.bottom() - 40.0), Align2::CENTER_CENTER, "PHOTO MODE  ·  WASD + mouse fly  ·  Space / Ctrl up, down  ·  1-8 pose  ·  H hide  ·  Enter take  ·  P leave", 15.0, Color32::WHITE);
+                return;
+            }
+            // a vault boss's introduction: only its name card (the cinematic stays clean)
+            let intro = self.boss_intro.get();
+            if intro.on && !intro.skipped {
+                crate::raid_ui::intro_card(p, rect, &intro);
                 return;
             }
             self.hub_hud(p, rect, cam, g);

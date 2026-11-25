@@ -116,3 +116,9 @@ Forge Smoke, Spark Cracker), the callout names and the clock tower, cranes and f
 assets/characters/look_vault_*.glb, look_vault.png (the Ashen Vault's Warden armour, Magistrate's
   robes and the Ashblood Regent's long coat) and assets/weapons/ashblood_glaive* - original models
   made for this game with tools/blender/build_vault_outfits.py and build_weapons.py.
+
+assets/bosses/*.glb and assets/bosses/textures/*.png (the Ashen Vault's bosses: the Warden of Wax, the
+  Twin Assessors Tally and Seal, the Chained Ledger, the Ashen Magistrate, the Ashblood Regent's crown
+  and mantle, a chain link and a floor anchor) - original models and hand-painted-look baked textures
+  made for this game with tools/blender/build_bosses.py (no third-party parts). Their rigs and
+  animations are posed in code (src/bosses.rs, src/gpu/raid_draw/boss_draw.rs).

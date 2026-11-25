@@ -9,6 +9,9 @@ use super::*;
 use crate::raid::{self, Cause, FoeKind, Stage, TeleKind, NO_MOVE};
 use crate::vault::{self, ROOMS, VY};
 
+mod boss_draw;
+pub(super) use boss_draw::regalia;
+
 /// Unlit, flat colour (fogged): the shader's material 2.
 const FLAT: [f32; 4] = [-1.0, 2.0, 1.0, 0.0];
 
@@ -88,81 +91,23 @@ pub fn draw(op: &mut MB, ad: &mut MB, al: &mut MB, cam: &Cam, g: &Game) {
             up_quad(al, [v3(rm.x.0, y, rm.z.0), v3(rm.x.1, y, rm.z.0), v3(rm.x.1, y, rm.z.1), v3(rm.x.0, y, rm.z.1)], lina([236, 200, 120], 0.35 + 0.3 * r.flood));
         }
     }
-    // ---- the bosses that aren't fighters
-    for (fi, f) in r.foes.iter().enumerate().filter(|(_, f)| f.alive) {
+    // ---- the bosses that aren't fighters: their models, posed (boss_draw)
+    boss_draw::draw_all(op, ad, al, cam, g, r);
+    for f in r.foes.iter().filter(|f| f.alive) {
         let p = if g.is_authority() { f.pos } else { f.shown };
         let m = M3::rot_y(f.yaw);
         let fwd = yaw_fwd(f.yaw);
-        let wind = f.state != 0;
         match f.kind {
-            FoeKind::Warden => {
-                let wax = lin([232, 214, 172]);
-                op.tube(p, p + v3(0.0, 3.2, 0.0), 1.25, 0.85, v3(1.0, 0.0, 0.0), 1.0, wax, -1.0, 0.7);
-                op.ellipsoid(p + v3(0.0, 3.6, 0.0), &m, v3(0.8, 0.7, 0.8), wax, -1.0, 0.7, 0.0);
-                for k in 0..6 {
-                    let a = k as f32 * 1.05 + 0.3;
-                    let q = p + v3(a.sin() * 1.05, 2.6 + (k % 3) as f32 * 0.35, a.cos() * 1.05);
-                    op.tube(q, q - v3(0.0, 0.9 + (k % 2) as f32 * 0.5, 0.0), 0.12, 0.04, v3(1.0, 0.0, 0.0), 1.0, wax, -1.0, 0.9);
-                }
-                // its wick and flame (brighter while winding up)
-                let top = p + v3(0.0, 4.35, 0.0);
-                op.tube(top - v3(0.0, 0.1, 0.0), top + v3(0.0, 0.35, 0.0), 0.05, 0.03, v3(1.0, 0.0, 0.0), 1.0, lin([30, 26, 22]), -1.0, 0.2);
-                let fl = 0.85 + 0.15 * (t * 17.0).sin();
-                ad.billboard(cam, top + v3(0.0, 0.6, 0.0), 0.55 * fl * if wind { 1.5 } else { 1.0 }, lina([255, 190, 80], 0.95));
-                ad.billboard(cam, top + v3(0.0, 0.5, 0.0), 0.25, lina([255, 250, 220], 1.0));
-                // two arms holding a great taper like a club
-                let hand = p + v3(0.0, 2.6, 0.0) + yaw_right(f.yaw) * 1.1 + fwd * 0.6;
-                op.tube(hand, hand + fwd * 1.6 + v3(0.0, 0.6, 0.0), 0.18, 0.14, v3(0.0, 1.0, 0.0), 1.0, wax, -1.0, 0.8);
-            }
-            FoeKind::Tally | FoeKind::Seal => {
-                let gold = f.kind == FoeKind::Tally;
-                let robe = if gold { lin([196, 150, 52]) } else { lin([120, 122, 130]) };
-                let trim = if gold { lin([255, 220, 120]) } else { lin([200, 204, 214]) };
-                op.tube(p, p + v3(0.0, 2.2, 0.0), 0.85, 0.42, fwd, 1.0, robe, -1.0, if gold { 1.6 } else { 0.6 });
-                op.ellipsoid(p + v3(0.0, 2.55, 0.0), &m, v3(0.32, 0.38, 0.32), trim, -1.0, 1.2, 0.0);
-                // a mask with a level line for a face, and the scales held out
-                op.obox(p + v3(0.0, 2.55, 0.0) + fwd * 0.3, &m, v3(0.24, 0.04, 0.02), lin([30, 24, 18]), -1.0, 0.2);
-                let hand = p + v3(0.0, 1.9, 0.0) + fwd * 0.75;
-                let tilt = (t * 1.5).sin() * 0.15;
-                let side = yaw_right(f.yaw);
-                op.tube(hand - side * 0.6 + v3(0.0, tilt, 0.0), hand + side * 0.6 - v3(0.0, tilt, 0.0), 0.03, 0.03, fwd, 1.0, trim, -1.0, 1.5);
-                for s in [-1.0f32, 1.0] {
-                    let pan = hand + side * (0.6 * s) - v3(0.0, 0.45 + tilt * s, 0.0);
-                    op.tube(pan, pan + v3(0.0, 0.04, 0.0), 0.22, 0.24, fwd, 1.0, trim, -1.0, 1.5);
-                }
-                if raid::vulnerable(r, fi).is_err() {
-                    // bound: a shimmering band joins the two
-                    if let Some(o) = r.foes.iter().find(|o| o.alive && o.kind != f.kind && matches!(o.kind, FoeKind::Tally | FoeKind::Seal)) {
-                        let op2 = if g.is_authority() { o.pos } else { o.shown };
-                        ad.beam(cam, p + v3(0.0, 1.6, 0.0), op2 + v3(0.0, 1.6, 0.0), 0.12, lina([255, 230, 150], 0.35 + 0.2 * (t * 6.0).sin().abs()));
-                    }
-                }
-            }
-            FoeKind::Ledger => {
-                let c = p + v3(0.0, 3.0 + (t * 1.3).sin() * 0.2, 0.0);
-                let open: f32 = 0.5 + if wind { 0.35 } else { 0.0 };
-                let cover = lin([70, 24, 26]);
-                for s in [-1.0f32, 1.0] {
-                    let hinge = c + yaw_right(f.yaw) * (s * 0.02);
-                    let leaf = yaw_right(f.yaw) * s * open.cos() + V3::UP * open.sin();
-                    op.obox(hinge + leaf * 0.9, &M3 { x: leaf, y: leaf.cross(fwd).norm(), z: fwd }, v3(0.9, 0.06, 1.2), cover, -1.0, 0.4);
-                    op.obox(hinge + leaf * 0.88 + leaf.cross(fwd).norm() * 0.07, &M3 { x: leaf, y: leaf.cross(fwd).norm(), z: fwd }, v3(0.84, 0.03, 1.12), lin([226, 214, 186]), -1.0, 0.2);
-                }
-                // chains down to the floor at four corners
-                for k in 0..4 {
-                    let a = k as f32 * 1.5708 + 0.785;
-                    let base = v3(p.x + a.sin() * 3.5, VY, p.z + a.cos() * 3.5);
-                    op.tube(base, c, 0.05, 0.05, v3(0.0, 1.0, 0.0), 1.0, lin([70, 70, 76]), -1.0, 1.8);
-                }
-                ad.billboard(cam, c + v3(0.0, 0.3, 0.0), 1.4, lina([140, 60, 255], 0.25 + if wind { 0.3 } else { 0.0 }));
-            }
             FoeKind::Thrall => {
+                // an ink thrall: a crawling blot of ink with violet eyes, wobbling as it goes
                 let ink = lin([18, 16, 30]);
-                op.ellipsoid(p + v3(0.0, 0.55, 0.0), &m, v3(0.45, 0.55, 0.45), ink, -1.0, 1.4, 0.0);
-                op.ellipsoid(p + v3(0.0, 1.1, 0.0), &m, v3(0.28, 0.25, 0.28), ink, -1.0, 1.4, 0.0);
+                let wob = (t * 7.0 + p.x * 1.3).sin() * 0.06;
+                op.ellipsoid(p + v3(0.0, 0.55, 0.0), &m, v3(0.45 + wob, 0.55 - wob, 0.45), ink, -1.0, 1.4, 0.0);
+                op.ellipsoid(p + v3(0.0, 1.1, 0.0) + fwd * 0.05, &m, v3(0.28, 0.25, 0.28), ink, -1.0, 1.4, 0.0);
                 for s in [-1.0f32, 1.0] {
                     ad.billboard(cam, p + v3(0.0, 1.13, 0.0) + fwd * 0.25 + yaw_right(f.yaw) * (0.1 * s), 0.06, lina([180, 120, 255], 1.0));
                 }
+                al.billboard(cam, v3(p.x, VY + 0.05, p.z) - fwd * 0.6, 0.5, lina([12, 8, 24], 0.6));
             }
             FoeKind::Regent if !r.regent.vanished => regent_extras(ad, al, cam, g, r, p, f.yaw),
             _ => {}

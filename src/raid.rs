@@ -243,7 +243,7 @@ impl FoeKind {
             FoeKind::Thrall => (0.5, 1.2),
             FoeKind::Rift => (0.5, 0.9),
             FoeKind::Regent => (0.6, 2.4),
-            FoeKind::Magistrate => (0.55, 2.2),
+            FoeKind::Magistrate => (0.95, 3.5),
         }
     }
     pub fn base_hp(self) -> f32 {
@@ -3009,13 +3009,76 @@ pub fn lights(g: &Game) -> Vec<(V3, f32, [f32; 3])> {
     let Some(r) = g.raid.as_ref() else { return Vec::new() };
     let mut out = Vec::new();
     let flick = 0.85 + 0.15 * (g.time * 13.0).sin() * (g.time * 7.3).cos();
-    for f in r.foes.iter().filter(|f| f.alive) {
+    // each boss lights itself: warm fire on the Warden and the Magistrate, gold on Tally, cold on
+    // Seal, violet on the Ledger (brighter as they wind up, so the move reads)
+    for (k, f) in r.foes.iter().enumerate().filter(|(_, f)| f.alive) {
+        let p = if g.is_authority() { f.pos } else { f.shown };
+        let up = if f.state != 0 { 1.35 } else { 1.0 };
+        let fwd = yaw_fwd(f.yaw);
+        // a cool key light from the front and above, so its shape reads against the dark hall
+        let (key_h, key) = match f.kind {
+            FoeKind::Warden => (6.5, 1.2),
+            FoeKind::Ledger => (6.0, 1.0),
+            FoeKind::Magistrate => (5.5, 1.3),
+            FoeKind::Tally | FoeKind::Seal => (4.5, 0.8),
+            _ => (0.0, 0.0),
+        };
+        if key > 0.0 {
+            out.push((p + fwd * 3.5 + v3(0.0, key_h, 0.0), 10.0, [0.85 * key, 0.95 * key, 1.45 * key]));
+        }
         match f.kind {
-            FoeKind::Warden => out.push((f.pos + v3(0.0, 4.9, 0.0), 9.0, [3.2 * flick, 2.0 * flick, 0.7])),
-            FoeKind::Magistrate => out.push((f.pos + v3(0.0, 1.4, 0.0), 6.0, [2.2, 0.9, 0.3])),
-            FoeKind::Regent if !r.regent.vanished => out.push((f.pos + v3(0.0, 2.6, 0.0), 4.0, [1.6, 0.15, 0.12])),
+            FoeKind::Warden => {
+                out.push((p + v3(0.0, 5.4, 0.0), 11.0, [3.4 * flick * up, 2.0 * flick * up, 0.7]));
+                out.push((p + v3(0.0, 3.0, 0.0) + fwd * 1.2, 4.0, [2.0 * flick, 0.7, 0.2]));
+            }
+            FoeKind::Tally => out.push((p + v3(0.0, 3.3, 0.0) + fwd * 0.6, 6.5, [2.3 * up, 1.75 * up, 0.7])),
+            FoeKind::Seal => out.push((p + v3(0.0, 3.6, 0.0) + fwd * 0.6, 6.5, [0.9 * up, 1.1 * up, 1.7 * up])),
+            FoeKind::Ledger => out.push((p + v3(0.0, 3.4, 0.0) + fwd * 0.8, 11.0, [1.7 * up, 0.75 * up, 2.8 * up])),
+            FoeKind::Magistrate => {
+                let gavel = p + yaw_right(f.yaw) * 1.0 + fwd * 0.7 + v3(0.0, if f.state == 1 { 5.0 } else { 3.1 }, 0.0);
+                out.push((gavel, 8.5, [3.2 * flick * up, 1.3 * flick * up, 0.35]));
+            }
+            FoeKind::Regent if !r.regent.vanished => out.push((p + v3(0.0, 2.6, 0.0), 4.0, [1.6, 0.15, 0.12])),
             _ => {}
         }
+        // the Assessors bound: their chain glows between them
+        if f.kind == FoeKind::Tally && matches!(vulnerable(r, k), Err(s) if s.starts_with("BOUND")) {
+            if let Some(o) = r.foes.iter().find(|o| o.alive && o.kind == FoeKind::Seal) {
+                let op = if g.is_authority() { o.pos } else { o.shown };
+                out.push(((p + op) * 0.5 + v3(0.0, 1.6, 0.0), 7.0, [2.6, 1.9, 0.6]));
+            }
+        }
+    }
+    // each hall's own light: high, cold shafts from its windows against the bosses' warm fire, so
+    // they stand out from the dark
+    let rm = ROOMS[r.room.min(ROOMS.len() - 1)];
+    let c = rm.centre();
+    let top = VY + vault::ROOM_H - 1.5;
+    match r.room {
+        0 => {
+            out.push((v3(rm.x.0 + 2.5, top, rm.z.0 + 2.5), 16.0, [0.5, 0.75, 1.7]));
+            out.push((v3(rm.x.1 - 2.5, top, rm.z.1 - 2.5), 16.0, [0.5, 0.75, 1.7]));
+            for (k, (x, z)) in vault::PLATES.iter().enumerate() {
+                let lit = r.plates.get(k).copied().unwrap_or(0.0);
+                if lit > 0.2 {
+                    out.push((v3(*x, VY + 1.0, *z), 4.5, [2.2 * lit, 1.5 * lit, 0.5 * lit]));
+                }
+            }
+        }
+        1 => {
+            out.push((v3(c.x - 5.0, top - 0.5, c.z), 10.0, [2.0, 1.5, 0.65]));
+            out.push((v3(c.x + 5.0, top - 0.5, c.z), 10.0, [2.0, 1.5, 0.65]));
+            out.push((v3(c.x, top, rm.z.0 + 1.5), 15.0, [0.55, 0.75, 1.6]));
+        }
+        2 => {
+            out.push((v3(c.x, top - 1.0, rm.z.0 + 2.0), 11.0, [0.55, 0.6, 1.4]));
+            out.push((v3(c.x, top - 1.0, rm.z.1 - 2.0), 11.0, [0.55, 0.6, 1.4]));
+        }
+        4 if !r.floor_down => {
+            out.push((v3(c.x - 8.0, top + 1.0, c.z - 6.0), 18.0, [0.7, 0.85, 1.8]));
+            out.push((v3(c.x + 8.0, top + 1.0, c.z + 8.0), 18.0, [0.7, 0.85, 1.8]));
+        }
+        _ => {}
     }
     // the roof's red moonlight, and its corner lanterns burning red
     if r.room == 3 {
@@ -3047,12 +3110,19 @@ pub fn night(g: &Game, cam: V3) -> f32 {
     if ROOMS[3].contains(cam, 1.0) || (cam.y > VY - 2.0 && cam.y < VY + 14.0 && cam.x > 14.0 && cam.z > -10.0 && cam.z < 12.0) { 1.0 } else { 0.0 }
 }
 
-/// The foes drawn as fighters (the Ashblood Regent, the Ashen Magistrate), dressed for it.
+/// Whether the camera is down in one of the vault's halls (not the Regent's roof): its light is
+/// low there, so the bosses' fires and the halls' cold windows carry the scene.
+pub fn indoors(g: &Game, cam: V3) -> bool {
+    g.raid.is_some() && cam.y < VY + vault::ROOM_H + 1.0 && ROOMS.iter().enumerate().any(|(k, rm)| k != 3 && rm.contains(cam, 1.0))
+}
+
+/// The foes drawn as fighters (the Ashblood Regent), dressed for it.
 pub fn fighters(g: &Game) -> Vec<Fighter> {
     let Some(r) = g.raid.as_ref() else { return Vec::new() };
     let mut out = Vec::new();
     for (k, f) in r.foes.iter().enumerate() {
-        if !f.alive || !matches!(f.kind, FoeKind::Regent | FoeKind::Magistrate) || (f.kind == FoeKind::Regent && r.regent.vanished) {
+        // (the Magistrate has its own model now: drawn with the other bosses)
+        if !f.alive || f.kind != FoeKind::Regent || r.regent.vanished {
             continue;
         }
         let mag = f.kind == FoeKind::Magistrate;

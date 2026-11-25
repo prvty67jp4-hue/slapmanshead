@@ -94,3 +94,14 @@ The team map's own set pieces are built by `build_props.py`:
 What it writes: `app/assets/env/props/varrow_<name>.glb`, one shared 1024 x 1024 texture
 `app/assets/env/props/varrow_props.png`, and previews in `app/shots/varrow/props/`. The props are looks only:
 the map (`World::bridgeworks` in `src/world.rs`) places invisible blocks where players must collide with them.
+
+## The vault's bosses (`build_bosses.py`)
+
+    blender --background --factory-startup --python app/tools/blender/build_bosses.py -- [warden tally seal ledger magistrate regalia props] [--no-renders]
+
+Writes `app/assets/bosses/<name>.glb` (one object per moving part, each with its origin at its joint: pelvis,
+torso, head, upper_l/r, fore_l/r, thigh_l/r, shin_l/r, halberd, robe, scales, ledger, gavel, lower/upper jaw,
+wing_l/r, quill, crown, mantle, link, anchor), `textures/<name>.png` (1024 square, 512 for regalia and props)
+and `app/shots/bosses/<name>.png` turntables. Objects named `fx_<part>_<kind>_<n>` are markers the game attaches
+flames, eyes, a mouth, chains to (they aren't drawn). The rig (which part hangs from which) and every animation
+are in code: `src/bosses.rs` and `src/gpu/raid_draw/boss_draw.rs`. Materials named `glow_*` are drawn unlit.
