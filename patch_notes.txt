@@ -1,0 +1,16 @@
+# Patch notes
+# (The game shows this file on the Patch notes page and the first lines on the season's start
+# screen. "## " starts a section, "- " a point; edit it beside the game, no code needed.)
+
+## Season 1: The Red Moon
+- A new free season track: 50 tiers of cosmetics earned by playing matches, raiding the Ashen Vault, completing challenges and winning Varrow's games. Nothing is for sale.
+- Rewards: coat colours for every fighter, season dyes, weapon finishes, six new emotes, titles, banners, nameplates, and the Moonlit Ashhound at tier 50. Prestige levels after tier 50 add a coloured border to your profile card.
+- Challenges: three daily and five weekly challenges of your own (daily reset 00:00 UTC, weekly on Monday), one free reroll a day, and ten season challenges with bigger rewards.
+- Ranked 1v1 soft reset: ratings move halfway back to the middle and settle quickly. Season-end rewards go by your peak rank.
+- Profile cards: banner, title, nameplate, rank, favourite fighter, top stats and three showcased rewards. Right-click a player in Varrow Centre and pick View profile card. A match history tab sits beside it.
+
+## Steam
+- 56 achievements, lifetime stats, Steam Cloud saves, rich presence with Join buttons, parties, and Steam Input with Xbox, PlayStation, Switch and Steam Deck button icons.
+
+## Competitive
+- Ranked 1v1 with placements and the Ledger of Champions, killcams, replays you can step through and clip, and a caster view for spectators and the Court Pits' stands.

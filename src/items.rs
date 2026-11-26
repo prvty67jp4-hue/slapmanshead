@@ -124,7 +124,7 @@ impl ItemKey {
     pub fn source(self) -> String {
         match self {
             ItemKey::Look(v) => hub::look(v).map_or(String::new(), |l| format!("{} · {}", l.set, l.unlock.text())),
-            ItemKey::Dye(v) => if crate::raid::loot_of_dye(v).is_some() { "found in the Ashen Vault".into() } else { "a starter dye".into() },
+            ItemKey::Dye(v) => if crate::raid::loot_of_dye(v).is_some() { "found in the Ashen Vault".into() } else if v >= crate::gear::SEASON_DYES { "a season's reward".into() } else { "a starter dye".into() },
             _ => "found in the Ashen Vault".into(),
         }
     }
@@ -132,7 +132,7 @@ impl ItemKey {
     pub fn starter(self) -> bool {
         match self {
             ItemKey::Look(v) => hub::look(v).is_some_and(|l| l.unlock == Unlock::Always),
-            ItemKey::Dye(v) => crate::raid::loot_of_dye(v).is_none(),
+            ItemKey::Dye(v) => crate::raid::loot_of_dye(v).is_none() && v < crate::gear::SEASON_DYES,
             _ => false,
         }
     }

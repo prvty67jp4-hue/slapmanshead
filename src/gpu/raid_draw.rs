@@ -567,7 +567,8 @@ fn bank_booth(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
 
 /// Pets: the Cinder Wisp follows whoever wears it, bobbing over their shoulder.
 fn pets(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
-    if g.hub.is_none() {
+    // (and the menu's fighter, previewing a season pet)
+    if g.hub.is_none() && g.kind != crate::game::Kind::Demo {
         return;
     }
     for (i, f) in g.f.iter().enumerate() {
@@ -580,14 +581,19 @@ fn pets(op: &mut MB, ad: &mut MB, cam: &Cam, g: &Game) {
         if (p - cam.pos).len() > 40.0 {
             continue;
         }
-        // an ember core, a soft glow, a trail of sparks, two dark eyes looking ahead
-        op.ellipsoid(p, &M3::rot_y(f.yaw), v3(0.11, 0.13, 0.11), lin([255, 150, 40]), -1.0, 0.0, 0.0);
-        ad.billboard(cam, p, 0.32, lina([255, 120, 30], 0.55));
+        // an ember core, a soft glow, a trail of sparks, two dark eyes looking ahead (a season pet
+        // in its own colour)
+        let (core, glow, spark) = match crate::season::pet_colour(f.hub.look.pet) {
+            Some(c) => (c, [(c[0] as u16 * 4 / 5) as u8, (c[1] as u16 * 4 / 5) as u8, (c[2] as u16 * 4 / 5) as u8], [c[0].saturating_add(40), c[1].saturating_add(40), c[2].saturating_add(40)]),
+            None => ([255, 150, 40], [255, 120, 30], [255, 140, 40]),
+        };
+        op.ellipsoid(p, &M3::rot_y(f.yaw), v3(0.11, 0.13, 0.11), lin(core), -1.0, 0.0, 0.0);
+        ad.billboard(cam, p, 0.32, lina(glow, 0.55));
         ad.billboard(cam, p + v3(0.0, 0.1, 0.0), 0.16, lina([255, 230, 150], 0.8));
         for k in 0..4 {
             let ph = (t * 0.8 + k as f32 * 0.25).fract();
             let q = p - yaw_fwd(f.yaw) * (0.1 + ph * 0.4) + v3((k as f32 * 2.1 + t).sin() * 0.05, -ph * 0.25, 0.0);
-            ad.billboard(cam, q, 0.05 * (1.0 - ph), lina([255, 140, 40], 1.0 - ph));
+            ad.billboard(cam, q, 0.05 * (1.0 - ph), lina(spark, 1.0 - ph));
         }
         let fw = yaw_fwd(f.yaw);
         for s in [-1.0f32, 1.0] {

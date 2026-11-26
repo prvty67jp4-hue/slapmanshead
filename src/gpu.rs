@@ -179,7 +179,8 @@ fn worn_of(g: &Game, f: &Fighter) -> (Vec<u8>, [[u8; 3]; crate::hub::SLOT_COUNT]
     if let Some(k) = f.kit.as_ref() {
         return (k.equip.iter().copied().filter(|&id| id != 0).collect(), [k.dyes; crate::hub::SLOT_COUNT], k.charm_glows());
     }
-    if g.mt.mode == crate::game::Mode::Hub {
+    // (the menu's fighter wears a look while a season reward is previewed on it)
+    if g.mt.mode == crate::game::Mode::Hub || (g.kind == crate::game::Kind::Demo && f.hub.look.items.iter().any(|&i| i != 0)) {
         let o = &f.hub.look;
         return (o.pieces().iter().map(|p| p.0).collect(), o.dyes, false);
     }
@@ -2243,7 +2244,11 @@ fn coat_style(body: u8, lk: &Look, outfit: u8) -> (f32, f32, [f32; 4], [f32; 4])
     // a mastery outfit colours the coat or cape (the hem keeps the player's colour)
     match crate::career::OUTFITS.get(outfit as usize).and_then(|o| o.2) {
         Some(c) => (span, length, lin(c), trim),
-        None => (span, length, base, trim),
+        // a season's coat colours its hem too
+        None => match crate::season::outfit_colours(outfit) {
+            Some((coat, hem)) => (span, length, lin(coat), lin(hem)),
+            None => (span, length, base, trim),
+        },
     }
 }
 
@@ -2698,6 +2703,8 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
         let slide = if f.weapon == Weapon::Shotgun { f.pump_k() * crate::weapons::PUMP_TRAVEL } else { 0.0 };
         let (s, c) = if matches!(f.weapon, Weapon::Revolver | Weapon::HandCannon) { revolver_turn(f).sin_cos() } else { (0.0, 1.0) };
         let turn = |v: V3| v3(v.x * c - v.y * s, v.x * s + v.y * c, v.z);
+        // a season's weapon finish: the colour laid over the weapon's own, stronger the shinier
+        let finish = crate::season::finish(f.loadout.finish).map(|(col, shine)| (lin(col), 0.6 + 0.3 * shine, 1.0 + 0.35 * shine));
         for part in &m.parts {
             for v in &part.tris {
                 let (p, n) = match part.kind {
@@ -2705,7 +2712,11 @@ fn weapon_mesh(mb: &mut MB, add_mb: &mut MB, cam: &Cam, f: &Fighter, hand: V3, w
                     PartKind::Pump => (v.p - v3(0.0, 0.0, slide), v.n),
                     PartKind::Cylinder => (part.pivot + turn(v.p - part.pivot), turn(v.n)),
                 };
-                mb.vert(hand + wf.apply(p), wf.apply(n), v.uv, v.col, v.ex);
+                let col = match finish {
+                    Some((fc, k, bright)) => [(v.col[0] + (fc[0] - v.col[0]) * k) * bright, (v.col[1] + (fc[1] - v.col[1]) * k) * bright, (v.col[2] + (fc[2] - v.col[2]) * k) * bright, v.col[3]],
+                    None => v.col,
+                };
+                mb.vert(hand + wf.apply(p), wf.apply(n), v.uv, col, v.ex);
             }
         }
         if f.weapon.is_melee() && f.guard {

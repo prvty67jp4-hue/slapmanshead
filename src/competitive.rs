@@ -1109,9 +1109,9 @@ impl App {
                 g.set_map(MapId::Arena);
                 g.f[0].is_bot = true;
                 g.bots[0] = Some(bot::Bot::new(0.15, 9));
-                g.set_ready(Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0, body: 0, outfit: 0 });
+                g.set_ready(Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0, body: 0, outfit: 0, finish: 0 });
                 g.f[1].rank = Rank::to_byte(Some(Rank { tier: 5, div: 1 }));
-                g.f[1].loadout = Loadout { melee: Weapon::Dagger, gun1: Weapon::Rifle, gun2: Weapon::HandCannon, item: 0, body: 2, outfit: 0 };
+                g.f[1].loadout = Loadout { melee: Weapon::Dagger, gun1: Weapon::Rifle, gun2: Weapon::HandCannon, item: 0, body: 2, outfit: 0, finish: 0 };
                 // (until a kill on you that the killcam shows as a headshot, or one at all)
                 let mut any = None;
                 for _ in 0..(600.0 / TICK) as usize {

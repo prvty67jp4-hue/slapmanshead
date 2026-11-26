@@ -455,13 +455,16 @@ pub struct Loadout {
     pub item: u8,
     /// The fighter (see crate::chars): 0 Ranger, 1 Huntress, 2 Brawler, 3 Striker.
     pub body: u8,
-    /// Their outfit colour (see career::OUTFITS), unlocked through mastery.
+    /// Their outfit colour (see career::OUTFITS, unlocked through mastery; then a season's coats:
+    /// crate::season::outfit_colours).
     pub outfit: u8,
+    /// Their weapon finish (0 none; crate::season::finish).
+    pub finish: u8,
 }
 
 impl Default for Loadout {
     fn default() -> Self {
-        Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 2, body: 0, outfit: 0 }
+        Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 2, body: 0, outfit: 0, finish: 0 }
     }
 }
 
@@ -469,11 +472,12 @@ impl Loadout {
     pub fn to_bytes(self) -> [u8; 4] {
         // the fighter rides in the item byte's top half
         // the outfit rides in the blade byte's top half
-        [(self.melee as u8) | (self.outfit.min(15) << 4), self.gun1 as u8, self.gun2 as u8, (self.item & 0x0f) | (self.body.min(15) << 4)]
+        // the weapon finish rides in the two guns' top halves (low half first)
+        [(self.melee as u8) | (self.outfit.min(15) << 4), (self.gun1 as u8) | ((self.finish & 0x0f) << 4), (self.gun2 as u8) | (self.finish & 0xf0), (self.item & 0x0f) | (self.body.min(15) << 4)]
     }
     /// Read and repair (a melee in the melee slot, guns in the gun slots).
     pub fn from_bytes(b: [u8; 4]) -> Loadout {
-        let mut l = Loadout { outfit: (b[0] >> 4).min(3), melee: Weapon::from_u8(b[0] & 0x0f), gun1: Weapon::from_u8(b[1]), gun2: Weapon::from_u8(b[2]), item: (b[3] & 0x0f).min(2), body: (b[3] >> 4).min(crate::chars::COUNT as u8 - 1) };
+        let mut l = Loadout { outfit: b[0] >> 4, melee: Weapon::from_u8(b[0] & 0x0f), gun1: Weapon::from_u8(b[1] & 0x0f), gun2: Weapon::from_u8(b[2] & 0x0f), item: (b[3] & 0x0f).min(2), body: (b[3] >> 4).min(crate::chars::COUNT as u8 - 1), finish: (b[1] >> 4) | (b[2] & 0xf0) };
         if !l.melee.is_melee() {
             l.melee = Weapon::Katana;
         }
@@ -493,7 +497,7 @@ impl Loadout {
         let n = Weapon::GUNS.len();
         let a = rng.next_u32() as usize % n;
         let b = (a + 1 + rng.next_u32() as usize % (n - 1)) % n;
-        Loadout { melee: m, gun1: Weapon::GUNS[a], gun2: Weapon::GUNS[b], item: (rng.next_u32() % 3) as u8, body: (rng.next_u32() % crate::chars::COUNT as u32) as u8, outfit: 0 }
+        Loadout { melee: m, gun1: Weapon::GUNS[a], gun2: Weapon::GUNS[b], item: (rng.next_u32() % 3) as u8, body: (rng.next_u32() % crate::chars::COUNT as u32) as u8, outfit: 0, finish: 0 }
     }
 }
 
@@ -3022,14 +3026,14 @@ impl Game {
             2 => Weapon::Greatsword,
             _ => Weapon::Katana,
         };
-        let lo = Loadout { melee, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0, body, outfit: 0 };
+        let lo = Loadout { melee, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0, body, outfit: 0, finish: 0 };
         g.my_loadout = lo;
         g.add_player(0, name, true, None, 0);
         g.f[0].loadout = lo;
         g.f[0].equip();
         g.add_player(1, "Dummy", true, Some(0.0), 0);
         g.bots[1] = None; // it just stands there
-        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0, body: (body + 1) % 4, outfit: 0 };
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0, body: (body + 1) % 4, outfit: 0, finish: 0 };
         g.f[1].equip();
         g.f[0].respawn_at(v3(0.0, 0.0, PREVIEW_Z), 0.0);
         g.f[1].respawn_at(v3(0.0, 0.0, PREVIEW_Z + 1.6), std::f32::consts::PI);
@@ -3131,14 +3135,14 @@ impl Game {
     pub fn training(name: &str) -> Game {
         let mut g = Game::new(Kind::Offline, 0, Mode::Ffa, 9999);
         g.set_map(MapId::Courtyard);
-        g.my_loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rocket, gun2: Weapon::Revolver, item: 2, body: 0, outfit: 0 };
+        g.my_loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rocket, gun2: Weapon::Revolver, item: 2, body: 0, outfit: 0, finish: 0 };
         g.add_player(0, name, true, None, 0);
         let homes = [v3(-3.5, 0.0, -6.0), v3(0.0, 0.0, -6.2), v3(3.5, 0.0, -6.0)];
         for (k, &h) in homes.iter().enumerate() {
             let s = k + 1;
             g.add_player(s, &format!("Dummy {}", s), true, Some(0.0), 0);
             g.bots[s] = None; // stands still
-            g.f[s].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0, body: 0, outfit: 0 };
+            g.f[s].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Shotgun, item: 0, body: 0, outfit: 0, finish: 0 };
             g.f[s].equip();
             g.f[s].respawn_at(h, 0.0);
             g.f[s].spawn_prot = 0.0;
@@ -10057,7 +10061,7 @@ pub(crate) mod lag_comp_tests {
         g.world = flat_world();
         g.bots[1] = None;
         g.mt.phase = Phase::Fight;
-        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0, body: 0, outfit: 0 };
+        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Rifle, gun2: Weapon::Revolver, item: 0, body: 0, outfit: 0, finish: 0 };
         g.f[0].pos = v3(0.0, 0.0, -10.0);
         g.f[1].pos = v3(0.0, 0.0, 0.0);
         g.f[0].spawn_prot = 0.0;
@@ -10363,7 +10367,7 @@ mod hitbox_tests {
         g.f[1].yaw = std::f32::consts::PI; // facing the shooter
         g.f[0].spawn_prot = 0.0;
         g.f[1].spawn_prot = 0.0;
-        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0, finish: 0 };
         g.f[1].equip();
         for _ in 0..30 {
             g.f[1].pos = v3(0.0, 0.0, 0.0);
@@ -10402,7 +10406,7 @@ mod hitbox_tests {
         g.mt.phase = Phase::Fight;
         for i in 0..2 {
             g.f[i].ap = 0.0; // no armour soaking up the counter
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0, finish: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = Weapon::Katana;
@@ -10804,10 +10808,10 @@ mod weapon_tests {
         g.world = crate::game::lag_comp_tests::flat_world();
         g.bots[1] = None;
         g.mt.phase = Phase::Fight;
-        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: gun, gun2: Weapon::Revolver, item: 0, body: 0, outfit: 0 };
+        g.f[0].loadout = Loadout { melee: Weapon::Katana, gun1: gun, gun2: Weapon::Revolver, item: 0, body: 0, outfit: 0, finish: 0 };
         g.f[0].equip();
         g.f[0].pos = v3(0.0, 0.0, -10.0);
-        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Smg, item: 0, body: 0, outfit: 0 };
+        g.f[1].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Smg, item: 0, body: 0, outfit: 0, finish: 0 };
         g.f[1].equip();
         for i in 0..2 {
             g.f[i].spawn_prot = 0.0;
@@ -11007,7 +11011,7 @@ mod weapon_tests {
         assert!(r.dmg * r.head >= MAX_HP, "revolver headshot one-taps");
         // tapping (half a second apart): every shot dead-on
         let mut f = Fighter::new("x", 0, true);
-        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
+        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0, finish: 0 };
         f.equip();
         f.cur = 1;
         f.weapon = Weapon::Revolver;
@@ -11146,7 +11150,7 @@ mod melee_depth_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: blade, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
+            g.f[i].loadout = Loadout { melee: blade, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0, finish: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = blade;
@@ -11386,7 +11390,7 @@ mod fairness_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Revolver, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0, finish: 0 };
             g.f[i].equip();
             g.f[i].cur = 0;
             g.f[i].weapon = Weapon::Katana;
@@ -11527,7 +11531,7 @@ mod shuriken_tests {
         g.mt.phase = Phase::Fight;
         g.mt.timer = 99.0;
         for i in 0..2 {
-            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shuriken, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0 };
+            g.f[i].loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shuriken, gun2: Weapon::Rifle, item: 0, body: 0, outfit: 0, finish: 0 };
             g.f[i].equip();
             g.f[i].ap = 0.0;
             g.f[i].spawn_prot = 0.0;

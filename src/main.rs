@@ -61,6 +61,8 @@ mod glyphs;
 mod party;
 mod presence;
 mod steam_ui;
+mod season;
+mod season_ui;
 
 /// (tests) Held by the timing test and the busiest tests, so they never run at once.
 #[cfg(test)]
@@ -723,6 +725,11 @@ enum Page {
     Replays,
     /// Achievements with their progress (crate::achievements, crate::steam_ui).
     Achievements,
+    /// The season: its track and the challenges; the profile card and match history; the patch
+    /// notes (crate::season, crate::season_ui).
+    Season,
+    Profile,
+    PatchNotes,
 }
 
 enum Screen {
@@ -953,6 +960,9 @@ struct App {
     cloud: cloud::Cloud,
     party: party::Party,
     sui: steam_ui::SteamUi,
+    /// The season: progress, challenges, rewards, history (crate::season), and its screens.
+    season: season::Progress,
+    season_ui: season_ui::SeasonUi,
 }
 
 /// Controller movement and held buttons, merged into the game input.
@@ -1001,6 +1011,8 @@ impl App {
             cloud: cloud::Cloud::default(),
             party: party::Party::default(),
             sui: steam_ui::SteamUi::default(),
+            season: season::Progress::default(),
+            season_ui: season_ui::SeasonUi::default(),
             screen: Screen::Menu(Page::Main),
             demo,
             gpu: None,
@@ -1145,6 +1157,12 @@ impl App {
         if app.screenshot.is_none() && !app.autoplay {
             app.load_ranked();
         }
+        // the season: today's challenges, a new season settled (the ranked soft reset), the start
+        // screen once per season
+        app.season_start();
+        if let Ok(s) = std::env::var("DUEL_SEASON_SCENE") {
+            app.season_scene(&s);
+        }
         // test switches: DUEL_BODY=0..3 picks the fighter, DUEL_MELEE=0..2 the blade
         if let Some(b) = std::env::var("DUEL_BODY").ok().and_then(|v| v.parse::<u8>().ok()) {
             app.settings.loadout.body = b.min(chars::COUNT as u8 - 1);
@@ -1231,6 +1249,12 @@ impl App {
                 app.screen = Screen::Menu(Page::Replays);
             } else if pg == "achievements" {
                 app.screen = Screen::Menu(Page::Achievements);
+            } else if pg == "season" {
+                app.screen = Screen::Menu(Page::Season);
+            } else if pg == "profile" {
+                app.screen = Screen::Menu(Page::Profile);
+            } else if pg == "patch_notes" {
+                app.screen = Screen::Menu(Page::PatchNotes);
             }
         }
         // test switches for Ledger Duels pictures (menus and matches): DUEL_LEDGER_RULES=<rule
@@ -1606,11 +1630,17 @@ impl App {
         let level = self.career.level();
         let day = career::today();
         let quiet = game.match_stats.get(game.local).is_some_and(|s| s.shots == 0);
+        // the season's track and challenges: the same XP, and what it counts toward
+        let sday = season::day_now();
+        let sctx = season::Ctx { body, duel: game.mt.mode.duel_like() || game.hub.as_ref().is_some_and(|h| h.pit_of(game.local).is_some()), ranked: self.ranked_match.is_some() };
+        let won = evs.iter().any(|e| matches!(e, CareerEv::MatchWon));
+        let ended = evs.iter().any(|e| matches!(e, CareerEv::MatchEnd));
         for ev in evs {
             let xp = self.career.apply_as(ev, Some(body), day);
             self.match_xp += xp;
             // achievements count the same things (their own copy: crate::achievements)
             self.ach.feed(ev, Some(body), day);
+            self.season.feed(season::reg(), sday, ev, sctx, xp, false);
             if matches!(ev, CareerEv::MatchWon) && quiet && game.gauntlet.is_none() && game.train.is_none() {
                 self.ach.quiet_win();
             }
@@ -1619,6 +1649,11 @@ impl App {
                     game.say(format!("+{xp} XP (execution)"));
                 }
             }
+        }
+        // the match history
+        if ended && game.gauntlet.is_none() && game.train.is_none() {
+            let me = &game.f[game.local];
+            self.season.played(season::Played { when: season::secs_now(), mode: game.mt.mode.name().to_string(), map: lore::map_name(game.world.map).to_string(), won, kills: me.kills.max(0) as u32, deaths: me.deaths.max(0) as u32, xp: self.match_xp, ranked: self.ranked_match.is_some() });
         }
         for note in std::mem::take(&mut self.career.notes) {
             game.say(note);
@@ -2743,6 +2778,8 @@ impl eframe::App for App {
             let b = self.settings.loadout.body.min(3);
             let o = self.settings.outfits[b as usize];
             self.settings.loadout.outfit = if self.career.outfit_unlocked(b, o as usize) { o } else { 0 };
+            // a season's coat and weapon finish, when one is worn
+            self.season_wear();
         }
         // frame-rate limit: wait out the rest of this frame's time
         if self.settings.fps_cap > 0 && self.screenshot.is_none() {
@@ -2847,6 +2884,7 @@ impl eframe::App for App {
         self.watchdog.stage("Steam");
         self.steam_frame(dt);
         self.steam_layer_frame(dt);
+        self.season_frame(dt);
         self.ranked_queue_tick(dt);
         if let Some((_, t)) = self.ranked_change.as_mut() {
             *t += dt;
@@ -3120,9 +3158,10 @@ impl eframe::App for App {
             Screen::Lobby { .. } => true,
             Screen::Play { game, .. } => game.hub.is_some() && !self.captured,
         };
-        if friends_here {
+        if friends_here && !self.season_ui.start_open {
             self.friends_ui(&ctx, rect);
         }
+        self.season_overlays(&ctx, rect);
         self.draw_ach_toast(&ctx, rect);
         if go_menu {
             self.leave_to_menu();
@@ -3182,6 +3221,9 @@ impl eframe::App for App {
             // the last achievements and saves reach Steam before the game closes
             if self.ach.dirty && self.screenshot.is_none() {
                 self.ach.save();
+            }
+            if self.season.dirty && self.screenshot.is_none() {
+                season::save(&mut self.season);
             }
             self.ach.push_stats(self.api.as_mut());
             let account = self.steam.as_ref().map_or(0, |s| s.me);
@@ -4867,7 +4909,7 @@ fn gallery_pose(g: &mut Game, page: &str) {
         f.stun_t = 0.0;
         f.reload_t = 0.0;
         f.spawn_prot = 0.0;
-        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0, body: (i % chars::COUNT) as u8, outfit: 0 };
+        f.loadout = Loadout { melee: Weapon::Katana, gun1: Weapon::Shotgun, gun2: Weapon::Revolver, item: 0, body: (i % chars::COUNT) as u8, outfit: 0, finish: 0 };
         f.cur = 2;
         f.weapon = Weapon::Revolver;
         let fwd = f.fwd();
@@ -7759,6 +7801,10 @@ impl App {
     fn menu_ui(&mut self, ctx: &egui::Context, rect: Rect, page: Page) -> bool {
         self.sync_steam_name();
         self.quick_play_tick();
+        // the season start screen covers the menu (crate::season_ui)
+        if self.season_ui.start_open {
+            return false;
+        }
         // your fighter wears your Ledger gear while you look at it
         {
             let want = self.ledger.current().clone();
@@ -7852,13 +7898,19 @@ impl App {
         if matches!(page, Page::Main | Page::Play) {
             p.text(Pos2::new(rect.left() + 16.0, rect.bottom() - 12.0), Align2::LEFT_BOTTOM, VERSION, FontId::proportional(13.0), Color32::from_rgba_unmultiplied(230, 220, 210, 170));
             let mut report = false;
+            let mut patch = false;
             egui::Area::new(egui::Id::unique("report-bug")).fixed_pos(Pos2::new(rect.left() + 14.0, rect.bottom() - 64.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-                let b = egui::Button::new(egui::RichText::new("Report a bug").size(14.0)).min_size(Vec2::new(130.0, 28.0));
-                report = ui.add(b).on_hover_text("Saves a bug report and opens the folder with it, your crash and freeze logs: send the newest files to the developer").clicked();
+                ui.horizontal(|ui| {
+                    let b = egui::Button::new(egui::RichText::new("Report a bug").size(14.0)).min_size(Vec2::new(130.0, 28.0));
+                    report = ui.add(b).on_hover_text("Saves a bug report and opens the folder with it, your crash and freeze logs: send the newest files to the developer").clicked();
+                    if ui.add(egui::Button::new(egui::RichText::new("Patch notes").size(14.0)).min_size(Vec2::new(120.0, 28.0))).clicked() {
+                        patch = true;
+                    }
+                });
             });
             // what it did, in a box beside the button
             if let Some((note, _)) = &self.report_note {
-                egui::Area::new(egui::Id::unique("report-note")).fixed_pos(Pos2::new(rect.left() + 180.0, rect.bottom() - 58.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+                egui::Area::new(egui::Id::unique("report-note")).fixed_pos(Pos2::new(rect.left() + 300.0, rect.bottom() - 58.0)).order(egui::Order::Foreground).show(ctx, |ui| {
                     egui::Frame::new().fill(Color32::from_rgba_unmultiplied(10, 9, 18, 220)).corner_radius(4.0).inner_margin(6.0).show(ui, |ui| {
                         ui.set_max_width((rect.width() * 0.5).min(620.0));
                         ui.label(egui::RichText::new(note.as_str()).size(12.5).color(Color32::from_rgb(255, 210, 170)));
@@ -7868,7 +7920,13 @@ impl App {
             if report {
                 self.report_bug();
             }
+            if patch {
+                self.screen = Screen::Menu(Page::PatchNotes);
+                return false;
+            }
         }
+        // the season page shows its picked reward on the menu's fighter
+        self.season_preview(page);
         let mut next: Option<Page> = None;
         let mut action: Option<Box<dyn FnOnce(&mut App)>> = None;
         let pos = Pos2::new(rect.left() + 48.0, rect.top() + 150.0);
@@ -7885,7 +7943,7 @@ impl App {
             next = Some(Page::Main);
         }
         let width = match page {
-            Page::Settings | Page::Mastery | Page::Lore | Page::Replays | Page::Achievements => 600.0,
+            Page::Settings | Page::Mastery | Page::Lore | Page::Replays | Page::Achievements | Page::Season | Page::Profile | Page::PatchNotes => 600.0,
             Page::Ranked => 520.0,
             Page::Play => 520.0,
             _ => 380.0,
@@ -8171,6 +8229,21 @@ impl App {
                 }
                 Page::Achievements => {
                     if let Some(n) = self.achievements_page(ui) {
+                        next = Some(n);
+                    }
+                }
+                Page::Season => {
+                    if let Some(n) = self.season_page(ui) {
+                        next = Some(n);
+                    }
+                }
+                Page::Profile => {
+                    if let Some(n) = self.profile_page(ui) {
+                        next = Some(n);
+                    }
+                }
+                Page::PatchNotes => {
+                    if let Some(n) = self.patch_notes_page(ui) {
                         next = Some(n);
                     }
                 }
@@ -9112,6 +9185,14 @@ impl App {
                     (one(ui, a), one(ui, b))
                 }).inner
             };
+            let (seas, prof) = pair(ui, "Season", "Profile");
+            if seas {
+                self.season_ui.scroll_once = true;
+                *next = Some(Page::Season);
+            }
+            if prof {
+                *next = Some(Page::Profile);
+            }
             let (stats, achs) = pair(ui, "Stats", "Achievements");
             if stats {
                 *next = Some(Page::Stats);

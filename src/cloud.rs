@@ -18,6 +18,7 @@ pub fn files(account: u64) -> Vec<(String, PathBuf)> {
         ("career.txt".into(), crate::platform::data_file("career.txt")),
         ("hub.txt".into(), crate::hub_ui::hub_save_path()),
         ("achievements.txt".into(), crate::achievements::path()),
+        ("season.txt".into(), crate::season::path()),
     ];
     if let Some(p) = crate::items::bank_path(account) {
         v.push((p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), Some(p)));

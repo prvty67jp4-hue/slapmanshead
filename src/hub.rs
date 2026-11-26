@@ -283,7 +283,8 @@ pub const OUTFIT_BYTES: usize = SLOT_COUNT * 4 + 2;
 
 /// The dyes the vault gives (locked until found).
 pub fn dye_locked(d: u8, earned: &Earned) -> bool {
-    crate::raid::loot_of_dye(d).is_some_and(|l| !earned.loot_owned(l))
+    // (and a season dye not earned yet: crate::season)
+    crate::raid::loot_of_dye(d).is_some_and(|l| !earned.loot_owned(l)) || crate::season::dye_locked(d)
 }
 
 /// A title's words (a crate::raid::LOOT id).
@@ -321,7 +322,8 @@ impl Outfit {
             }
             let _ = k;
         }
-        if self.pet != 0 && !earned.loot_owned(crate::raid::L_PET) {
+        // (the vault's Cinder Wisp, or a season's pet)
+        if self.pet == 1 && !earned.loot_owned(crate::raid::L_PET) || self.pet >= 2 && !crate::season::pet_owned(self.pet) {
             self.pet = 0;
         }
         if title_text(self.title).is_none() || !earned.loot_owned(self.title) {
@@ -359,7 +361,10 @@ impl Outfit {
                 o.dyes[k][z] = b[SLOT_COUNT + k * 3 + z].min(n);
             }
         }
-        o.pet = b.get(SLOT_COUNT * 4).copied().unwrap_or(0).min(1);
+        o.pet = b.get(SLOT_COUNT * 4).copied().unwrap_or(0);
+        if o.pet >= 2 && crate::season::pet_colour(o.pet).is_none() {
+            o.pet = 0;
+        }
         o.title = b.get(SLOT_COUNT * 4 + 1).copied().unwrap_or(0).min(crate::raid::LOOT.len() as u8 - 1);
         Some(o)
     }
@@ -385,6 +390,13 @@ pub enum Emote {
     Salute = 6,
     Clap = 7,
     Laugh = 8,
+    // season emotes (crate::season: earned on a season's track)
+    Kneel = 9,
+    Point = 10,
+    Shrug = 11,
+    MoonBow = 12,
+    Toast = 13,
+    Brood = 14,
 }
 
 impl Emote {
@@ -400,11 +412,17 @@ impl Emote {
             6 => Emote::Salute,
             7 => Emote::Clap,
             8 => Emote::Laugh,
+            9 => Emote::Kneel,
+            10 => Emote::Point,
+            11 => Emote::Shrug,
+            12 => Emote::MoonBow,
+            13 => Emote::Toast,
+            14 => Emote::Brood,
             _ => Emote::None,
         }
     }
     pub fn name(self) -> &'static str {
-        ["", "Wave", "Bow", "Dance", "Sit", "Cheer", "Salute", "Clap", "Laugh"][self as usize]
+        ["", "Wave", "Bow", "Dance", "Sit", "Cheer", "Salute", "Clap", "Laugh", "Kneel", "Point", "Shrug", "Moonward Bow", "Raise a Toast", "Brood"][self as usize]
     }
     /// How long it plays (dancing and sitting keep going until you move).
     pub fn length(self) -> Option<f32> {
@@ -416,8 +434,15 @@ impl Emote {
             Emote::Salute => Some(2.2),
             Emote::Clap => Some(2.8),
             Emote::Laugh => Some(2.6),
+            Emote::Kneel | Emote::Brood => None,
+            Emote::Point => Some(2.0),
+            Emote::Shrug => Some(1.8),
+            Emote::MoonBow => Some(2.6),
+            Emote::Toast => Some(2.4),
         }
     }
+    /// The season emotes, in the order the wheel's inner ring shows them.
+    pub const SEASON: [Emote; 6] = [Emote::Kneel, Emote::Point, Emote::Shrug, Emote::MoonBow, Emote::Toast, Emote::Brood];
 }
 
 /// A fighter's hub state: their look, their emote (and when it began, game time), where they
@@ -798,6 +823,8 @@ pub enum HubEv {
     GiftOffer { gid: u32, from: u8, to: u8, item: [u8; 2], n: u16, create: bool },
     GiftAnswer { gid: u32, by: u8, accept: bool },
     GiftDone { gid: u32, from: u8, to: u8, item: [u8; 2], n: u16, ok: bool, why: String },
+    /// (player, relayed) my profile card (crate::season::Card), sent now and then.
+    Card { who: u8, card: Vec<u8> },
 }
 
 /// Scoreboards: one per aim drill, then the Rooftop Run (lower is better there), then recent duels.
@@ -1021,6 +1048,10 @@ impl HubEv {
                 b.push(*ok as u8);
                 wb_long(&mut b, why);
             }
+            HubEv::Card { who, card } => {
+                b.extend_from_slice(&[29, *who, card.len().min(160) as u8]);
+                b.extend(card.iter().take(160));
+            }
         }
         b
     }
@@ -1033,7 +1064,7 @@ impl HubEv {
                 let w = who(r.u8()?);
                 HubEv::Look { who: w, look: Outfit::from_bytes(r.bytes(OUTFIT_BYTES)?)? }
             }
-            2 => HubEv::Emote { who: who(r.u8()?), emote: r.u8()?.min(8) },
+            2 => HubEv::Emote { who: who(r.u8()?), emote: r.u8()?.min(14) },
             3 => HubEv::Sit { who: who(r.u8()?), seat: r.u16()? },
             4 => HubEv::Challenge { from: who(r.u8()?), to: r.u8()?, kind: r.u8()?.min(1) },
             5 => HubEv::Answer { id: r.u16()?, by: who(r.u8()?), accept: r.u8()? == 1 },
@@ -1110,13 +1141,18 @@ impl HubEv {
             26 => HubEv::GiftOffer { gid: r.u32()?, from: who(r.u8()?), to: who(r.u8()?), item: [r.u8()?, r.u8()?], n: r.u16()?, create: r.u8()? == 1 },
             27 => HubEv::GiftAnswer { gid: r.u32()?, by: who(r.u8()?), accept: r.u8()? == 1 },
             28 => HubEv::GiftDone { gid: r.u32()?, from: who(r.u8()?), to: who(r.u8()?), item: [r.u8()?, r.u8()?], n: r.u16()?, ok: r.u8()? == 1, why: r.long()? },
+            29 => {
+                let w = who(r.u8()?);
+                let n = r.u8()? as usize;
+                HubEv::Card { who: w, card: r.bytes(n)?.to_vec() }
+            }
             _ => return None,
         })
     }
 
     /// Whether the host passes a player's message straight on to everyone.
     pub fn relayed(&self) -> bool {
-        matches!(self, HubEv::Look { .. } | HubEv::Emote { .. })
+        matches!(self, HubEv::Look { .. } | HubEv::Emote { .. } | HubEv::Card { .. })
     }
 }
 
@@ -1139,6 +1175,8 @@ pub struct Hub {
     pub run: RunState,
     pub ghost: Vec<GhostFrame>,
     pub run_best: u32,
+    /// Everyone's profile cards as they last sent them (crate::season::Card bytes), by slot.
+    pub cards: std::collections::HashMap<usize, Vec<u8>>,
     /// (this computer) a challenge waiting for our answer, and an aim-room invitation.
     pub asked: Option<Challenge>,
     pub duo_ask: Option<(u8, u8)>,
@@ -1175,6 +1213,7 @@ impl Hub {
             run: RunState { next: 0, ..Default::default() },
             ghost: Vec::new(),
             run_best: 0,
+            cards: std::collections::HashMap::new(),
             asked: None,
             duo_ask: None,
             toasts: Vec::new(),
@@ -1458,6 +1497,13 @@ impl Game {
                 if w < self.f.len() {
                     self.f[w].hub.look = look;
                     self.apply_look_weapon(w);
+                }
+            }
+            HubEv::Card { who, card } => {
+                // (a player only speaks for themselves)
+                let w = if auth { from } else { who as usize };
+                if let Some(h) = self.hub.as_mut() {
+                    h.cards.insert(w, card);
                 }
             }
             HubEv::Emote { who, emote } => {

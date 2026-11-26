@@ -1,0 +1,103 @@
+# A Duel Rush season. Every file in this folder (season1.txt, season2.txt...) is read when the
+# game starts, so a new season is a new file: no code. Lines are "key = value"; # starts a note.
+#
+# id, name, start (a Monday, UTC), weeks, the XP for each tier (50 tiers), the XP for each
+# prestige level after tier 50, the season's colour (r,g,b), and its story ("theme" lines join).
+id = 1
+name = The Red Moon
+start = 2026-11-23
+weeks = 10
+tier_xp = 3000
+prestige_xp = 4000
+colour = 205,46,52
+theme = Once a generation the moon over Varrow turns the colour of an old wound, and the Ashblood Regent, Lord Vesper Kael, wakes on the roof of the Ashen Vault.
+theme = The Court calls it the Red Moon and closes its ledgers early. The pits stay open. Under that light every debt is called in, and every duellist who fights beneath it carries a little of its colour home.
+theme = Fight through the season to earn the Regent's crimson: coats, lacquers, banners, titles, and at the last, the Moonlit Ashhound that walks at his side.
+
+# Rewards: "tier N = kind | name | details" (all cosmetic):
+#   outfit    | name | coat r,g,b | hem r,g,b        (a coat or cape colour for any fighter)
+#   dye       | the name of a dye in the wardrobe's palette (season dyes stay locked until earned)
+#   finish    | name | r,g,b | shine 0-1            (a weapon finish)
+#   emote     | name | kneel, point, shrug, moonbow, toast or brood
+#   title     | the words under your name
+#   banner    | name | top r,g,b | bottom r,g,b | moon, stripes, chevron or plain
+#   nameplate | name | fill r,g,b | text r,g,b
+#   pet       | name | r,g,b
+tier 1 = title | Moonwatcher
+tier 2 = nameplate | Dusk Ledger | 52,22,28 | 255,214,190
+tier 3 = finish | Rust-Red Lacquer | 150,46,40 | 0.2
+tier 4 = banner | Red Moon Rising | 120,22,30 | 26,10,18 | moon
+tier 5 = dye | Regent's Crimson
+tier 6 = emote | Moonward Bow | moonbow
+tier 7 = outfit | Bloodmoon Coat | 128,22,30 | 210,170,120
+tier 8 = title | Called by the Moon
+tier 9 = nameplate | Waxlight | 90,64,30 | 255,236,200
+tier 10 = finish | Vault Brass | 196,150,70 | 0.45
+tier 11 = banner | Court in Session | 60,20,24 | 140,110,60 | stripes
+tier 12 = dye | Blood Moon
+tier 13 = emote | Raise a Toast | toast
+tier 14 = title | Debt Collector
+tier 15 = outfit | Ashen Rose Mantle | 120,74,84 | 230,200,200
+tier 16 = finish | Moonlit Silver | 205,212,230 | 0.6
+tier 17 = nameplate | Night Watch | 20,26,44 | 190,210,255
+tier 18 = banner | The Long Night | 18,18,36 | 70,20,40 | moon
+tier 19 = dye | Moonlit Silver
+tier 20 = emote | Kneel Before the Court | kneel
+tier 21 = title | Red-Handed
+tier 22 = finish | Cinder Edge | 230,110,40 | 0.8
+tier 23 = outfit | Regent's Velvet | 74,12,30 | 200,150,70
+tier 24 = nameplate | Gilded Writ | 120,86,30 | 255,240,190
+tier 25 = banner | Chevron of the Pits | 140,40,30 | 40,14,14 | chevron
+tier 26 = dye | Ashen Rose
+tier 27 = emote | That Way | point
+tier 28 = title | Unpaid and Unafraid
+tier 29 = finish | Bloodglass | 170,10,30 | 0.9
+tier 30 = outfit | Vigil Grey | 70,70,78 | 205,46,52
+tier 31 = nameplate | Crimson Seal | 110,14,22 | 255,200,170
+tier 32 = banner | Ledger Lines | 30,24,20 | 90,70,50 | stripes
+tier 33 = title | Moon-Touched
+tier 34 = emote | Who, Me? | shrug
+tier 35 = finish | Eclipse Black | 22,20,26 | 0.5
+tier 36 = outfit | Ember Regalia | 170,60,26 | 255,200,110
+tier 37 = nameplate | Rooftop Run | 30,50,52 | 180,240,230
+tier 38 = banner | Over the Tiles | 40,60,70 | 14,20,26 | chevron
+tier 39 = title | The Regent's Shadow
+tier 40 = emote | Brood | brood
+tier 41 = finish | Regent's Gold | 230,180,60 | 1.0
+tier 42 = outfit | Midnight Writ | 26,26,60 | 205,46,52
+tier 43 = nameplate | Ashblood | 90,10,20 | 255,120,110
+tier 44 = banner | The Vault Roof | 80,12,22 | 12,8,14 | moon
+tier 45 = title | Blood on the Ledger
+tier 46 = finish | Red Moon | 220,40,48 | 1.0
+tier 47 = outfit | Lord Kael's Cloak | 100,8,20 | 230,190,90
+tier 48 = nameplate | Regent's Hall | 40,8,14 | 255,215,140
+tier 49 = banner | Under the Red Moon | 205,46,52 | 30,8,14 | moon
+tier 50 = pet | Moonlit Ashhound | 230,60,64
+
+# Prestige after tier 50: the border colour of each prestige level (the last one repeats).
+prestige = 196,128,74 | 200,208,220 | 255,200,70 | 230,60,64 | 190,120,255
+
+# Season-end rewards by your peak Ranked 1v1 rank this season (0 Ash, 1 Iron, 2 Brass,
+# 3 Silver Writ, 4 Gold Writ, 5 Court, 6 Magistrate, 7 Ledger of Champions): every one up to it.
+rank 1 = title | Iron Under the Red Moon
+rank 2 = nameplate | Brass of the Red Moon | 110,76,30 | 255,220,160
+rank 3 = banner | Silver Writ, Red Moon | 150,156,170 | 60,20,28 | moon
+rank 4 = finish | Gold Writ Lacquer | 255,205,80 | 0.9
+rank 5 = title | Courtier of the Red Moon
+rank 6 = outfit | Magistrate's Crimson | 150,20,26 | 255,220,150
+rank 7 = banner | Champion of the Red Moon | 190,120,255 | 60,10,30 | moon
+
+# Season challenges: "challenge = what goal | text | xp" and, optionally, "| a reward" as above.
+# What: wins, wins_as:<0-3 fighter>, duel_wins, kills, headshots, parries, executions, writs,
+# matches, waves, boss:<room 0-4>, vault, vault_hard, rooftop, rooftop_under:<seconds>,
+# table:<chess|checkers|connect4>, pit, multikills, ranked_wins, hub_games.
+challenge = wins 50 | Win 50 matches under the red moon | 8000
+challenge = headshots 300 | Land 300 headshot kills | 6000
+challenge = parries 150 | Perfectly parry 150 blows | 6000
+challenge = executions 40 | Perform 40 executions | 6000
+challenge = boss:3 3 | Defeat the Ashblood Regent 3 times | 8000 | title | Moonslayer
+challenge = vault_hard 1 | Clear the Ashen Vault on Sealed Writ | 10000 | banner | Sealed Beneath the Moon | 90,8,20 | 20,6,10 | chevron
+challenge = ranked_wins 25 | Win 25 Ranked 1v1 matches | 8000
+challenge = rooftop_under:45 1 | Finish the Rooftop Run in under 45 seconds | 5000
+challenge = hub_games 20 | Win 20 games at the Varrow tables or in the Court pits | 5000
+challenge = writs 20 | Claim 20 Writs | 6000 | nameplate | Writ-Taker | 70,10,18 | 255,180,160

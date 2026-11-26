@@ -472,6 +472,18 @@ impl App {
                         ui_state.wheel = false;
                     }
                 }
+                // the season emotes earned, on an outer ring between the others
+                let extra: Vec<Emote> = Emote::SEASON.iter().copied().filter(|e| crate::season::emote_owned(*e)).collect();
+                for (k, e) in extra.iter().enumerate() {
+                    let a = (k as f32 + 0.5) / 8.0 * std::f32::consts::TAU;
+                    let p = c + Vec2::new(a.sin() * r * 1.75, -a.cos() * r * 1.75);
+                    let b = Rect::from_center_size(p, Vec2::new(126.0, 36.0) * s);
+                    let resp = ui.put(b, egui::Button::new(egui::RichText::new(e.name()).size(14.0 * s).color(Color32::from_rgb(255, 170, 160))));
+                    if resp.clicked() {
+                        game.hub_emote(*e);
+                        ui_state.wheel = false;
+                    }
+                }
                 ui.painter().text(c, Align2::CENTER_CENTER, "EMOTES", FontId::proportional(18.0 * s), ACCENT);
             });
         }
@@ -539,7 +551,20 @@ impl App {
         // when they would overlap in a crowd (a name with no room left is left out); an emote's
         // name shows under it only for its first moments
         for (sp, size, a, name, emote, role, rank) in Self::name_tags(g, cam, s) {
-            let col = Color32::from_rgba_unmultiplied(235, 230, 220, (a * 235.0) as u8);
+            let mut col = Color32::from_rgba_unmultiplied(235, 230, 220, (a * 235.0) as u8);
+            // their profile card: a season nameplate behind the name, their title under it
+            let card = g.f.iter().position(|f| f.present && f.name == name).and_then(|k| h.cards.get(&k)).and_then(|b| crate::season::Card::from_bytes(b));
+            if let Some(c) = &card {
+                if let Some(crate::season::Reward::Nameplate { fill, text }) = crate::season::reg().items.get(c.nameplate as usize).map(|i| &i.reward) {
+                    let w = p.layout_no_wrap(name.clone(), FontId::proportional(size), col).size().x;
+                    let r = Rect::from_center_size(Pos2::new(sp.x, sp.y - size * 0.58), Vec2::new(w + size * 1.1, size * 1.3));
+                    p.rect_filled(r, size * 0.3, Color32::from_rgba_unmultiplied(fill[0], fill[1], fill[2], (a * 210.0) as u8));
+                    col = Color32::from_rgba_unmultiplied(text[0], text[1], text[2], (a * 245.0) as u8);
+                }
+                if let Some(t) = c.title_text() {
+                    text_shadow(p, sp + Vec2::new(0.0, size * 0.85), Align2::CENTER_BOTTOM, t, size * 0.72, Color32::from_rgba_unmultiplied(255, 205, 170, (a * 200.0) as u8));
+                }
+            }
             text_shadow(p, sp, Align2::CENTER_BOTTOM, &name, size, col);
             // the owner's gold crown, an admin's silver one, before the name
             if role > 0 {
@@ -1029,6 +1054,10 @@ fn wardrobe_screen(ctx: &egui::Context, rect: Rect, s: f32, g: &mut Game, st: &m
                             ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
                             for (k, (name, _)) in crate::gear::DYES.iter().enumerate() {
                                 let k = k as u8;
+                                // (season dyes show once a season's track has given them)
+                                if crate::season::dye_locked(k) {
+                                    continue;
+                                }
                                 let col = dye_color(k);
                                 let resp = tile(ui, Vec2::splat(11.5 * s), cur == k, true, |p, r| {
                                     p.rect_filled(r.expand(2.0), 3.0, col);

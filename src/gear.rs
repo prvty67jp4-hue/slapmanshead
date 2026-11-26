@@ -512,7 +512,7 @@ impl Rules {
 // ---------------------------------------------------------------- loadouts
 
 /// Dyes for gear with dye zones (the coat, its trim, an accent): name and colour (linear).
-pub const DYES: [(&str, [f32; 3]); 27] = [
+pub const DYES: [(&str, [f32; 3]); 31] = [
     ("Oiled Brown", [0.20, 0.11, 0.05]),
     ("Brass", [0.62, 0.42, 0.14]),
     ("Teal", [0.03, 0.42, 0.40]),
@@ -543,7 +543,14 @@ pub const DYES: [(&str, [f32; 3]); 27] = [
     ("Ember Gold", [0.95, 0.48, 0.05]),
     // (the Ashblood Regent's)
     ("Red Moon", [0.62, 0.02, 0.035]),
+    // season dyes (crate::season: locked until a season's track gives them)
+    ("Regent's Crimson", [0.36, 0.01, 0.04]),
+    ("Blood Moon", [0.55, 0.06, 0.03]),
+    ("Moonlit Silver", [0.68, 0.70, 0.80]),
+    ("Ashen Rose", [0.45, 0.22, 0.26]),
 ];
+/// The first season dye (they run to the end of DYES).
+pub const SEASON_DYES: u8 = 27;
 /// The dye zones, and the Rig's own colours: oiled brown canvas, brass trim, a teal accent.
 pub const DYE_ZONES: [&str; 3] = ["Coat", "Trim", "Accent"];
 pub const DEFAULT_DYES: [u8; 3] = [0, 1, 2];

@@ -751,6 +751,10 @@ impl App {
         });
         ui.label(egui::RichText::new(role.name()).color(Color32::from_gray(180)));
         let mut next = None;
+        if ui.button("View profile card").clicked() {
+            self.season_ui.view = Some(who);
+            *close = true;
+        }
         if ui.button("Challenge to a duel").clicked() {
             next = Some(HubPanel::Challenge(who));
         }

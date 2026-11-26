@@ -632,6 +632,9 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
             Emote::Sit if f.hub.seat != crate::hub::SEAT_NONE => Play::new("Sitting_Idle_Loop", 1.0, true),
             Emote::Sit => Play::new("Crouch_Idle_Loop", 0.6, true),
             Emote::Laugh => Play::new("Idle_Talking_Loop", 1.3, true),
+            // (season emotes) down on one knee; a low, brooding crouch
+            Emote::Kneel => Play::new("Crouch_Idle_Loop", 0.4, true),
+            Emote::Brood => Play::new("Crouch_Idle_Loop", 0.25, true),
             _ => Play::new("Idle_Loop", 1.0, true),
         }
     } else if speed > 0.6 {
@@ -1036,6 +1039,49 @@ fn animate_with(rig: &Rig, st: &mut CharState, f: &Fighter, pos: V3, now: f32, t
                 turn(&mut pose, b.head, Vec3::X, -0.22 * k);
                 ik(&mut pose, true, chest + v(0.1, -0.3, 0.24), v(0.5, -0.4, -0.2));
                 ik(&mut pose, false, chest + v(-0.1, -0.3, 0.24), v(-0.5, -0.4, -0.2));
+            }
+            // ---- the season emotes
+            Emote::Kneel => {
+                // head bowed, a fist to the heart, the other hand on the knee
+                turn(&mut pose, b.head, Vec3::X, 0.35 * k);
+                ik(&mut pose, true, chest + v(0.05, -0.02, 0.16), v(0.5, -0.5, 0.0));
+                ik(&mut pose, false, sh_l + v(-0.08, -0.5, 0.32), v(-0.4, -0.2, -0.2));
+            }
+            Emote::Point => {
+                // the arm straight out, a little sway as it holds
+                let hold = (et * 3.0).sin() * 0.02;
+                ik(&mut pose, true, sh_r + v(0.08, 0.06 + hold, 0.62), v(0.5, -0.3, 0.0));
+                turn(&mut pose, b.head, Vec3::Y, -0.15 * k);
+            }
+            Emote::Shrug => {
+                // palms up, shoulders up, head tilted
+                let up = (et * 2.2).sin().abs() * 0.04;
+                ik(&mut pose, true, sh_r + v(0.34, -0.22 + up, 0.2), v(0.4, -0.6, -0.1));
+                ik(&mut pose, false, sh_l + v(-0.34, -0.22 + up, 0.2), v(-0.4, -0.6, -0.1));
+                turn(&mut pose, b.head, Vec3::Z, 0.22 * k);
+            }
+            Emote::MoonBow => {
+                // a deep courtly bow, one arm swept wide, the other across the chest
+                for bone in [b.spine2, b.spine3] {
+                    turn(&mut pose, bone, Vec3::X, 0.55 * k);
+                }
+                turn(&mut pose, b.head, Vec3::X, 0.25 * k);
+                ik(&mut pose, true, sh_r + v(0.55, -0.12, -0.12), v(0.3, -0.4, -0.4));
+                ik(&mut pose, false, chest + v(0.04, -0.1, 0.18), v(-0.5, -0.5, 0.0));
+            }
+            Emote::Toast => {
+                // a cup raised high, then brought to the lips
+                let sip = smooth01((et - 1.2) / 0.4) * (1.0 - smooth01((et - 2.0) / 0.3));
+                let raised = sh_r + v(0.16, 0.5, 0.18);
+                let lips = head + v(0.04, -0.08, 0.14);
+                ik(&mut pose, true, raised.lerp(lips, sip), v(0.5, -0.3, -0.2));
+                turn(&mut pose, b.head, Vec3::X, -0.25 * sip * k);
+            }
+            Emote::Brood => {
+                // elbow on the knee, chin on the fist
+                turn(&mut pose, b.spine3, Vec3::X, 0.25 * k);
+                ik(&mut pose, true, head + v(0.02, -0.14, 0.12), v(0.5, -0.6, 0.2));
+                ik(&mut pose, false, sh_l + v(-0.05, -0.48, 0.3), v(-0.4, -0.2, -0.2));
             }
             _ => {}
         }

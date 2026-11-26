@@ -210,9 +210,11 @@ impl App {
             Some((room, was_beaten, wipes)) => {
                 if beaten && (room != r.room || !was_beaten) {
                     self.ach.boss_down(r.room as u8);
+                    self.season.boss_down(crate::season::reg(), crate::season::day_now(), r.room as u8, false);
                     if r.stage == Stage::Done {
                         let ms = if r.result_ms > 0 { r.result_ms } else { (r.total_time * 1000.0) as u32 };
                         self.ach.vault_cleared(ms, r.hard);
+                        self.season.vault_cleared(crate::season::reg(), crate::season::day_now(), r.hard, false);
                     }
                 }
                 if r.wipes > wipes {

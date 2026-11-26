@@ -301,6 +301,8 @@ pub struct Record {
     pub stats_dirty: bool,
     /// Cosmetics owned when an admin session began (what it adds is set aside).
     gate_base: Option<u32>,
+    /// A record just started from the career: what's already earned unlocks without a toast each.
+    quiet: bool,
 }
 
 fn now_secs() -> u64 {
@@ -323,7 +325,7 @@ impl Record {
     pub fn seeded(career: &Career) -> Record {
         let mut clean = career.clone();
         clean.notes.clear();
-        Record { clean, dirty: true, stats_dirty: true, ..Default::default() }
+        Record { clean, dirty: true, stats_dirty: true, quiet: true, ..Default::default() }
     }
 
     pub fn save(&mut self) {
@@ -541,7 +543,9 @@ impl Record {
             let (cur, goal) = self.progress(def.goal);
             if cur >= goal {
                 self.unlocked.insert(def.id.to_string(), now_secs());
-                self.toasts.push((k, 0.0));
+                if !self.quiet {
+                    self.toasts.push((k, 0.0));
+                }
                 api.ach_set(&api_name(def.id));
                 new.push(k);
             }
@@ -550,6 +554,7 @@ impl Record {
             self.dirty = true;
             self.push_stats(api);
         }
+        self.quiet = false;
         new
     }
 
@@ -985,6 +990,15 @@ mod tests {
         assert_eq!(back.life, r.life);
         assert_eq!(back.unlocked, r.unlocked);
         assert_eq!((back.clean.wins, back.clean.kills), (12, 40));
+        // a record started from an old career unlocks what's earned without a toast for each
+        let mut first = Record::seeded(&Career { wins: 12, ..Default::default() });
+        let mut quiet_steam = FakeSteam::new(9);
+        assert!(!first.check(&mut quiet_steam, false).is_empty());
+        assert!(first.toasts.is_empty() && first.is_unlocked("win_10"));
+        first.feed(CareerEv::Parry, None, career::today());
+        first.life.parries = 100;
+        first.check(&mut quiet_steam, false);
+        assert_eq!(first.toasts.len(), 1, "later ones are toasted");
         // another computer unlocked one on Steam; this one has one Steam hasn't heard of
         let mut steam = FakeSteam::new(1);
         steam.achievements.insert("ACH_WIN_10".into(), true);
