@@ -1507,6 +1507,14 @@ impl Game {
 
     /// What the host says (or what this computer decided itself).
     fn hub_apply(&mut self, e: HubEv) {
+        let mut table_won = None;
+        self.hub_apply_inner(e, &mut table_won);
+        if let Some((kind, hard)) = table_won {
+            self.career.push(crate::game::CareerEv::TableWin { kind, hard });
+        }
+    }
+
+    fn hub_apply_inner(&mut self, e: HubEv, table_won: &mut Option<(u8, bool)>) {
         // (the admin events the host broadcasts act here too: crate::commands)
         if matches!(e, HubEv::Announce { .. } | HubEv::World { .. } | HubEv::Move { .. } | HubEv::Mute { .. } | HubEv::Reply { .. }) {
             let me = self.local;
@@ -1561,13 +1569,17 @@ impl Game {
                 if in_now && !in_before {
                     h.fade = Some((1.2, format!("Entering the {}", if p == 0 { "West Court Pit" } else { "East Court Pit" })));
                 }
+                let won = in_before && !in_now && was.and_then(|d| d.winner()).is_some_and(|w| was.is_some_and(|d| d.who[w] as usize == me));
                 if in_before && !in_now {
                     h.fade = Some((1.0, "Back to Varrow Centre".into()));
-                    if was.and_then(|d| d.winner()).is_some_and(|w| was.is_some_and(|d| d.who[w] as usize == me)) {
+                    if won {
                         h.earned.pit_wins += 1;
                     }
                 }
                 self.pit_moves(p, was, duel);
+                if won {
+                    self.career.push(crate::game::CareerEv::PitWin);
+                }
             }
             HubEv::TableState { table, ver, board, seats, outcome, last } => {
                 if let Some(t) = h.tables.get_mut(table as usize) {
@@ -1576,7 +1588,16 @@ impl Game {
                             t.board = b;
                         }
                         t.seats = [Sitter::from_u8(seats[0]), Sitter::from_u8(seats[1])];
+                        let was = t.outcome;
                         t.outcome = Outcome::from_u8(outcome);
+                        // (a guest's own win at a table: the host's side counts its own)
+                        if self.kind == Kind::Client && was != t.outcome {
+                            if let Outcome::Win(s) = t.outcome {
+                                if t.seats[s as usize] == Sitter::Player(me as u8) {
+                                    *table_won = Some((t.board.kind() as u8, t.seats[1 - s as usize] == Sitter::Bot(Level::Hard)));
+                                }
+                            }
+                        }
                         if t.last != last {
                             t.moved_t = now;
                         }
@@ -1943,10 +1964,18 @@ impl Game {
     fn host_table_done(&mut self, t: usize) {
         let Some(h) = self.hub.as_mut() else { return };
         let tb = &h.tables[t];
+        let mut won = None;
         if let Outcome::Win(s) = tb.outcome {
-            if tb.seats[1 - s as usize] == Sitter::Bot(Level::Hard) && tb.seats[s as usize] == Sitter::Player(self.local as u8) {
+            let hard = tb.seats[1 - s as usize] == Sitter::Bot(Level::Hard);
+            if tb.seats[s as usize] == Sitter::Player(self.local as u8) {
+                won = Some((tb.board.kind() as u8, hard));
+            }
+            if hard && tb.seats[s as usize] == Sitter::Player(self.local as u8) {
                 h.earned.table_hard = true;
             }
+        }
+        if let Some((kind, hard)) = won {
+            self.career.push(crate::game::CareerEv::TableWin { kind, hard });
         }
         self.host_send_table(t);
     }
@@ -2226,6 +2255,7 @@ impl Game {
                     h.toast(format!("Rooftop Run: {t:.2} s{}", if best { "  - your best!" } else { "" }));
                     let _ = name;
                     let who = me as u8;
+                    self.career.push(crate::game::CareerEv::Rooftop { ms });
                     self.hub_send(HubEv::Score { who, board: BOARD_RUN, value: ms });
                 } else {
                     let n = h.run.next;

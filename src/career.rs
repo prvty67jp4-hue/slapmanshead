@@ -282,6 +282,8 @@ impl Career {
                 self.count(Count::MultiKills);
                 0
             }
+            // (counted by crate::achievements, not here)
+            CareerEv::Chain(_) | CareerEv::Parry | CareerEv::Rooftop { .. } | CareerEv::PitWin | CareerEv::TableWin { .. } => 0,
         };
         // challenges finished by this
         let set = weekly_set(self.week);

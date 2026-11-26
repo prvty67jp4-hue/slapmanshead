@@ -1,0 +1,19 @@
+"lang"
+{
+	"Language"	"english"
+	"Tokens"
+	{
+		"#Status_Menu"	"In the menus"
+		"#Status_Hub"	"In the Varrow Centre"
+		"#Status_Ranked"	"Ranked 1v1 - %rank% - %score% on %map%"
+		"#Status_Match"	"%mode% on %map%"
+		"#Status_MatchScore"	"%mode% - %score% on %map%"
+		"#Status_Gauntlet"	"The Gauntlet - wave %wave%"
+		"#Status_Raid"	"Raiding the Ashen Vault - room %room%"
+		"#Status_RaidHard"	"Raiding the Ashen Vault (Sealed Writ) - room %room%"
+		"#Status_Training"	"Training with the dummies"
+		"#Status_Watching"	"Watching a match on %map%"
+		"#Status_Replays"	"Watching replays"
+		"#Status_Party"	"In a party of %size%"
+	}
+}

@@ -585,6 +585,15 @@ pub enum CareerEv {
     WritClaim { streak: u32 },
     /// Two kills in quick succession (or more).
     MultiKill,
+    /// Kills chained in quick succession (2 a double, 5 a rampage).
+    Chain(u32),
+    /// A perfect parry (a blade or a hook).
+    Parry,
+    /// Varrow Centre: the Rooftop Run finished (ms), a duel won in a pit, a game won at a table
+    /// (its crate::boards::GameKind, against the Hard bot or not).
+    Rooftop { ms: u32 },
+    PitWin,
+    TableWin { kind: u8, hard: bool },
 }
 /// A combo finished: the elimination hit's "weapon" (kill feed).
 pub const COMBO_TOOL: u8 = 22;
@@ -4626,6 +4635,9 @@ impl Game {
             if kk == self.local && chain == 2 {
                 self.career.push(CareerEv::MultiKill);
             }
+            if kk == self.local && chain >= 2 {
+                self.career.push(CareerEv::Chain(chain as u32));
+            }
         }
         if k == Some(self.local) && victim != self.local && self.is_enemy(self.local, victim) {
             self.streak = if self.time - self.last_kill_time < 4.0 { self.streak + 1 } else { 1 };
@@ -7462,6 +7474,9 @@ impl Game {
             }
             if b.guard && facing && b.guard_t <= PERFECT_PARRY && b.parry_lock <= 0.0 && !counter {
                 self.stat(j, |s| s.parries += 1);
+                if j == self.local {
+                    self.career.push(CareerEv::Parry);
+                }
                 // perfect parry: the attacker reels, open to a counter
                 let at = &mut self.f[i];
                 at.stun_t = STAGGER_TIME;
@@ -9679,6 +9694,9 @@ impl Game {
             // parried: the hook is knocked away and the thrower reels
             self.impact_fx(end, 4);
             self.stat(j, |s| s.parries += 1);
+            if j == self.local {
+                self.career.push(CareerEv::Parry);
+            }
             let f = &mut self.f[i];
             f.stun_t = f.stun_t.max(0.35);
             f.stagger_t = f.stagger_t.max(0.35);

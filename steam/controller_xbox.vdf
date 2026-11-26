@@ -1,0 +1,773 @@
+"controller_mappings"
+{
+	"version"		"3"
+	"revision"		"1"
+	"title"		"Duel Rush - Xbox"
+	"description"		"The default layout: move on the left stick, look on the right, shoot on the right trigger, guard on the left."
+	"creator"		"0"
+	"controller_type"		"controller_xbox360"
+	"Timestamp"		"0"
+	"group"
+	{
+		"id"		"0"
+		"mode"		"four_buttons"
+		"inputs"
+		{
+			"button_a"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_select"
+						}
+					}
+				}
+			}
+			"button_b"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_back"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"1"
+		"mode"		"dpad"
+		"inputs"
+		{
+			"dpad_north"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_up"
+						}
+					}
+				}
+			}
+			"dpad_south"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_down"
+						}
+					}
+				}
+			}
+			"dpad_west"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_left"
+						}
+					}
+				}
+			}
+			"dpad_east"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_right"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"2"
+		"mode"		"switches"
+		"inputs"
+		{
+			"left_bumper"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_prev_tab"
+						}
+					}
+				}
+			}
+			"right_bumper"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_next_tab"
+						}
+					}
+				}
+			}
+			"button_menu"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action menu_controls menu_close"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"3"
+		"mode"		"joystick_move"
+		"gameactions"
+		{
+			"menu_controls"		"menu_move"
+		}
+	}
+	"group"
+	{
+		"id"		"4"
+		"mode"		"joystick_move"
+		"gameactions"
+		{
+			"menu_controls"		"menu_scroll"
+		}
+	}
+	"group"
+	{
+		"id"		"5"
+		"mode"		"four_buttons"
+		"inputs"
+		{
+			"button_a"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls jump"
+						}
+					}
+				}
+			}
+			"button_b"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls slide"
+						}
+					}
+				}
+			}
+			"button_x"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls reload"
+						}
+					}
+				}
+			}
+			"button_y"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls next_weapon"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"6"
+		"mode"		"switches"
+		"inputs"
+		{
+			"left_bumper"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls ability"
+						}
+					}
+				}
+			}
+			"right_bumper"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls kick"
+						}
+					}
+				}
+			}
+			"button_escape"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls scoreboard"
+						}
+					}
+				}
+			}
+			"button_menu"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls pause"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"7"
+		"mode"		"joystick_move"
+		"inputs"
+		{
+			"click"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls dash"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"8"
+		"mode"		"joystick_move"
+		"inputs"
+		{
+			"click"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls finisher"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"9"
+		"mode"		"dpad"
+		"inputs"
+		{
+			"dpad_north"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls use_item"
+						}
+					}
+				}
+			}
+			"dpad_west"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls blade"
+						}
+					}
+				}
+			}
+			"dpad_east"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls swap_guns"
+						}
+					}
+				}
+			}
+			"dpad_south"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action combat_controls quick_chat"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"10"
+		"mode"		"joystick_move"
+		"gameactions"
+		{
+			"combat_controls"		"move"
+		}
+	}
+	"group"
+	{
+		"id"		"11"
+		"mode"		"joystick_move"
+		"gameactions"
+		{
+			"combat_controls"		"look"
+		}
+	}
+	"group"
+	{
+		"id"		"12"
+		"mode"		"trigger"
+		"gameactions"
+		{
+			"combat_controls"		"fire"
+		}
+	}
+	"group"
+	{
+		"id"		"13"
+		"mode"		"trigger"
+		"gameactions"
+		{
+			"combat_controls"		"guard"
+		}
+	}
+	"group"
+	{
+		"id"		"14"
+		"mode"		"four_buttons"
+		"inputs"
+		{
+			"button_a"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action hub_controls hub_jump"
+						}
+					}
+				}
+			}
+			"button_b"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action hub_controls hub_crouch"
+						}
+					}
+				}
+			}
+			"button_x"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action hub_controls hub_interact"
+						}
+					}
+				}
+			}
+			"button_y"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action hub_controls hub_wheel"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"15"
+		"mode"		"joystick_move"
+		"inputs"
+		{
+			"click"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action hub_controls hub_dash"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"16"
+		"mode"		"dpad"
+		"inputs"
+		{
+			"dpad_south"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action hub_controls hub_chat"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"17"
+		"mode"		"switches"
+		"inputs"
+		{
+			"button_escape"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action hub_controls hub_players"
+						}
+					}
+				}
+			}
+			"button_menu"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action hub_controls hub_menu"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"18"
+		"mode"		"joystick_move"
+		"gameactions"
+		{
+			"hub_controls"		"hub_move"
+		}
+	}
+	"group"
+	{
+		"id"		"19"
+		"mode"		"joystick_move"
+		"gameactions"
+		{
+			"hub_controls"		"hub_look"
+		}
+	}
+	"group"
+	{
+		"id"		"20"
+		"mode"		"trigger"
+		"gameactions"
+		{
+			"hub_controls"		"fire"
+		}
+	}
+	"group"
+	{
+		"id"		"21"
+		"mode"		"trigger"
+		"gameactions"
+		{
+			"hub_controls"		"guard"
+		}
+	}
+	"group"
+	{
+		"id"		"22"
+		"mode"		"switches"
+		"inputs"
+		{
+			"right_bumper"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action spectate_controls spec_next"
+						}
+					}
+				}
+			}
+			"left_bumper"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action spectate_controls spec_prev"
+						}
+					}
+				}
+			}
+			"button_escape"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action spectate_controls spec_scoreboard"
+						}
+					}
+				}
+			}
+			"button_menu"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action spectate_controls spec_menu"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"23"
+		"mode"		"four_buttons"
+		"inputs"
+		{
+			"button_y"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action spectate_controls spec_camera"
+						}
+					}
+				}
+			}
+			"button_b"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action spectate_controls spec_leave"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"24"
+		"mode"		"joystick_move"
+		"gameactions"
+		{
+			"spectate_controls"		"spec_move"
+		}
+	}
+	"group"
+	{
+		"id"		"25"
+		"mode"		"joystick_move"
+		"gameactions"
+		{
+			"spectate_controls"		"spec_look"
+		}
+	}
+	"preset"
+	{
+		"id"		"0"
+		"name"		"menu_controls"
+		"group_source_bindings"
+		{
+			"0"		"button_diamond active"
+			"1"		"dpad active"
+			"2"		"switch active"
+			"3"		"left_joystick active"
+			"4"		"right_joystick active"
+		}
+	}
+	"preset"
+	{
+		"id"		"1"
+		"name"		"combat_controls"
+		"group_source_bindings"
+		{
+			"5"		"button_diamond active"
+			"6"		"switch active"
+			"7"		"left_joystick active"
+			"8"		"right_joystick active"
+			"9"		"dpad active"
+			"10"		"left_joystick active"
+			"11"		"right_joystick active"
+			"12"		"right_trigger active"
+			"13"		"left_trigger active"
+		}
+	}
+	"preset"
+	{
+		"id"		"2"
+		"name"		"hub_controls"
+		"group_source_bindings"
+		{
+			"14"		"button_diamond active"
+			"15"		"left_joystick active"
+			"16"		"dpad active"
+			"17"		"switch active"
+			"18"		"left_joystick active"
+			"19"		"right_joystick active"
+			"20"		"right_trigger active"
+			"21"		"left_trigger active"
+		}
+	}
+	"preset"
+	{
+		"id"		"3"
+		"name"		"spectate_controls"
+		"group_source_bindings"
+		{
+			"22"		"switch active"
+			"23"		"button_diamond active"
+			"24"		"left_joystick active"
+			"25"		"right_joystick active"
+		}
+	}
+	"settings"
+	{
+		"action_set_trigger_cursor_show"		"0"
+	}
+}

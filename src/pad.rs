@@ -239,28 +239,10 @@ impl Pads {
 }
 
 /// What a button is called on the controller in hand (for on-screen prompts).
+/// (Xbox, PlayStation, Switch with its swapped letters, the Steam Deck: crate::glyphs; Settings
+/// or Steam Input can name the family for the frame.)
 pub fn button_name(bit: u32, pad_name: Option<&str>) -> &'static str {
-    let n = pad_name.unwrap_or("").to_ascii_lowercase();
-    let ps = n.contains("playstation") || n.contains("dualshock") || n.contains("dualsense") || n.contains("ps4") || n.contains("ps5") || n.contains("sony");
-    match bit {
-        btn::A => if ps { "Cross" } else { "A" },
-        btn::B => if ps { "Circle" } else { "B" },
-        btn::X => if ps { "Square" } else { "X" },
-        btn::Y => if ps { "Triangle" } else { "Y" },
-        btn::LB => if ps { "L1" } else { "LB" },
-        btn::RB => if ps { "R1" } else { "RB" },
-        btn::LT => if ps { "L2" } else { "LT" },
-        btn::RT => if ps { "R2" } else { "RT" },
-        btn::VIEW => if ps { "Share" } else { "View" },
-        btn::MENU => if ps { "Options" } else { "Menu" },
-        btn::L3 => "L3",
-        btn::R3 => "R3",
-        btn::UP => "D-pad up",
-        btn::DOWN => "D-pad down",
-        btn::LEFT => "D-pad left",
-        btn::RIGHT => "D-pad right",
-        _ => "?",
-    }
+    crate::glyphs::name(bit, crate::glyphs::current(pad_name))
 }
 
 /// Every gameplay action and the controller button for it (shown in Settings and How to Play).

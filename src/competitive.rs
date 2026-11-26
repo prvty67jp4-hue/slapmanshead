@@ -591,7 +591,19 @@ impl App {
         }
         let pair = self.caster_pair(game);
         let everyone: Vec<usize> = (0..game.f.len()).filter(|&s| game.f[s].present && !game.f[s].spectate && !(game.watcher && s == game.local)).collect();
-        let (k1, k2, q, e, c, v, f, b) = ctx.input(|i| (i.key_pressed(Key::Num1), i.key_pressed(Key::Num2), i.key_pressed(Key::Q), i.key_pressed(Key::E), i.key_pressed(Key::C), i.key_pressed(Key::V), i.key_pressed(Key::F), i.key_pressed(Key::B)));
+        let (k1, k2, q, e, mut c, mut v, mut f, mut b) = ctx.input(|i| (i.key_pressed(Key::Num1), i.key_pressed(Key::Num2), i.key_pressed(Key::Q), i.key_pressed(Key::E), i.key_pressed(Key::C), i.key_pressed(Key::V), i.key_pressed(Key::F), i.key_pressed(Key::B)));
+        // a controller (Steam Input's spectating set or the game's own reading): bumpers pick who,
+        // Y steps through the cameras
+        let pad = self.pad;
+        let (q, e) = (q || pad.tapped(pad::btn::LB), e || pad.tapped(pad::btn::RB));
+        if pad.tapped(pad::btn::Y) {
+            match self.spec.mode {
+                SPEC_FOLLOW => v = true,
+                SPEC_EYES => b = true,
+                SPEC_CASTER => f = true,
+                _ => c = true,
+            }
+        }
         let sp = &mut self.spec;
         if let Some((a, bb)) = pair {
             if k1 {

@@ -1,0 +1,12 @@
+# The game's Steam App ID: the one value that switches the Steam features on.
+#
+# 480 is Valve's public test app ("Spacewar"). While it's 480 the game uses Steam for lobbies,
+# relayed play, invites, the friends list, rich presence (the plain "status" line) and the
+# controller, and keeps achievements, stats and saves on this computer only (they're shown in the
+# game exactly the same way).
+#
+# Put the game's own App ID here (one number, nothing else on its line) and rebuild: achievements
+# and stats go to Steam, saves sync through Steam Cloud, and friends see the localized rich
+# presence lines. Upload the files in this folder to the Steamworks partner site first (see
+# README.md). The DUEL_APP_ID environment variable overrides this for a test run.
+480

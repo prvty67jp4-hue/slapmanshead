@@ -1,0 +1,1438 @@
+"480"
+{
+	"gamename"		"Duel Rush"
+	"version"		"1"
+	"stats"
+	{
+		"1"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"1"
+			"name"		"STAT_WINS"
+			"display"
+			{
+				"name"		"Matches won"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"2"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"2"
+			"name"		"STAT_MATCHES"
+			"display"
+			{
+				"name"		"Matches played"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"3"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"3"
+			"name"		"STAT_KILLS"
+			"display"
+			{
+				"name"		"Eliminations"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"4"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"4"
+			"name"		"STAT_HEADSHOTS"
+			"display"
+			{
+				"name"		"Headshot kills"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"5"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"5"
+			"name"		"STAT_PARRIES"
+			"display"
+			{
+				"name"		"Perfect parries"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"6"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"6"
+			"name"		"STAT_EXECUTIONS"
+			"display"
+			{
+				"name"		"Executions"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"7"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"7"
+			"name"		"STAT_WRITS"
+			"display"
+			{
+				"name"		"Writs claimed"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"8"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"8"
+			"name"		"STAT_HEAD_STREAK"
+			"display"
+			{
+				"name"		"Best headshot streak"
+			}
+			"min"		"0"
+			"incrementonly"		"0"
+			"permission"		"2"
+		}
+		"9"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"9"
+			"name"		"STAT_BOSSES"
+			"display"
+			{
+				"name"		"Vault bosses felled"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"10"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"10"
+			"name"		"STAT_RAID_CLEARS"
+			"display"
+			{
+				"name"		"Vault clears"
+			}
+			"min"		"0"
+			"incrementonly"		"1"
+			"permission"		"2"
+		}
+		"11"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"11"
+			"name"		"STAT_ROOFTOP_MS"
+			"display"
+			{
+				"name"		"Best Rooftop Run (ms)"
+			}
+			"min"		"0"
+			"incrementonly"		"0"
+			"permission"		"2"
+		}
+		"12"
+		{
+			"bits"
+			{
+			}
+			"type"		"INT"
+			"id"		"12"
+			"name"		"STAT_COSMETICS"
+			"display"
+			{
+				"name"		"Cosmetics owned"
+			}
+			"min"		"0"
+			"incrementonly"		"0"
+			"permission"		"2"
+		}
+		"13"
+		{
+			"type"		"ACHIEVEMENTS"
+			"id"		"13"
+			"bits"
+			{
+				"0"
+				{
+					"name"		"ACH_WIN_FIRST"
+					"display"
+					{
+						"name"
+						{
+							"english"		"First Entry in the Ledger"
+							"token"		"ACH_WIN_FIRST_NAME"
+						}
+						"desc"
+						{
+							"english"		"Win your first match. The clerks will spell your name wrong, but it's in ink now."
+							"token"		"ACH_WIN_FIRST_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/win_first.png"
+						"icon_gray"		"icons/win_first_locked.png"
+					}
+				}
+				"1"
+				{
+					"name"		"ACH_WIN_10"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Ten Debts Settled"
+							"token"		"ACH_WIN_10_NAME"
+						}
+						"desc"
+						{
+							"english"		"Win 10 matches."
+							"token"		"ACH_WIN_10_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/win_10.png"
+						"icon_gray"		"icons/win_10_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_WINS"
+						}
+						"min_val"		"0"
+						"max_val"		"10"
+					}
+				}
+				"2"
+				{
+					"name"		"ACH_WIN_100"
+					"display"
+					{
+						"name"
+						{
+							"english"		"A Hundred Writs Answered"
+							"token"		"ACH_WIN_100_NAME"
+						}
+						"desc"
+						{
+							"english"		"Win 100 matches. Varrow's taverns have started arguing about you."
+							"token"		"ACH_WIN_100_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/win_100.png"
+						"icon_gray"		"icons/win_100_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_WINS"
+						}
+						"min_val"		"0"
+						"max_val"		"100"
+					}
+				}
+				"3"
+				{
+					"name"		"ACH_WIN_1000"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Thousandfold Seal"
+							"token"		"ACH_WIN_1000_NAME"
+						}
+						"desc"
+						{
+							"english"		"Win 1,000 matches. There's no wax left in the city without your name pressed into it."
+							"token"		"ACH_WIN_1000_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/win_1000.png"
+						"icon_gray"		"icons/win_1000_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_WINS"
+						}
+						"min_val"		"0"
+						"max_val"		"1000"
+					}
+				}
+				"4"
+				{
+					"name"		"ACH_KILLS_1000"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Ink and Iron"
+							"token"		"ACH_KILLS_1000_NAME"
+						}
+						"desc"
+						{
+							"english"		"Take down 1,000 opponents."
+							"token"		"ACH_KILLS_1000_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/kills_1000.png"
+						"icon_gray"		"icons/kills_1000_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_KILLS"
+						}
+						"min_val"		"0"
+						"max_val"		"1000"
+					}
+				}
+				"5"
+				{
+					"name"		"ACH_HEADS_500"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Crown Collector"
+							"token"		"ACH_HEADS_500_NAME"
+						}
+						"desc"
+						{
+							"english"		"Land 500 headshot kills."
+							"token"		"ACH_HEADS_500_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/heads_500.png"
+						"icon_gray"		"icons/heads_500_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_HEADSHOTS"
+						}
+						"min_val"		"0"
+						"max_val"		"500"
+					}
+				}
+				"6"
+				{
+					"name"		"ACH_HEAD_STREAK_3"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Three Crowns Running"
+							"token"		"ACH_HEAD_STREAK_3_NAME"
+						}
+						"desc"
+						{
+							"english"		"Land 3 headshot kills in a row without dying."
+							"token"		"ACH_HEAD_STREAK_3_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/head_streak_3.png"
+						"icon_gray"		"icons/head_streak_3_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_HEAD_STREAK"
+						}
+						"min_val"		"0"
+						"max_val"		"3"
+					}
+				}
+				"7"
+				{
+					"name"		"ACH_HEAD_STREAK_7"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Lanternman's Eye"
+							"token"		"ACH_HEAD_STREAK_7_NAME"
+						}
+						"desc"
+						{
+							"english"		"Land 7 headshot kills in a row without dying. Nobody on the walls aims like that."
+							"token"		"ACH_HEAD_STREAK_7_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/head_streak_7.png"
+						"icon_gray"		"icons/head_streak_7_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_HEAD_STREAK"
+						}
+						"min_val"		"0"
+						"max_val"		"7"
+					}
+				}
+				"8"
+				{
+					"name"		"ACH_PARRY_100"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Steel Says No"
+							"token"		"ACH_PARRY_100_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perfectly parry 100 blows. The Court calls it insolence; the pits call it art."
+							"token"		"ACH_PARRY_100_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/parry_100.png"
+						"icon_gray"		"icons/parry_100_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_PARRIES"
+						}
+						"min_val"		"0"
+						"max_val"		"100"
+					}
+				}
+				"9"
+				{
+					"name"		"ACH_EXEC_100"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Headsman's Tally"
+							"token"		"ACH_EXEC_100_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform 100 executions."
+							"token"		"ACH_EXEC_100_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_100.png"
+						"icon_gray"		"icons/exec_100_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_EXECUTIONS"
+						}
+						"min_val"		"0"
+						"max_val"		"100"
+					}
+				}
+				"10"
+				{
+					"name"		"ACH_WRITS_25"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Writ-Breaker"
+							"token"		"ACH_WRITS_25_NAME"
+						}
+						"desc"
+						{
+							"english"		"Claim 25 Writs from fighters on a streak."
+							"token"		"ACH_WRITS_25_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/writs_25.png"
+						"icon_gray"		"icons/writs_25_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_WRITS"
+						}
+						"min_val"		"0"
+						"max_val"		"25"
+					}
+				}
+				"11"
+				{
+					"name"		"ACH_RAMPAGE"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Rampage in the Rows"
+							"token"		"ACH_RAMPAGE_NAME"
+						}
+						"desc"
+						{
+							"english"		"Chain 5 eliminations in quick succession."
+							"token"		"ACH_RAMPAGE_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/rampage.png"
+						"icon_gray"		"icons/rampage_locked.png"
+					}
+				}
+				"12"
+				{
+					"name"		"ACH_QUIET_WIN"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Quiet Ledger"
+							"token"		"ACH_QUIET_WIN_NAME"
+						}
+						"desc"
+						{
+							"english"		"Win a match without firing a single shot."
+							"token"		"ACH_QUIET_WIN_DESC"
+						}
+						"hidden"		"1"
+						"icon"		"icons/quiet_win.png"
+						"icon_gray"		"icons/quiet_win_locked.png"
+					}
+				}
+				"13"
+				{
+					"name"		"ACH_MASTER_CORVIN"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Warden of the Border"
+							"token"		"ACH_MASTER_CORVIN_NAME"
+						}
+						"desc"
+						{
+							"english"		"Reach mastery 20 with Corvin Vale."
+							"token"		"ACH_MASTER_CORVIN_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/master_corvin.png"
+						"icon_gray"		"icons/master_corvin_locked.png"
+					}
+				}
+				"14"
+				{
+					"name"		"ACH_MASTER_SABLE"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Every Debt Collected"
+							"token"		"ACH_MASTER_SABLE_NAME"
+						}
+						"desc"
+						{
+							"english"		"Reach mastery 20 with Sable Rook."
+							"token"		"ACH_MASTER_SABLE_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/master_sable.png"
+						"icon_gray"		"icons/master_sable_locked.png"
+					}
+				}
+				"15"
+				{
+					"name"		"ACH_MASTER_BRAM"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Anvil Does Not Bend"
+							"token"		"ACH_MASTER_BRAM_NAME"
+						}
+						"desc"
+						{
+							"english"		"Reach mastery 20 with Bram \"Anvil\" Kask."
+							"token"		"ACH_MASTER_BRAM_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/master_bram.png"
+						"icon_gray"		"icons/master_bram_locked.png"
+					}
+				}
+				"16"
+				{
+					"name"		"ACH_MASTER_ILYA"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Light Over the Lower Ward"
+							"token"		"ACH_MASTER_ILYA_NAME"
+						}
+						"desc"
+						{
+							"english"		"Reach mastery 20 with Ilya Fen."
+							"token"		"ACH_MASTER_ILYA_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/master_ilya.png"
+						"icon_gray"		"icons/master_ilya_locked.png"
+					}
+				}
+				"17"
+				{
+					"name"		"ACH_EXEC_WARDENS_VERDICT"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Verdict Stands"
+							"token"		"ACH_EXEC_WARDENS_VERDICT_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Warden's Verdict execution."
+							"token"		"ACH_EXEC_WARDENS_VERDICT_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_wardens_verdict.png"
+						"icon_gray"		"icons/exec_wardens_verdict_locked.png"
+					}
+				}
+				"18"
+				{
+					"name"		"ACH_EXEC_BORDER_LEDGER"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Struck from the Border Ledger"
+							"token"		"ACH_EXEC_BORDER_LEDGER_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Border Ledger execution."
+							"token"		"ACH_EXEC_BORDER_LEDGER_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_border_ledger.png"
+						"icon_gray"		"icons/exec_border_ledger_locked.png"
+					}
+				}
+				"19"
+				{
+					"name"		"ACH_EXEC_LANTERN_WATCH"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Lantern Out at Midnight"
+							"token"		"ACH_EXEC_LANTERN_WATCH_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Lantern Watch execution."
+							"token"		"ACH_EXEC_LANTERN_WATCH_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_lantern_watch.png"
+						"icon_gray"		"icons/exec_lantern_watch_locked.png"
+					}
+				}
+				"20"
+				{
+					"name"		"ACH_EXEC_RIDGE_FALL"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Over the Ridge"
+							"token"		"ACH_EXEC_RIDGE_FALL_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Ridge Fall execution."
+							"token"		"ACH_EXEC_RIDGE_FALL_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_ridge_fall.png"
+						"icon_gray"		"icons/exec_ridge_fall_locked.png"
+					}
+				}
+				"21"
+				{
+					"name"		"ACH_EXEC_THE_COLLECTION"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Added to the Collection"
+							"token"		"ACH_EXEC_THE_COLLECTION_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform The Collection execution."
+							"token"		"ACH_EXEC_THE_COLLECTION_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_the_collection.png"
+						"icon_gray"		"icons/exec_the_collection_locked.png"
+					}
+				}
+				"22"
+				{
+					"name"		"ACH_EXEC_BOUNTY_CLOSED"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Bounty Paid in Full"
+							"token"		"ACH_EXEC_BOUNTY_CLOSED_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Bounty Closed execution."
+							"token"		"ACH_EXEC_BOUNTY_CLOSED_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_bounty_closed.png"
+						"icon_gray"		"icons/exec_bounty_closed_locked.png"
+					}
+				}
+				"23"
+				{
+					"name"		"ACH_EXEC_FROZEN_LAKE"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Through the Ice"
+							"token"		"ACH_EXEC_FROZEN_LAKE_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Frozen Lake execution."
+							"token"		"ACH_EXEC_FROZEN_LAKE_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_frozen_lake.png"
+						"icon_gray"		"icons/exec_frozen_lake_locked.png"
+					}
+				}
+				"24"
+				{
+					"name"		"ACH_EXEC_HOOK_AND_LINE"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Reeled In"
+							"token"		"ACH_EXEC_HOOK_AND_LINE_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Hook and Line execution."
+							"token"		"ACH_EXEC_HOOK_AND_LINE_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_hook_and_line.png"
+						"icon_gray"		"icons/exec_hook_and_line_locked.png"
+					}
+				}
+				"25"
+				{
+					"name"		"ACH_EXEC_HAMMER_FALLS"
+					"display"
+					{
+						"name"
+						{
+							"english"		"When the Hammer Falls"
+							"token"		"ACH_EXEC_HAMMER_FALLS_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Hammer Falls execution."
+							"token"		"ACH_EXEC_HAMMER_FALLS_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_hammer_falls.png"
+						"icon_gray"		"icons/exec_hammer_falls_locked.png"
+					}
+				}
+				"26"
+				{
+					"name"		"ACH_EXEC_QUENCH"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Quenched"
+							"token"		"ACH_EXEC_QUENCH_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Quench execution."
+							"token"		"ACH_EXEC_QUENCH_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_quench.png"
+						"icon_gray"		"icons/exec_quench_locked.png"
+					}
+				}
+				"27"
+				{
+					"name"		"ACH_EXEC_FOUNDRY_BELL"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Bell Tolls Once"
+							"token"		"ACH_EXEC_FOUNDRY_BELL_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Foundry Bell execution."
+							"token"		"ACH_EXEC_FOUNDRY_BELL_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_foundry_bell.png"
+						"icon_gray"		"icons/exec_foundry_bell_locked.png"
+					}
+				}
+				"28"
+				{
+					"name"		"ACH_EXEC_ANVIL_DROP"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Flattened on the Anvil"
+							"token"		"ACH_EXEC_ANVIL_DROP_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Anvil Drop execution."
+							"token"		"ACH_EXEC_ANVIL_DROP_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_anvil_drop.png"
+						"icon_gray"		"icons/exec_anvil_drop_locked.png"
+					}
+				}
+				"29"
+				{
+					"name"		"ACH_EXEC_LIGHTS_OUT"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Lights Out, Varrow"
+							"token"		"ACH_EXEC_LIGHTS_OUT_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Lights Out execution."
+							"token"		"ACH_EXEC_LIGHTS_OUT_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_lights_out.png"
+						"icon_gray"		"icons/exec_lights_out_locked.png"
+					}
+				}
+				"30"
+				{
+					"name"		"ACH_EXEC_ROOFTOP_RUN"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Off the Rooftops"
+							"token"		"ACH_EXEC_ROOFTOP_RUN_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Rooftop Run execution."
+							"token"		"ACH_EXEC_ROOFTOP_RUN_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_rooftop_run.png"
+						"icon_gray"		"icons/exec_rooftop_run_locked.png"
+					}
+				}
+				"31"
+				{
+					"name"		"ACH_EXEC_LOWER_WARD_LIGHTNING"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Lightning in the Lower Ward"
+							"token"		"ACH_EXEC_LOWER_WARD_LIGHTNING_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Lower Ward Lightning execution."
+							"token"		"ACH_EXEC_LOWER_WARD_LIGHTNING_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_lower_ward_lightning.png"
+						"icon_gray"		"icons/exec_lower_ward_lightning_locked.png"
+					}
+				}
+				"32"
+				{
+					"name"		"ACH_EXEC_SKYLIGHT"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Through the Skylight"
+							"token"		"ACH_EXEC_SKYLIGHT_NAME"
+						}
+						"desc"
+						{
+							"english"		"Perform the Skylight execution."
+							"token"		"ACH_EXEC_SKYLIGHT_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/exec_skylight.png"
+						"icon_gray"		"icons/exec_skylight_locked.png"
+					}
+				}
+				"33"
+				{
+					"name"		"ACH_RANK_PLACED"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Entered in the Rolls"
+							"token"		"ACH_RANK_PLACED_NAME"
+						}
+						"desc"
+						{
+							"english"		"Finish your placement matches in Ranked 1v1."
+							"token"		"ACH_RANK_PLACED_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/rank_placed.png"
+						"icon_gray"		"icons/rank_placed_locked.png"
+					}
+				}
+				"34"
+				{
+					"name"		"ACH_RANK_SILVER"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Sealed in Silver"
+							"token"		"ACH_RANK_SILVER_NAME"
+						}
+						"desc"
+						{
+							"english"		"Reach Silver Writ in Ranked 1v1."
+							"token"		"ACH_RANK_SILVER_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/rank_silver.png"
+						"icon_gray"		"icons/rank_silver_locked.png"
+					}
+				}
+				"35"
+				{
+					"name"		"ACH_RANK_GOLD"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Gilded Seal"
+							"token"		"ACH_RANK_GOLD_NAME"
+						}
+						"desc"
+						{
+							"english"		"Reach Gold Writ in Ranked 1v1."
+							"token"		"ACH_RANK_GOLD_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/rank_gold.png"
+						"icon_gray"		"icons/rank_gold_locked.png"
+					}
+				}
+				"36"
+				{
+					"name"		"ACH_RANK_MAGISTRATE"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Robes of the Magistrate"
+							"token"		"ACH_RANK_MAGISTRATE_NAME"
+						}
+						"desc"
+						{
+							"english"		"Reach Magistrate in Ranked 1v1."
+							"token"		"ACH_RANK_MAGISTRATE_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/rank_magistrate.png"
+						"icon_gray"		"icons/rank_magistrate_locked.png"
+					}
+				}
+				"37"
+				{
+					"name"		"ACH_RANK_LEDGER"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Ledger of Champions"
+							"token"		"ACH_RANK_LEDGER_NAME"
+						}
+						"desc"
+						{
+							"english"		"Stand among the top 100 on the Ranked 1v1 board."
+							"token"		"ACH_RANK_LEDGER_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/rank_ledger.png"
+						"icon_gray"		"icons/rank_ledger_locked.png"
+					}
+				}
+				"38"
+				{
+					"name"		"ACH_BOSS_WARDEN"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Wax Hall Falls Silent"
+							"token"		"ACH_BOSS_WARDEN_NAME"
+						}
+						"desc"
+						{
+							"english"		"Defeat the Warden in the Wax Hall."
+							"token"		"ACH_BOSS_WARDEN_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/boss_warden.png"
+						"icon_gray"		"icons/boss_warden_locked.png"
+					}
+				}
+				"39"
+				{
+					"name"		"ACH_BOSS_ASSESSORS"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Both Judges Overruled"
+							"token"		"ACH_BOSS_ASSESSORS_NAME"
+						}
+						"desc"
+						{
+							"english"		"Defeat the Twin Assessors."
+							"token"		"ACH_BOSS_ASSESSORS_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/boss_assessors.png"
+						"icon_gray"		"icons/boss_assessors_locked.png"
+					}
+				}
+				"40"
+				{
+					"name"		"ACH_BOSS_LEDGER"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Chained Ledger Closes"
+							"token"		"ACH_BOSS_LEDGER_NAME"
+						}
+						"desc"
+						{
+							"english"		"Defeat the Chained Ledger."
+							"token"		"ACH_BOSS_LEDGER_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/boss_ledger.png"
+						"icon_gray"		"icons/boss_ledger_locked.png"
+					}
+				}
+				"41"
+				{
+					"name"		"ACH_BOSS_REGENT"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Red Moon Setting"
+							"token"		"ACH_BOSS_REGENT_NAME"
+						}
+						"desc"
+						{
+							"english"		"Defeat the Ashblood Regent, Lord Vesper Kael, on the vault's roof."
+							"token"		"ACH_BOSS_REGENT_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/boss_regent.png"
+						"icon_gray"		"icons/boss_regent_locked.png"
+					}
+				}
+				"42"
+				{
+					"name"		"ACH_BOSS_MAGISTRATE"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Magistrate Is Overruled"
+							"token"		"ACH_BOSS_MAGISTRATE_NAME"
+						}
+						"desc"
+						{
+							"english"		"Defeat the Ashen Magistrate."
+							"token"		"ACH_BOSS_MAGISTRATE_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/boss_magistrate.png"
+						"icon_gray"		"icons/boss_magistrate_locked.png"
+					}
+				}
+				"43"
+				{
+					"name"		"ACH_VAULT_CLEAR"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Vaultbreaker"
+							"token"		"ACH_VAULT_CLEAR_NAME"
+						}
+						"desc"
+						{
+							"english"		"Clear the Ashen Vault."
+							"token"		"ACH_VAULT_CLEAR_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/vault_clear.png"
+						"icon_gray"		"icons/vault_clear_locked.png"
+					}
+				}
+				"44"
+				{
+					"name"		"ACH_SEALED_WRIT"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Under the Sealed Writ"
+							"token"		"ACH_SEALED_WRIT_NAME"
+						}
+						"desc"
+						{
+							"english"		"Clear the Ashen Vault on Sealed Writ."
+							"token"		"ACH_SEALED_WRIT_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/sealed_writ.png"
+						"icon_gray"		"icons/sealed_writ_locked.png"
+					}
+				}
+				"45"
+				{
+					"name"		"ACH_VAULT_FAST"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Before the Ink Dries"
+							"token"		"ACH_VAULT_FAST_NAME"
+						}
+						"desc"
+						{
+							"english"		"Clear the Ashen Vault in under 20 minutes."
+							"token"		"ACH_VAULT_FAST_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/vault_fast.png"
+						"icon_gray"		"icons/vault_fast_locked.png"
+					}
+				}
+				"46"
+				{
+					"name"		"ACH_VAULT_FASTER"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Audit at a Gallop"
+							"token"		"ACH_VAULT_FASTER_NAME"
+						}
+						"desc"
+						{
+							"english"		"Clear the Ashen Vault in under 12 minutes."
+							"token"		"ACH_VAULT_FASTER_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/vault_faster.png"
+						"icon_gray"		"icons/vault_faster_locked.png"
+					}
+				}
+				"47"
+				{
+					"name"		"ACH_VAULT_WIPES"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Ashes, Ashes"
+							"token"		"ACH_VAULT_WIPES_NAME"
+						}
+						"desc"
+						{
+							"english"		"Fall with your whole party 10 times in the vault. The Court keeps a ledger of that too."
+							"token"		"ACH_VAULT_WIPES_DESC"
+						}
+						"hidden"		"1"
+						"icon"		"icons/vault_wipes.png"
+						"icon_gray"		"icons/vault_wipes_locked.png"
+					}
+				}
+				"48"
+				{
+					"name"		"ACH_ROOFTOP"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Over the Tiles"
+							"token"		"ACH_ROOFTOP_NAME"
+						}
+						"desc"
+						{
+							"english"		"Finish the Rooftop Run."
+							"token"		"ACH_ROOFTOP_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/rooftop.png"
+						"icon_gray"		"icons/rooftop_locked.png"
+					}
+				}
+				"49"
+				{
+					"name"		"ACH_ROOFTOP_TARGET"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Gutter Runner"
+							"token"		"ACH_ROOFTOP_TARGET_NAME"
+						}
+						"desc"
+						{
+							"english"		"Finish the Rooftop Run in under 45 seconds."
+							"token"		"ACH_ROOFTOP_TARGET_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/rooftop_target.png"
+						"icon_gray"		"icons/rooftop_target_locked.png"
+					}
+				}
+				"50"
+				{
+					"name"		"ACH_CHESS_HARD"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Checkmate the Clerk"
+							"token"		"ACH_CHESS_HARD_NAME"
+						}
+						"desc"
+						{
+							"english"		"Win a game of chess against the Hard bot at the Varrow tables."
+							"token"		"ACH_CHESS_HARD_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/chess_hard.png"
+						"icon_gray"		"icons/chess_hard_locked.png"
+					}
+				}
+				"51"
+				{
+					"name"		"ACH_PIT_10"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Pit Regular"
+							"token"		"ACH_PIT_10_NAME"
+						}
+						"desc"
+						{
+							"english"		"Win 10 duels in the Court pits."
+							"token"		"ACH_PIT_10_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/pit_10.png"
+						"icon_gray"		"icons/pit_10_locked.png"
+					}
+				}
+				"52"
+				{
+					"name"		"ACH_FASHION_50"
+					"display"
+					{
+						"name"
+						{
+							"english"		"The Varrow Wardrobe"
+							"token"		"ACH_FASHION_50_NAME"
+						}
+						"desc"
+						{
+							"english"		"Own 50 cosmetics. The tailors on Lantern Row know you by name."
+							"token"		"ACH_FASHION_50_DESC"
+						}
+						"hidden"		"0"
+						"icon"		"icons/fashion_50.png"
+						"icon_gray"		"icons/fashion_50_locked.png"
+					}
+					"progress"
+					{
+						"value"
+						{
+							"operation"		"statvalue"
+							"operand1"		"STAT_COSMETICS"
+						}
+						"min_val"		"0"
+						"max_val"		"50"
+					}
+				}
+				"53"
+				{
+					"name"		"ACH_SECRET_MIRROR"
+					"display"
+					{
+						"name"
+						{
+							"english"		"Who Owes Whom"
+							"token"		"ACH_SECRET_MIRROR_NAME"
+						}
+						"desc"
+						{
+							"english"		"Admire yourself in the wardrobe mirror."
+							"token"		"ACH_SECRET_MIRROR_DESC"
+						}
+						"hidden"		"1"
+						"icon"		"icons/secret_mirror.png"
+						"icon_gray"		"icons/secret_mirror_locked.png"
+					}
+				}
+				"54"
+				{
+					"name"		"ACH_SECRET_PHOTO"
+					"display"
+					{
+						"name"
+						{
+							"english"		"For the Broadsheet"
+							"token"		"ACH_SECRET_PHOTO_NAME"
+						}
+						"desc"
+						{
+							"english"		"Take a photo in Varrow Centre."
+							"token"		"ACH_SECRET_PHOTO_DESC"
+						}
+						"hidden"		"1"
+						"icon"		"icons/secret_photo.png"
+						"icon_gray"		"icons/secret_photo_locked.png"
+					}
+				}
+				"55"
+				{
+					"name"		"ACH_SECRET_STANDS"
+					"display"
+					{
+						"name"
+						{
+							"english"		"From the Gallery"
+							"token"		"ACH_SECRET_STANDS_NAME"
+						}
+						"desc"
+						{
+							"english"		"Watch a match from the stands."
+							"token"		"ACH_SECRET_STANDS_DESC"
+						}
+						"hidden"		"1"
+						"icon"		"icons/secret_stands.png"
+						"icon_gray"		"icons/secret_stands_locked.png"
+					}
+				}
+			}
+		}
+	}
+}

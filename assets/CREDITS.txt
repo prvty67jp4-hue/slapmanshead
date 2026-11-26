@@ -122,3 +122,7 @@ assets/bosses/*.glb and assets/bosses/textures/*.png (the Ashen Vault's bosses: 
   and mantle, a chain link and a floor anchor) - original models and hand-painted-look baked textures
   made for this game with tools/blender/build_bosses.py (no third-party parts). Their rigs and
   animations are posed in code (src/bosses.rs, src/gpu/raid_draw/boss_draw.rs).
+
+steam/icons/*.png (achievement icons)
+  Drawn by the game itself (crate::achievements::icon) from its own weapon pictures and wardrobe
+  icons listed above, on medallions it draws; nothing new from outside.

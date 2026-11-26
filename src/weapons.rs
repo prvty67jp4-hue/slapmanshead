@@ -74,6 +74,12 @@ impl Model {
 }
 
 /// Each weapon's files: its name, the model, the simplified copy for far away, the icon, the texture.
+/// A weapon's icon (PNG) by its file name ("katana", "ashblood_glaive"...): crate::achievements
+/// draws its icons from them.
+pub fn icon_png(name: &str) -> Option<&'static [u8]> {
+    FILES.iter().find(|f| f.0 == name).map(|f| f.3)
+}
+
 const FILES: [(&str, &[u8], &[u8], &[u8], &[u8]); 14] = [
     ("dagger", include_bytes!("../assets/weapons/dagger.glb"), include_bytes!("../assets/weapons/dagger_far.glb"), include_bytes!("../assets/weapons/icons/dagger.png"), include_bytes!("../assets/weapons/textures/dagger.png")),
     ("katana", include_bytes!("../assets/weapons/katana.glb"), include_bytes!("../assets/weapons/katana_far.glb"), include_bytes!("../assets/weapons/icons/katana.png"), include_bytes!("../assets/weapons/textures/katana.png")),

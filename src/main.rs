@@ -55,6 +55,12 @@ mod items;
 mod gifts;
 mod bank_ui;
 mod vault;
+mod achievements;
+mod cloud;
+mod glyphs;
+mod party;
+mod presence;
+mod steam_ui;
 
 /// (tests) Held by the timing test and the busiest tests, so they never run at once.
 #[cfg(test)]
@@ -68,7 +74,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, Stroke, Vec2,
 use game::*;
 use math::*;
 use net::{Incoming, Net};
-use platform::{firewall, steam};
+use platform::{firewall, steam, steam_api};
 use render::Cam;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -149,6 +155,9 @@ struct Settings {
     auto_update: bool,
     /// The vault's boss introductions already watched (one bit per hall): those can be skipped.
     boss_intros: u8,
+    /// Controller button glyphs: 0 match the pad (Steam Input or its name), 1 Xbox, 2 PlayStation,
+    /// 3 Switch, 4 Steam Deck (crate::glyphs).
+    glyphs: u8,
 }
 
 /// Interface sizes: (name, zoom).
@@ -397,6 +406,7 @@ impl Default for Settings {
             pad_sens: 1.0,
             pad_invert: false,
             aim_assist: true,
+            glyphs: 0,
             ui_scale: 0,
             dyn_res: false,
             post: gpu::Quality::PRESETS[2].1.post,
@@ -509,6 +519,7 @@ impl Settings {
                             "pad_sens" => s.pad_sens = v.parse().unwrap_or(1.0f32).clamp(0.2, 3.0),
                             "pad_invert" => s.pad_invert = v == "1",
                             "aim_assist" => s.aim_assist = v != "0",
+                            "glyphs" => s.glyphs = v.parse::<u8>().unwrap_or(0).min(4),
                             "ui_scale" => s.ui_scale = v.parse().unwrap_or(0usize).min(UI_SCALES.len() - 1),
                             "dyn_res" => s.dyn_res = v == "1",
                             "steam_name" => s.steam_name = v != "0",
@@ -611,7 +622,7 @@ impl Settings {
                 "quality={}\nfullscreen={}\nfps_cap={}\nvsync={}\ncross_style={}\ncross_size={}\ncross_color={r},{g},{b}\nnet_test={}\nnet_lag={}\nnet_loss={}\nmusic_volume={}\ncross_red={}\nmusic_on={}\nmenu_music={}\nmatch_music={}\nuse_steam={}\nsteam_public={}\nviolence={}\naim_v=3\n",
                 self.quality, self.fullscreen as u8, self.fps_cap, self.vsync as u8, self.cross_style, self.cross_size, self.net_test as u8, self.net_lag, self.net_loss, self.music_volume, self.cross_red as u8, self.music_on as u8, self.menu_music as u8, self.match_music as u8, self.use_steam as u8, self.steam_public as u8, self.violence
             );
-            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\nabilities={}\nauto_update={}\nboss_intros={}\noutfits={},{},{},{}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8, self.abilities as u8, self.auto_update as u8, self.boss_intros, self.outfits[0], self.outfits[1], self.outfits[2], self.outfits[3]);
+            text += &format!("pad_sens={}\npad_invert={}\naim_assist={}\nui_scale={}\ndyn_res={}\nsteam_name={}\nabilities={}\nauto_update={}\nboss_intros={}\nglyphs={}\noutfits={},{},{},{}\n", self.pad_sens, self.pad_invert as u8, self.aim_assist as u8, self.ui_scale, self.dyn_res as u8, self.steam_name as u8, self.abilities as u8, self.auto_update as u8, self.boss_intros, self.glyphs, self.outfits[0], self.outfits[1], self.outfits[2], self.outfits[3]);
             let f = self.post;
             text += &format!(
                 "fx_soft_shadows={}\nfx_ssao={}\nfx_bloom={}\nfx_rays={}\nfx_grading={}\nfx_vignette={}\n",
@@ -710,6 +721,8 @@ enum Page {
     Ranked,
     /// The match history and the replay viewer (crate::replay).
     Replays,
+    /// Achievements with their progress (crate::achievements, crate::steam_ui).
+    Achievements,
 }
 
 enum Screen {
@@ -933,6 +946,13 @@ struct App {
     spec: competitive::SpecCam,
     /// Leaving the match opens its replay.
     replay_after: bool,
+    /// Steam beyond lobbies (crate::platform::steam_api): achievements and stats, the cloud, the
+    /// party, presence, Steam Input; and its screen side (crate::steam_ui).
+    api: Box<dyn steam_api::SteamApi>,
+    ach: achievements::Record,
+    cloud: cloud::Cloud,
+    party: party::Party,
+    sui: steam_ui::SteamUi,
 }
 
 /// Controller movement and held buttons, merged into the game input.
@@ -976,6 +996,11 @@ impl App {
             watch_next: false,
             spec: competitive::SpecCam::default(),
             replay_after: false,
+            api: Box::new(steam_api::NoSteam),
+            ach: achievements::Record::default(),
+            cloud: cloud::Cloud::default(),
+            party: party::Party::default(),
+            sui: steam_ui::SteamUi::default(),
             screen: Screen::Menu(Page::Main),
             demo,
             gpu: None,
@@ -1110,6 +1135,12 @@ impl App {
                 }
             }
         }
+        // achievements, Steam Cloud (a newer save from another computer comes in first), presence,
+        // the party and Steam Input (fall back to this computer when Steam or the App ID can't)
+        app.steam_layer_start();
+        if let Ok(s) = std::env::var("DUEL_STEAM_SCENE") {
+            app.steam_scene(&s);
+        }
         // the ranked record for this account (a match left mid-way last time counts as lost now)
         if app.screenshot.is_none() && !app.autoplay {
             app.load_ranked();
@@ -1198,6 +1229,8 @@ impl App {
                 app.screen = Screen::Menu(Page::Ranked);
             } else if pg == "replays" {
                 app.screen = Screen::Menu(Page::Replays);
+            } else if pg == "achievements" {
+                app.screen = Screen::Menu(Page::Achievements);
             }
         }
         // test switches for Ledger Duels pictures (menus and matches): DUEL_LEDGER_RULES=<rule
@@ -1572,9 +1605,15 @@ impl App {
         }
         let level = self.career.level();
         let day = career::today();
+        let quiet = game.match_stats.get(game.local).is_some_and(|s| s.shots == 0);
         for ev in evs {
             let xp = self.career.apply_as(ev, Some(body), day);
             self.match_xp += xp;
+            // achievements count the same things (their own copy: crate::achievements)
+            self.ach.feed(ev, Some(body), day);
+            if matches!(ev, CareerEv::MatchWon) && quiet && game.gauntlet.is_none() && game.train.is_none() {
+                self.ach.quiet_win();
+            }
             if let CareerEv::Kill { finisher, .. } = ev {
                 if finisher > 0 {
                     game.say(format!("+{xp} XP (execution)"));
@@ -1641,6 +1680,11 @@ impl App {
                     }
                 }
                 steam::SteamEvent::JoinLobby(id) => self.pending_lobby = Some(id),
+                steam::SteamEvent::WatchLobby(id) => {
+                    self.watch_next = true;
+                    self.pending_lobby = Some(id);
+                }
+                steam::SteamEvent::JoinParty(id) => self.party.join(self.api.as_mut(), id),
                 steam::SteamEvent::Entered(Ok(id)) => {
                     let host = self.steam.as_mut().and_then(|s| s.entered(id));
                     let client = self.steam.as_ref().map(|s| s.client.clone());
@@ -2299,15 +2343,8 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.settings.pad_sens, 0.2..=3.0).text("look speed"));
                 ui.checkbox(&mut self.settings.pad_invert, "Invert look up / down");
                 ui.checkbox(&mut self.settings.aim_assist, "Aim assist (the aim slows a little over an enemy)");
-                egui::CollapsingHeader::new("Controller layout").show(ui, |ui| {
-                    egui::Grid::new("padlayout").num_columns(2).spacing([14.0, 3.0]).striped(true).show(ui, |ui| {
-                        for (what, button) in pad::LAYOUT {
-                            ui.label(egui::RichText::new(what).size(14.0));
-                            ui.label(egui::RichText::new(button).size(14.0).strong());
-                            ui.end_row();
-                        }
-                    });
-                });
+                // the layout drawn with the controller's own glyphs, and Steam Input (crate::steam_ui)
+                self.controller_glyphs_ui(ui);
             }
             2 => {
                 ui_kit::section(ui, "Quality");
@@ -2559,6 +2596,16 @@ fn main() -> eframe::Result<()> {
     // a crash leaves a report in the Bug reports folder
     reports::install_crash_log();
     memlog("start");
+    // DUEL_WRITE_STEAM=<folder>: write the Steamworks files (achievements and icons, rich presence,
+    // Steam Input with the Steam Deck layout) for the App ID in steam/app_id.txt, and stop
+    if let Some(dir) = std::env::var_os("DUEL_WRITE_STEAM") {
+        let dir = PathBuf::from(dir);
+        match steam_ui::write_steam_files(&dir, steam::app_id()) {
+            Ok(n) => eprintln!("wrote {n} Steamworks files to {}", dir.display()),
+            Err(e) => eprintln!("couldn't write the Steamworks files: {e}"),
+        }
+        return Ok(());
+    }
     let args: Vec<String> = std::env::args().collect();
     let mut screenshot = None;
     let mut i = 1;
@@ -2620,7 +2667,14 @@ impl eframe::App for App {
     /// a controller exactly as with a keyboard.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         use pad::Nav;
-        let st = self.pads.poll();
+        // Steam Input's controller when it's reading one (its action set for the screen), else the
+        // game's own reading
+        let mut st = self.pads.poll();
+        if let Some(sp) = self.steam_pad_poll() {
+            st = sp;
+        }
+        // prompts and glyphs: Settings' family, else Steam Input's, else the pad's name
+        glyphs::set_current((self.settings.glyphs != 0 || self.sui.pad_kind.is_some()).then(|| self.glyph_kind()));
         self.pad = st;
         // who's playing: the controller once it's touched, the mouse and keyboard once they are
         if st.used() {
@@ -2792,6 +2846,7 @@ impl eframe::App for App {
 
         self.watchdog.stage("Steam");
         self.steam_frame(dt);
+        self.steam_layer_frame(dt);
         self.ranked_queue_tick(dt);
         if let Some((_, t)) = self.ranked_change.as_mut() {
             *t += dt;
@@ -3058,6 +3113,17 @@ impl eframe::App for App {
                 }
             }
         }
+        // Steam: the friends panel (menus, a lobby, Varrow Centre while the mouse is free) and an
+        // achievement's toast over everything
+        let friends_here = match &self.screen {
+            Screen::Menu(p) => !(*p == Page::Replays && self.replay_view.is_some()) && !self.menu_gear && !self.menu_loadout,
+            Screen::Lobby { .. } => true,
+            Screen::Play { game, .. } => game.hub.is_some() && !self.captured,
+        };
+        if friends_here {
+            self.friends_ui(&ctx, rect);
+        }
+        self.draw_ach_toast(&ctx, rect);
         if go_menu {
             self.leave_to_menu();
         }
@@ -3113,6 +3179,13 @@ impl eframe::App for App {
         }
         if !self.autoplay {
             self.settings.save();
+            // the last achievements and saves reach Steam before the game closes
+            if self.ach.dirty && self.screenshot.is_none() {
+                self.ach.save();
+            }
+            self.ach.push_stats(self.api.as_mut());
+            let account = self.steam.as_ref().map_or(0, |s| s.me);
+            self.cloud.upkeep(self.api.as_mut(), account, 0.0, true);
         }
     }
 }
@@ -5287,6 +5360,32 @@ fn player_color(idx: u8) -> Color32 {
     Color32::from_rgb(l(c[0]), l(c[1]), l(c[2]))
 }
 
+/// At the end of a match the screen has two columns (nothing overlaps): the player list, the
+/// result banner and the announcer's lines on the left (clear of the minimap), the results panel
+/// on the right (under the kill feed). The left column's centre:
+fn over_column_x(rect: Rect) -> f32 {
+    (rect.left() + 205.0 + 270.0).max(rect.left() + rect.width() * 0.33).min(rect.right() - 460.0 - 280.0).max(rect.left() + 280.0)
+}
+
+/// The match is over (the two-column layout applies).
+fn over_layout(g: &Game) -> bool {
+    g.mt.phase == Phase::MatchOver && g.mt.mode != Mode::Gauntlet && g.gauntlet.is_none()
+}
+
+/// Where the player list goes.
+fn scoreboard_rect(rect: Rect, g: &Game) -> Rect {
+    let n = g.f.iter().filter(|f| f.present).count();
+    let w = 540.0;
+    let h = 70.0 + n as f32 * 28.0 + if g.mt.mode.teams() { 30.0 } else { 0.0 };
+    let cx = if over_layout(g) { over_column_x(rect) } else { rect.center().x };
+    Rect::from_center_size(Pos2::new(cx, rect.top() + 110.0 + h * 0.5), Vec2::new(w, h))
+}
+
+/// The results panel's top-left corner at the end of a match.
+fn over_panel_pos(rect: Rect) -> Pos2 {
+    Pos2::new(rect.right() - 432.0, rect.top() + 172.0)
+}
+
 fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
     let mut rows: Vec<&Fighter> = g.f.iter().filter(|f| f.present).collect();
     rows.sort_by(|a, b| (a.team, -a.kills, a.deaths).cmp(&(b.team, -b.kills, b.deaths)));
@@ -5297,9 +5396,8 @@ fn draw_scoreboard(p: &egui::Painter, rect: Rect, g: &Game) {
             rows.sort_by(|a, b| (-a.kills, a.deaths).cmp(&(-b.kills, b.deaths)));
         }
     }
-    let w = 540.0;
-    let h = 70.0 + rows.len() as f32 * 28.0 + if g.mt.mode.teams() { 30.0 } else { 0.0 };
-    let r = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 110.0 + h * 0.5), Vec2::new(w, h));
+    let r = scoreboard_rect(rect, g);
+    let w = r.width();
     p.rect_filled(r, 10.0, Color32::from_rgba_unmultiplied(10, 8, 20, 215));
     p.rect_stroke(r, 10.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 150, 70, 110)), egui::StrokeKind::Inside);
     let x0 = r.left() + 20.0;
@@ -5765,6 +5863,9 @@ impl App {
         // ---- subtitles: the lines that concern you and the announcer's, newest at the bottom
         let subs: Vec<&game::Voice> = g.voice.iter().filter(|v| v.subtitle && v.t >= 0.0).collect();
         let mut y = rect.bottom() - 150.0 * s;
+        // (the match over: in the left column, clear of the results panel)
+        let over = over_layout(g);
+        let c = if over { Pos2::new(over_column_x(rect), c.y) } else { c };
         for v in subs.iter().rev().take(3) {
             let a = (v.t / 0.15).min(1.0) * ((game::VOICE_LIFE - v.t) / 0.5).clamp(0.0, 1.0);
             let (who, col) = match v.who {
@@ -5772,7 +5873,7 @@ impl App {
                 _ => ("THE ANNOUNCER".to_string(), Color32::from_rgb(255, 170, 90)),
             };
             let mut job = egui::text::LayoutJob::default();
-            job.wrap.max_width = (rect.width() * 0.6).min(720.0 * s);
+            job.wrap.max_width = if over { 520.0 } else { (rect.width() * 0.6).min(720.0 * s) };
             job.append(&format!("{who}  "), 0.0, egui::TextFormat::simple(ui_kit::display(15.0 * s), col.gamma_multiply(a)));
             job.append(&format!("\u{201c}{}\u{201d}", v.text), 0.0, egui::TextFormat::simple(FontId::proportional(17.0 * s), Color32::from_rgb(245, 238, 226).gamma_multiply(a)));
             let gal = p.layout_job(job);
@@ -6831,7 +6932,11 @@ impl App {
         // draw_story; "GET READY" stays on the scoreboard and the count goes under the card)
         let story_card = g.mt.phase == Phase::Countdown && g.train.is_none() && g.preview.is_none() && g.mt.mode != Mode::Gauntlet;
         if let Some((text, _)) = &g.banner {
-            if !story_card {
+            if over_layout(g) {
+                // (the match is over: under the player list, in its column)
+                let sb = scoreboard_rect(rect, g);
+                fit_center(p, Pos2::new(sb.center().x, sb.bottom() + 46.0 * s), text, 42.0 * s, sb.width(), ACCENT);
+            } else if !story_card {
                 fit_center(p, Pos2::new(c.x, rect.top() + rect.height() * 0.3), text, 46.0 * s, rect.width() - 40.0, ACCENT);
             }
         }
@@ -7034,7 +7139,12 @@ fn mode_picker(ui: &mut egui::Ui, mode: &mut u8) {
 /// A menu panel. When it's taller than the room below `pos` (a short window, a handheld, or the
 /// Couch / TV interface size) its contents scroll, and the selected button scrolls into view.
 fn panel<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
-        let room = (ctx.content_rect().bottom() - pos.y - 66.0).max(160.0);
+    panel_to(ctx, id, pos, width, ctx.content_rect().bottom() - 66.0, f)
+}
+
+/// A panel that stops (and scrolls) above ottom.
+fn panel_to<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, bottom: f32, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let room = (bottom - pos.y).max(160.0);
         egui::Area::new(egui::Id::unique(id))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
@@ -7775,7 +7885,7 @@ impl App {
             next = Some(Page::Main);
         }
         let width = match page {
-            Page::Settings | Page::Mastery | Page::Lore | Page::Replays => 600.0,
+            Page::Settings | Page::Mastery | Page::Lore | Page::Replays | Page::Achievements => 600.0,
             Page::Ranked => 520.0,
             Page::Play => 520.0,
             _ => 380.0,
@@ -7915,6 +8025,7 @@ impl App {
                     ui.label(format!("Kills {}  ·  Deaths {}  ·  K/D {:.2}  ·  Headshots {}  ·  Matches {}  ·  Gauntlet waves {}", cr.kills, cr.deaths, kd, cr.headshots, cr.matches, cr.waves));
                     ui.add_space(6.0);
                     ui.label(format!("Wins {}  ·  Writs claimed {}", cr.wins, cr.writs));
+                    self.lifetime_stats_ui(ui);
                     ui_kit::section(ui, "This week");
                     let day = career::today();
                     for (ch, n, done) in cr.challenges(day) {
@@ -8055,6 +8166,11 @@ impl App {
                 }
                 Page::Replays => {
                     if let Some(n) = self.replays_page(ui) {
+                        next = Some(n);
+                    }
+                }
+                Page::Achievements => {
+                    if let Some(n) = self.achievements_page(ui) {
                         next = Some(n);
                     }
                 }
@@ -8394,7 +8510,9 @@ impl App {
                 _ => (Vec::new(), 255),
             };
             let mut map_pick: Option<MapId> = None;
-            panel(ctx, "over", Pos2::new(center.x, center.y + 60.0), 360.0, |ui| {
+            let at = if run.is_none() { over_panel_pos(rect) } else { Pos2::new(center.x - 205.0, center.y - 120.0) };
+            // (above the weapons and health along the bottom)
+            panel_to(ctx, "over", at, 360.0, rect.bottom() - 175.0, |ui| {
                 if run.is_none() {
                     ui.heading(if won { "Victory" } else { "Match over" });
                     ui.label(egui::RichText::new(format!("+{match_xp} XP this match")).font(ui_kit::display(22.0)).color(ACCENT));
@@ -8982,13 +9100,30 @@ impl App {
             if Self::big_button_h(ui, "Lore", 42.0) {
                 *next = Some(Page::Lore);
             }
-            if Self::big_button_h(ui, "Stats", 42.0) {
+            // two to a row: the menu fits a 900-pixel-high window above Report a bug
+            let half = ((w - 8.0) / 2.0).floor();
+            let pair = |ui: &mut egui::Ui, a: &str, b: &str| -> (bool, bool) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let one = |ui: &mut egui::Ui, t: &str| ui.allocate_ui_with_layout(Vec2::new(half, 42.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        ui.set_width(half);
+                        Self::big_button_h(ui, t, 42.0)
+                    }).inner;
+                    (one(ui, a), one(ui, b))
+                }).inner
+            };
+            let (stats, achs) = pair(ui, "Stats", "Achievements");
+            if stats {
                 *next = Some(Page::Stats);
             }
-            if Self::big_button_h(ui, "Ranked 1v1", 42.0) {
+            if achs {
+                *next = Some(Page::Achievements);
+            }
+            let (ranked, replays) = pair(ui, "Ranked 1v1", "Replays");
+            if ranked {
                 *next = Some(Page::Ranked);
             }
-            if Self::big_button_h(ui, "Replays", 42.0) {
+            if replays {
                 *next = Some(Page::Replays);
             }
             if Self::big_button_h(ui, "How to Play", 42.0) {

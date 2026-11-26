@@ -1,0 +1,241 @@
+"Action Manifest"
+{
+	"configurations"
+	{
+		"480"
+		{
+			"controller_xboxone"
+			{
+				"0"
+				{
+					"path"		"controller_xbox.vdf"
+				}
+			}
+			"controller_xbox360"
+			{
+				"0"
+				{
+					"path"		"controller_xbox.vdf"
+				}
+			}
+			"controller_ps5"
+			{
+				"0"
+				{
+					"path"		"controller_ps.vdf"
+				}
+			}
+			"controller_switch_pro"
+			{
+				"0"
+				{
+					"path"		"controller_switch.vdf"
+				}
+			}
+			"controller_neptune"
+			{
+				"0"
+				{
+					"path"		"controller_steamdeck.vdf"
+				}
+			}
+		}
+	}
+	"actions"
+	{
+		"menu_controls"
+		{
+			"title"		"#Set_menu_controls"
+			"legacy_set"		"0"
+			"StickPadGyro"
+			{
+				"menu_move"
+				{
+					"title"		"#Action_menu_move"
+					"input_mode"		"joystick_move"
+				}
+				"menu_scroll"
+				{
+					"title"		"#Action_menu_scroll"
+					"input_mode"		"joystick_move"
+				}
+			}
+			"AnalogTrigger"
+			{
+			}
+			"Button"
+			{
+				"menu_select"		"#Action_menu_select"
+				"menu_back"		"#Action_menu_back"
+				"menu_up"		"#Action_menu_up"
+				"menu_down"		"#Action_menu_down"
+				"menu_left"		"#Action_menu_left"
+				"menu_right"		"#Action_menu_right"
+				"menu_prev_tab"		"#Action_menu_prev_tab"
+				"menu_next_tab"		"#Action_menu_next_tab"
+				"menu_close"		"#Action_menu_close"
+			}
+		}
+		"combat_controls"
+		{
+			"title"		"#Set_combat_controls"
+			"legacy_set"		"0"
+			"StickPadGyro"
+			{
+				"move"
+				{
+					"title"		"#Action_move"
+					"input_mode"		"joystick_move"
+				}
+				"look"
+				{
+					"title"		"#Action_look"
+					"input_mode"		"joystick_move"
+				}
+			}
+			"AnalogTrigger"
+			{
+				"fire"		"#Action_fire"
+				"guard"		"#Action_guard"
+			}
+			"Button"
+			{
+				"jump"		"#Action_jump"
+				"slide"		"#Action_slide"
+				"reload"		"#Action_reload"
+				"next_weapon"		"#Action_next_weapon"
+				"ability"		"#Action_ability"
+				"kick"		"#Action_kick"
+				"dash"		"#Action_dash"
+				"finisher"		"#Action_finisher"
+				"use_item"		"#Action_use_item"
+				"blade"		"#Action_blade"
+				"swap_guns"		"#Action_swap_guns"
+				"quick_chat"		"#Action_quick_chat"
+				"scoreboard"		"#Action_scoreboard"
+				"pause"		"#Action_pause"
+			}
+		}
+		"hub_controls"
+		{
+			"title"		"#Set_hub_controls"
+			"legacy_set"		"0"
+			"StickPadGyro"
+			{
+				"hub_move"
+				{
+					"title"		"#Action_hub_move"
+					"input_mode"		"joystick_move"
+				}
+				"hub_look"
+				{
+					"title"		"#Action_hub_look"
+					"input_mode"		"joystick_move"
+				}
+			}
+			"AnalogTrigger"
+			{
+				"fire"		"#Action_fire"
+				"guard"		"#Action_guard"
+			}
+			"Button"
+			{
+				"hub_jump"		"#Action_hub_jump"
+				"hub_crouch"		"#Action_hub_crouch"
+				"hub_interact"		"#Action_hub_interact"
+				"hub_wheel"		"#Action_hub_wheel"
+				"hub_dash"		"#Action_hub_dash"
+				"hub_chat"		"#Action_hub_chat"
+				"hub_players"		"#Action_hub_players"
+				"hub_menu"		"#Action_hub_menu"
+			}
+		}
+		"spectate_controls"
+		{
+			"title"		"#Set_spectate_controls"
+			"legacy_set"		"0"
+			"StickPadGyro"
+			{
+				"spec_move"
+				{
+					"title"		"#Action_spec_move"
+					"input_mode"		"joystick_move"
+				}
+				"spec_look"
+				{
+					"title"		"#Action_spec_look"
+					"input_mode"		"joystick_move"
+				}
+			}
+			"AnalogTrigger"
+			{
+			}
+			"Button"
+			{
+				"spec_next"		"#Action_spec_next"
+				"spec_prev"		"#Action_spec_prev"
+				"spec_camera"		"#Action_spec_camera"
+				"spec_leave"		"#Action_spec_leave"
+				"spec_scoreboard"		"#Action_spec_scoreboard"
+				"spec_menu"		"#Action_spec_menu"
+			}
+		}
+	}
+	"localization"
+	{
+		"english"
+		{
+			"Set_menu_controls"		"Menus"
+			"Action_menu_move"		"Move"
+			"Action_menu_scroll"		"Scroll"
+			"Action_menu_select"		"Select"
+			"Action_menu_back"		"Back"
+			"Action_menu_up"		"Up"
+			"Action_menu_down"		"Down"
+			"Action_menu_left"		"Left"
+			"Action_menu_right"		"Right"
+			"Action_menu_prev_tab"		"Prev tab"
+			"Action_menu_next_tab"		"Next tab"
+			"Action_menu_close"		"Close"
+			"Set_combat_controls"		"Combat"
+			"Action_move"		"Move"
+			"Action_look"		"Look"
+			"Action_fire"		"Fire"
+			"Action_guard"		"Guard"
+			"Action_jump"		"Jump"
+			"Action_slide"		"Slide"
+			"Action_reload"		"Reload"
+			"Action_next_weapon"		"Next weapon"
+			"Action_ability"		"Ability"
+			"Action_kick"		"Kick"
+			"Action_dash"		"Dash"
+			"Action_finisher"		"Finisher"
+			"Action_use_item"		"Use item"
+			"Action_blade"		"Blade"
+			"Action_swap_guns"		"Swap guns"
+			"Action_quick_chat"		"Quick chat"
+			"Action_scoreboard"		"Scoreboard"
+			"Action_pause"		"Pause"
+			"Set_hub_controls"		"Varrow Centre"
+			"Action_hub_move"		"Move"
+			"Action_hub_look"		"Look"
+			"Action_hub_jump"		"Jump"
+			"Action_hub_crouch"		"Crouch"
+			"Action_hub_interact"		"Interact"
+			"Action_hub_wheel"		"Wheel"
+			"Action_hub_dash"		"Dash"
+			"Action_hub_chat"		"Chat"
+			"Action_hub_players"		"Players"
+			"Action_hub_menu"		"Menu"
+			"Set_spectate_controls"		"Spectating"
+			"Action_spec_move"		"Move"
+			"Action_spec_look"		"Look"
+			"Action_spec_next"		"Next"
+			"Action_spec_prev"		"Prev"
+			"Action_spec_camera"		"Camera"
+			"Action_spec_leave"		"Leave"
+			"Action_spec_scoreboard"		"Scoreboard"
+			"Action_spec_menu"		"Menu"
+		}
+	}
+}

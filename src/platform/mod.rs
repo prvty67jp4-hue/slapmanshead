@@ -2,7 +2,8 @@
 //! here, so the rest of the game never asks which system it runs on:
 //!
 //! - where saves go (settings, career, presets, hang reports),
-//! - Steam (lobbies, relayed networking, leaderboards) in [`steam`],
+//! - Steam (lobbies, relayed networking, leaderboards) in [`steam`], and achievements, stats,
+//!   Steam Cloud, presence, friends and Steam Input behind one interface in [`steam_api`],
 //! - the Windows Firewall check in [`firewall`],
 //! - how the mouse is held during play,
 //! - which device this is (a Steam Deck gets settings that hold 60 frames a second).
@@ -12,6 +13,7 @@
 
 pub mod firewall;
 pub mod steam;
+pub mod steam_api;
 
 use std::path::PathBuf;
 

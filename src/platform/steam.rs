@@ -10,8 +10,29 @@ use std::time::Instant;
 use steamworks::networking_types::{NetworkingIdentity, SendFlags};
 use steamworks::{CallbackHandle, Client, DistanceFilter, LobbyId, LobbyKey, LobbyType, SteamId, StringFilter, StringFilterKind};
 
-/// Steamworks' public test app ("Spacewar"), until we have our own App ID.
-pub const APP_ID: u32 = 480;
+/// Steamworks' public test app ("Spacewar"): what `steam/app_id.txt` holds until the game has its
+/// own App ID.
+pub const TEST_APP: u32 = 480;
+
+/// The App ID from `steam/app_id.txt` (the first line that's only a number), read when the game
+/// is built; `DUEL_APP_ID` overrides it for a test run.
+pub fn app_id() -> u32 {
+    if let Some(v) = std::env::var("DUEL_APP_ID").ok().and_then(|v| v.trim().parse().ok()) {
+        return v;
+    }
+    parse_app_id(include_str!("../../steam/app_id.txt")).unwrap_or(TEST_APP)
+}
+
+/// The App ID in the config file's text.
+pub fn parse_app_id(text: &str) -> Option<u32> {
+    text.lines().map(str::trim).filter(|l| !l.starts_with('#')).find_map(|l| l.parse::<u32>().ok()).filter(|&n| n > 0)
+}
+
+/// The game's own App ID (not the shared test one): achievements, stats, Steam Cloud and
+/// localized rich presence switch on.
+pub fn real_app(id: u32) -> bool {
+    id != TEST_APP
+}
 /// Lobby data that marks our lobbies among everyone else testing with App ID 480.
 const GAME_TAG: &str = "duelrush";
 
@@ -22,6 +43,10 @@ pub enum SteamEvent {
     Entered(Result<u64, ()>),
     /// A friend clicked "Join game" (or accepted an invite): join this lobby.
     JoinLobby(u64),
+    /// A friend's "Join game" on a match that can only be watched (ranked): watch it.
+    WatchLobby(u64),
+    /// An invite to a friend's party (crate::party).
+    JoinParty(u64),
     LobbyList(Vec<u64>),
     /// The Gauntlet leaderboard after sending a score: our global rank (0 if unknown) and the
     /// top entries (name, score, rank).
@@ -92,10 +117,40 @@ pub fn lobby_from_args(args: &[String]) -> Option<u64> {
     args.get(i + 1)?.parse().ok()
 }
 
+/// What a "Join game" (or an invite's) connect string asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Connect {
+    /// Play in this lobby.
+    Lobby(u64),
+    /// Watch the match in this lobby (a ranked 1v1 has no free player's place).
+    Watch(u64),
+    /// Join this party (crate::party): its leader takes everyone into their matches.
+    Party(u64),
+}
+
+/// The connect request in command-line arguments (Steam starts the game with the connect string
+/// when it isn't running yet) or a rich-presence connect string split into words.
+pub fn connect_from_args(args: &[String]) -> Option<Connect> {
+    let num = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)?.parse::<u64>().ok());
+    if let Some(p) = num("+join_party") {
+        return Some(Connect::Party(p));
+    }
+    let l = num("+connect_lobby")?;
+    Some(if args.iter().any(|a| a == "+watch") { Connect::Watch(l) } else { Connect::Lobby(l) })
+}
+
 /// The same from a rich-presence connect string.
-fn lobby_from_connect(s: &str) -> Option<u64> {
+pub fn parse_connect(s: &str) -> Option<Connect> {
     let parts: Vec<String> = s.split_whitespace().map(str::to_string).collect();
-    lobby_from_args(&parts)
+    connect_from_args(&parts)
+}
+
+#[cfg(test)]
+fn lobby_from_connect(s: &str) -> Option<u64> {
+    match parse_connect(s)? {
+        Connect::Lobby(l) | Connect::Watch(l) => Some(l),
+        Connect::Party(_) => None,
+    }
 }
 
 impl Steam {
@@ -104,7 +159,8 @@ impl Steam {
         if std::env::var_os("DUEL_NO_STEAM").is_some() || !library_present() {
             return None;
         }
-        let client = std::panic::catch_unwind(|| Client::init_app(APP_ID)).ok()?.ok()?;
+        let id = app_id();
+        let client = std::panic::catch_unwind(|| Client::init_app(id)).ok()?.ok()?;
         let events: Arc<Mutex<Vec<SteamEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let mut callbacks = Vec::new();
         // a friend chose "Join game" on us, or we accepted a lobby invite
@@ -116,10 +172,14 @@ impl Steam {
         }));
         let ev = events.clone();
         callbacks.push(client.register_callback(move |j: steamworks::GameRichPresenceJoinRequested| {
-            if let Some(id) = lobby_from_connect(&j.connect) {
-                if let Ok(mut e) = ev.lock() {
-                    e.push(SteamEvent::JoinLobby(id));
-                }
+            let e = match parse_connect(&j.connect) {
+                Some(Connect::Lobby(id)) => SteamEvent::JoinLobby(id),
+                Some(Connect::Watch(id)) => SteamEvent::WatchLobby(id),
+                Some(Connect::Party(id)) => SteamEvent::JoinParty(id),
+                None => return,
+            };
+            if let Ok(mut q) = ev.lock() {
+                q.push(e);
             }
         }));
         // anyone messaging us is a player joining (or a lobby browser measuring ping): accept
@@ -336,10 +396,11 @@ impl Steam {
         }
     }
 
+    /// (the presence lines themselves come from crate::presence each second; this only makes the
+    /// lobby joinable straight away)
     fn set_presence(&self, lobby: u64) {
         let f = self.client.friends();
         f.set_rich_presence("connect", Some(&format!("+connect_lobby {lobby}")));
-        f.set_rich_presence("status", Some("In a Duel Rush lobby"));
     }
 
     /// Join a lobby (from the browser, the friends list or an invite).
@@ -369,7 +430,7 @@ impl Steam {
             self.client.matchmaking().leave_lobby(LobbyId::from_raw(id));
         }
         self.hosting = false;
-        self.client.friends().clear_rich_presence();
+        self.client.friends().set_rich_presence("connect", None);
     }
 
     /// Open Steam's invite window for our lobby.
